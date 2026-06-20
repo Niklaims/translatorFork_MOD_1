@@ -2011,6 +2011,115 @@ class TranslationValidatorDialog(QDialog):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.regex_edit.setText(dialog.get_text())
 
+    def _get_ai_repair_target_rows(self):
+        selected_rows = sorted({
+            item.row()
+            for item in self.table_results.selectedItems()
+            if item.row() in self.results_data
+        })
+        if selected_rows:
+            return selected_rows, True
+
+        target_rows = []
+        for row in range(self.table_results.rowCount()):
+            if self.table_results.isRowHidden(row):
+                continue
+            data = self.results_data.get(row, {})
+            if data.get('structural_errors'):
+                target_rows.append(row)
+
+        return target_rows, False
+
+    def _mark_row_changed_by_ai_repair(self, row):
+        data = self.results_data.get(row)
+        if not isinstance(data, dict):
+            return
+
+        data['is_edited'] = True
+        data['status'] = 'edited'
+        self._invalidate_analysis_for_data(data)
+
+        internal_path = data.get('internal_html_path')
+        if internal_path:
+            self.dirty_files.add(internal_path)
+
+        self.table_results.removeCellWidget(row, 1)
+        reason_item = self.table_results.item(row, 1)
+        if not reason_item:
+            reason_item = QTableWidgetItem("")
+            self.table_results.setItem(row, 1, reason_item)
+        reason_item.setText("")
+
+        len_item = self.table_results.item(row, 2)
+        if len_item:
+            len_item.setText("- | -")
+
+        status_item = self.table_results.item(row, 3)
+        if status_item:
+            status_item.setText("Редакт.")
+
+        self.update_row_color(row, 'edited')
+        self._fixer_stale_rows.add(row)
+
+    def _repair_ai_artifacts_for_selection(self):
+        rows, used_selection = self._get_ai_repair_target_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Автоправка",
+                "Выделите строки для исправления или запустите проверку, чтобы появились структурные проблемы."
+            )
+            return
+
+        changed_rows = []
+        unchanged_count = 0
+        errors = []
+
+        for row in rows:
+            data = self.results_data.get(row)
+            if not isinstance(data, dict):
+                continue
+
+            try:
+                original_html = self._ensure_row_original_html_loaded(row)
+                translated_html = self._ensure_row_translated_html_loaded(row)
+                if not translated_html:
+                    unchanged_count += 1
+                    continue
+
+                repaired_html = repair_ai_html_artifacts(original_html, translated_html)
+                if repaired_html != translated_html:
+                    data['translated_html'] = repaired_html
+                    self._mark_row_changed_by_ai_repair(row)
+                    changed_rows.append(row)
+                else:
+                    unchanged_count += 1
+            except Exception as exc:
+                chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
+                errors.append(f"{chapter_name}: {exc}")
+
+        if changed_rows:
+            self.btn_save_changes.setEnabled(True)
+            self._fixer_data_fingerprint = None
+            self.reapply_filters()
+            self.update_comparison_view()
+            scope_text = "выделенных строках" if used_selection else "видимых проблемных строках"
+            message = (
+                f"Исправлено глав: {len(changed_rows)} в {scope_text}.\n"
+                f"Без изменений: {unchanged_count}.\n\n"
+                "Проверьте результат справа и нажмите «Сохранить изменения»."
+            )
+            if errors:
+                message += "\n\nОшибки:\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    message += f"\n... и ещё {len(errors) - 5}."
+            QMessageBox.information(self, "Автоправка завершена", message)
+        else:
+            message = "Автоправка не нашла изменений для выбранных строк."
+            if errors:
+                message += "\n\nОшибки:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Автоправка", message)
+
     def _show_results_context_menu(self, pos):
         clicked_item = self.table_results.itemAt(pos)
         if not clicked_item:
