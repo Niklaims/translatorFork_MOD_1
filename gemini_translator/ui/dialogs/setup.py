@@ -5213,7 +5213,23 @@ class InitialSetupDialog(QDialog):
             self._finish_auto_validator_followup(auto_settings)
             return
 
-        dialog.start_analysis()
+        auto_targets = []
+        if hasattr(dialog, '_get_eligible_analysis_paths'):
+            auto_targets = sorted(dialog._get_eligible_analysis_paths(), key=extract_number_from_path)
+        elif getattr(dialog, 'path_row_map', None):
+            auto_targets = sorted(dialog.path_row_map.keys(), key=extract_number_from_path)
+
+        if not auto_targets:
+            self._auto_followup_running = False
+            self._auto_validator_dialog = None
+            dialog.deleteLater()
+            self._finish_auto_validator_followup(
+                auto_settings,
+                "Auto validator skipped: no chapters available for validation.",
+            )
+            return
+
+        dialog.start_analysis(specific_targets=auto_targets)
         if dialog.analysis_thread:
             dialog.analysis_thread.analysis_finished.connect(self._on_auto_validator_finished)
         else:
@@ -5388,16 +5404,6 @@ class InitialSetupDialog(QDialog):
 
         if chapters_to_retry:
             signature = tuple(sorted(chapters_to_retry))
-            if signature in self._auto_last_retry_signatures:
-                self._auto_log(
-                    "Получен тот же набор глав для повторного перевода. Автоцикл остановлен: "
-                    f"{self._format_auto_chapter_list(signature, limit=10)}.",
-                    force=True
-                )
-                self._reset_auto_workflow_state()
-                self.check_ready()
-                return
-
             self._auto_last_retry_signatures.add(signature)
             self.add_files_for_retry(self.selected_file, list(signature))
             cjk_retries = sum(1 for _, _, profile in ratio_profiles.values() if profile == "CJK")

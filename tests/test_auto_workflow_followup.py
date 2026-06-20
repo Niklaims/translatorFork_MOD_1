@@ -85,11 +85,13 @@ class _AutoWorkflowHarness:
         self._auto_validator_dialog = dialog
         self.auto_translate_widget = _AutoTranslateWidgetStub(settings)
         self.key_management_widget = _KeyManagementWidgetStub()
+        self.selected_file = "C:/project/book.epub"
         self._auto_followup_running = True
         self._auto_last_retry_signatures = set()
         self._auto_last_untranslated_fix_signatures = set(repeated_signatures or set())
         self.logs = []
         self.consistency_calls = []
+        self.retry_requests = []
         self.reset_calls = 0
         self.ready_calls = 0
         self.project_manager = None
@@ -122,6 +124,9 @@ class _AutoWorkflowHarness:
 
     def _run_auto_consistency_followup(self, auto_settings):
         self.consistency_calls.append(dict(auto_settings))
+
+    def add_files_for_retry(self, epub_path, chapter_paths):
+        self.retry_requests.append((epub_path, list(chapter_paths)))
 
     def _reset_auto_workflow_state(self):
         self.reset_calls += 1
@@ -158,6 +163,7 @@ class _AutoValidatorDialogLaunchStub:
         self.check_show_all = _CheckStateStub()
         self.check_revalidate_ok = _CheckStateStub()
         self.path_row_map = {"Text/ch1.xhtml": 0}
+        self.start_analysis_targets = []
         self.analysis_thread = type(
             "_AnalysisThreadStub",
             (),
@@ -173,6 +179,12 @@ class _AutoValidatorDialogLaunchStub:
 
     def start_analysis(self, specific_targets=None):
         self.start_analysis_calls += 1
+        self.start_analysis_targets.append(
+            tuple(specific_targets) if specific_targets is not None else None
+        )
+
+    def _get_eligible_analysis_paths(self):
+        return set(self.path_row_map.keys())
 
     def deleteLater(self):
         self.deleted = True
@@ -283,6 +295,32 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
 
         self.assertEqual(ratio_limit, 0.70)
         self.assertEqual(profile, "alphabetic")
+
+    def test_repeated_short_retry_signature_is_requeued(self):
+        settings = {
+            "retry_short_enabled": True,
+            "retry_untranslated_enabled": False,
+            "auto_restart_after_retry": False,
+        }
+        short_chapter = "Text/ch1.xhtml"
+        dialog = _ValidatorDialogStub(
+            {
+                0: {
+                    "internal_html_path": short_chapter,
+                    "len_orig": 500,
+                    "ratio_value": 0.20,
+                }
+            },
+            allow_auto_fix=False,
+        )
+        harness = _AutoWorkflowHarness(dialog, settings)
+        harness._auto_last_retry_signatures.add((short_chapter,))
+
+        harness._on_auto_validator_finished(total_scanned=1, suspicious_found=1)
+
+        self.assertEqual(harness.retry_requests, [(harness.selected_file, [short_chapter])])
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertEqual(harness.ready_calls, 1)
 
     def test_repeated_untranslated_signature_advances_to_consistency(self):
         settings = {
@@ -449,6 +487,7 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
         self.assertTrue(dialog.check_show_all.isChecked())
         self.assertTrue(dialog.check_revalidate_ok.isChecked())
         self.assertEqual(dialog.start_analysis_calls, 1)
+        self.assertEqual(dialog.start_analysis_targets, [("Text/ch1.xhtml",)])
         self.assertIs(harness._auto_validator_dialog, dialog)
         self.assertEqual(harness.start_btn.enabled_values, [False])
         self.assertEqual(harness.reset_calls, 0)
