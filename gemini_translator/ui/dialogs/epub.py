@@ -58,7 +58,7 @@ except ImportError:
     LEVENSHTEIN_AVAILABLE = False
     
 # --- Импорты из нашего проекта ---
-from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed, EpubCreator, get_epub_chapter_sizes_with_cache
+from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed, EpubCreator, estimate_epub_chapter_input_tokens, get_epub_chapter_sizes_with_cache
 from ...utils.text import unify_paragraphs_for_ai
 from ...utils.project_manager import TranslationProjectManager
 from ...utils.project_migrator import ProjectMigrator, SyncThread
@@ -1601,16 +1601,16 @@ class EpubHtmlSelectorDialog(QDialog):
                         if median_bytes > 0:
                             try:
                                 content_sample = zf.read(median_name).decode('utf-8', errors='ignore')
-                                chars_count = len(content_sample)
-                                ratio = chars_count / median_bytes
+                                tokens_count = estimate_epub_chapter_input_tokens(content_sample)
+                                ratio = tokens_count / median_bytes
                             except Exception:
                                 pass # Оставляем ratio = 1.0
                         
                         # 4. Применяем коэффициент ко всем файлам
                         for name, b_size in temp_byte_sizes:
                             # Округляем до целого
-                            estimated_chars = int(b_size * ratio)
-                            self._size_cache[name] = estimated_chars
+                            estimated_tokens = max(1, int(b_size * ratio)) if b_size > 0 else 0
+                            self._size_cache[name] = estimated_tokens
 
             except Exception as e:
                 print(f"Ошибка чтения размеров: {e}")
@@ -1639,9 +1639,9 @@ class EpubHtmlSelectorDialog(QDialog):
         self.list_widget.clear()
         for i, file_path in enumerate(chapters_to_show):
             # self._size_cache теперь хранит напрямую {path: total_chars}
-            size_chars = self._size_cache.get(file_path, 0)
+            size_tokens = self._size_cache.get(file_path, 0)
             
-            display_text = f"{os.path.basename(file_path)} ({size_chars:,} симв.)"
+            display_text = f"{os.path.basename(file_path)} ({size_tokens:,} ток.)"
             item = QListWidgetItem(display_text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, file_path)
             

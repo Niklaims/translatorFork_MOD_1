@@ -197,7 +197,10 @@ def _build_sequential_chapter_chains(chapters: list[str], split_count: int) -> l
 
 
 def _chapter_sizes(epub_path: str, chapters: list[str], project_manager=None) -> dict[str, int]:
-    from .utils.epub_tools import get_epub_chapter_sizes_with_cache
+    from .utils.epub_tools import (
+        estimate_epub_chapter_input_tokens,
+        get_epub_chapter_sizes_with_cache,
+    )
 
     sizes = {}
     if project_manager is not None:
@@ -208,7 +211,9 @@ def _chapter_sizes(epub_path: str, chapters: list[str], project_manager=None) ->
         with zipfile.ZipFile(epub_path, "r") as archive:
             for chapter in missing:
                 try:
-                    sizes[chapter] = len(archive.read(chapter).decode("utf-8", "ignore"))
+                    sizes[chapter] = estimate_epub_chapter_input_tokens(
+                        archive.read(chapter).decode("utf-8", "ignore")
+                    )
                 except Exception:
                     sizes[chapter] = 0
     return {chapter: int(sizes.get(chapter, 0) or 0) for chapter in chapters}
@@ -484,6 +489,8 @@ def build_task_plan(epub_path: str, chapters: list[str], settings: dict, project
     summary.update({
         "sequential": bool(settings.get("sequential_translation")),
         "chain_count": len(task_chains),
+        "total_source_tokens": sum(sizes.values()),
+        "total_source_metric": "gemini_input_tokens",
         "total_source_chars": sum(sizes.values()),
     })
     return TaskPlan(chapters=chapters, payloads=payloads, task_chains=task_chains, settings=settings, summary=summary)

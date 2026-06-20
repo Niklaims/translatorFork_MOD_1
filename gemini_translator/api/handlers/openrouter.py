@@ -38,6 +38,22 @@ def get_dynamic_server_url(endpoint_filename: str, default_port: int = 8000) -> 
     return f"http://127.0.0.1:{default_port}/v1/chat/completions"
 
 class OpenRouterApiHandler(BaseApiHandler):
+    def _apply_openai_reasoning_options(self, payload):
+        model_config = self.worker.model_config if isinstance(self.worker.model_config, dict) else {}
+        provider_config = self.worker.provider_config if isinstance(self.worker.provider_config, dict) else {}
+        raw_effort = (
+            model_config.get("reasoning_effort")
+            or model_config.get("default_reasoning_effort")
+            or provider_config.get("reasoning_effort")
+            or provider_config.get("default_reasoning_effort")
+        )
+        if isinstance(raw_effort, bool) or raw_effort is None:
+            return
+
+        effort = str(raw_effort).strip().lower()
+        if effort:
+            payload["reasoning_effort"] = effort
+
     def setup_client(self, client_override=None, proxy_settings=None):
         super().setup_client(client_override, proxy_settings)
         if not client_override: return False
@@ -89,6 +105,7 @@ class OpenRouterApiHandler(BaseApiHandler):
         temperature = self._temperature_payload_value()
         if temperature is not None:
             payload["temperature"] = temperature
+        self._apply_openai_reasoning_options(payload)
         if max_output_tokens is not None: payload["max_tokens"] = max_output_tokens
         elif allow_incomplete:
              payload["max_tokens"] = int(self.worker.model_config.get("max_output_tokens", 8192) * 0.98)

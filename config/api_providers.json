@@ -627,6 +627,38 @@
       }
     }
   },
+  "arbz": {
+    "display_name": "AI ARBZ Translator",
+    "handler_class": "OpenRouterApiHandler",
+    "base_url": "https://ai.arbz.lol/v1/chat/completions",
+    "base_timeout": 1200,
+    "is_async": true,
+    "needs_warmup": true,
+    "visible": true,
+    "post_session_creation_delay": 1.0,
+    "file_suffix": "_translated_arbz.html",
+    "shared_request_counter": false,
+    "reset_policy": {
+      "type": "rolling",
+      "duration_hours": 24
+    },
+    "models": {
+      "ARBZ Translator": {
+        "id": "translator",
+        "rpm": 3,
+        "needs_chunking": true,
+        "max_concurrent_requests": 6,
+        "max_output_tokens": 8192,
+        "context_length": 128000,
+        "reasoning_effort": "high",
+        "default_reasoning_effort": "high",
+        "thinkingLevel": [
+          "high"
+        ],
+        "min_thinking_budget": "high"
+      }
+    }
+  },
   "neuroapi": {
     "display_name": "NeuroAPI (Платный / VIP Модели)",
     "handler_class": "OpenRouterApiHandler",

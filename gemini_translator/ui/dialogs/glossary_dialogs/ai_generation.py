@@ -26,6 +26,7 @@ from gemini_translator.ui.widgets.chapter_list_widget import ChapterListWidget
 from gemini_translator.utils.language_tools import LanguageDetector
 # Импорты для работы движка
 from gemini_translator.api import config as api_config
+from gemini_translator.utils.epub_tools import estimate_epub_chapter_input_tokens
 from gemini_translator.utils.glossary_tools import GlossaryAggregator, ContextManager
 from gemini_translator.utils.settings import SettingsManager
 from gemini_translator.core.task_manager import TaskDBWorker
@@ -1102,6 +1103,10 @@ class GenerationSessionDialog(QDialog):
             f"Фиксированный размер пакета: {value:,} симв.\n"
             f"({self._glossary_task_size_lock_reason})"
         )
+        self.translation_options_widget.info_label.setText(
+            f"Fixed package size: {value:,} Gemini tokens.\n"
+            f"({self._glossary_task_size_lock_reason})"
+        )
 
     def _update_new_terms_limit_from_current_size(self):
         """
@@ -1118,6 +1123,7 @@ class GenerationSessionDialog(QDialog):
 
         # Расчет в токенах: ~1 новый термин на каждые 500 токенов контента
         estimated_tokens = current_chars / chars_per_token
+        estimated_tokens = self.translation_options_widget.task_size_spin.value()
         recommended_limit = self.round_up_to_tens(max(10, int(estimated_tokens / 500)))
         
         clamped_limit = max(self.new_terms_limit_spin.minimum(), 
@@ -1845,7 +1851,9 @@ class GenerationSessionDialog(QDialog):
         try:
             with zipfile.ZipFile(open(self.epub_path, 'rb'), 'r') as zf:
                 for chapter in self.html_files:
-                    real_chapter_sizes[chapter] = len(zf.read(chapter).decode('utf-8', 'ignore'))
+                    real_chapter_sizes[chapter] = estimate_epub_chapter_input_tokens(
+                        zf.read(chapter).decode('utf-8', 'ignore')
+                    )
         except Exception as e:
             QMessageBox.critical(self, "Ошибка чтения файла", f"Не удалось прочитать главы из EPUB: {e}")
             return
@@ -2445,6 +2453,10 @@ class GenerationSessionDialog(QDialog):
                 f"Фиксированный размер пакета: {locked_value:,} симв.\n"
                 f"({lock_reason})"
             )
+            self.translation_options_widget.info_label.setText(
+                f"Fixed package size: {locked_value:,} Gemini tokens.\n"
+                f"({lock_reason})"
+            )
             return
 
         if getattr(self.translation_options_widget, 'is_task_size_user_defined', lambda: False)():
@@ -2457,15 +2469,13 @@ class GenerationSessionDialog(QDialog):
         model_config = api_config.all_models().get(model_name, {})
         context_limit_tokens = model_config.get("context_length", 128000)
 
-        chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
-
         # Glossary extraction has heavier prompt/output overhead than plain translation,
         # so a smaller share of the context stays much more stable in practice.
         target_budget_tokens = context_limit_tokens * 0.075
-        recommended_chars = int(target_budget_tokens * chars_per_token)
+        recommended_tokens = int(target_budget_tokens)
 
         spin = self.translation_options_widget.task_size_spin
-        final_val = max(5000, min(recommended_chars, spin.maximum()))
+        final_val = max(500, min(recommended_tokens, spin.maximum()))
         
         # Установка вызовет сигнал valueChanged, который запустит _update_new_terms_limit_from_current_size
         if hasattr(self.translation_options_widget, 'set_task_size_limit'):
@@ -2480,6 +2490,10 @@ class GenerationSessionDialog(QDialog):
             model_name,
         )
         self.translation_options_widget.info_label.setText(info_text)
+        self.translation_options_widget.info_label.setText(
+            f"Auto size: {final_val:,} Gemini tokens.\n"
+            f"({budget_share_label} context {model_name})"
+        )
 
     def _redraw_task_list_and_update_map(self):
         """Перерисовывает список задач и обновляет карту сгенерированных глав ИЗ БАЗЫ ДАННЫХ."""

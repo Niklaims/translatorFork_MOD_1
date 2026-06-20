@@ -251,6 +251,9 @@ class AutoTranslateWidget(QWidget):
         )
         self.translation_profile_hint.setWordWrap(True)
         self.translation_profile_hint.setStyleSheet("color: #9aa4b2;")
+        self.translation_profile_hint.setText(
+            "0 in batch limit inherits the common task size. Non-zero values are Gemini input tokens and are used directly."
+        )
         profile_layout.addWidget(self.translation_profile_hint, 4, 0, 1, 2)
 
         self.translation_summary_frame = QFrame()
@@ -749,6 +752,7 @@ class AutoTranslateWidget(QWidget):
     def _estimate_batch_chars_from_tokens(self, token_count: int):
         if token_count <= 0:
             return None, None
+        return max(500, min(int(token_count), 350000)), "Gemini tokens"
         chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
         profile_name = "единая токен-оценка"
         estimated_chars = int(round(token_count * chars_per_token))
@@ -818,6 +822,17 @@ class AutoTranslateWidget(QWidget):
         else:
             batch_text = "Лимит пакета: как в общих настройках."
 
+        if batch_tokens > 0:
+            batch_text = (
+                f"Batch limit: ~{self._format_number(batch_tokens)} input tokens "
+                f"(task limit: {self._format_number(estimated_chars)} Gemini tokens, profile: {profile_name})."
+            )
+        elif self._current_task_size_limit > 0:
+            batch_text = (
+                "Batch limit: inherited from common settings "
+                f"({self._format_number(self._current_task_size_limit)} Gemini tokens)."
+            )
+
         self.translation_summary_label.setText(
             f"Основной прогон пойдёт в режиме «{mode_text}». "
             f"Модель: {model_text}. Thinking: {thinking_text}. {batch_text}"
@@ -830,6 +845,12 @@ class AutoTranslateWidget(QWidget):
             notes.append("Перед сборкой задач токены будут автоматически переведены в символьный лимит.")
         else:
             notes.append("Если оставить 0, будет взят текущий размер задачи из общей вкладки.")
+        if batch_tokens > 0:
+            notes = [
+                note for note in notes
+                if "символ" not in note.lower() and "СЃРёРј" not in note
+            ]
+            notes.append("The token limit is used directly when building tasks.")
         self.translation_summary_note.setText(" ".join(notes))
 
     def _update_control_states(self):

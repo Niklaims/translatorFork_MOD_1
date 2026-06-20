@@ -11,7 +11,9 @@ import time
 import zipfile
 import threading
 import random
-from ..utils.language_tools import SmartGlossaryFilter, GlossaryRegexService
+from ..utils.language_tools import SmartGlossaryFilter, GlossaryRegexService, get_chinese_script_variants
+from ..utils.epub_tools import normalize_epub_chapter_heading_to_h1
+from ..utils.helpers import estimate_gemini_tokens
 from ..api import config as api_config
 # --- ДОБАВЛЯЕМ ИМПОРТ BEAUTIFULSOUP ---
 try:
@@ -257,6 +259,7 @@ class ContextManager:
         items = self._reorder_glossary_items(raw_items)
 
         total_items = len(items)
+        source_text_wall = re.sub(r'\W+', '', text_content or '', flags=re.UNICODE)
 
         for index, (original, data) in enumerate(items):
             rus, note = "", ""
@@ -267,7 +270,15 @@ class ContextManager:
 
             if not rus: continue
 
-            entry = {"s": original, "t": rus}
+            source_term = original
+            if source_text_wall:
+                for script_variant in get_chinese_script_variants(original):
+                    clean_variant = re.sub(r'\W+', '', script_variant, flags=re.UNICODE)
+                    if clean_variant and clean_variant in source_text_wall:
+                        source_term = script_variant
+                        break
+
+            entry = {"s": source_term, "t": rus}
             if note: entry["i"] = note
 
             json_str = json.dumps(entry, ensure_ascii=False)
@@ -509,6 +520,13 @@ class TaskPreparer:
         self.task_input_size_limit = settings.get('task_size_limit', 30000)
         self.epub_path = settings.get('file_path')
 
+    def _chunk_target_chars_for_token_limit(self, html_fragment):
+        token_count = estimate_gemini_tokens(html_fragment)
+        if token_count <= 0:
+            return self.task_input_size_limit
+        chars_per_token = max(1.0, len(html_fragment or "") / token_count)
+        return max(api_config.min_chunk_size(), int(self.task_input_size_limit * chars_per_token))
+
     def prepare_tasks(self, chapter_list):
         if self.use_batching:
             return self._prepare_batch_tasks(chapter_list)
@@ -614,6 +632,7 @@ class TaskPreparer:
         try:
             with open(self.epub_path, 'rb') as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
                 content = epub_zip.read(chapter_file).decode("utf-8", "ignore")
+            content = normalize_epub_chapter_heading_to_h1(content)
 
             prefix, body_content, suffix = "", content, ""
             content_lower = content.lower()
@@ -624,7 +643,8 @@ class TaskPreparer:
                 body_content = content[start_body_content_pos:end_body_tag_pos]
                 suffix = content[end_body_tag_pos:]
 
-            chunks = split_text_into_chunks(body_content, self.task_input_size_limit,
+            chunk_target_chars = self._chunk_target_chars_for_token_limit(body_content)
+            chunks = split_text_into_chunks(body_content, chunk_target_chars,
                                             api_config.chunk_search_window(), api_config.min_chunk_size())
             return [
                 ('epub_chunk', self.epub_path, chapter_file, chunk_content, i, len(chunks), prefix, suffix)
@@ -650,6 +670,7 @@ class TaskPreparer:
 
                 try:
                     content = epub_zip.read(chapter_file).decode("utf-8", "ignore")
+                    content = normalize_epub_chapter_heading_to_h1(content)
 
                     prefix, body_content, suffix = "", content, ""
                     content_lower = content.lower()
@@ -658,7 +679,8 @@ class TaskPreparer:
                         start_body_content_pos = content_lower.find('>', start_body_tag_pos) + 1
                         prefix, body_content, suffix = content[:start_body_content_pos], content[start_body_content_pos:end_body_tag_pos], content[end_body_tag_pos:]
 
-                    chunks = split_text_into_chunks(body_content, self.task_input_size_limit,
+                    chunk_target_chars = self._chunk_target_chars_for_token_limit(body_content)
+                    chunks = split_text_into_chunks(body_content, chunk_target_chars,
                                                     api_config.chunk_search_window(), api_config.min_chunk_size())
 
                     for i, chunk_content in enumerate(chunks):

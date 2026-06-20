@@ -41,6 +41,7 @@ from ...utils.settings import SettingsManager
 from ...utils.epub_tools import (
     extract_number_from_path,
     calculate_potential_output_size,
+    estimate_epub_chapter_input_tokens,
     get_epub_chapter_sizes_with_cache,
     get_epub_chapter_order,
 )
@@ -2117,7 +2118,7 @@ class InitialSetupDialog(QDialog):
         total_output_tokens = 0
         max_input_tokens = 0
         max_output_tokens = 0
-        total_source_chars = 0
+        total_source_tokens = 0
         task_type_counter = Counter()
         chapter_occurrences = Counter()
         cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
@@ -2162,7 +2163,7 @@ class InitialSetupDialog(QDialog):
             task_total_input = task_input_tokens + per_task_overhead
             total_html_tokens += task_input_tokens
             total_output_tokens += task_output_tokens
-            total_source_chars += task_source_chars
+            total_source_tokens += task_input_tokens
             max_input_tokens = max(max_input_tokens, task_total_input)
             max_output_tokens = max(max_output_tokens, task_output_tokens)
 
@@ -2216,7 +2217,7 @@ class InitialSetupDialog(QDialog):
             ),
             "",
             "Нагрузка",
-            f"Символов исходника: ~{total_source_chars:,}".replace(",", " "),
+            f"Токенов исходника: ~{int(round(total_source_tokens)):,}".replace(",", " "),
             f"Входные токены HTML: ~{int(round(total_html_tokens)):,}".replace(",", " "),
             f"Служебные токены на запрос: ~{per_task_overhead:,}".replace(",", " "),
             f"Общий вход: ~{int(round(total_input_tokens)):,} токенов".replace(",", " "),
@@ -3165,7 +3166,7 @@ class InitialSetupDialog(QDialog):
             auto_translation_mode,
             auto_has_translation_override,
             auto_batch_token_limit,
-            auto_batch_char_limit,
+            auto_batch_task_limit,
             auto_batch_profile,
         ) = self._resolve_auto_translation_options(auto_settings)
         auto_model_name, auto_model_config, auto_model_warning = self._resolve_auto_model_override(auto_settings)
@@ -3184,11 +3185,11 @@ class InitialSetupDialog(QDialog):
                     f"Основной автоперевод будет собран {mode_titles.get(auto_translation_mode, auto_translation_mode)}.",
                     force=True
                 )
-            if auto_batch_token_limit > 0 and auto_batch_char_limit:
+            if auto_batch_token_limit > 0 and auto_batch_task_limit:
                 self._auto_log(
                     "Лимит пакета для основного автопрогона: "
                     f"~{auto_batch_token_limit} входных токенов "
-                    f"(≈{auto_batch_char_limit} символов, профиль: {auto_batch_profile}).",
+                    f"(лимит задачи: {auto_batch_task_limit} токенов, профиль: {auto_batch_profile}).",
                     force=True
                 )
         if auto_settings.get('enabled') and not is_auto_restart and auto_model_warning:
@@ -3205,7 +3206,29 @@ class InitialSetupDialog(QDialog):
         )
 
         # 2. Проверяем все условия для старта
-        if not all([self.selected_file, tasks_exist, self.output_folder, active_keys_for_start]):
+        missing_start_requirements = []
+        if not self.selected_file:
+            missing_start_requirements.append("не выбран файл")
+        if not tasks_exist:
+            missing_start_requirements.append("нет задач в очереди")
+        if not self.output_folder:
+            missing_start_requirements.append("не выбрана папка проекта")
+        if not active_keys_for_start:
+            missing_start_requirements.append("нет активной сессии сервиса/ключей")
+
+        if missing_start_requirements:
+            if is_auto_restart:
+                self._auto_log(
+                    "Автоперезапуск перевода остановлен: "
+                    + ", ".join(missing_start_requirements)
+                    + ". Подготовленные задачи останутся в очереди, если они были созданы.",
+                    force=True
+                )
+                self._auto_restart_session_override = None
+                self._reset_auto_workflow_state()
+                self.check_ready()
+                return
+
             QMessageBox.warning(self, "Ошибка", "Необходимо выбрать файл, задачи, папку и активную сессию сервиса.")
             return
 
@@ -3956,11 +3979,9 @@ class InitialSetupDialog(QDialog):
         if token_limit <= 0:
             return None, None
 
-        chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
-        profile_name = "единая токен-оценка"
-        estimated_chars = int(round(token_limit * chars_per_token))
-        estimated_chars = max(500, min(estimated_chars, 350000))
-        return estimated_chars, profile_name
+        profile_name = "Gemini-токены"
+        task_token_limit = max(500, min(token_limit, 350000))
+        return task_token_limit, profile_name
 
     def _get_effective_auto_short_ratio_limit(self, auto_settings: dict | None, result_data: dict | None = None):
         if not isinstance(auto_settings, dict):
@@ -4243,15 +4264,15 @@ class InitialSetupDialog(QDialog):
             mode = 'inherit'
 
         batch_token_limit = int(auto_settings.get('batch_token_limit_override', 0) or 0)
-        batch_char_limit = None
+        batch_task_limit = None
         token_profile = None
         if batch_token_limit > 0:
-            batch_char_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
-            if batch_char_limit:
-                translation_options['task_size_limit'] = batch_char_limit
+            batch_task_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
+            if batch_task_limit:
+                translation_options['task_size_limit'] = batch_task_limit
                 has_override = True
 
-        return translation_options, mode, has_override, batch_token_limit, batch_char_limit, token_profile
+        return translation_options, mode, has_override, batch_token_limit, batch_task_limit, token_profile
 
     def _build_sequential_chapter_chains(self, chapters: list, split_count: int) -> list[list]:
         chapters = list(chapters or [])
@@ -4307,7 +4328,9 @@ class InitialSetupDialog(QDialog):
                 try:
                     with open(self.selected_file, 'rb') as epub_file, zipfile.ZipFile(epub_file, 'r') as zf:
                         for chapter in missing_size_chapters:
-                            real_chapter_sizes[chapter] = len(zf.read(chapter).decode('utf-8', 'ignore'))
+                            real_chapter_sizes[chapter] = estimate_epub_chapter_input_tokens(
+                                zf.read(chapter).decode('utf-8', 'ignore')
+                            )
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(
                         self,
