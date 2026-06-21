@@ -1193,6 +1193,15 @@ if __name__ == "__main__":
                         main_window_to_run = ranobelib_window
                     else:
                         continue
+                elif selected_tool == 'qidian_rulate_creator':
+                    from gemini_translator.ui.dialogs.qidian_rulate_creator import QidianRulateCreatorWindow
+
+                    main_window_to_run = QidianRulateCreatorWindow()
+                    if hasattr(main_window_to_run, "set_return_to_menu_handler"):
+                        def return_to_menu():
+                            app.exit(EXIT_CODE_REBOOT)
+
+                        main_window_to_run.set_return_to_menu_handler(return_to_menu)
                 elif selected_tool == 'prompt_benchmark':
                     from gemini_translator.ui.dialogs.benchmark import PromptBenchmarkDialog
                     main_window_to_run = PromptBenchmarkDialog()

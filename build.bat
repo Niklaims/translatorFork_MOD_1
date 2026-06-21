@@ -159,6 +159,7 @@ call :build_app_base "ПОЛНОСТЬЮ ПОРТАТИВНАЯ"
 --add-data "ffprobe.exe;." ^
 --add-data "gemini_translator\scripts\chatgpt_workascii_bridge.cjs;gemini_translator\scripts" ^
 --add-data "gemini_translator\scripts\chatgpt_profile_launcher.cjs;gemini_translator\scripts" ^
+--add-data "qidian_rulate\tags.txt;qidian_rulate" ^
 --add-data "C:\Users\shest\Downloads\rulate\translatorFork 1.1\ranobelib\__init__.py;ranobelib" ^
 --add-data "C:\Users\shest\Downloads\rulate\translatorFork 1.1\ranobelib\api_upload.py;ranobelib" ^
 --add-data "C:\Users\shest\Downloads\rulate\translatorFork 1.1\ranobelib\constants.py;ranobelib" ^
@@ -212,6 +213,8 @@ if %ERRORLEVEL% EQU 0 (
     copy /Y "gemini_translator\scripts\chatgpt_workascii_bridge.cjs" "dist\gemini_translator\scripts\chatgpt_workascii_bridge.cjs" > nul
     if not exist "dist\gemini_translator\scripts" mkdir "dist\gemini_translator\scripts"
     copy /Y "gemini_translator\scripts\chatgpt_profile_launcher.cjs" "dist\gemini_translator\scripts\chatgpt_profile_launcher.cjs" > nul
+    if not exist "dist\qidian_rulate" mkdir "dist\qidian_rulate"
+    copy /Y "qidian_rulate\tags.txt" "dist\qidian_rulate\tags.txt" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
     copy /Y "C:\Users\shest\Downloads\rulate\translatorFork 1.1\ranobelib\__init__.py" "dist\ranobelib\__init__.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
@@ -280,6 +283,8 @@ if %ERRORLEVEL% EQU 0 (
     copy /Y "gemini_translator\scripts\chatgpt_workascii_bridge.cjs" "dist\%AppName%\gemini_translator\scripts\chatgpt_workascii_bridge.cjs" > nul
     if not exist "dist\%AppName%\gemini_translator\scripts" mkdir "dist\%AppName%\gemini_translator\scripts"
     copy /Y "gemini_translator\scripts\chatgpt_profile_launcher.cjs" "dist\%AppName%\gemini_translator\scripts\chatgpt_profile_launcher.cjs" > nul
+    if not exist "dist\%AppName%\qidian_rulate" mkdir "dist\%AppName%\qidian_rulate"
+    copy /Y "qidian_rulate\tags.txt" "dist\%AppName%\qidian_rulate\tags.txt" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
     copy /Y "C:\Users\shest\Downloads\rulate\translatorFork 1.1\ranobelib\__init__.py" "dist\%AppName%\ranobelib\__init__.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"

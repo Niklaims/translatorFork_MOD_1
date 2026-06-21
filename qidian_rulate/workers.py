@@ -1,0 +1,1139 @@
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sys
+import traceback
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote, urljoin
+
+import requests
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from gemini_translator.api import config as api_config
+from gemini_translator.api.factory import get_api_handler_class
+
+from .models import PreparedRulateMetadata, QidianBookMetadata, RulateBookDraft
+
+try:
+    from ranobelib.constants import BROWSER_ARGS
+except Exception:
+    BROWSER_ARGS = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-infobars",
+    ]
+
+QIDIAN_RULATE_APP_DATA_DIR = Path.home() / ".qidian_rulate_creator"
+RULATE_PROFILE_DIR = Path(
+    os.environ.get(
+        "QIDIAN_RULATE_PROFILE_DIR",
+        str(QIDIAN_RULATE_APP_DATA_DIR / "rulate_profile"),
+    )
+)
+RULATE_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+QIDIAN_BOOK_RE = re.compile(r"^https?://(?:www\.)?qidian\.com/book/\d+/?(?:[?#].*)?$", re.IGNORECASE)
+RULATE_CATEGORY_URL = "https://tl.rulate.ru/book/0/edit/cat"
+RULATE_INFO_URL = "https://tl.rulate.ru/book/0/edit/info#general"
+RULATE_LOGIN_URL = "https://tl.rulate.ru/book/0/edit/info"
+RULATE_BOOK_TYPE_TITLE = "Книга"
+RULATE_BOOK_TYPE_DESCRIPTION = "Публикуйте свои произведения"
+RULATE_BOOK_TYPE_SELECTOR = 'a.create-card.card-book[href*="typ=A"]'
+RULATE_CHINESE_CATEGORY_TITLE = "Китайские"
+
+RULATE_GENRES = [
+    "боевик",
+    "боевые искусства",
+    "городское фэнтези",
+    "детектив",
+    "драма",
+    "киберпанк",
+    "комедия",
+    "литрпг",
+    "мистика",
+    "научная фантастика",
+    "повседневность",
+    "постапокалиптика",
+    "приключения",
+    "психология",
+    "романтика",
+    "сверхъестественное",
+    "сэйнэн",
+    "сюаньхуань",
+    "сянься (XianXia)",
+    "триллер",
+    "ужасы",
+    "уся (wuxia)",
+    "фантастика",
+    "фэнтези",
+]
+
+FALLBACK_GENRES = ["фэнтези", "мистика", "приключения"]
+FALLBACK_TAG_CANDIDATES = [
+    "sci-fi",
+    "мистика",
+    "мистические тайны",
+    "тайны",
+    "сверхъестественное",
+    "потусторонний мир",
+    "путешествие в другой мир",
+    "путешествие между мирами",
+    "путешествия по измерениям",
+    "современный мир",
+    "китай",
+]
+TAGS_FILE_ENV = "RULATE_TAGS_FILE"
+_RULATE_TAGS_CACHE: list[str] | None = None
+
+
+def validate_qidian_url(url: str) -> bool:
+    return bool(QIDIAN_BOOK_RE.match((url or "").strip()))
+
+
+def _tag_file_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_value = os.environ.get(TAGS_FILE_ENV)
+    if env_value:
+        candidates.append(Path(env_value))
+
+    module_root = Path(__file__).resolve().parents[1]
+    candidates.extend([
+        module_root / "qidian_rulate" / "tags.txt",
+        module_root / "tags.txt",
+        Path.cwd() / "tags.txt",
+    ])
+
+    unique = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def load_rulate_tags() -> list[str]:
+    global _RULATE_TAGS_CACHE
+    if _RULATE_TAGS_CACHE is not None:
+        return list(_RULATE_TAGS_CACHE)
+
+    for path in _tag_file_candidates():
+        if not path.exists() or not path.is_file():
+            continue
+        for encoding in ("utf-8-sig", "utf-8", "cp1251"):
+            try:
+                raw_lines = path.read_text(encoding=encoding).splitlines()
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            continue
+
+        tags = []
+        seen = set()
+        for line in raw_lines:
+            tag = _clean_text(line)
+            key = tag.lower()
+            if tag and key not in seen:
+                seen.add(key)
+                tags.append(tag)
+        _RULATE_TAGS_CACHE = tags
+        return list(tags)
+
+    _RULATE_TAGS_CACHE = []
+    return []
+
+
+def _fallback_tags_from_allowed(allowed_tags: list[str]) -> list[str]:
+    by_lower = {tag.lower(): tag for tag in allowed_tags}
+    result = []
+    for candidate in FALLBACK_TAG_CANDIDATES:
+        tag = by_lower.get(candidate.lower())
+        if tag and tag not in result:
+            result.append(tag)
+        if len(result) >= 3:
+            return result
+    for tag in allowed_tags:
+        if tag not in result:
+            result.append(tag)
+        if len(result) >= 3:
+            return result
+    return result
+
+
+def normalize_rulate_tags(value) -> list[str]:
+    allowed_tags = load_rulate_tags()
+    if not allowed_tags:
+        searched = ", ".join(str(path) for path in _tag_file_candidates())
+        raise ValueError(f"Файл tags.txt с тегами Rulate не найден. Проверенные пути: {searched}")
+    return _normalize_list(
+        value,
+        allowed=allowed_tags,
+        fallback=_fallback_tags_from_allowed(allowed_tags),
+    )
+
+
+def configure_playwright_runtime() -> None:
+    if sys.platform == "win32" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+        try:
+            current_policy = asyncio.get_event_loop_policy()
+        except Exception:
+            current_policy = None
+        if not isinstance(current_policy, asyncio.WindowsProactorEventLoopPolicy):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+    resolved_paths = {
+        "PLAYWRIGHT_BROWSERS_PATH": api_config.find_playwright_browsers_path(),
+        "PLAYWRIGHT_NODEJS_PATH": api_config.find_node_executable(),
+        "PLAYWRIGHT_PACKAGE_ROOT": api_config.find_playwright_package_root(),
+    }
+    for env_name, resolved_path in resolved_paths.items():
+        if not resolved_path:
+            continue
+        path_obj = Path(resolved_path)
+        if path_obj.exists():
+            os.environ[env_name] = str(path_obj)
+
+
+def _playwright_browser_install_hint() -> str:
+    python_executable = sys.executable or "python"
+    return (
+        "Playwright не нашел совместимый Chromium. "
+        f"Установите браузер командой: \"{python_executable}\" -m playwright install chromium"
+    )
+
+
+def _is_browser_missing_error(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "executable doesn't exist" in text
+        or "playwright install" in text
+        or "browserType.launch" in text and "executable" in text
+        or "chromium distribution" in text and "not found" in text
+    )
+
+
+def _candidate_browser_cache_roots() -> list[Path]:
+    roots: list[Path] = []
+    for env_name in ("PLAYWRIGHT_BROWSERS_PATH",):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            roots.append(Path(env_value))
+
+    try:
+        executable_dir = api_config.get_executable_dir()
+    except Exception:
+        executable_dir = None
+    try:
+        dev_root = api_config.get_dev_project_root()
+    except Exception:
+        dev_root = None
+
+    module_root = Path(__file__).resolve().parents[1]
+    for base in (module_root, executable_dir, dev_root, Path.cwd()):
+        if base:
+            roots.append(Path(base) / "playwright_runtime" / "ms-playwright")
+
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        roots.append(Path(localappdata) / "ms-playwright")
+
+    unique = []
+    seen = set()
+    for root in roots:
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        key = str(resolved).lower()
+        if key not in seen and resolved.exists() and resolved.is_dir():
+            seen.add(key)
+            unique.append(resolved)
+    return unique
+
+
+def _revision_from_path(path: Path) -> int:
+    match = re.search(r"chromium-(\d+)", str(path))
+    if not match:
+        return -1
+    return int(match.group(1))
+
+
+def _find_cached_chromium_executable() -> Path | None:
+    candidates: list[Path] = []
+    for root in _candidate_browser_cache_roots():
+        candidates.extend(root.glob("chromium-*/chrome-win*/chrome.exe"))
+    existing = [candidate for candidate in candidates if candidate.exists() and candidate.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=_revision_from_path)
+
+
+def _launch_chromium(playwright, *, headless: bool, log_callback=None):
+    try:
+        return playwright.chromium.launch(
+            headless=headless,
+            args=BROWSER_ARGS,
+        )
+    except Exception as error:
+        if not _is_browser_missing_error(error):
+            raise
+        if log_callback:
+            log_callback("WARNING", "Playwright Chromium не найден, пробую fallback-браузер.")
+
+    cached_executable = _find_cached_chromium_executable()
+    if cached_executable:
+        try:
+            if log_callback:
+                log_callback("INFO", f"Playwright: запускаю Chromium из {cached_executable}.")
+            return playwright.chromium.launch(
+                executable_path=str(cached_executable),
+                headless=headless,
+                args=BROWSER_ARGS,
+            )
+        except Exception as error:
+            if log_callback:
+                log_callback("WARNING", f"Кэшированный Chromium не запустился: {error}")
+
+    for channel in ("chrome", "msedge"):
+        try:
+            if log_callback:
+                log_callback("INFO", f"Playwright: пробую системный браузер {channel}.")
+            return playwright.chromium.launch(
+                channel=channel,
+                headless=headless,
+                args=BROWSER_ARGS,
+            )
+        except Exception as error:
+            if log_callback:
+                log_callback("WARNING", f"Системный браузер {channel} не запустился: {error}")
+
+    raise RuntimeError(_playwright_browser_install_hint())
+
+
+def _launch_persistent_chromium_context(playwright, *, user_data_dir: str, viewport: dict, log_callback=None):
+    try:
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=False,
+            viewport=viewport,
+            args=BROWSER_ARGS,
+        )
+    except Exception as error:
+        if not _is_browser_missing_error(error):
+            raise
+        if log_callback:
+            log_callback("WARNING", "Playwright Chromium не найден, пробую fallback-браузер.")
+
+    cached_executable = _find_cached_chromium_executable()
+    if cached_executable:
+        try:
+            if log_callback:
+                log_callback("INFO", f"Playwright: запускаю Chromium из {cached_executable}.")
+            return playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                executable_path=str(cached_executable),
+                headless=False,
+                viewport=viewport,
+                args=BROWSER_ARGS,
+            )
+        except Exception as error:
+            if log_callback:
+                log_callback("WARNING", f"Кэшированный Chromium не запустился: {error}")
+
+    for channel in ("chrome", "msedge"):
+        try:
+            if log_callback:
+                log_callback("INFO", f"Playwright: пробую системный браузер {channel}.")
+            return playwright.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel=channel,
+                headless=False,
+                viewport=viewport,
+                args=BROWSER_ARGS,
+            )
+        except Exception as error:
+            if log_callback:
+                log_callback("WARNING", f"Системный браузер {channel} не запустился: {error}")
+
+    raise RuntimeError(_playwright_browser_install_hint())
+
+
+def _clean_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _normalize_url(value: str | None, base_url: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("//"):
+        return "https:" + value
+    return urljoin(base_url, value)
+
+
+def _download_cover_image(cover_url: str, *, referer: str) -> bytes:
+    cover_url = (cover_url or "").strip()
+    if not cover_url:
+        return b""
+    try:
+        response = requests.get(
+            cover_url,
+            timeout=20,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                "Referer": referer,
+            },
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        image_signatures = (b"\xff\xd8", b"\x89PNG", b"GIF", b"RIFF")
+        if not response.content:
+            return b""
+        if "image" not in content_type.lower() and not response.content.startswith(image_signatures):
+            return b""
+        return response.content
+    except Exception:
+        return b""
+
+
+def google_translate_title_to_english(title: str, timeout: int = 20) -> str:
+    title = (title or "").strip()
+    if not title:
+        return ""
+    endpoint = (
+        "https://translate.googleapis.com/translate_a/single"
+        f"?client=gtx&sl=zh-CN&tl=en&dt=t&q={quote(title)}"
+    )
+    response = requests.get(endpoint, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    parts = data[0] if data and isinstance(data[0], list) else []
+    translated = "".join(str(part[0]) for part in parts if part and part[0])
+    return _clean_text(translated)
+
+
+def parse_prepared_metadata(raw_response: str) -> PreparedRulateMetadata:
+    raw_response = (raw_response or "").strip()
+    raw_response = re.sub(r"^```(?:json)?\s*", "", raw_response, flags=re.IGNORECASE)
+    raw_response = re.sub(r"\s*```$", "", raw_response)
+    match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+    payload_text = match.group(0) if match else raw_response
+    payload = json.loads(payload_text)
+
+    genres = _normalize_list(payload.get("genres"), allowed=RULATE_GENRES, fallback=FALLBACK_GENRES)
+    tags = normalize_rulate_tags(payload.get("tags"))
+
+    return PreparedRulateMetadata(
+        english_title=_clean_text(payload.get("english_title")),
+        translated_title=_clean_text(payload.get("translated_title")),
+        translated_description=_clean_multiline(payload.get("translated_description")),
+        genres=genres,
+        tags=tags,
+    )
+
+
+def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str]) -> list[str]:
+    if isinstance(value, str):
+        candidates = [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
+    elif isinstance(value, list):
+        candidates = [_clean_text(str(part)) for part in value if _clean_text(str(part))]
+    else:
+        candidates = []
+
+    if allowed:
+        by_lower = {item.lower(): item for item in allowed}
+        normalized = []
+        for item in candidates:
+            canonical = by_lower.get(item.lower())
+            if canonical and canonical not in normalized:
+                normalized.append(canonical)
+    else:
+        normalized = []
+        for item in candidates:
+            item = item.lower()
+            if item and item not in normalized:
+                normalized.append(item)
+
+    for item in fallback:
+        if len(normalized) >= 3:
+            break
+        if item not in normalized:
+            normalized.append(item)
+    return normalized[:8]
+
+
+def _clean_multiline(value: str | None) -> str:
+    value = str(value or "").strip()
+    value = re.sub(r"\r\n?", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
+    allowed_genres = ", ".join(RULATE_GENRES)
+    return f"""Ты готовишь карточку китайской веб-новеллы для Rulate.
+
+Верни только JSON без markdown.
+
+Поля JSON:
+- english_title: английское название. Используй это значение, если оно пригодно: {english_title!r}
+- translated_title: литературное название на русском.
+- translated_description: литературный русский перевод описания. Не вставляй название отдельной строкой.
+- genres: от 3 до 5 жанров строго из списка допустимых жанров.
+- tags: от 3 до 8 существующих тегов Rulate. Не придумывай новые теги; ориентируйся на уже используемые теги вроде: sci-fi, мистика, мистические тайны, тайны, сверхъестественное, потусторонний мир, путешествие в другой мир, путешествие между мирами, путешествия по измерениям, современный мир, китай.
+
+Допустимые жанры Rulate:
+{allowed_genres}
+
+Исходные данные:
+Китайское название: {metadata.title_original}
+Автор: {metadata.author_name}
+Описание:
+{metadata.description}
+"""
+
+
+class QidianFetchWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    metadata_ready = pyqtSignal(object)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, qidian_url: str, visible_browser: bool = False):
+        super().__init__()
+        self.qidian_url = qidian_url.strip()
+        self.visible_browser = visible_browser
+
+    def log(self, level: str, message: str) -> None:
+        self.log_signal.emit(level, message)
+
+    def run(self) -> None:
+        try:
+            if not validate_qidian_url(self.qidian_url):
+                raise ValueError("Введите ссылку вида https://www.qidian.com/book/1041604040/")
+
+            configure_playwright_runtime()
+            from playwright.sync_api import sync_playwright
+
+            self.log("INFO", "Qidian: открываю страницу книги...")
+            with sync_playwright() as playwright:
+                browser = _launch_chromium(
+                    playwright,
+                    headless=not self.visible_browser,
+                    log_callback=self.log,
+                )
+                page = browser.new_page(
+                    viewport={"width": 1280, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/125.0.0.0 Safari/537.36"
+                    ),
+                )
+                try:
+                    page.goto(self.qidian_url, wait_until="domcontentloaded", timeout=60000)
+                    page.wait_for_timeout(2500)
+                    payload = page.evaluate(_QIDIAN_EXTRACT_SCRIPT)
+                finally:
+                    browser.close()
+
+            cover_url = _normalize_url(payload.get("cover_url"), self.qidian_url)
+            metadata = QidianBookMetadata(
+                source_url=self.qidian_url,
+                title_original=_clean_text(payload.get("title")),
+                author_name=_clean_text(payload.get("author")),
+                description=_clean_multiline(payload.get("description")),
+                cover_url=cover_url,
+                cover_image_data=_download_cover_image(cover_url, referer=self.qidian_url),
+            )
+            if not metadata.title_original:
+                raise ValueError("Qidian: не удалось определить название книги.")
+            if not metadata.author_name:
+                self.log("WARNING", "Qidian: автор не найден, его можно вписать вручную.")
+            if not metadata.description:
+                self.log("WARNING", "Qidian: описание не найдено, его можно вставить вручную.")
+            if metadata.cover_url and not metadata.cover_image_data:
+                self.log("WARNING", "Qidian: ссылка на обложку найдена, но предпросмотр загрузить не удалось.")
+            self.metadata_ready.emit(metadata)
+            self.log("SUCCESS", f"Qidian: получено '{metadata.title_original}'.")
+        except Exception as error:
+            self.log("ERROR", f"Qidian: {error}")
+            self.log("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+
+class RulateLoginWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    finished_signal = pyqtSignal()
+
+    def run(self) -> None:
+        try:
+            configure_playwright_runtime()
+            from playwright.sync_api import sync_playwright
+
+            self.log_signal.emit("INFO", "Rulate: открываю браузер для входа.")
+            with sync_playwright() as playwright:
+                browser = _launch_persistent_chromium_context(
+                    playwright,
+                    user_data_dir=str(RULATE_PROFILE_DIR),
+                    viewport={"width": 1280, "height": 900},
+                    log_callback=self.log_signal.emit,
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+                try:
+                    page.goto(RULATE_LOGIN_URL, timeout=60000)
+                except Exception:
+                    pass
+                self.log_signal.emit(
+                    "WARNING",
+                    "Войдите в Rulate в открытом браузере и закройте окно браузера. Куки сохранятся.",
+                )
+                try:
+                    while True:
+                        page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+            self.log_signal.emit("SUCCESS", "Rulate: браузер закрыт, куки сохранены.")
+        except Exception as error:
+            self.log_signal.emit("ERROR", f"Rulate login: {error}")
+            self.log_signal.emit("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+
+class AiPrepareWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    prepared_ready = pyqtSignal(object)
+    finished_signal = pyqtSignal()
+
+    def __init__(
+        self,
+        metadata: QidianBookMetadata,
+        provider_id: str,
+        model_settings: dict,
+        active_keys: list[str],
+        settings_manager,
+    ):
+        super().__init__()
+        self.metadata = metadata
+        self.provider_id = provider_id
+        self.model_settings = model_settings or {}
+        self.active_keys = active_keys or []
+        self.settings_manager = settings_manager
+
+    def log(self, level: str, message: str) -> None:
+        self.log_signal.emit(level, message)
+
+    def run(self) -> None:
+        try:
+            english_title = ""
+            try:
+                self.log("INFO", "Google Translate: перевожу название на английский...")
+                english_title = google_translate_title_to_english(self.metadata.title_original)
+                self.log("SUCCESS", f"Google Translate: {english_title}")
+            except Exception as error:
+                self.log("WARNING", f"Google Translate недоступен, английское название попросим у AI: {error}")
+
+            if not self.provider_id:
+                raise ValueError("Не выбран AI-сервис.")
+            if not self.active_keys:
+                raise ValueError("Не выбран активный ключ или сессия для AI-сервиса.")
+
+            prompt = build_ai_prompt(self.metadata, english_title)
+            raw_response = self._run_ai_request(prompt)
+            prepared = parse_prepared_metadata(raw_response)
+            if english_title and not prepared.english_title:
+                prepared.english_title = english_title
+            if not prepared.translated_title:
+                raise ValueError("AI не вернул название на русском.")
+            if not prepared.translated_description:
+                raise ValueError("AI не вернул описание на русском.")
+
+            self.prepared_ready.emit(prepared)
+            self.log("SUCCESS", "AI: данные для Rulate подготовлены.")
+        except Exception as error:
+            self.log("ERROR", f"AI: {error}")
+            self.log("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+    def _run_ai_request(self, prompt: str) -> str:
+        provider_config = deepcopy(api_config.api_providers().get(self.provider_id) or {})
+        if not provider_config:
+            raise ValueError(f"Провайдер '{self.provider_id}' не найден в конфиге.")
+
+        model_name = self.model_settings.get("model") or api_config.default_model_name()
+        model_config = deepcopy(api_config.all_models().get(model_name) or {})
+        if not model_config:
+            provider_models = provider_config.get("models") or {}
+            model_config = deepcopy(provider_models.get(model_name) or {})
+        if not model_config:
+            raise ValueError(f"Модель '{model_name}' не найдена в конфиге провайдера.")
+
+        model_config.setdefault("provider", self.provider_id)
+        model_config.setdefault("id", model_config.get("model_id") or model_name)
+        api_key = self.active_keys[0]
+
+        worker = _SingleRequestWorker(
+            settings_manager=self.settings_manager,
+            provider_config=provider_config,
+            model_config=model_config,
+            api_key=api_key,
+            model_settings=self.model_settings,
+            log_callback=self.log,
+        )
+
+        handler_class_name = provider_config.get("handler_class")
+        if not handler_class_name:
+            raise ValueError(f"У провайдера '{self.provider_id}' не указан handler_class.")
+
+        handler_class = get_api_handler_class(handler_class_name)
+        handler = handler_class(worker)
+        client = SimpleNamespace(api_key=api_key)
+        proxy_settings = self.settings_manager.load_proxy_settings() if self.settings_manager else None
+        if not handler.setup_client(client_override=client, proxy_settings=proxy_settings):
+            raise ValueError(f"Не удалось подготовить клиент провайдера '{self.provider_id}'.")
+
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(
+                handler.execute_api_call(
+                    prompt,
+                    "Qidian -> Rulate",
+                    allow_incomplete=False,
+                    debug=False,
+                    use_stream=True,
+                    max_output_tokens=4096,
+                )
+            )
+        finally:
+            close_coro = getattr(handler, "_close_thread_session_internal", None)
+            if callable(close_coro):
+                try:
+                    loop.run_until_complete(close_coro())
+                except Exception:
+                    pass
+            loop.close()
+
+
+class RulateFillWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, draft: RulateBookDraft):
+        super().__init__()
+        self.draft = draft
+
+    def log(self, level: str, message: str) -> None:
+        self.log_signal.emit(level, message)
+
+    def run(self) -> None:
+        try:
+            configure_playwright_runtime()
+            from playwright.sync_api import sync_playwright
+
+            self.log("INFO", "Rulate: открываю форму создания книги...")
+            with sync_playwright() as playwright:
+                browser = _launch_persistent_chromium_context(
+                    playwright,
+                    user_data_dir=str(RULATE_PROFILE_DIR),
+                    viewport={"width": 1280, "height": 900},
+                    log_callback=self.log,
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+                form_opened = self._select_catalog_category(page)
+                if not form_opened:
+                    self.log("WARNING", "Rulate: форма после выбора раздела не открылась, пробую открыть общую информацию напрямую.")
+                    page.goto(RULATE_INFO_URL, timeout=60000)
+                    page.wait_for_timeout(1500)
+
+                if page.locator("#form-edit").count() == 0:
+                    self.log(
+                        "WARNING",
+                        "Форма не найдена. Если открыта страница входа, войдите в Rulate и повторите заполнение.",
+                    )
+                    page.wait_for_timeout(60000)
+                    return
+
+                self._fill_general(page)
+                self._fill_description(page)
+                self.log(
+                    "SUCCESS",
+                    "Rulate: форма заполнена. Проверьте вкладки и нажмите сохранение вручную.",
+                )
+                try:
+                    while True:
+                        page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+        except Exception as error:
+            self.log("ERROR", f"Rulate: {error}")
+            self.log("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+    def _select_catalog_category(self, page) -> bool:
+        self.log("INFO", "Rulate: открываю выбор раздела каталога...")
+        page.goto(RULATE_CATEGORY_URL, timeout=60000)
+        page.wait_for_timeout(1500)
+
+        try:
+            page.locator(RULATE_BOOK_TYPE_SELECTOR).first.click(timeout=10000)
+        except Exception:
+            self.log("WARNING", "Rulate: не удалось автоматически выбрать тип 'Книга'. Проверьте страницу категории вручную.")
+            return False
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        page.wait_for_timeout(1200)
+        self.log("SUCCESS", "Rulate: тип 'Книга' выбран.")
+
+        selected = page.evaluate(
+            """(categoryTitle) => {
+                const normalize = (value) => (value || "").replace(/\\s+/g, " ").trim();
+                const clickCandidate = (selector) => {
+                    const candidates = Array.from(document.querySelectorAll(selector));
+                    for (const candidate of candidates) {
+                        if (candidate.tagName === "A") {
+                            const href = candidate.getAttribute("href") || "";
+                            if (href && href !== "#" && !href.includes("/book/0/edit/cat")) {
+                                continue;
+                            }
+                        }
+                        if (normalize(candidate.textContent) === categoryTitle) {
+                            candidate.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (clickCandidate("a, button, label")) return true;
+
+                const inputs = Array.from(document.querySelectorAll("input[type=radio], input[type=checkbox]"));
+                for (const input of inputs) {
+                    const id = input.getAttribute("id");
+                    const label = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+                    const parentText = normalize(input.closest("label, li, div")?.textContent);
+                    if (normalize(label?.textContent) === categoryTitle || parentText === categoryTitle) {
+                        input.checked = true;
+                        input.dispatchEvent(new Event("input", {bubbles: true}));
+                        input.dispatchEvent(new Event("change", {bubbles: true}));
+                        input.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            RULATE_CHINESE_CATEGORY_TITLE,
+        )
+        if not selected:
+            self.log("WARNING", "Rulate: не удалось автоматически выбрать раздел 'Китайские'. Проверьте страницу категории вручную.")
+            return False
+
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        try:
+            page.locator("#form-edit").wait_for(state="attached", timeout=20000)
+        except Exception:
+            self.log("WARNING", "Rulate: раздел 'Китайские' выбран, но форма редактирования пока не найдена.")
+            return False
+
+        self.log("SUCCESS", "Rulate: раздел каталога 'Китайские' выбран, форма открыта.")
+        return True
+
+    def _fill_general(self, page) -> None:
+        qidian = self.draft.qidian
+        prepared = self.draft.prepared
+        page.click('a[href="#general"]')
+        page.select_option("#Book_s_lang", "7")
+        page.select_option("#Book_t_lang", "1")
+        _fill(page, "#Book_s_title", prepared.english_title)
+        _fill(page, "#Book_t_title", prepared.translated_title)
+        _fill(page, "#Book_author", qidian.author_name)
+        _fill(page, "#Book_source_url", qidian.source_url)
+        _fill(page, "#Book_a_title_1", qidian.title_original)
+
+    def _fill_description(self, page) -> None:
+        qidian = self.draft.qidian
+        prepared = self.draft.prepared
+        page.click('a[href="#description"]')
+        _fill(page, "#Book_new_img_url", qidian.cover_url)
+        page.select_option('select[name="Book[status]"]', "1")
+        page.evaluate(
+            """(description) => {
+                const textarea = document.querySelector("#Book_descr");
+                if (textarea) {
+                    textarea.value = description;
+                    textarea.dispatchEvent(new Event("input", {bubbles: true}));
+                    textarea.dispatchEvent(new Event("change", {bubbles: true}));
+                }
+                if (window.CKEDITOR && CKEDITOR.instances && CKEDITOR.instances.Book_descr) {
+                    CKEDITOR.instances.Book_descr.setData(description);
+                }
+            }""",
+            prepared.translated_description,
+        )
+        for genre in prepared.genres[:5]:
+            _select_magic_value(page, "#Book_genres", genre, allow_free=False)
+        for tag in prepared.tags[:8]:
+            _select_magic_value(page, "#Book_tags", tag, allow_free=False)
+
+
+class _PromptBuilder:
+    system_instruction = None
+
+
+class _SingleRequestWorker:
+    def __init__(
+        self,
+        *,
+        settings_manager,
+        provider_config: dict,
+        model_config: dict,
+        api_key: str,
+        model_settings: dict,
+        log_callback,
+    ):
+        self.settings_manager = settings_manager
+        self.provider_config = provider_config
+        self.model_config = model_config
+        self.api_key = api_key
+        self.model_id = model_config.get("id")
+        self.prompt_builder = _PromptBuilder()
+        self.system_instruction = None
+        self.is_cancelled = False
+        self.sync_executor = None
+        self.temperature = model_settings.get("temperature")
+        self.temperature_override_enabled = model_settings.get("temperature_override_enabled", False)
+        self.thinking_enabled = model_settings.get("thinking_enabled", False)
+        self.thinking_budget = model_settings.get("thinking_budget")
+        self.thinking_level = model_settings.get("thinking_level")
+        self.max_concurrent_requests = model_settings.get("max_concurrent_requests") or 1
+        self.workascii_workspace_name = model_settings.get("workascii_workspace_name", "")
+        self.workascii_workspace_index = model_settings.get("workascii_workspace_index", 0)
+        self.workascii_timeout_sec = model_settings.get("workascii_timeout_sec", 900)
+        self.workascii_headless = model_settings.get("workascii_headless", False)
+        self.workascii_profile_template_dir = model_settings.get("workascii_profile_template_dir", "")
+        self.workascii_refresh_every_requests = model_settings.get("workascii_refresh_every_requests", 0)
+        self.debug_logging_enabled = model_settings.get("debug_logging_enabled", False)
+        self.debug_operation_filters = model_settings.get("debug_operation_filters", "")
+        self.debug_max_log_mb = model_settings.get("debug_max_log_mb", 128)
+        self._log_callback = log_callback
+
+    def _post_event(self, event: str, data: dict | None = None) -> None:
+        message = (data or {}).get("message") if isinstance(data, dict) else None
+        if message:
+            self._log_callback("INFO", str(message))
+
+    def get_debug_operation_context(self) -> dict:
+        return {"feature": "qidian_rulate"}
+
+
+def _fill(page, selector: str, value: str) -> None:
+    value = value or ""
+    locator = page.locator(selector)
+    locator.wait_for(state="attached", timeout=15000)
+    locator.fill(value)
+    page.evaluate(
+        """([selector, value]) => {
+            const element = document.querySelector(selector);
+            if (!element) return;
+            element.value = value;
+            element.dispatchEvent(new Event("input", {bubbles: true}));
+            element.dispatchEvent(new Event("change", {bubbles: true}));
+        }""",
+        [selector, value],
+    )
+
+
+def _select_magic_value(page, selector: str, value: str, *, allow_free: bool) -> None:
+    value = (value or "").strip()
+    if not value:
+        return
+
+    selected = page.evaluate(
+        """([selector, value, allowFree]) => {
+            if (!window.jQuery) return false;
+            const box = window.jQuery(selector);
+            const api = box.data("magicSuggest") || box.data("magicsuggest") || box.data("ms");
+            if (!api || typeof api.setValue !== "function") return false;
+            const displayField = (api.settings && api.settings.displayField) || "name";
+            const valueField = (api.settings && api.settings.valueField) || displayField;
+            let selectedValue = value;
+            const data = typeof api.getData === "function"
+                ? api.getData()
+                : ((api.settings && api.settings.data) || []);
+            const items = Array.isArray(data) ? data : Object.values(data || {});
+            const matched = items.find(item => {
+                const display = item && item[displayField] != null ? String(item[displayField]) : "";
+                const name = item && item.name != null ? String(item.name) : "";
+                const title = item && item.title != null ? String(item.title) : "";
+                return [display, name, title].some(candidate => (
+                    candidate && candidate.toLowerCase() === String(value).toLowerCase()
+                ));
+            });
+            if (matched && matched[valueField] != null) {
+                selectedValue = matched[valueField];
+            } else if (!allowFree) {
+                return false;
+            }
+            const current = typeof api.getValue === "function" ? api.getValue() : [];
+            const next = Array.isArray(current) ? current.slice() : [];
+            if (!next.some(item => String(item).toLowerCase() === String(selectedValue).toLowerCase())) {
+                next.push(selectedValue);
+            }
+            api.setValue(next);
+            return true;
+        }""",
+        [selector, value, allow_free],
+    )
+    if selected:
+        return
+
+    input_locator = page.locator(f"{selector} input").first
+    input_locator.click()
+    input_locator.fill(value)
+    page.wait_for_timeout(400)
+    try:
+        page.locator(f"{selector} .ms-res-item", has_text=value).first.click(timeout=3500)
+    except Exception:
+        if allow_free:
+            input_locator.press("Enter")
+
+
+_QIDIAN_EXTRACT_SCRIPT = r"""() => {
+    const text = (node) => (node && node.textContent ? node.textContent.replace(/\s+/g, " ").trim() : "");
+    const multilineText = (node) => (node && node.textContent
+        ? node.textContent.replace(/\r/g, "").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim()
+        : "");
+    const attr = (selector, name) => {
+        const node = document.querySelector(selector);
+        return node ? (node.getAttribute(name) || "").trim() : "";
+    };
+    const firstText = (selectors) => {
+        for (const selector of selectors) {
+            const value = text(document.querySelector(selector));
+            if (value) return value;
+        }
+        return "";
+    };
+    const firstMultilineText = (selectors) => {
+        for (const selector of selectors) {
+            const value = multilineText(document.querySelector(selector));
+            if (value) return value;
+        }
+        return "";
+    };
+    const firstAttr = (selectors, name) => {
+        for (const selector of selectors) {
+            const value = attr(selector, name);
+            if (value) return value;
+        }
+        return "";
+    };
+    const meta = (name) => (
+        attr(`meta[property="${name}"]`, "content") ||
+        attr(`meta[name="${name}"]`, "content")
+    );
+    const bodyText = () => (document.body && document.body.innerText
+        ? document.body.innerText.replace(/\r/g, "").trim()
+        : "");
+    const cleanAuthor = (value) => {
+        value = (value || "").replace(/^作者[:：]\s*/, "").replace(/\s+/g, " ").trim();
+        value = value.split(/[，,。|]/)[0].trim();
+        const badgeTexts = new Set(["白金", "大神", "签约", "VIP", "连载", "完本", "作家"]);
+        if (!value || badgeTexts.has(value) || value.length > 32) return "";
+        return value;
+    };
+    const authorFromBody = () => {
+        const body = bodyText();
+        const patterns = [
+            /作者[:：]\s*([^\n\r]+)/,
+            /(?:^|\n)\s*([^\n\r]{1,20})\s*\n\s*(?:阅文集团|作品总数|累计字数)/,
+            /(?:^|\n)\s*([^\n\r]{1,20})创作的/
+        ];
+        for (const pattern of patterns) {
+            const match = body.match(pattern);
+            if (match) {
+                const candidate = cleanAuthor(match[1]);
+                if (candidate) return candidate;
+            }
+        }
+        return "";
+    };
+    const descriptionFromBody = () => {
+        const body = bodyText();
+        const match = body.match(/作品简介\s*([\s\S]*?)(?:\n\s*(?:男生月票榜|女生月票榜|月票|推荐票|包含本书的书单|目录|书友互动|本书荣誉))/);
+        if (!match) return "";
+        return match[1]
+            .replace(/[ \t]+\n/g, "\n")
+            .replace(/\n[ \t]+/g, "\n")
+            .replace(/\n{3,}/g, "\n\n")
+            .trim();
+    };
+    const imageFromSrcset = (srcset) => {
+        if (!srcset) return "";
+        const first = srcset.split(",")[0] || "";
+        return first.trim().split(/\s+/)[0] || "";
+    };
+    const authorLink = document.querySelector('a[href*="my.qidian.com/author"], a[href*="/author/"]');
+    const author =
+        cleanAuthor(meta("og:novel:author")) ||
+        cleanAuthor(text(authorLink)) ||
+        cleanAuthor(firstText([".book-info .writer", ".book-info .author", ".writer", ".author"])) ||
+        authorFromBody();
+    const cover =
+        meta("og:image") ||
+        meta("og:novel:book_cover") ||
+        firstAttr([
+            ".book-img img",
+            ".book-cover img",
+            ".book-info img",
+            "img[src*='bookcover']",
+            "img"
+        ], "src") ||
+        imageFromSrcset(firstAttr([".book-img img", ".book-cover img", "img"], "srcset"));
+    const description =
+        descriptionFromBody() ||
+        firstMultilineText([
+            ".book-intro p",
+            ".book-intro",
+            ".intro p",
+            ".intro",
+            ".book-info-detail .intro",
+            "[class*='intro'] p",
+            "[class*='desc']"
+        ]) ||
+        meta("description");
+    return {
+        title: firstText(["h1", ".book-info h1", ".book-name", "[class*='bookName']"]) || meta("og:title"),
+        author,
+        description,
+        cover_url: cover
+    };
+}"""

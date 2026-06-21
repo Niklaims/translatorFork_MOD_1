@@ -19,6 +19,7 @@ datas = [
     ("ffprobe.exe", "."),
     ("gemini_translator\\scripts\\chatgpt_workascii_bridge.cjs", "gemini_translator\\scripts"),
     ("gemini_translator\\scripts\\chatgpt_profile_launcher.cjs", "gemini_translator\\scripts"),
+    ("qidian_rulate\\tags.txt", "qidian_rulate"),
 ]
 
 spec = importlib.util.find_spec("playwright")
