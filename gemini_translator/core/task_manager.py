@@ -2193,8 +2193,6 @@ class ChapterQueueManager(QObject):
             if disk_conn: disk_conn.close()
 
 class TaskDBWorker(QThread):
-    finished = pyqtSignal()
-
     def __init__(self, target_func, *args, **kwargs):
         super().__init__()
         self.target_func = target_func
@@ -2208,5 +2206,3 @@ class TaskDBWorker(QThread):
         except Exception as e:
             print(f"[CRITICAL DB WORKER ERROR] Ошибка в фоновой задаче: {e}")
             self.result = None
-        finally:
-            self.finished.emit()
