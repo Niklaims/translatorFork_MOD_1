@@ -13,6 +13,7 @@ from gemini_translator.api import config as api_config
 from gemini_translator.ui.widgets.model_settings_widget import (
     CHATGPT_LOGIN_URL,
     CHATGPT_SIGNUP_URL,
+    CustomModelDialog,
     ModelSettingsWidget,
 )
 
@@ -51,6 +52,7 @@ class _WidgetSettingsStub:
         self._last_system_prompt_text = ""
         self._last_system_prompt_preset_name = ""
         self._last_settings = {}
+        self.custom_provider_models = {}
 
     def load_system_prompts(self):
         return dict(self._system_prompts)
@@ -76,6 +78,10 @@ class _WidgetSettingsStub:
 
     def get_last_settings(self):
         return dict(self._last_settings)
+
+    def add_custom_provider_model(self, provider_id, display_name, model_config):
+        self.custom_provider_models.setdefault(provider_id, {})[display_name] = dict(model_config)
+        return True
 
 
 class ModelSettingsWidgetTests(unittest.TestCase):
@@ -157,6 +163,46 @@ class ModelSettingsWidgetTests(unittest.TestCase):
 
         widget.set_available_models("gemini")
         self.assertTrue(widget.refresh_models_btn.isHidden())
+
+    def test_custom_model_dialog_builds_model_config(self):
+        dialog = CustomModelDialog(
+            "Demo Provider",
+            defaults={
+                "rpm": 12,
+                "max_concurrent_requests": 3,
+                "context_length": 64000,
+                "max_output_tokens": 4096,
+            },
+        )
+        self.addCleanup(dialog.close)
+
+        dialog.model_id_edit.setText("demo/model")
+        dialog.display_name_edit.setText("Demo Model")
+
+        display_name, model_config = dialog.get_model_entry()
+
+        self.assertEqual(display_name, "Demo Model")
+        self.assertEqual(model_config["id"], "demo/model")
+        self.assertEqual(model_config["rpm"], 12)
+        self.assertEqual(model_config["max_concurrent_requests"], 3)
+        self.assertEqual(model_config["context_length"], 64000)
+        self.assertEqual(model_config["max_output_tokens"], 4096)
+        self.assertTrue(model_config["user_defined"])
+
+    def test_save_custom_model_entry_uses_settings_manager(self):
+        widget = self._create_widget()
+
+        saved = widget._save_custom_model_entry(
+            "demo",
+            "Demo Model",
+            {"id": "demo/model", "rpm": 10},
+        )
+
+        self.assertTrue(saved)
+        self.assertEqual(
+            widget.settings_manager.custom_provider_models["demo"]["Demo Model"]["id"],
+            "demo/model",
+        )
 
     def test_temperature_uses_model_default_until_override_enabled(self):
         widget = self._create_widget()

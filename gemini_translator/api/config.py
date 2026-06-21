@@ -365,6 +365,7 @@ _PROVIDER_DISPLAY_MAP = {}
 _ALL_TRANSLATED_SUFFIXES = []
 _DYNAMIC_PROVIDER_MODELS = {}
 _DYNAMIC_PROVIDER_MODELS_TS = {}
+_CUSTOM_PROVIDER_MODELS = {}
 _DYNAMIC_PROVIDER_MODELS_LOCK = threading.Lock()
 _LOCAL_MODEL_DISCOVERY_TTL_SECONDS = 15.0
 _LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS = 0.75
@@ -387,12 +388,77 @@ def _build_all_models(providers_config: dict) -> dict:
     }
 
 
+def _normalize_custom_provider_models(custom_provider_models) -> dict:
+    if not isinstance(custom_provider_models, dict):
+        return {}
+
+    normalized = {}
+    for provider_id, models in custom_provider_models.items():
+        provider_key = str(provider_id or "").strip()
+        if not provider_key or not isinstance(models, dict):
+            continue
+
+        normalized_models = {}
+        for display_name, model_config in models.items():
+            model_name = str(display_name or "").strip()
+            if not model_name:
+                continue
+
+            if isinstance(model_config, dict):
+                next_config = deepcopy(model_config)
+            else:
+                next_config = {"id": str(model_config or "").strip()}
+
+            model_id = str(next_config.get("id") or "").strip()
+            if not model_id:
+                model_id = model_name
+
+            next_config["id"] = model_id
+            next_config["user_defined"] = True
+            normalized_models[model_name] = next_config
+
+        if normalized_models:
+            normalized[provider_key] = normalized_models
+
+    return normalized
+
+
 def _compose_runtime_providers() -> dict:
     providers = deepcopy(_API_PROVIDERS)
     for provider_id, models in _DYNAMIC_PROVIDER_MODELS.items():
         if provider_id in providers and models is not None:
             providers[provider_id]["models"] = deepcopy(models)
+    for provider_id, models in _CUSTOM_PROVIDER_MODELS.items():
+        if provider_id not in providers or not isinstance(models, dict):
+            continue
+        merged_models = deepcopy(providers[provider_id].get("models", {}))
+        merged_models.update(deepcopy(models))
+        providers[provider_id]["models"] = merged_models
     return providers
+
+
+def set_custom_provider_models(custom_provider_models):
+    global _CUSTOM_PROVIDER_MODELS, _ALL_MODELS
+    _CUSTOM_PROVIDER_MODELS = _normalize_custom_provider_models(custom_provider_models)
+    if _API_PROVIDERS:
+        _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+    return custom_provider_models_snapshot()
+
+
+def add_custom_provider_model(provider_id: str, display_name: str, model_config: dict):
+    custom_models = custom_provider_models_snapshot()
+    provider_key = str(provider_id or "").strip()
+    model_name = str(display_name or "").strip()
+    if not provider_key or not model_name:
+        return custom_models
+
+    provider_models = custom_models.setdefault(provider_key, {})
+    provider_models[model_name] = deepcopy(model_config or {})
+    return set_custom_provider_models(custom_models)
+
+
+def custom_provider_models_snapshot():
+    return deepcopy(_CUSTOM_PROVIDER_MODELS)
 
 
 def _local_model_discovery_enabled() -> bool:

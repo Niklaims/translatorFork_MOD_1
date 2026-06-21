@@ -6,7 +6,8 @@ import subprocess
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QGroupBox, QGridLayout, QLabel, QComboBox, QSpinBox, QDoubleSpinBox,
-    QHBoxLayout, QCheckBox, QWidget, QVBoxLayout, QPushButton, QDialog, QDialogButtonBox
+    QFormLayout, QHBoxLayout, QCheckBox, QWidget, QVBoxLayout, QPushButton,
+    QDialog, QDialogButtonBox, QLineEdit
 )
 from PyQt6.QtCore import pyqtSignal, pyqtSlot
 from .common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
@@ -18,6 +19,107 @@ from ...utils import markdown_viewer
 
 CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
 CHATGPT_SIGNUP_URL = "https://chatgpt.com/auth/login?mode=signup"
+
+
+class CustomModelDialog(QDialog):
+    def __init__(self, provider_name: str, defaults: dict | None = None, parent=None):
+        super().__init__(parent)
+        defaults = defaults or {}
+        self.setWindowTitle("Добавить свою модель")
+        self.setMinimumWidth(460)
+
+        layout = QVBoxLayout(self)
+        intro_label = QLabel(f"Сервис: {provider_name or 'текущий'}")
+        intro_label.setObjectName("mutedLabel")
+        layout.addWidget(intro_label)
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+
+        self.display_name_edit = QLineEdit()
+        self.display_name_edit.setPlaceholderText("Например: DeepSeek V4 Pro")
+        form.addRow("Название в списке:", self.display_name_edit)
+
+        self.model_id_edit = QLineEdit()
+        self.model_id_edit.setPlaceholderText("Например: deepseek-v4-pro")
+        form.addRow("ID модели:", self.model_id_edit)
+
+        self.rpm_spin = NoScrollSpinBox()
+        self.rpm_spin.setRange(1, 1000)
+        self.rpm_spin.setValue(self._positive_int(defaults.get("rpm"), 10))
+        form.addRow("RPM:", self.rpm_spin)
+
+        self.max_concurrent_spin = NoScrollSpinBox()
+        self.max_concurrent_spin.setRange(0, 1000)
+        self.max_concurrent_spin.setValue(self._non_negative_int(defaults.get("max_concurrent_requests"), 1))
+        form.addRow("Параллельные запросы:", self.max_concurrent_spin)
+
+        self.context_length_spin = NoScrollSpinBox()
+        self.context_length_spin.setRange(1000, 2_000_000)
+        self.context_length_spin.setSingleStep(1000)
+        self.context_length_spin.setValue(self._positive_int(defaults.get("context_length"), 128000))
+        form.addRow("Контекст:", self.context_length_spin)
+
+        self.max_output_tokens_spin = NoScrollSpinBox()
+        self.max_output_tokens_spin.setRange(256, 512000)
+        self.max_output_tokens_spin.setSingleStep(256)
+        self.max_output_tokens_spin.setValue(self._positive_int(defaults.get("max_output_tokens"), 8192))
+        form.addRow("Max output tokens:", self.max_output_tokens_spin)
+
+        self.needs_chunking_checkbox = QCheckBox("Разбивать большие главы на части")
+        self.needs_chunking_checkbox.setChecked(bool(defaults.get("needs_chunking", True)))
+        form.addRow("", self.needs_chunking_checkbox)
+
+        layout.addLayout(form)
+
+        self.button_box = QDialogButtonBox()
+        add_button = self.button_box.addButton("Добавить", QDialogButtonBox.ButtonRole.AcceptRole)
+        add_button.setDefault(True)
+        self.button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        layout.addWidget(self.button_box)
+
+    @staticmethod
+    def _positive_int(value, fallback):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed > 0 else fallback
+
+    @staticmethod
+    def _non_negative_int(value, fallback):
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return parsed if parsed >= 0 else fallback
+
+    def accept(self):
+        model_id = self.model_id_edit.text().strip()
+        if not model_id:
+            QtWidgets.QMessageBox.warning(self, "Своя модель", "Укажите ID модели.")
+            return
+        super().accept()
+
+    def get_model_entry(self):
+        model_id = self.model_id_edit.text().strip()
+        display_name = self.display_name_edit.text().strip() or model_id
+        max_concurrent = self.max_concurrent_spin.value()
+        model_config = {
+            "id": model_id,
+            "rpm": self.rpm_spin.value(),
+            "needs_chunking": self.needs_chunking_checkbox.isChecked(),
+            "max_concurrent_requests": max_concurrent,
+            "max_output_tokens": self.max_output_tokens_spin.value(),
+            "context_length": self.context_length_spin.value(),
+            "context_window": self.context_length_spin.value(),
+            "min_thinking_budget": False,
+            "user_defined": True,
+        }
+        return display_name, model_config
+
 
 class ModelSettingsWidget(QGroupBox):
     """
@@ -112,6 +214,10 @@ class ModelSettingsWidget(QGroupBox):
         self.refresh_models_btn.clicked.connect(self._refresh_current_provider_models)
         self.refresh_models_btn.setVisible(False)
         left_layout.addWidget(self.refresh_models_btn, 0, 2)
+        self.add_custom_model_btn = QPushButton("+ своя")
+        self.add_custom_model_btn.setToolTip("Добавить модель в текущий сервис.")
+        self.add_custom_model_btn.clicked.connect(self._open_custom_model_dialog)
+        left_layout.addWidget(self.add_custom_model_btn, 0, 3)
         
         self.rpm_row_widget = QWidget()
         self.rpm_row_widget.setObjectName("rpm_row")
@@ -652,6 +758,8 @@ class ModelSettingsWidget(QGroupBox):
         self.workascii_group.setVisible(is_workascii)
         self.refresh_models_btn.setVisible(is_local_provider)
         self.refresh_models_btn.setEnabled(is_local_provider)
+        can_add_custom_model = bool(provider_id and api_config.api_providers().get(provider_id))
+        self.add_custom_model_btn.setEnabled(can_add_custom_model)
     # ----------------------------------------------------
     # Публичные методы
     # ----------------------------------------------------
@@ -854,6 +962,77 @@ class ModelSettingsWidget(QGroupBox):
         self._emit_settings_changed()
     
     
+    def _current_model_defaults(self):
+        model_name = self.model_combo.currentText()
+        model_config = api_config.all_models().get(model_name, {})
+        if not isinstance(model_config, dict):
+            model_config = {}
+
+        context_length = (
+            model_config.get("context_length")
+            or model_config.get("context_window")
+            or 128000
+        )
+        max_concurrent = model_config.get("max_concurrent_requests")
+        if max_concurrent is None:
+            max_concurrent = self.max_concurrent_spin.value() or 1
+
+        return {
+            "rpm": model_config.get("rpm") or self.rpm_spin.value() or 10,
+            "max_concurrent_requests": max_concurrent,
+            "context_length": context_length,
+            "max_output_tokens": model_config.get("max_output_tokens") or api_config.default_max_output_tokens(),
+            "needs_chunking": model_config.get("needs_chunking", True),
+        }
+
+    def _save_custom_model_entry(self, provider_id, display_name, model_config):
+        saver = getattr(self.settings_manager, "add_custom_provider_model", None)
+        if callable(saver):
+            return bool(saver(provider_id, display_name, model_config))
+
+        api_config.add_custom_provider_model(provider_id, display_name, model_config)
+        return True
+
+    @pyqtSlot()
+    def _open_custom_model_dialog(self):
+        provider_id = getattr(self, "_current_provider_id", None)
+        if not provider_id:
+            return
+
+        provider_config = api_config.api_providers().get(provider_id, {})
+        provider_display_name = provider_config.get("display_name") or provider_id
+        dialog = CustomModelDialog(
+            provider_display_name,
+            defaults=self._current_model_defaults(),
+            parent=self,
+        )
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        display_name, model_config = dialog.get_model_entry()
+        if display_name in provider_config.get("models", {}):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Своя модель",
+                "Модель с таким названием уже есть в текущем сервисе.",
+            )
+            return
+
+        if not self._save_custom_model_entry(provider_id, display_name, model_config):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Своя модель",
+                "Не удалось сохранить модель.",
+            )
+            return
+
+        self.set_available_models(provider_id)
+        index = self.model_combo.findText(display_name)
+        if index != -1:
+            self.model_combo.setCurrentIndex(index)
+        self._emit_settings_changed()
+
     @pyqtSlot(str) # <-- Делаем его слотом
     def set_available_models(self, provider_id: str): # <-- Теперь принимает ID
         """Обновляет список доступных моделей на основе ID провайдера."""
