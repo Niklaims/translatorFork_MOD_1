@@ -103,6 +103,40 @@ class SequentialTranslationTests(unittest.TestCase):
             ("epub", "book.epub", "Text/ch3.xhtml"),
         ])
 
+    def test_task_preparer_does_not_open_epub_when_chunking_disabled(self):
+        settings = {
+            "file_path": "/tmp/does-not-need-to-exist.epub",
+            "use_batching": False,
+            "chunking": False,
+            "sequential_translation": False,
+            "task_size_limit": 1000,
+        }
+        preparer = TaskPreparer(settings, {"Text/ch1.xhtml": 300, "Text/ch2.xhtml": 500})
+
+        tasks = preparer.prepare_tasks(["Text/ch1.xhtml", "Text/ch2.xhtml"])
+
+        self.assertEqual(tasks, [
+            ("epub", "/tmp/does-not-need-to-exist.epub", "Text/ch1.xhtml"),
+            ("epub", "/tmp/does-not-need-to-exist.epub", "Text/ch2.xhtml"),
+        ])
+
+    def test_task_preparer_does_not_open_epub_when_no_chapters_need_chunking(self):
+        settings = {
+            "file_path": "/tmp/does-not-need-to-exist.epub",
+            "use_batching": False,
+            "chunking": True,
+            "sequential_translation": False,
+            "task_size_limit": 1000,
+        }
+        preparer = TaskPreparer(settings, {"Text/ch1.xhtml": 300, "Text/ch2.xhtml": 500})
+
+        tasks = preparer.prepare_tasks(["Text/ch1.xhtml", "Text/ch2.xhtml"])
+
+        self.assertEqual(tasks, [
+            ("epub", "/tmp/does-not-need-to-exist.epub", "Text/ch1.xhtml"),
+            ("epub", "/tmp/does-not-need-to-exist.epub", "Text/ch2.xhtml"),
+        ])
+
     def test_task_preparer_batches_small_chapters_across_large_chapter(self):
         settings = {
             "file_path": "book.epub",

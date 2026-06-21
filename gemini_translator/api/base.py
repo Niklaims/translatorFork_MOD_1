@@ -7,7 +7,6 @@ import ssl
 import contextvars
 import time
 import sys
-from collections import Counter
 import certifi
 from PyQt6.QtWidgets import QApplication
 from ..utils.async_helpers import run_sync
@@ -285,6 +284,19 @@ class BaseApiHandler:
     
     
     
+    def _is_shutdown_cancellation(self) -> bool:
+        """True when a CancelledError reflects a user/system stop rather than a
+        network-level interruption.
+
+        On teardown the runtime cancels in-flight coroutines
+        (async_worker_runtime.stop_workers) — the worker's is_cancelled may not be
+        set yet, but during a graceful stop is_shutting_down is. Both must count,
+        otherwise the cancellation is misclassified as a NETWORK error and gets
+        logged + requeued instead of being silently treated as CANCEL."""
+        worker = self.worker
+        return bool(getattr(worker, 'is_cancelled', False)
+                    or getattr(worker, 'is_shutting_down', False))
+
     async def execute_api_call(self, prompt, log_prefix, allow_incomplete=False, debug=False, use_stream=True, max_output_tokens=None):
         self.worker.settings_manager.increment_request_count(self.worker.api_key, self.worker.model_id)
         trace = self._create_debug_trace(log_prefix)
@@ -298,7 +310,7 @@ class BaseApiHandler:
                 else:
                     result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
             except asyncio.CancelledError as exc:
-                if self.worker.is_cancelled:
+                if self._is_shutdown_cancellation():
                     raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
 
                 error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
@@ -346,28 +358,16 @@ class BaseApiHandler:
             if checker_task in done:
                 # Если сработала отмена
                 api_task.cancel()
-                # Обязательно дожидаемся отмены, чтобы избежать warning'ов
-                try:
-                    await api_task
-                except asyncio.CancelledError:
-                    pass
                 raise OperationCancelledError("Отмена обнаружена во время ожидания API")
             
             if api_task in done:
                 # Если API ответило (или упало с ошибкой)
-                checker_task.cancel()
                 return await api_task
                 
         except asyncio.TimeoutError:
-            checker_task.cancel()
-            api_task.cancel() # Отменяем зависший запрос
             raise NetworkError(f"Глобальный таймаут API ({api_timeout}с) превышен.", delay_seconds=30)
-        except Exception as e:
-            # Страховка на случай непредвиденных ошибок в asyncio.wait
-            checker_task.cancel()
-            if not api_task.done():
-                api_task.cancel()
-            raise e
+        finally:
+            await self._cancel_and_drain_tasks(checker_task, api_task)
 
     async def _sync_executor_wrapper(self, prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens):
         """Обертка для СИНХРОННЫХ вызовов (через run_sync)."""
@@ -387,19 +387,27 @@ class BaseApiHandler:
         try:
             done, pending = await asyncio.wait({api_task, checker_task}, return_when=asyncio.FIRST_COMPLETED)
             if checker_task in done:
-                api_task.cancel()
                 raise OperationCancelledError("Отмена обнаружена во время ожидания API")
             if api_task in done:
-                checker_task.cancel()
                 return await api_task
         except asyncio.TimeoutError:
-            checker_task.cancel()
             raise NetworkError(f"Глобальный таймаут API ({api_timeout}с) превышен.")
+        finally:
+            await self._cancel_and_drain_tasks(checker_task, api_task)
 
     async def _cancellation_checker(self):
         """Пингует флаг отмены каждые 200мс."""
         while not self.worker.is_cancelled:
             await asyncio.sleep(0.2)
+
+    async def _cancel_and_drain_tasks(self, *tasks):
+        """Отменяет owned-задачи и забирает их исключения перед shutdown."""
+        real_tasks = [task for task in tasks if task is not None]
+        for task in real_tasks:
+            if not task.done():
+                task.cancel()
+        if real_tasks:
+            await asyncio.gather(*real_tasks, return_exceptions=True)
     
     def call_api(self, prompt, log_prefix, allow_incomplete=False, use_stream=True, debug=False, max_output_tokens=None):
         """
@@ -484,8 +492,10 @@ class BaseApiHandler:
         
     def _detect_looping(self, text):
         """
-        [Диагностика 2.0] Статистический анализ зацикливания.
-        Проверяет периодичность повторов и кластеризацию повторяющихся блоков.
+        [Диагностика 3.0] Анализ зацикливания в хвосте ответа.
+        Для PartialGenerationError важен именно участок перед обрывом:
+        повторяющиеся абзацы в середине главы сами по себе не означают,
+        что модель ушла в петлю.
         """
         if not text: return False
         
@@ -494,59 +504,62 @@ class BaseApiHandler:
         blocks = []
         for b in raw_blocks:
             clean = re.sub(r'<[^>]+>', '', b).strip()
+            clean = re.sub(r'\s+', ' ', clean)
             if clean: blocks.append(clean)
             
         if len(blocks) < 4: return False
 
-        # 2. Картирование: Текст -> Список индексов вхождений
-        index_map = {}
-        for idx, block in enumerate(blocks):
-            if block not in index_map: index_map[block] = []
-            index_map[block].append(idx)
+        tail_blocks = blocks[-32:]
+        if self._has_repeated_suffix_cycle(tail_blocks):
+            return True
 
-        # 3. Критерий А: Одиночный периодический цикл (Oscillation)
-        # "Если один абзац имеет вхождения > 3 и дистанция повторяется в 70% случаев"
-        for block, indices in index_map.items():
-            count = len(indices)
-            if count <= 1: continue
-            
-            # Для коротких фраз повышаем порог, чтобы не ловить "Он кивнул."
-            is_short = len(block) < 30
-            required_count = 5 if is_short else 4
-            
-            if count >= required_count:
-                # Вычисляем дистанции (шаги) между вхождениями: [2, 5, 8] -> [3, 3]
-                diffs = [indices[i+1] - indices[i] for i in range(len(indices)-1)]
-                
-                if not diffs: continue
-                
-                # Анализ частоты дистанций
-                dist_counts = Counter(diffs)
-                most_common_dist, freq = dist_counts.most_common(1)[0]
-                
-                # Если одна и та же дистанция встречается в >= 70% случаев -> это ритмичный цикл
-                if freq / len(diffs) >= 0.70:
-                    return True
+        if self._has_repeated_tail_cluster(blocks):
+            return True
 
-        # 4. Критерий Б: Сценарная петля (Cluster Loop)
-        # "Если три абзаца рядом имеют множественные вхождения"
-        consecutive_repeats = 0
-        
-        for idx, block in enumerate(blocks):
-            # Проверяем, встречается ли этот блок где-то еще в тексте
-            if len(index_map[block]) > 1:
-                consecutive_repeats += 1
+        return False
+
+    def _sequence_text_length(self, blocks):
+        return sum(len(block) for block in blocks)
+
+    def _has_repeated_suffix_cycle(self, blocks):
+        max_period = min(8, len(blocks) // 2)
+        for period in range(1, max_period + 1):
+            pattern = blocks[-period:]
+            pattern_len = self._sequence_text_length(pattern)
+            if pattern_len <= 0:
+                continue
+
+            repetitions = 1
+            cursor = len(blocks) - period
+            while cursor - period >= 0 and blocks[cursor - period:cursor] == pattern:
+                repetitions += 1
+                cursor -= period
+
+            if period == 1:
+                is_short = len(pattern[0]) < 30
+                required_repetitions = 8 if is_short else 4
+                min_total_chars = 120
             else:
-                consecutive_repeats = 0
-            
-            # Если нашли цепочку из 3 подряд идущих блоков, которые есть где-то еще
-            if consecutive_repeats >= 3:
-                # Доп. проверка: суммарная длина должна быть значимой (исключаем диалог "Да/Нет/Да")
-                b1 = blocks[idx]
-                b2 = blocks[idx-1]
-                b3 = blocks[idx-2]
-                if (len(b1) + len(b2) + len(b3)) > 60:
-                     return True
+                required_repetitions = 3
+                min_total_chars = 180
+
+            if repetitions >= required_repetitions and pattern_len * repetitions >= min_total_chars:
+                return True
+
+        return False
+
+    def _has_repeated_tail_cluster(self, blocks):
+        max_cluster_size = min(6, len(blocks) // 2)
+        for size in range(max_cluster_size, 2, -1):
+            suffix = blocks[-size:]
+            if self._sequence_text_length(suffix) < 180:
+                continue
+
+            suffix_start = len(blocks) - size
+            latest_non_overlapping_start = suffix_start - size
+            for start in range(0, latest_non_overlapping_start + 1):
+                if blocks[start:start + size] == suffix:
+                    return True
 
         return False
         
