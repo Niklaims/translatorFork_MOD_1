@@ -5,7 +5,10 @@ import zipfile
 from unittest.mock import patch
 
 from gemini_translator.core.consistency_engine import filter_consistency_problems_by_confidence
-from gemini_translator.ui.dialogs.auto_workflow import AutoConsistencyWorker
+from gemini_translator.ui.dialogs.auto_workflow import (
+    AutoConsistencyWorker,
+    load_project_chapters_for_consistency,
+)
 from gemini_translator.ui.dialogs.setup import InitialSetupDialog
 
 
@@ -85,11 +88,13 @@ class _AutoWorkflowHarness:
         self._auto_validator_dialog = dialog
         self.auto_translate_widget = _AutoTranslateWidgetStub(settings)
         self.key_management_widget = _KeyManagementWidgetStub()
+        self.selected_file = "C:/project/book.epub"
         self._auto_followup_running = True
         self._auto_last_retry_signatures = set()
         self._auto_last_untranslated_fix_signatures = set(repeated_signatures or set())
         self.logs = []
         self.consistency_calls = []
+        self.retry_requests = []
         self.reset_calls = 0
         self.ready_calls = 0
         self.project_manager = None
@@ -122,6 +127,9 @@ class _AutoWorkflowHarness:
 
     def _run_auto_consistency_followup(self, auto_settings):
         self.consistency_calls.append(dict(auto_settings))
+
+    def add_files_for_retry(self, epub_path, chapter_paths):
+        self.retry_requests.append((epub_path, list(chapter_paths)))
 
     def _reset_auto_workflow_state(self):
         self.reset_calls += 1
@@ -158,6 +166,7 @@ class _AutoValidatorDialogLaunchStub:
         self.check_show_all = _CheckStateStub()
         self.check_revalidate_ok = _CheckStateStub()
         self.path_row_map = {"Text/ch1.xhtml": 0}
+        self.start_analysis_targets = []
         self.analysis_thread = type(
             "_AnalysisThreadStub",
             (),
@@ -173,6 +182,12 @@ class _AutoValidatorDialogLaunchStub:
 
     def start_analysis(self, specific_targets=None):
         self.start_analysis_calls += 1
+        self.start_analysis_targets.append(
+            tuple(specific_targets) if specific_targets is not None else None
+        )
+
+    def _get_eligible_analysis_paths(self):
+        return set(self.path_row_map.keys())
 
     def deleteLater(self):
         self.deleted = True
@@ -229,7 +244,192 @@ class _RunAutoValidatorHarness:
         )
 
 
+class _StartTaskManagerStub:
+    def __init__(self, has_pending_tasks):
+        self._has_pending_tasks = bool(has_pending_tasks)
+        self.release_calls = 0
+
+    def has_pending_tasks(self):
+        return self._has_pending_tasks
+
+    def release_held_tasks(self):
+        self.release_calls += 1
+
+
+class _StartEngineStub:
+    def __init__(self, has_pending_tasks):
+        self.task_manager = _StartTaskManagerStub(has_pending_tasks)
+
+
+class _StartKeyManagementWidgetStub:
+    def __init__(self, active_keys):
+        self._active_keys = list(active_keys or [])
+
+    def get_active_keys(self):
+        return list(self._active_keys)
+
+
+class _StartTranslationHarness:
+    _start_translation = InitialSetupDialog._start_translation
+
+    def __init__(self, has_pending_tasks=True, active_keys=None):
+        self.selected_file = "C:/project/book.epub"
+        self.output_folder = "C:/project"
+        self.engine = _StartEngineStub(has_pending_tasks)
+        self.key_management_widget = _StartKeyManagementWidgetStub(active_keys)
+        self.auto_translate_widget = _AutoTranslateWidgetStub({"enabled": True})
+        self._auto_restart_session_override = None
+        self._auto_followup_running = True
+        self.logs = []
+        self.reset_calls = 0
+        self.ready_calls = 0
+
+    def _check_and_sync_active_session(self):
+        return False
+
+    def _resolve_auto_translation_options(self, auto_settings):
+        return {}, "inherit", False, 0, None, None
+
+    def _resolve_auto_model_override(self, auto_settings):
+        return None, None, None
+
+    def _auto_log(self, message, force=False, **kwargs):
+        entry = {"message": message, "force": force}
+        entry.update(kwargs)
+        self.logs.append(entry)
+
+    def _reset_auto_workflow_state(self):
+        self.reset_calls += 1
+        self._auto_followup_running = False
+
+    def check_ready(self):
+        self.ready_calls += 1
+
+
+class _TranslationOptionsWidgetStub:
+    def get_settings(self):
+        return {
+            "use_batching": False,
+            "chunking": False,
+            "chunk_on_error": False,
+            "sequential_translation": True,
+            "sequential_translation_splits": 1,
+            "task_size_limit": 1500,
+        }
+
+
+class _AutoTranslationOptionsHarness:
+    _resolve_auto_translation_options = InitialSetupDialog._resolve_auto_translation_options
+
+    def __init__(self):
+        self.translation_options_widget = _TranslationOptionsWidgetStub()
+
+    def _estimate_auto_task_size_limit(self, token_limit: int):
+        return int(token_limit) * 2, "stub-profile"
+
+
+class _ConsistencyProjectManagerStub:
+    def __init__(self, project_folder, originals, versions_map):
+        self.project_folder = project_folder
+        self._originals = list(originals)
+        self._versions_map = {
+            original: dict(versions)
+            for original, versions in versions_map.items()
+        }
+
+    def get_all_originals(self):
+        return list(self._originals)
+
+    def get_versions_for_original(self, original_path):
+        return dict(self._versions_map.get(original_path, {}))
+
+
 class AutoWorkflowFollowupTests(unittest.TestCase):
+    def test_auto_translation_options_include_chapter_limit_and_source_context(self):
+        harness = _AutoTranslationOptionsHarness()
+
+        options, mode, has_override, batch_tokens, batch_task_limit, profile = (
+            harness._resolve_auto_translation_options({
+                "translation_mode_override": "batch",
+                "batch_token_limit_override": 2000,
+                "batch_chapter_limit_override": 3,
+                "source_context_enabled": True,
+                "source_context_chapters": 2,
+                "source_context_char_limit": 40000,
+            })
+        )
+
+        self.assertEqual(mode, "batch")
+        self.assertTrue(has_override)
+        self.assertEqual(batch_tokens, 2000)
+        self.assertEqual(batch_task_limit, 4000)
+        self.assertEqual(profile, "stub-profile")
+        self.assertTrue(options["use_batching"])
+        self.assertFalse(options["chunking"])
+        self.assertEqual(options["max_chapters_per_batch"], 3)
+        self.assertTrue(options["sequential_original_context_enabled"])
+        self.assertEqual(options["sequential_original_context_chapters"], 2)
+        self.assertEqual(options["sequential_original_context_char_limit"], 40000)
+
+    def test_load_project_chapters_for_consistency_can_include_original_epub_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = os.path.join(temp_dir, "book.epub")
+            translated_rel_path = os.path.join("Text", "chapter1.html")
+            translated_full_path = os.path.join(temp_dir, translated_rel_path)
+            os.makedirs(os.path.dirname(translated_full_path), exist_ok=True)
+            with open(translated_full_path, "w", encoding="utf-8") as handle:
+                handle.write("<html><body><p>Он вошёл в зал.</p></body></html>")
+
+            internal_path = "Text/chapter1.xhtml"
+            with zipfile.ZipFile(epub_path, "w") as epub_zip:
+                epub_zip.writestr(internal_path, "<html><body><p>他走进大厅。</p></body></html>")
+
+            project_manager = _ConsistencyProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": translated_rel_path}},
+            )
+
+            chapters = load_project_chapters_for_consistency(
+                project_manager,
+                original_epub_path=epub_path,
+                include_original=True,
+            )
+
+            self.assertEqual(len(chapters), 1)
+            self.assertEqual(chapters[0]["name"], "chapter1.xhtml")
+            self.assertIn("Он вошёл", chapters[0]["content"])
+            self.assertIn("他走进大厅", chapters[0]["source_content"])
+            self.assertEqual(chapters[0]["source_path"], internal_path)
+
+    def test_load_project_chapters_for_consistency_omits_original_without_flag(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = os.path.join(temp_dir, "book.epub")
+            translated_rel_path = os.path.join("Text", "chapter1.html")
+            translated_full_path = os.path.join(temp_dir, translated_rel_path)
+            os.makedirs(os.path.dirname(translated_full_path), exist_ok=True)
+            with open(translated_full_path, "w", encoding="utf-8") as handle:
+                handle.write("<p>Перевод</p>")
+
+            internal_path = "Text/chapter1.xhtml"
+            with zipfile.ZipFile(epub_path, "w") as epub_zip:
+                epub_zip.writestr(internal_path, "<p>原文</p>")
+
+            project_manager = _ConsistencyProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": translated_rel_path}},
+            )
+
+            chapters = load_project_chapters_for_consistency(
+                project_manager,
+                original_epub_path=epub_path,
+                include_original=False,
+            )
+
+            self.assertEqual(len(chapters), 1)
+            self.assertNotIn("source_content", chapters[0])
+
     def test_auto_short_ratio_uses_cjk_limit_from_flag(self):
         harness = _AutoRatioHarness()
 
@@ -283,6 +483,32 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
 
         self.assertEqual(ratio_limit, 0.70)
         self.assertEqual(profile, "alphabetic")
+
+    def test_repeated_short_retry_signature_is_requeued(self):
+        settings = {
+            "retry_short_enabled": True,
+            "retry_untranslated_enabled": False,
+            "auto_restart_after_retry": False,
+        }
+        short_chapter = "Text/ch1.xhtml"
+        dialog = _ValidatorDialogStub(
+            {
+                0: {
+                    "internal_html_path": short_chapter,
+                    "len_orig": 500,
+                    "ratio_value": 0.20,
+                }
+            },
+            allow_auto_fix=False,
+        )
+        harness = _AutoWorkflowHarness(dialog, settings)
+        harness._auto_last_retry_signatures.add((short_chapter,))
+
+        harness._on_auto_validator_finished(total_scanned=1, suspicious_found=1)
+
+        self.assertEqual(harness.retry_requests, [(harness.selected_file, [short_chapter])])
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertEqual(harness.ready_calls, 1)
 
     def test_repeated_untranslated_signature_advances_to_consistency(self):
         settings = {
@@ -449,11 +675,46 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
         self.assertTrue(dialog.check_show_all.isChecked())
         self.assertTrue(dialog.check_revalidate_ok.isChecked())
         self.assertEqual(dialog.start_analysis_calls, 1)
+        self.assertEqual(dialog.start_analysis_targets, [("Text/ch1.xhtml",)])
         self.assertIs(harness._auto_validator_dialog, dialog)
         self.assertEqual(harness.start_btn.enabled_values, [False])
         self.assertEqual(harness.reset_calls, 0)
         self.assertEqual(harness.ready_calls, 0)
         self.assertEqual(harness.finished_calls, [])
+
+    def test_auto_restart_without_active_keys_logs_and_unlocks(self):
+        harness = _StartTranslationHarness(has_pending_tasks=True, active_keys=[])
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.QMessageBox.warning",
+            side_effect=AssertionError("auto restart should not show a modal warning"),
+        ):
+            harness._start_translation(is_auto_restart=True)
+
+        self.assertEqual(harness.engine.task_manager.release_calls, 0)
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertEqual(harness.ready_calls, 1)
+        self.assertFalse(harness._auto_followup_running)
+        self.assertTrue(
+            any("нет активной сессии сервиса/ключей" in entry["message"] for entry in harness.logs)
+        )
+
+    def test_auto_restart_without_pending_tasks_logs_and_unlocks(self):
+        harness = _StartTranslationHarness(has_pending_tasks=False, active_keys=["stub-key"])
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.QMessageBox.warning",
+            side_effect=AssertionError("auto restart should not show a modal warning"),
+        ):
+            harness._start_translation(is_auto_restart=True)
+
+        self.assertEqual(harness.engine.task_manager.release_calls, 0)
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertEqual(harness.ready_calls, 1)
+        self.assertFalse(harness._auto_followup_running)
+        self.assertTrue(
+            any("нет задач в очереди" in entry["message"] for entry in harness.logs)
+        )
 
 
 class _AutoLogDispatchHarness:
@@ -547,6 +808,7 @@ class _AutoConsistencyFollowupHarness:
     def __init__(self):
         self.project_manager = object()
         self.settings_manager = object()
+        self.selected_file = "C:/project/book.epub"
         self.key_management_widget = _KeyManagementWidgetStub()
         self.start_btn = _ButtonStub()
         self.logs = []
@@ -680,6 +942,42 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         self.assertEqual(harness.start_btn.enabled_values, [False])
         self.assertTrue(
             any("AI-consistency автофикс по уровням уверенности: high." in entry["message"] for entry in harness.logs)
+        )
+
+    def test_run_auto_consistency_followup_passes_original_flag_to_loader(self):
+        harness = _AutoConsistencyFollowupHarness()
+        chapters = [
+            {
+                "name": "chapter1.xhtml",
+                "content": "<p>one</p>",
+                "source_content": "<p>一</p>",
+                "path": "C:/temp/ch1.xhtml",
+            }
+        ]
+        auto_settings = {
+            "ai_consistency_auto_fix": False,
+            "ai_consistency_use_original": True,
+            "ai_consistency_chunk_size": 1,
+        }
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.load_project_chapters_for_consistency",
+            return_value=chapters,
+        ) as loader, patch(
+            "gemini_translator.ui.dialogs.setup.AutoConsistencyWorker",
+            _AutoConsistencyWorkerStub,
+        ):
+            harness._run_auto_consistency_followup(auto_settings)
+
+        loader.assert_called_once_with(
+            harness.project_manager,
+            original_epub_path=harness.selected_file,
+            include_original=True,
+        )
+        worker = _AutoConsistencyWorkerStub.instances[0]
+        self.assertTrue(worker.config["consistency_include_original"])
+        self.assertTrue(
+            any("будет сверять перевод с оригиналом EPUB" in entry["message"] for entry in harness.logs)
         )
 
     def test_run_auto_consistency_followup_keeps_empty_level_selection(self):

@@ -41,6 +41,7 @@ from ...utils.settings import SettingsManager
 from ...utils.epub_tools import (
     extract_number_from_path,
     calculate_potential_output_size,
+    estimate_epub_chapter_input_tokens,
     get_epub_chapter_sizes_with_cache,
     get_epub_chapter_order,
 )
@@ -316,6 +317,8 @@ class InitialSetupDialog(QDialog):
         self._auto_pending_network_retry_chapters = set()
         self._auto_filter_repack_signatures = set()
         self._auto_filter_redirect_signatures = set()
+        self._auto_filter_parallel_redirect_signatures = set()
+        self._auto_filter_parallel_redirect_runs = {}
         self._auto_restart_session_override = None
         self._auto_validator_dialog = None
         self._auto_consistency_worker = None
@@ -1180,6 +1183,10 @@ class InitialSetupDialog(QDialog):
         event_name = event_data.get('event')
         data = event_data.get('data', {})
 
+        if data.get('background_session'):
+            self._handle_background_session_event(event_name, data)
+            return
+
         if self.is_blocked_by_child_dialog and event_name != 'tasks_for_retry_ready':
             return
 
@@ -1215,6 +1222,10 @@ class InitialSetupDialog(QDialog):
 
         if event_name == 'task_state_changed':
             self._schedule_snapshot_save()
+            return
+
+        if event_name == 'task_finished':
+            self._maybe_start_parallel_filter_redirect(event_data)
             return
 
         # Логика для geoblock остается здесь, так как она показывает модальное окно
@@ -1577,8 +1588,12 @@ class InitialSetupDialog(QDialog):
                     QMessageBox.critical(self, "Ошибка перемещения", f"Не удалось переместить исходный файл:\n{e}")
                     return
 
+        old_project_cleanup_confirmed = False
         if pending_cleanup_offer or not is_known_project:
-            self._maybe_offer_old_project_chapter_cleanup(effective_folder, effective_file_path)
+            old_project_cleanup_confirmed = self._maybe_offer_old_project_chapter_cleanup(
+                effective_folder,
+                effective_file_path
+            )
 
         # Добавляем в историю уже финальные, эффективные пути
         self.settings_manager.add_to_project_history(effective_file_path, effective_folder)
@@ -1593,7 +1608,7 @@ class InitialSetupDialog(QDialog):
         if self.html_files:
             self._ask_and_filter_chapters()
 
-        self._on_project_data_changed()
+        self._on_project_data_changed(offer_snapshot_restore=not old_project_cleanup_confirmed)
 
     def _update_cjk_options_for_widgets(self):
         """
@@ -2047,6 +2062,11 @@ class InitialSetupDialog(QDialog):
         if not meta:
             return
 
+        saved_sig = meta.get('epub_sig')
+        current_sig = self.engine.task_manager._get_epub_signature(self.selected_file)
+        if not saved_sig or saved_sig != current_sig:
+            return
+
         saved_task_count = meta.get('saved_task_count')
         if saved_task_count is None:
             saved_task_count = meta.get('recoverable_tasks', 0)
@@ -2149,7 +2169,7 @@ class InitialSetupDialog(QDialog):
         total_output_tokens = 0
         max_input_tokens = 0
         max_output_tokens = 0
-        total_source_chars = 0
+        total_source_tokens = 0
         task_type_counter = Counter()
         chapter_occurrences = Counter()
         cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
@@ -2194,7 +2214,7 @@ class InitialSetupDialog(QDialog):
             task_total_input = task_input_tokens + per_task_overhead
             total_html_tokens += task_input_tokens
             total_output_tokens += task_output_tokens
-            total_source_chars += task_source_chars
+            total_source_tokens += task_input_tokens
             max_input_tokens = max(max_input_tokens, task_total_input)
             max_output_tokens = max(max_output_tokens, task_output_tokens)
 
@@ -2248,7 +2268,7 @@ class InitialSetupDialog(QDialog):
             ),
             "",
             "Нагрузка",
-            f"Символов исходника: ~{total_source_chars:,}".replace(",", " "),
+            f"Токенов исходника: ~{int(round(total_source_tokens)):,}".replace(",", " "),
             f"Входные токены HTML: ~{int(round(total_html_tokens)):,}".replace(",", " "),
             f"Служебные токены на запрос: ~{per_task_overhead:,}".replace(",", " "),
             f"Общий вход: ~{int(round(total_input_tokens)):,} токенов".replace(",", " "),
@@ -2571,28 +2591,35 @@ class InitialSetupDialog(QDialog):
         # Возвращаем результат для отображения сообщения пользователю.
         return filtered_chapters, original_chapter_count
 
+    def _remove_queue_snapshot_for_folder(self, folder_path):
+        snapshot_path = os.path.join(folder_path, "queue_snapshot.db")
+        if not os.path.exists(snapshot_path):
+            return None
+        try:
+            os.remove(snapshot_path)
+            return None
+        except OSError as exc:
+            return (snapshot_path, str(exc))
+
     def _maybe_offer_old_project_chapter_cleanup(self, folder_path, file_path):
-        text_folder = os.path.join(folder_path, "OEBPS", "Text")
-        if not os.path.isdir(text_folder):
-            return False
+        project_manager = TranslationProjectManager(folder_path)
+        cleanup_targets = project_manager.find_reused_project_cleanup_targets()
+        existing_files = cleanup_targets["files"]
+        entry_count = cleanup_targets["entries"]
 
-        existing_files = []
-        for root, _, files in os.walk(text_folder):
-            for filename in files:
-                existing_files.append(os.path.join(root, filename))
-
-        if not existing_files:
+        if not existing_files and entry_count <= 0:
             return False
 
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Старые главы в проекте")
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setText(
-            f"В папке проекта уже найдено {len(existing_files)} файл(ов) в 'OEBPS\\Text'."
+            "В папке проекта уже найдены старые данные глав.\n"
+            f"Файлов: {len(existing_files)}; записей карты: {entry_count}."
         )
         msg_box.setInformativeText(
             f"Вы добавляете новый EPUB '{os.path.basename(file_path)}' в существующий проект.\n\n"
-            "Можно удалить прошлые главы из 'OEBPS\\Text' и очистить связанные записи "
+            "Можно удалить прошлые HTML-файлы глав и очистить связанные записи "
             "в 'translation_map.json', чтобы старый текст не смешивался с новым.\n\n"
             "Удалить прошлые главы?"
         )
@@ -2604,13 +2631,18 @@ class InitialSetupDialog(QDialog):
         if msg_box.clickedButton() != remove_button:
             return False
 
-        cleanup_result = TranslationProjectManager(folder_path).cleanup_translations_in_subtree("OEBPS/Text")
-        if cleanup_result["failed"]:
+        cleanup_result = project_manager.cleanup_reused_project_chapter_outputs()
+        snapshot_error = self._remove_queue_snapshot_for_folder(folder_path)
+        failures = list(cleanup_result["failed"])
+        if snapshot_error:
+            failures.append(snapshot_error)
+
+        if failures:
             details = "\n".join(
-                f"- {path}" for path, _ in cleanup_result["failed"][:5]
+                f"- {path}" for path, _ in failures[:5]
             )
-            if len(cleanup_result["failed"]) > 5:
-                details += f"\n… и еще {len(cleanup_result['failed']) - 5}."
+            if len(failures) > 5:
+                details += f"\n… и еще {len(failures) - 5}."
             QMessageBox.warning(
                 self,
                 "Очистка выполнена не полностью",
@@ -3167,6 +3199,25 @@ class InitialSetupDialog(QDialog):
             # Обновляем UI, так как это был прямой вызов от пользователя
             self._on_project_data_changed()
 
+    def _ensure_pending_tasks_for_start(self) -> bool:
+        """
+        Guarantees that the internal task queue matches the selected chapters
+        before start validation runs.
+        """
+        engine = getattr(self, 'engine', None)
+        task_manager = getattr(engine, 'task_manager', None) or getattr(self, 'task_manager', None)
+        if task_manager and task_manager.has_pending_tasks():
+            return True
+
+        if not (self.selected_file and self.output_folder and self.html_files):
+            return False
+
+        print("[INFO] Очередь задач пуста перед стартом. Пересобираю её из выбранных глав…")
+        self._prepare_and_display_tasks(clean_rebuild=True)
+        engine = getattr(self, 'engine', None)
+        task_manager = getattr(engine, 'task_manager', None) or getattr(self, 'task_manager', None)
+        return bool(task_manager and task_manager.has_pending_tasks())
+
 
     def _start_translation(
         self,
@@ -3197,7 +3248,7 @@ class InitialSetupDialog(QDialog):
             auto_translation_mode,
             auto_has_translation_override,
             auto_batch_token_limit,
-            auto_batch_char_limit,
+            auto_batch_task_limit,
             auto_batch_profile,
         ) = self._resolve_auto_translation_options(auto_settings)
         auto_model_name, auto_model_config, auto_model_warning = self._resolve_auto_model_override(auto_settings)
@@ -3216,11 +3267,11 @@ class InitialSetupDialog(QDialog):
                     f"Основной автоперевод будет собран {mode_titles.get(auto_translation_mode, auto_translation_mode)}.",
                     force=True
                 )
-            if auto_batch_token_limit > 0 and auto_batch_char_limit:
+            if auto_batch_token_limit > 0 and auto_batch_task_limit:
                 self._auto_log(
                     "Лимит пакета для основного автопрогона: "
                     f"~{auto_batch_token_limit} входных токенов "
-                    f"(≈{auto_batch_char_limit} символов, профиль: {auto_batch_profile}).",
+                    f"(лимит задачи: {auto_batch_task_limit} токенов, профиль: {auto_batch_profile}).",
                     force=True
                 )
         if auto_settings.get('enabled') and not is_auto_restart and auto_model_warning:
@@ -3228,8 +3279,8 @@ class InitialSetupDialog(QDialog):
         if auto_settings.get('enabled') and not is_auto_restart and auto_model_name:
             self._auto_log(f"Модель основного автопрогона: {auto_model_name}.", force=True)
 
-        # 1. Проверяем, существуют ли задачи, заглядывая напрямую в TaskManager
-        tasks_exist = self.engine and self.engine.task_manager and self.engine.task_manager.has_pending_tasks()
+        # 1. Проверяем и при необходимости восстанавливаем очередь задач.
+        tasks_exist = self._ensure_pending_tasks_for_start()
         active_keys_for_start = (
             pending_session_override.get('api_keys')
             if isinstance(pending_session_override, dict) and pending_session_override.get('api_keys')
@@ -3237,7 +3288,29 @@ class InitialSetupDialog(QDialog):
         )
 
         # 2. Проверяем все условия для старта
-        if not all([self.selected_file, tasks_exist, self.output_folder, active_keys_for_start]):
+        missing_start_requirements = []
+        if not self.selected_file:
+            missing_start_requirements.append("не выбран файл")
+        if not tasks_exist:
+            missing_start_requirements.append("нет задач в очереди")
+        if not self.output_folder:
+            missing_start_requirements.append("не выбрана папка проекта")
+        if not active_keys_for_start:
+            missing_start_requirements.append("нет активной сессии сервиса/ключей")
+
+        if missing_start_requirements:
+            if is_auto_restart:
+                self._auto_log(
+                    "Автоперезапуск перевода остановлен: "
+                    + ", ".join(missing_start_requirements)
+                    + ". Подготовленные задачи останутся в очереди, если они были созданы.",
+                    force=True
+                )
+                self._auto_restart_session_override = None
+                self._reset_auto_workflow_state()
+                self.check_ready()
+                return
+
             QMessageBox.warning(self, "Ошибка", "Необходимо выбрать файл, задачи, папку и активную сессию сервиса.")
             return
 
@@ -3853,9 +3926,25 @@ class InitialSetupDialog(QDialog):
         ТОЛЬКО обновляет UI-лейбл на основе текущих настроек и последней калибровки.
         Версия 2.0: Корректно учитывает количество клиентов (параллельных окон).
         """
+        label = self.model_settings_widget.fuzzy_status_label
+        dynamic_glossary_enabled = self.model_settings_widget.dynamic_glossary_checkbox.isChecked()
+        fuzzy_threshold = self.model_settings_widget.fuzzy_threshold_spin.value()
+
+        if not dynamic_glossary_enabled:
+            label.setText("Fuzzy-поиск: выключен (динамический глоссарий отключен)")
+            label.setToolTip("Динамический глоссарий отключен, поэтому fuzzy-фильтрация не выполняется.")
+            label.setStyleSheet("color: #aaa; font-size: 10px;")
+            return
+
+        if fuzzy_threshold >= 100:
+            label.setText("Fuzzy-поиск: выключен (точный поиск)")
+            label.setToolTip("Порог 100% отключает нечеткий fuzzy-поиск. Используется быстрый точный поиск по глоссарию.")
+            label.setStyleSheet("color: #aaa; font-size: 10px;")
+            return
+
         if self.cpu_performance_index is None or self.cpu_performance_index == 0:
-            self.model_settings_widget.fuzzy_status_label.setText("Fuzzy-поиск: (требуется калибровка 🔄)")
-            self.model_settings_widget.fuzzy_status_label.setStyleSheet("color: #aaa;")
+            label.setText("Fuzzy-поиск: (требуется калибровка 🔄)")
+            label.setStyleSheet("color: #aaa;")
             return
 
         # --- Получаем все необходимые данные ---
@@ -3888,9 +3977,6 @@ class InitialSetupDialog(QDialog):
         total_application_rpm = rpm * num_clients
         interval = 60 / total_application_rpm
         # --- КОНЕЦ КЛЮЧЕВОГО ИСПРАВЛЕНИЯ ---
-
-        # --- Управление UI (теперь с корректными данными) ---
-        label = self.model_settings_widget.fuzzy_status_label
 
         if estimated_time > interval:
             label.setText(f"Fuzzy-поиск: ~{estimated_time:.2f} сек. (Дольше, чем {interval:.2f}с/запрос. 🔴)")
@@ -3988,11 +4074,9 @@ class InitialSetupDialog(QDialog):
         if token_limit <= 0:
             return None, None
 
-        chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
-        profile_name = "единая токен-оценка"
-        estimated_chars = int(round(token_limit * chars_per_token))
-        estimated_chars = max(500, min(estimated_chars, 350000))
-        return estimated_chars, profile_name
+        profile_name = "Gemini-токены"
+        task_token_limit = max(500, min(token_limit, 350000))
+        return task_token_limit, profile_name
 
     def _get_effective_auto_short_ratio_limit(self, auto_settings: dict | None, result_data: dict | None = None):
         if not isinstance(auto_settings, dict):
@@ -4248,6 +4332,12 @@ class InitialSetupDialog(QDialog):
         if not isinstance(auto_settings, dict):
             auto_settings = {}
 
+        def _safe_int(value, default=0):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
         mode = str(auto_settings.get('translation_mode_override', 'inherit') or 'inherit')
         has_override = False
         if mode == 'batch':
@@ -4274,16 +4364,35 @@ class InitialSetupDialog(QDialog):
         else:
             mode = 'inherit'
 
-        batch_token_limit = int(auto_settings.get('batch_token_limit_override', 0) or 0)
-        batch_char_limit = None
+        batch_token_limit = _safe_int(auto_settings.get('batch_token_limit_override', 0) or 0)
+        batch_task_limit = None
         token_profile = None
         if batch_token_limit > 0:
-            batch_char_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
-            if batch_char_limit:
-                translation_options['task_size_limit'] = batch_char_limit
+            batch_task_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
+            if batch_task_limit:
+                translation_options['task_size_limit'] = batch_task_limit
                 has_override = True
 
-        return translation_options, mode, has_override, batch_token_limit, batch_char_limit, token_profile
+        chapter_limit = _safe_int(auto_settings.get('batch_chapter_limit_override', 0) or 0)
+        if chapter_limit > 0:
+            translation_options['max_chapters_per_batch'] = chapter_limit
+            has_override = True
+
+        if auto_settings.get('source_context_enabled'):
+            source_context_chapters = max(
+                1,
+                _safe_int(auto_settings.get('source_context_chapters', 1) or 1, default=1),
+            )
+            source_context_char_limit = max(
+                1000,
+                _safe_int(auto_settings.get('source_context_char_limit', 60000) or 60000, default=60000),
+            )
+            translation_options['sequential_original_context_enabled'] = True
+            translation_options['sequential_original_context_chapters'] = source_context_chapters
+            translation_options['sequential_original_context_char_limit'] = source_context_char_limit
+            has_override = True
+
+        return translation_options, mode, has_override, batch_token_limit, batch_task_limit, token_profile
 
     def _build_sequential_chapter_chains(self, chapters: list, split_count: int) -> list[list]:
         chapters = list(chapters or [])
@@ -4339,7 +4448,9 @@ class InitialSetupDialog(QDialog):
                 try:
                     with open(self.selected_file, 'rb') as epub_file, zipfile.ZipFile(epub_file, 'r') as zf:
                         for chapter in missing_size_chapters:
-                            real_chapter_sizes[chapter] = len(zf.read(chapter).decode('utf-8', 'ignore'))
+                            real_chapter_sizes[chapter] = estimate_epub_chapter_input_tokens(
+                                zf.read(chapter).decode('utf-8', 'ignore')
+                            )
                 except Exception as e:
                     QtWidgets.QMessageBox.critical(
                         self,
@@ -4659,6 +4770,237 @@ class InitialSetupDialog(QDialog):
                     payload['file_label'] = file_label
             self._post_event('log_message', payload)
 
+    def _handle_background_session_event(self, event_name: str, data: dict):
+        if data.get('background_role') != 'auto_filter_redirect':
+            return
+        run_id = data.get('background_run_id')
+        if not run_id:
+            return
+        runner = self._auto_filter_parallel_redirect_runs.get(run_id)
+        if not runner:
+            return
+        if event_name == 'session_started':
+            runner['session_id'] = data.get('session_id')
+            return
+        if event_name == 'session_finished':
+            self._finish_parallel_filter_redirect_run(run_id, data.get('reason'))
+
+    def _maybe_start_parallel_filter_redirect(self, event_data: dict) -> bool:
+        if not self.is_session_active:
+            return False
+        auto_settings = self.auto_translate_widget.get_settings() if hasattr(self, 'auto_translate_widget') else {}
+        if not (auto_settings.get('enabled') and auto_settings.get('filter_redirect_enabled')):
+            return False
+
+        data = event_data.get('data', {}) if isinstance(event_data, dict) else {}
+        if data.get('success'):
+            return False
+        error_type = str(data.get('error_type') or "").upper()
+        if error_type not in {'FILTERED', 'CONTENT_FILTER'}:
+            return False
+
+        task_info = data.get('task_info')
+        if not isinstance(task_info, tuple) or len(task_info) < 2:
+            return False
+        chapters = self._extract_chapters_from_payload(task_info[1])
+        if not chapters:
+            return False
+
+        redirect_override, redirect_warning = self._resolve_auto_filter_redirect_override(auto_settings)
+        if not redirect_override:
+            if redirect_warning:
+                self._auto_log(f"{redirect_warning} Параллельный redirect пропущен.", force=True)
+            return False
+
+        main_provider = self.key_management_widget.get_selected_provider()
+        redirect_provider = redirect_override.get('provider')
+        if not redirect_provider or redirect_provider == main_provider:
+            return False
+
+        return self._start_parallel_filter_redirect(
+            chapters,
+            auto_settings,
+            redirect_override,
+            source_task_ids=[task_info[0]],
+        )
+
+    def _build_filter_redirect_payloads(self, chapters: list[str], settings: dict) -> list:
+        from ...utils.glossary_tools import TaskPreparer
+
+        cached_sizes = get_epub_chapter_sizes_with_cache(self.project_manager, self.selected_file)
+        real_chapter_sizes = {
+            chapter: int(cached_sizes.get(chapter, 0) or 0)
+            for chapter in set(chapters)
+        }
+        missing_size_chapters = [chapter for chapter, size in real_chapter_sizes.items() if size <= 0]
+        if missing_size_chapters:
+            with open(self.selected_file, 'rb') as epub_file, zipfile.ZipFile(epub_file, 'r') as zf:
+                for chapter in missing_size_chapters:
+                    real_chapter_sizes[chapter] = estimate_epub_chapter_input_tokens(
+                        zf.read(chapter).decode('utf-8', 'ignore')
+                    )
+
+        preparer = TaskPreparer(settings, real_chapter_sizes)
+        return preparer.prepare_tasks(chapters)
+
+    def _start_parallel_filter_redirect(
+        self,
+        chapters,
+        auto_settings: dict,
+        redirect_override: dict,
+        source_task_ids=None,
+    ) -> bool:
+        if not (self.selected_file and self.output_folder and self.bus):
+            return False
+
+        normalized_chapters = self._normalize_auto_chapters(chapters, preserve_order=False)
+        if not normalized_chapters:
+            return False
+
+        signature = self._make_auto_chapter_signature(normalized_chapters)
+        for runner in self._auto_filter_parallel_redirect_runs.values():
+            if runner.get('signature') == signature:
+                runner.setdefault('source_task_ids', set()).update(str(task_id) for task_id in (source_task_ids or []))
+                return True
+
+        try:
+            settings = self.get_settings()
+            settings.update(self._get_filter_retry_translation_options())
+            settings.update(redirect_override)
+            settings['provider'] = redirect_override.get('provider')
+            settings['api_keys'] = list(redirect_override.get('api_keys') or [])
+            settings['model'] = redirect_override.get('model')
+            settings['model_config'] = redirect_override.get('model_config')
+            settings['background_session'] = True
+            settings['background_role'] = 'auto_filter_redirect'
+            settings['auto_translation'] = dict(auto_settings or {})
+            if self.output_folder:
+                settings['project_manager'] = TranslationProjectManager(self.output_folder)
+
+            run_id = str(uuid.uuid4())
+            settings['background_run_id'] = run_id
+            payloads = self._build_filter_redirect_payloads(normalized_chapters, settings)
+            if not payloads:
+                return False
+
+            db_uri = f"file:auto_filter_redirect_{run_id.replace('-', '_')}?mode=memory&cache=shared"
+            db_anchor = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
+            db_anchor.row_factory = sqlite3.Row
+            task_manager = ChapterQueueManager(
+                event_bus=self.bus,
+                db_uri=db_uri,
+                main_connection=db_anchor,
+            )
+            task_manager.set_pending_tasks(payloads)
+
+            engine = TranslationEngine(
+                context_manager=self.context_manager,
+                settings_manager=self.settings_manager,
+                task_manager=task_manager,
+                event_bus=self.bus,
+            )
+            engine_thread = QtCore.QThread(self)
+            engine.moveToThread(engine_thread)
+            engine_thread.finished.connect(engine.deleteLater)
+            engine_thread.start()
+
+            self._auto_filter_parallel_redirect_runs[run_id] = {
+                'signature': signature,
+                'chapters': normalized_chapters,
+                'source_task_ids': {str(task_id) for task_id in (source_task_ids or [])},
+                'task_manager': task_manager,
+                'engine': engine,
+                'thread': engine_thread,
+                'db_anchor': db_anchor,
+            }
+            self._auto_filter_parallel_redirect_signatures.add(signature)
+
+            provider_label = api_config.provider_display_map().get(
+                settings.get('provider'),
+                settings.get('provider'),
+            )
+            self._auto_log(
+                "Параллельно запускаю redirect глав с Content Filter "
+                f"в {provider_label}: {settings.get('model')}.",
+                force=True,
+                details_title="[AUTO] Параллельный filter redirect",
+                details_text=self._compose_auto_details([
+                    ("Главы", normalized_chapters),
+                    ("Ключи redirect", [f"...{key[-4:]}" for key in settings.get('api_keys', [])]),
+                ]),
+            )
+            self.bus.event_posted.emit({
+                'event': 'start_session_requested',
+                'source': 'InitialSetupDialog',
+                'session_id': None,
+                'data': {
+                    'settings': settings,
+                    'target_engine_id': engine.engine_id,
+                },
+            })
+            return True
+        except Exception as exc:
+            self._auto_log(f"Не удалось запустить параллельный filter redirect: {exc}", force=True)
+            return False
+
+    def _finish_parallel_filter_redirect_run(self, run_id: str, reason: str | None = None):
+        runner = self._auto_filter_parallel_redirect_runs.pop(run_id, None)
+        if not runner:
+            return
+
+        chapters = runner.get('chapters') or []
+        signature = runner.get('signature')
+        task_manager = runner.get('task_manager')
+        success_chapters = set()
+        error_chapters = set()
+
+        try:
+            states = task_manager._get_ui_state_list_background() if task_manager else []
+            for task_info, status, _details in states or []:
+                task_chapters = self._extract_chapters_from_payload(task_info[1])
+                if status == 'success':
+                    success_chapters.update(task_chapters)
+                elif status == 'error':
+                    error_chapters.update(task_chapters)
+
+            target_chapters = set(chapters)
+            if target_chapters and target_chapters.issubset(success_chapters):
+                source_task_ids = runner.get('source_task_ids') or set()
+                if source_task_ids and self.engine and self.engine.task_manager:
+                    self.engine.task_manager.mark_tasks_completed(source_task_ids)
+                self._auto_log(
+                    f"Параллельный filter redirect завершён: {len(target_chapters)} глав.",
+                    force=True,
+                    details_title="[AUTO] Параллельный filter redirect завершён",
+                    details_text=self._compose_auto_details([
+                        ("Главы", self._normalize_auto_chapters(success_chapters)),
+                    ]),
+                )
+            else:
+                if signature in self._auto_filter_parallel_redirect_signatures:
+                    self._auto_filter_parallel_redirect_signatures.discard(signature)
+                missing = sorted(target_chapters - success_chapters, key=extract_number_from_path)
+                self._auto_log(
+                    "Параллельный filter redirect завершился не полностью"
+                    + (f": {reason}" if reason else "."),
+                    force=True,
+                    details_title="[AUTO] Параллельный filter redirect: не все главы",
+                    details_text=self._compose_auto_details([
+                        ("Не готово", missing),
+                        ("Ошибки", self._normalize_auto_chapters(error_chapters)),
+                    ]),
+                )
+        finally:
+            thread = runner.get('thread')
+            if thread:
+                thread.quit()
+                thread.wait(3000)
+            db_anchor = runner.get('db_anchor')
+            if db_anchor:
+                db_anchor.close()
+            if task_manager:
+                task_manager.deleteLater()
+
     def _extract_chapters_from_payload(self, payload) -> list[str]:
         if not payload:
             return []
@@ -4863,6 +5205,7 @@ class InitialSetupDialog(QDialog):
         self._auto_pending_network_retry_chapters = set()
         self._auto_filter_repack_signatures = set()
         self._auto_filter_redirect_signatures = set()
+        self._auto_filter_parallel_redirect_signatures = set()
         self._auto_restart_session_override = None
         self._auto_validator_dialog = None
         self._auto_consistency_worker = None
@@ -4963,6 +5306,8 @@ class InitialSetupDialog(QDialog):
             return False
 
         filter_signature = self._make_auto_chapter_signature(filtered_chapters)
+        if filter_signature in self._auto_filter_parallel_redirect_signatures:
+            return False
         if auto_settings.get('filter_redirect_enabled') and self._auto_filter_repack_signatures:
             return False
 
@@ -5060,6 +5405,8 @@ class InitialSetupDialog(QDialog):
             return False
 
         filter_signature = self._make_auto_chapter_signature(filtered_chapters)
+        if filter_signature in self._auto_filter_parallel_redirect_signatures:
+            return False
         if auto_settings.get('filter_repack_enabled') and not self._auto_filter_repack_signatures:
             return False
         if self._auto_filter_redirect_signatures:
@@ -5201,7 +5548,23 @@ class InitialSetupDialog(QDialog):
             self._finish_auto_validator_followup(auto_settings)
             return
 
-        dialog.start_analysis()
+        auto_targets = []
+        if hasattr(dialog, '_get_eligible_analysis_paths'):
+            auto_targets = sorted(dialog._get_eligible_analysis_paths(), key=extract_number_from_path)
+        elif getattr(dialog, 'path_row_map', None):
+            auto_targets = sorted(dialog.path_row_map.keys(), key=extract_number_from_path)
+
+        if not auto_targets:
+            self._auto_followup_running = False
+            self._auto_validator_dialog = None
+            dialog.deleteLater()
+            self._finish_auto_validator_followup(
+                auto_settings,
+                "Auto validator skipped: no chapters available for validation.",
+            )
+            return
+
+        dialog.start_analysis(specific_targets=auto_targets)
         if dialog.analysis_thread:
             dialog.analysis_thread.analysis_finished.connect(self._on_auto_validator_finished)
         else:
@@ -5376,16 +5739,6 @@ class InitialSetupDialog(QDialog):
 
         if chapters_to_retry:
             signature = tuple(sorted(chapters_to_retry))
-            if signature in self._auto_last_retry_signatures:
-                self._auto_log(
-                    "Получен тот же набор глав для повторного перевода. Автоцикл остановлен: "
-                    f"{self._format_auto_chapter_list(signature, limit=10)}.",
-                    force=True
-                )
-                self._reset_auto_workflow_state()
-                self.check_ready()
-                return
-
             self._auto_last_retry_signatures.add(signature)
             self.add_files_for_retry(self.selected_file, list(signature))
             cjk_retries = sum(1 for _, _, profile in ratio_profiles.values() if profile == "CJK")
@@ -5436,7 +5789,12 @@ class InitialSetupDialog(QDialog):
         self.check_ready()
 
     def _run_auto_consistency_followup(self, auto_settings: dict):
-        chapters_to_analyze = load_project_chapters_for_consistency(self.project_manager)
+        include_original = bool(auto_settings.get('ai_consistency_use_original', False))
+        chapters_to_analyze = load_project_chapters_for_consistency(
+            self.project_manager,
+            original_epub_path=getattr(self, 'selected_file', None),
+            include_original=include_original,
+        )
         active_keys = self.key_management_widget.get_active_keys()
 
         if not chapters_to_analyze:
@@ -5464,11 +5822,18 @@ class InitialSetupDialog(QDialog):
             'provider': self.key_management_widget.get_selected_provider(),
             'chunk_size': int(auto_settings.get('ai_consistency_chunk_size', 3)),
             'consistency_fix_confidences': list(selected_confidences),
+            'consistency_include_original': include_original,
         })
 
         self._auto_followup_running = True
         self.start_btn.setEnabled(False)
         self._auto_log("Запускаю AI-проверку согласованности…", force=True)
+        if include_original:
+            chapters_with_original = sum(1 for chapter in chapters_to_analyze if chapter.get('source_content'))
+            self._auto_log(
+                f"AI-consistency будет сверять перевод с оригиналом EPUB: "
+                f"{chapters_with_original}/{len(chapters_to_analyze)} глав с исходным текстом.",
+            )
         self._auto_log(
             f"AI-consistency анализирует {len(chapters_to_analyze)} глав: "
             f"{self._format_auto_chapter_list([chapter.get('name') for chapter in chapters_to_analyze], limit=10, preserve_order=True)}",

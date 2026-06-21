@@ -6,6 +6,7 @@ import zipfile
 import re
 import json
 import hashlib
+import difflib
 from bs4 import BeautifulSoup, NavigableString, ProcessingInstruction, Comment, Declaration
 import shutil
 from datetime import datetime
@@ -20,7 +21,12 @@ from ...utils.validation_cache import (
     is_snapshot_compatible,
     restore_result_data,
 )
-from ...utils.text import find_unwrapped_body_text_snippets, is_well_formed_xml
+from ...utils.text import (
+    find_stray_angle_bracket_snippets,
+    find_unwrapped_body_text_snippets,
+    is_well_formed_xml,
+    repair_ai_html_artifacts,
+)
 from ...utils.project_migrator import ProjectMigrator
 from ...utils.translation_versions import (
     select_target_translation_version,
@@ -398,6 +404,201 @@ class ChapterStatusDelegate(QtWidgets.QStyledItemDelegate):
             return self.helpEvent(event, self.parent(), option, index)
         return super().editorEvent(event, model, option, index)
 
+
+def _review_line_text(value):
+    if value is None:
+        return ""
+    return str(value).rstrip("\r\n")
+
+
+def build_line_review_segments(old_text: str, new_text: str):
+    old_lines = (old_text or "").splitlines(keepends=True)
+    new_lines = (new_text or "").splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+
+    segments = []
+    changes = []
+    change_id = 0
+
+    for tag, old_start, old_end, new_start, new_end in matcher.get_opcodes():
+        if tag == "equal":
+            segments.append({
+                "kind": "equal",
+                "old_lines": old_lines[old_start:old_end],
+            })
+            continue
+
+        segment_changes = []
+        old_count = old_end - old_start
+        new_count = new_end - new_start
+        for offset in range(max(old_count, new_count)):
+            old_line = old_lines[old_start + offset] if offset < old_count else None
+            new_line = new_lines[new_start + offset] if offset < new_count else None
+            if old_line is None:
+                kind = "insert"
+            elif new_line is None:
+                kind = "delete"
+            else:
+                kind = "replace"
+
+            change = {
+                "id": change_id,
+                "kind": kind,
+                "old_line_no": old_start + offset + 1 if old_line is not None else old_start + 1,
+                "new_line_no": new_start + offset + 1 if new_line is not None else new_start + 1,
+                "old_text": old_line,
+                "new_text": new_line,
+            }
+            change_id += 1
+            segment_changes.append(change)
+            changes.append(change)
+
+        segments.append({
+            "kind": "change",
+            "changes": segment_changes,
+        })
+
+    return segments, changes
+
+
+def apply_line_review_selection(segments, accepted_change_ids):
+    accepted_change_ids = set(accepted_change_ids or [])
+    result_lines = []
+
+    for segment in segments:
+        if segment.get("kind") == "equal":
+            result_lines.extend(segment.get("old_lines") or [])
+            continue
+
+        for change in segment.get("changes") or []:
+            accepted = change.get("id") in accepted_change_ids
+            if accepted:
+                new_text = change.get("new_text")
+                if new_text is not None:
+                    result_lines.append(new_text)
+            else:
+                old_text = change.get("old_text")
+                if old_text is not None:
+                    result_lines.append(old_text)
+
+    return "".join(result_lines)
+
+
+class AIRepairReviewDialog(QDialog):
+    def __init__(self, candidates, parent=None):
+        super().__init__(parent)
+        self.candidates = candidates or []
+        self.setWindowTitle("Построчная проверка автоправки")
+        self.setMinimumSize(1000, 620)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Выберите строки, которые нужно применить. Неподтверждённые строки останутся как были."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Применить", "Файл", "Строка", "Было", "Стало"])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setWordWrap(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(self.table, 1)
+
+        select_layout = QHBoxLayout()
+        self.btn_select_all = QPushButton("Выбрать всё")
+        self.btn_select_none = QPushButton("Снять всё")
+        self.btn_select_all.clicked.connect(lambda: self._set_all_checked(True))
+        self.btn_select_none.clicked.connect(lambda: self._set_all_checked(False))
+        select_layout.addWidget(self.btn_select_all)
+        select_layout.addWidget(self.btn_select_none)
+        select_layout.addStretch()
+        layout.addLayout(select_layout)
+
+        button_box = QDialogButtonBox()
+        apply_button = button_box.addButton("Применить выбранное", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        apply_button.clicked.connect(self.accept)
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self._populate_table()
+
+    def _populate_table(self):
+        self.table.setRowCount(0)
+        for candidate_index, candidate in enumerate(self.candidates):
+            chapter = candidate.get("chapter") or f"Строка {candidate.get('row')}"
+            for change in candidate.get("changes") or []:
+                row = self.table.rowCount()
+                self.table.insertRow(row)
+
+                check_item = QTableWidgetItem("")
+                check_item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
+                check_item.setCheckState(Qt.CheckState.Checked)
+                check_item.setData(Qt.ItemDataRole.UserRole, (candidate_index, change.get("id")))
+                self.table.setItem(row, 0, check_item)
+
+                line_label = self._format_line_label(change)
+                values = [
+                    chapter,
+                    line_label,
+                    _review_line_text(change.get("old_text")),
+                    _review_line_text(change.get("new_text")),
+                ]
+                for col, value in enumerate(values, start=1):
+                    item = QTableWidgetItem(value)
+                    item.setToolTip(value)
+                    self.table.setItem(row, col, item)
+
+        self.table.resizeRowsToContents()
+
+    def _format_line_label(self, change):
+        kind = change.get("kind")
+        if kind == "insert":
+            return f"+{change.get('new_line_no', '')}"
+        if kind == "delete":
+            return f"-{change.get('old_line_no', '')}"
+        return f"{change.get('old_line_no', '')} -> {change.get('new_line_no', '')}"
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item:
+                item.setCheckState(state)
+
+    def selected_html_by_row(self):
+        accepted_by_candidate = {index: set() for index in range(len(self.candidates))}
+
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if not item or item.checkState() != Qt.CheckState.Checked:
+                continue
+            candidate_index, change_id = item.data(Qt.ItemDataRole.UserRole)
+            accepted_by_candidate.setdefault(candidate_index, set()).add(change_id)
+
+        result = {}
+        for candidate_index, candidate in enumerate(self.candidates):
+            selected_html = apply_line_review_selection(
+                candidate.get("segments") or [],
+                accepted_by_candidate.get(candidate_index, set()),
+            )
+            if selected_html != candidate.get("original_html"):
+                result[candidate["row"]] = selected_html
+
+        return result
+
 class StructureErrorsDialog(QDialog):
     """
     Диалоговое окно для детального отображения структурных несоответствий с
@@ -473,6 +674,9 @@ class StructureErrorsDialog(QDialog):
         def format_line(name, orig, trans):
             color = "red" if str(orig) != str(trans) else "green"
             return f'<li><b>{name}:</b> Оригинал: {orig}, Перевод: {trans} <font color="{color}">({ "Несовпадение" if str(orig) != str(trans) else "OK"})</font></li>'
+
+        def html_safe(value):
+            return str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         
         has_tag_errors = False
         tag_html = "<ul>"
@@ -492,8 +696,14 @@ class StructureErrorsDialog(QDialog):
         if 'body_root_text' in errors:
             has_tag_errors = True
             snippets = errors['body_root_text']
-            preview = "; ".join(snippets) if isinstance(snippets, list) else str(snippets)
+            preview = html_safe("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
             tag_html += format_line("Текст напрямую в &lt;body&gt;", "Нет", preview)
+
+        if 'stray_angle_brackets' in errors:
+            has_tag_errors = True
+            snippets = errors['stray_angle_brackets']
+            preview = html_safe("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
+            tag_html += format_line("Лишние &lt; или &gt; вне тегов", "Нет", preview)
 
         for h in sorted(errors.get('headings', {}).keys()):
             orig_h, trans_h = errors['headings'][h]
@@ -682,6 +892,9 @@ class ValidationThread(QThread):
             root_text_snippets = find_unwrapped_body_text_snippets(translated_content)
             if root_text_snippets:
                 structural_errors['body_root_text'] = root_text_snippets
+        angle_snippets = find_stray_angle_bracket_snippets(translated_content)
+        if angle_snippets:
+            structural_errors['stray_angle_brackets'] = angle_snippets
 
         # --- НАЧАЛО БЛОКА TRY (Восстановлено) ---
         try:
@@ -1682,6 +1895,8 @@ class TranslationValidatorDialog(QDialog):
         grid.setVerticalSpacing(4)
         
         self.check_structure = QCheckBox("Структура (теги, заголовки)")
+        self.btn_fix_ai_artifacts = QPushButton("Исправить ошибки ИИ")
+        self.btn_fix_ai_artifacts.clicked.connect(self._repair_ai_artifacts_for_selection)
         self.check_length_ratio = QCheckBox("Соотношение длин (перевод / оригинал)")
         
         untranslated_layout = QHBoxLayout()
@@ -1694,7 +1909,13 @@ class TranslationValidatorDialog(QDialog):
         untranslated_layout.addWidget(self.btn_fix_untranslated)
         untranslated_layout.addStretch()
     
-        grid.addWidget(self.check_structure, 0, 0)
+        structure_layout = QHBoxLayout()
+        structure_layout.setContentsMargins(0,0,0,0); structure_layout.setSpacing(5)
+        structure_layout.addWidget(self.check_structure)
+        structure_layout.addWidget(self.btn_fix_ai_artifacts)
+        structure_layout.addStretch()
+
+        grid.addLayout(structure_layout, 0, 0)
         grid.addLayout(untranslated_layout, 1, 0)
         grid.addWidget(self.check_length_ratio, 2, 0)
         
@@ -1818,6 +2039,11 @@ class TranslationValidatorDialog(QDialog):
         # Группа 1: Основные проверки
         structure_tooltip = "Проверяет соответствие ключевых тегов (<html>, <body>), заголовков (<h1>-<h6>), изображений и списков.\nТакже проверяет баланс тегов <p>."
         self.check_structure.setToolTip(structure_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
+        ai_repair_tooltip = (
+            "Исправляет типовые ошибки ИИ в HTML: лишние символы < или > вне тегов, "
+            "текст напрямую внутри body без p, потерянную обёртку body и баланс p."
+        )
+        self.btn_fix_ai_artifacts.setToolTip(ai_repair_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
         
         self.check_untranslated.setToolTip("Включить/выключить проверку на недоперевод.")
         self.btn_fix_untranslated.setToolTip("Ищет в переводе латинские слова (3+ букв) и иероглифы, которые также присутствуют в оригинале.\nОткрывает диалог для пакетного исправления, если что-то найдено.")
@@ -1980,6 +2206,154 @@ class TranslationValidatorDialog(QDialog):
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.regex_edit.setText(dialog.get_text())
+
+    def _get_ai_repair_target_rows(self):
+        selected_rows = sorted({
+            item.row()
+            for item in self.table_results.selectedItems()
+            if item.row() in self.results_data
+        })
+        if selected_rows:
+            return selected_rows, True
+
+        target_rows = []
+        for row in range(self.table_results.rowCount()):
+            if self.table_results.isRowHidden(row):
+                continue
+            data = self.results_data.get(row, {})
+            if data.get('structural_errors'):
+                target_rows.append(row)
+
+        return target_rows, False
+
+    def _mark_row_changed_by_ai_repair(self, row):
+        data = self.results_data.get(row)
+        if not isinstance(data, dict):
+            return
+
+        data['is_edited'] = True
+        data['status'] = 'edited'
+        self._invalidate_analysis_for_data(data)
+
+        internal_path = data.get('internal_html_path')
+        if internal_path:
+            self.dirty_files.add(internal_path)
+
+        self.table_results.removeCellWidget(row, 1)
+        reason_item = self.table_results.item(row, 1)
+        if not reason_item:
+            reason_item = QTableWidgetItem("")
+            self.table_results.setItem(row, 1, reason_item)
+        reason_item.setText("")
+
+        len_item = self.table_results.item(row, 2)
+        if len_item:
+            len_item.setText("- | -")
+
+        status_item = self.table_results.item(row, 3)
+        if status_item:
+            status_item.setText("Редакт.")
+
+        self.update_row_color(row, 'edited')
+        self._fixer_stale_rows.add(row)
+
+    def _repair_ai_artifacts_for_selection(self):
+        rows, used_selection = self._get_ai_repair_target_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Автоправка",
+                "Выделите строки для исправления или запустите проверку, чтобы появились структурные проблемы."
+            )
+            return
+
+        review_candidates = []
+        unchanged_count = 0
+        errors = []
+
+        for row in rows:
+            data = self.results_data.get(row)
+            if not isinstance(data, dict):
+                continue
+
+            try:
+                original_html = self._ensure_row_original_html_loaded(row)
+                translated_html = self._ensure_row_translated_html_loaded(row)
+                if not translated_html:
+                    unchanged_count += 1
+                    continue
+
+                repaired_html = repair_ai_html_artifacts(original_html, translated_html)
+                if repaired_html != translated_html:
+                    segments, changes = build_line_review_segments(translated_html, repaired_html)
+                    if changes:
+                        review_candidates.append({
+                            "row": row,
+                            "chapter": os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}"),
+                            "original_html": translated_html,
+                            "repaired_html": repaired_html,
+                            "segments": segments,
+                            "changes": changes,
+                        })
+                    else:
+                        unchanged_count += 1
+                else:
+                    unchanged_count += 1
+            except Exception as exc:
+                chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
+                errors.append(f"{chapter_name}: {exc}")
+
+        if not review_candidates:
+            message = "Автоправка не нашла изменений для выбранных строк."
+            if errors:
+                message += "\n\nОшибки:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Автоправка", message)
+            return
+
+        review_dialog = AIRepairReviewDialog(review_candidates, self)
+        if review_dialog.exec() != QDialog.DialogCode.Accepted:
+            self.lbl_status.setText("Автоправка отменена: изменения не применялись.")
+            return
+
+        approved_html_by_row = review_dialog.selected_html_by_row()
+        if not approved_html_by_row:
+            QMessageBox.information(self, "Автоправка", "Не выбрано ни одной строки для применения.")
+            return
+
+        changed_rows = []
+        for row, selected_html in approved_html_by_row.items():
+            data = self.results_data.get(row)
+            if not isinstance(data, dict):
+                continue
+            current_html = self._ensure_row_translated_html_loaded(row)
+            if selected_html == current_html:
+                continue
+            data['translated_html'] = selected_html
+            self._mark_row_changed_by_ai_repair(row)
+            changed_rows.append(row)
+
+        if changed_rows:
+            self.btn_save_changes.setEnabled(True)
+            self._fixer_data_fingerprint = None
+            self.reapply_filters()
+            self.update_comparison_view()
+            scope_text = "выделенных строках" if used_selection else "видимых проблемных строках"
+            message = (
+                f"Применено к главам: {len(changed_rows)} в {scope_text}.\n"
+                f"Глав с предложениями: {len(review_candidates)}.\n"
+                f"Без изменений: {unchanged_count}.\n\n"
+                "Проверьте результат справа и нажмите «Сохранить изменения»."
+            )
+            if errors:
+                message += "\n\nОшибки:\n" + "\n".join(errors[:5])
+                if len(errors) > 5:
+                    message += f"\n... и ещё {len(errors) - 5}."
+            QMessageBox.information(self, "Автоправка завершена", message)
+        else:
+            message = "Подтверждённые строки не изменили текущий текст."
+            if errors:
+                message += "\n\nОшибки:\n" + "\n".join(errors[:5])
+            QMessageBox.information(self, "Автоправка", message)
 
     def _show_results_context_menu(self, pos):
         clicked_item = self.table_results.itemAt(pos)

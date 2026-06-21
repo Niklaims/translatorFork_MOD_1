@@ -13,6 +13,31 @@
 import math
 import time
 import re
+
+GEMINI_ASCII_CHARS_PER_TOKEN = 4.0
+GEMINI_CYRILLIC_CHARS_PER_TOKEN = 2.2
+GEMINI_CJK_CHARS_PER_TOKEN = 1.5
+GEMINI_OTHER_CHARS_PER_TOKEN = 2.5
+
+
+def estimate_gemini_tokens(text):
+    """Estimate Gemini input tokens without an API round trip."""
+    if not text:
+        return 0
+
+    text = str(text)
+    ascii_like_chars = len(re.findall(r'[\x00-\x7f]', text))
+    cyrillic_chars = len(re.findall(r'[\u0400-\u04ff]', text))
+    cjk_chars = len(re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+    other_chars = max(0, len(text) - ascii_like_chars - cyrillic_chars - cjk_chars)
+
+    total_tokens = (
+        (ascii_like_chars / GEMINI_ASCII_CHARS_PER_TOKEN)
+        + (cyrillic_chars / GEMINI_CYRILLIC_CHARS_PER_TOKEN)
+        + (cjk_chars / GEMINI_CJK_CHARS_PER_TOKEN)
+        + (other_chars / GEMINI_OTHER_CHARS_PER_TOKEN)
+    )
+    return max(1, int(math.ceil(total_tokens)))
 # --- Добавляем глобальную проверку BeautifulSoup, так как она нужна в main.py ---
 try:
     from bs4 import BeautifulSoup
@@ -50,6 +75,7 @@ class TokenCounter:
         """
         if not text:
             return 0
+        return estimate_gemini_tokens(text)
         
         # Константы из конфига для более точного подсчета
         # Мы могли бы импортировать config, но чтобы избежать циклических зависимостей,

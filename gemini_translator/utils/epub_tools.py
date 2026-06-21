@@ -16,6 +16,143 @@ import zipfile
 import html as html_lib
 from xml.etree import ElementTree as ET
 from ..api import config as api_config
+from .helpers import estimate_gemini_tokens
+
+EPUB_HEADING_TAGS = ("h1", "h2", "h3")
+CHAPTER_SIZE_CACHE_METRIC = "gemini_input_tokens"
+CHAPTER_SIZE_CACHE_VERSION = 2
+
+
+def _normalize_epub_heading_text(text):
+    text = html_lib.unescape(str(text or ""))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_epub_heading_text(heading):
+    """
+    Extract normalized text from an EPUB heading.
+
+    Some EPUBs split the chapter number and title as:
+    <h2 class="head"><span class="chapter-sequence-number">...</span><br/>...</h2>
+    Using a separator keeps these parts from being glued together.
+    """
+    if not heading:
+        return ""
+
+    try:
+        return _normalize_epub_heading_text(heading.get_text(" ", strip=True))
+    except TypeError:
+        try:
+            return _normalize_epub_heading_text(heading.get_text())
+        except AttributeError:
+            return _normalize_epub_heading_text(heading)
+    except AttributeError:
+        return _normalize_epub_heading_text(heading)
+
+
+def _extract_first_epub_heading_text_regex(html_content, include_title=False):
+    tag_names = [*EPUB_HEADING_TAGS]
+    if include_title:
+        tag_names.append("title")
+
+    for tag_name in tag_names:
+        pattern = rf"<{tag_name}\b[^>]*>(.*?)</{tag_name}>"
+        match = re.search(pattern, str(html_content or ""), re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        raw_title = re.sub(r"<(?:br|hr)\b[^>]*>", " ", match.group(1), flags=re.IGNORECASE)
+        raw_title = re.sub(r"<[^>]+>", " ", raw_title)
+        title = _normalize_epub_heading_text(raw_title)
+        if title:
+            return title
+    return ""
+
+
+def extract_first_epub_heading_text(html_content, include_title=False):
+    if not html_content:
+        return ""
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return _extract_first_epub_heading_text_regex(html_content, include_title=include_title)
+
+    if isinstance(html_content, (str, bytes, bytearray)):
+        soup = BeautifulSoup(html_content, "html.parser")
+    else:
+        soup = html_content
+
+    heading = soup.find(list(EPUB_HEADING_TAGS))
+    title = extract_epub_heading_text(heading)
+    if title:
+        return title
+
+    if include_title:
+        title_tag = soup.find("title")
+        return extract_epub_heading_text(title_tag)
+
+    return ""
+
+
+def _heading_classes(heading):
+    classes = getattr(heading, "attrs", {}).get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    return {str(item).lower() for item in classes}
+
+
+def _has_class(tag, class_name):
+    classes = getattr(tag, "attrs", {}).get("class", [])
+    if isinstance(classes, str):
+        classes = classes.split()
+    return str(class_name).lower() in {str(item).lower() for item in classes}
+
+
+def _is_split_chapter_heading(heading):
+    if not heading or str(getattr(heading, "name", "")).lower() not in EPUB_HEADING_TAGS:
+        return False
+
+    classes = _heading_classes(heading)
+    has_head_class = "head" in classes
+    has_sequence_number = bool(heading.find(lambda tag: _has_class(tag, "chapter-sequence-number")))
+    has_break = bool(heading.find(["br", "hr"]))
+    return has_sequence_number and (has_head_class or has_break)
+
+
+def normalize_epub_chapter_heading_to_h1(html_content):
+    """
+    Normalize split EPUB chapter headings to a plain h1.
+
+    Example:
+    <h2 class="head"><span class="chapter-sequence-number">第175章</span><br/>小姨到访</h2>
+    becomes:
+    <h1>第175章 小姨到访</h1>
+    """
+    if not html_content:
+        return html_content
+
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return html_content
+
+    soup = BeautifulSoup(html_content, "html.parser")
+    heading = soup.find(_is_split_chapter_heading)
+    if not heading:
+        return html_content
+
+    title = extract_epub_heading_text(heading)
+    if not title:
+        return html_content
+
+    replacement = soup.new_tag("h1")
+    heading_id = heading.attrs.get("id")
+    if heading_id:
+        replacement["id"] = heading_id
+    replacement.string = title
+    heading.replace_with(replacement)
+    return str(soup)
+
 
 class EpubUpdater:
     """
@@ -63,6 +200,7 @@ class EpubUpdater:
                 try:
                     with open(new_file_disk_path, 'r', encoding='utf-8') as f:
                         raw_html = f.read()
+                        raw_html = normalize_epub_chapter_heading_to_h1(raw_html)
                         soup = BeautifulSoup(raw_html, 'html.parser')
                         
                         # 1. Ищем H1 (или H2, если нет H1)
@@ -71,7 +209,7 @@ class EpubUpdater:
                             header = soup.find('h2')
                         
                         if header:
-                            new_title_text = header.get_text().strip()
+                            new_title_text = extract_epub_heading_text(header)
                             if new_title_text:
                                 # Сохраняем для обновления TOC.
                                 # Ключом делаем старое имя файла, так как TOC ссылается на него (пока мы не обновили ссылки)
@@ -166,6 +304,7 @@ class EpubUpdater:
                 fname = os.path.basename(internal_path)
                 with open(disk_path, 'r', encoding='utf-8') as f:
                     content = f.read()
+                content = normalize_epub_chapter_heading_to_h1(content)
                 
                 # Если для этого файла есть новый заголовок
                 if fname in titles_update_map:
@@ -329,7 +468,10 @@ class EpubCreator:
         return ncx
         
     def _create_styles(self):
-        return '''body { font-family: Georgia, serif; } p { text-indent: 1.5em; margin: 0; }'''
+        return '''
+body { font-family: Georgia, serif; line-height: 1.55; }
+p { text-indent: 1.5em; margin: 0 0 0.85em 0; }
+'''
 
 
 def _get_path_from_item(item):
@@ -501,14 +643,18 @@ def calculate_potential_output_size(html_content, is_cjk):
         return len(html_content) * 2, 0
         
  
+def estimate_epub_chapter_input_tokens(html_content):
+    return estimate_gemini_tokens(html_content or "")
+
+
 
 def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_status=False):
     """
-    Получает ОБЩИЙ размер глав в символах, используя "ДНК" файла для кэширования.
-    Возвращает словарь {internal_path: total_chars}.
+    Получает ОБЩИЙ размер глав во входных Gemini-токенах, используя "ДНК" файла для кэширования.
+    Возвращает словарь {internal_path: input_tokens}.
     
     Улучшения:
-    1. Sanity Check: проверяет реальное количество символов в 3 точках (начало, середина, конец),
+    1. Sanity Check: проверяет реальное количество токенов в 3 точках (начало, середина, конец),
        чтобы убедиться, что кэш не врет.
     """
     if not project_manager or not epub_path or not os.path.exists(epub_path):
@@ -537,14 +683,20 @@ def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_s
 
     cache_data = project_manager.load_size_cache()
     is_cache_valid = False
+    is_epub_identity_match = False
     final_sizes = {}
 
     # --- ЭТАП 1: Проверка метаданных ---
     if cache_data and isinstance(cache_data, dict):
         metadata = cache_data.get('metadata', {})
-        if (metadata.get('epub_name') == current_epub_name and
+        is_epub_identity_match = (
+            metadata.get('epub_name') == current_epub_name and
             metadata.get('epub_size') == current_epub_size and
-            metadata.get('content_checksum') == current_content_checksum):
+            metadata.get('content_checksum') == current_content_checksum
+        )
+        if (is_epub_identity_match and
+            metadata.get('metric') == CHAPTER_SIZE_CACHE_METRIC and
+            int(metadata.get('version', 0) or 0) >= CHAPTER_SIZE_CACHE_VERSION):
             
             cached_sizes = cache_data.get('sizes', {})
             
@@ -563,11 +715,11 @@ def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_s
                             if idx < 0 or idx >= len(sorted_keys): continue
                             
                             check_path = sorted_keys[idx]
-                            cached_val = cached_sizes[check_path]
+                            cached_val = int(cached_sizes.get(check_path, 0) or 0)
                             
                             # Читаем реально
                             real_content = zf.read(check_path).decode('utf-8', errors='ignore')
-                            real_len = len(real_content)
+                            real_len = estimate_epub_chapter_input_tokens(real_content)
                             
                             if abs(real_len - cached_val) > 5: # Допускаем крошечную погрешность, но лучше точное совпадение
                                 print(f"[CACHE] Несовпадение в '{check_path}': кэш={cached_val}, реально={real_len}. Сброс.")
@@ -576,7 +728,10 @@ def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_s
                         
                         if all_samples_match:
                             is_cache_valid = True
-                            final_sizes = cached_sizes
+                            final_sizes = {
+                                path: int(value or 0)
+                                for path, value in cached_sizes.items()
+                            }
             except Exception as e:
                 print(f"[CACHE] Ошибка при Sanity Check: {e}. Сброс кэша.")
                 is_cache_valid = False
@@ -591,7 +746,7 @@ def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_s
             # Перебираем сохраненный ранее список файлов
             for fname, _ in chapter_info_list:
                 content_str = zf.read(fname).decode('utf-8', errors='ignore')
-                final_sizes[fname] = len(content_str)
+                final_sizes[fname] = estimate_epub_chapter_input_tokens(content_str)
     except Exception as e:
         print(f"[ERROR] Не удалось пересчитать размеры глав: {e}")
         return ({}, False) if return_cache_status else {}
@@ -600,13 +755,15 @@ def get_epub_chapter_sizes_with_cache(project_manager, epub_path, return_cache_s
         'metadata': {
             'epub_name': current_epub_name,
             'epub_size': current_epub_size,
-            'content_checksum': current_content_checksum
+            'content_checksum': current_content_checksum,
+            'metric': CHAPTER_SIZE_CACHE_METRIC,
+            'version': CHAPTER_SIZE_CACHE_VERSION
         },
         'sizes': final_sizes
     }
     project_manager.save_size_cache(new_cache_data)
     
-    return (final_sizes, False) if return_cache_status else final_sizes
+    return (final_sizes, is_epub_identity_match) if return_cache_status else final_sizes
     
     
     
@@ -623,11 +780,11 @@ def get_chapter_fingerprint(epub_zip, internal_path):
         
         # 1. Заголовок из тега <title>
         title_tag = soup.find('title')
-        title_text = title_tag.get_text().strip() if title_tag else ""
+        title_text = extract_epub_heading_text(title_tag) if title_tag else ""
         
         # 2. Текст из первого попавшегося H-тега
         h_tag = soup.find(['h1', 'h2', 'h3'])
-        h_text = h_tag.get_text().strip() if h_tag else ""
+        h_text = extract_epub_heading_text(h_tag) if h_tag else ""
         
         # 3. Чистая длина текста (без тегов)
         clean_text = soup.get_text()

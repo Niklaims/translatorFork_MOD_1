@@ -1,5 +1,9 @@
+import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -78,6 +82,73 @@ class _ConsistencyDialogHarness:
 
 
 class ConsistencyResponseNormalizationTests(unittest.TestCase):
+    def test_analysis_prompt_keeps_original_source_as_reference_only(self):
+        engine = ConsistencyEngine(object())
+
+        prompt = engine._build_analysis_prompt(
+            [
+                {
+                    "name": "chapter_01.xhtml",
+                    "content": "<p>Он вошёл в зал.</p>",
+                    "source_content": "<p>他走进大厅。</p>",
+                    "source_path": "Text/chapter_01.xhtml",
+                }
+            ],
+            {},
+        )
+
+        self.assertIn("SOURCE ORIGINAL", prompt)
+        self.assertIn("reference only", prompt)
+        self.assertIn("TRANSLATED TEXT TO ANALYZE", prompt)
+        self.assertIn("他走进大厅", prompt)
+        self.assertIn("Он вошёл", prompt)
+
+    def test_source_reference_prompt_can_be_configured(self):
+        engine = ConsistencyEngine(object())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prompts_path = Path(temp_dir) / "consistency_prompts.json"
+            prompts_path.write_text(
+                json.dumps(
+                    {
+                        "consistency_analysis": ["{chapters_text}"],
+                        "source_reference": {
+                            "intro": ["CUSTOM INTRO"],
+                            "chapter": [
+                                "CUSTOM CHAPTER {chapter_name}",
+                                "CUSTOM PATH {source_path}",
+                                "CUSTOM SUFFIX {source_path_suffix}",
+                                "CUSTOM ORIGINAL {source_content}",
+                                "CUSTOM TRANSLATED {translated_content}",
+                            ],
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("gemini_translator.api.config.get_resource_path", return_value=prompts_path):
+                prompt = engine._build_analysis_prompt(
+                    [
+                        {
+                            "name": "chapter_02.xhtml",
+                            "content": "<p>Перевод</p>",
+                            "source_content": "<p>原文</p>",
+                            "source_path": "Text/chapter_02.xhtml",
+                        }
+                    ],
+                    {},
+                )
+
+        self.assertIn("CUSTOM INTRO", prompt)
+        self.assertIn("CUSTOM CHAPTER chapter_02.xhtml", prompt)
+        self.assertIn("CUSTOM PATH Text/chapter_02.xhtml", prompt)
+        self.assertIn("CUSTOM SUFFIX : Text/chapter_02.xhtml", prompt)
+        self.assertIn("CUSTOM ORIGINAL <p>原文</p>", prompt)
+        self.assertIn("CUSTOM TRANSLATED <p>Перевод</p>", prompt)
+        self.assertNotIn("SOURCE ORIGINAL", prompt)
+
     def test_sanitize_fixed_chapter_rejects_new_latin_residue(self):
         engine = ConsistencyEngine(object())
         original = (

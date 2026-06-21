@@ -5,6 +5,9 @@ from collections import Counter
 from PyQt6 import QtCore, QtWidgets
 
 
+STATUS_FLUSH_INTERVAL_MS = 100
+
+
 class StatusBarWidget(QtWidgets.QWidget):
     """
     Виджет, отображающий многоцветный прогресс-бар и текстовый статус.
@@ -18,8 +21,12 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.error_count = 0
         self.total_tasks = 0
         self._uses_topic_subscription = False
+        self._pending_task_state = None
 
         self._init_ui()
+        self._status_flush_timer = QtCore.QTimer(self)
+        self._status_flush_timer.setSingleShot(True)
+        self._status_flush_timer.timeout.connect(self._flush_pending_task_state)
 
         app = QtWidgets.QApplication.instance()
 
@@ -101,31 +108,55 @@ class StatusBarWidget(QtWidgets.QWidget):
     def on_event(self, event_data: dict):
         """Слушает глобальную шину и реагирует на нужные события."""
         event_name = event_data.get("event")
-        data = event_data.get("data", {})
 
         if event_name == "session_started":
-            self.start_session(data.get("total_tasks", 0))
+            self._on_session_started(event_data)
 
         elif event_name == "session_finished":
-            self.stop_session()
+            self._on_session_finished(event_data)
 
         elif event_name == "task_state_changed":
-            if self.engine and self.engine.task_manager:
-                ui_state_list = self.engine.task_manager.get_ui_state_list()
+            self._on_task_state_changed(event_data)
 
-                self.total_tasks = len(ui_state_list)
-                self.progress_bar_text.setRange(0, self.total_tasks)
+    def _on_session_started(self, event_data: dict):
+        data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
+        self.start_session(data.get("total_tasks", 0))
 
-                status_counts = Counter(item[1] for item in ui_state_list)
-                error_total = sum(count for status, count in status_counts.items() if "error" in status)
-                in_progress_total = status_counts.get("in_progress", 0) + status_counts.get("completion", 0)
+    def _on_session_finished(self, event_data: dict):
+        self.stop_session()
 
-                self.update_counts(
-                    success=status_counts.get("success", 0) + status_counts.get("glossary_success", 0),
-                    in_progress=in_progress_total,
-                    filtered=status_counts.get("filtered", 0),
-                    error=error_total,
-                )
+    def _on_task_state_changed(self, event_data: dict):
+        data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
+        full_state = data.get("full_state")
+        self._pending_task_state = full_state if isinstance(full_state, list) else None
+        if not self._status_flush_timer.isActive():
+            self._status_flush_timer.start(STATUS_FLUSH_INTERVAL_MS)
+
+    def _flush_pending_task_state(self):
+        ui_state_list = self._pending_task_state
+        self._pending_task_state = None
+
+        if not isinstance(ui_state_list, list):
+            if not (self.engine and self.engine.task_manager):
+                return
+            ui_state_list = self.engine.task_manager.get_ui_state_list()
+
+        self._apply_task_state(ui_state_list)
+
+    def _apply_task_state(self, ui_state_list):
+        self.total_tasks = len(ui_state_list)
+        self.progress_bar_text.setRange(0, self.total_tasks)
+
+        status_counts = Counter(item[1] for item in ui_state_list)
+        error_total = sum(count for status, count in status_counts.items() if "error" in status)
+        in_progress_total = status_counts.get("in_progress", 0) + status_counts.get("completion", 0)
+
+        self.update_counts(
+            success=status_counts.get("success", 0) + status_counts.get("glossary_success", 0),
+            in_progress=in_progress_total,
+            filtered=status_counts.get("filtered", 0),
+            error=error_total,
+        )
 
     def start_session(self, total_tasks=0):
         """Вызывается в начале сессии для настройки."""
@@ -137,6 +168,8 @@ class StatusBarWidget(QtWidgets.QWidget):
 
     def stop_session(self):
         """Вызывается в конце сессии для сброса и скрытия."""
+        self._pending_task_state = None
+        self._status_flush_timer.stop()
         self.setVisible(False)
 
     def reset(self):
@@ -227,4 +260,5 @@ class StatusBarWidget(QtWidgets.QWidget):
                     self.bus.event_posted.disconnect(self.on_event)
             except (TypeError, RuntimeError, ValueError):
                 pass
+        self._status_flush_timer.stop()
         super().closeEvent(event)

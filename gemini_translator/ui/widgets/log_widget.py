@@ -58,6 +58,9 @@ LOG_STYLES = [
 MAX_LOG_BLOCKS = 1200
 MAX_STORED_DETAILS = 200
 MAX_DETAIL_TEXT_CHARS = 16000
+MAX_PENDING_LOG_MESSAGES = 2000
+MAX_LOG_FLUSH_BATCH_SIZE = 300
+LOG_FLUSH_INTERVAL_MS = 250
 
 
 class LogWidget(QWidget):
@@ -67,7 +70,11 @@ class LogWidget(QWidget):
         super().__init__(parent)
         self._details_map = {}
         self._uses_topic_subscription = False
+        self._pending_log_data = []
         self._init_ui()
+        self._log_flush_timer = QtCore.QTimer(self)
+        self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.timeout.connect(self._flush_pending_messages)
 
         self.bus = event_bus
         if self.bus is None:
@@ -120,10 +127,28 @@ class LogWidget(QWidget):
             return
 
         priority = data.get('priority', 'normal')
-        if priority == 'final':
-            QtCore.QTimer.singleShot(0, lambda: self._add_html_to_log(data))
-        else:
-            self._add_html_to_log(data)
+        self._queue_log_message(data)
+        self._schedule_log_flush(0 if priority == 'final' else LOG_FLUSH_INTERVAL_MS)
+
+    def _queue_log_message(self, data: dict):
+        self._pending_log_data.append(dict(data))
+        if len(self._pending_log_data) <= MAX_PENDING_LOG_MESSAGES:
+            return
+
+        dropped_count = len(self._pending_log_data) - MAX_PENDING_LOG_MESSAGES + 1
+        del self._pending_log_data[:dropped_count]
+        notice = {
+            'message': f"[WARN] Пропущено {dropped_count} сообщений лога: интерфейс не успевал их отрисовать."
+        }
+        self._pending_log_data.insert(0, notice)
+
+    def _schedule_log_flush(self, delay_ms: int = LOG_FLUSH_INTERVAL_MS):
+        if self._log_flush_timer.isActive():
+            return
+        # Hidden QTabWidget pages still receive log events; rendering them wastes CPU.
+        if not self.isVisible():
+            return
+        self._log_flush_timer.start(max(0, int(delay_ms)))
 
     def _show_details_dialog(self, title: str, text: str):
         dialog = QtWidgets.QDialog(self)
@@ -172,13 +197,26 @@ class LogWidget(QWidget):
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(file_path))
 
     def _add_html_to_log(self, data: dict):
+        self._insert_html_batch(self._build_log_html(data))
+
+    def _flush_pending_messages(self):
+        if not self._pending_log_data:
+            return
+
+        batch = self._pending_log_data[:MAX_LOG_FLUSH_BATCH_SIZE]
+        del self._pending_log_data[:MAX_LOG_FLUSH_BATCH_SIZE]
+
+        html_batch = "".join(self._build_log_html(data) for data in batch)
+        if html_batch:
+            self._insert_html_batch(html_batch)
+
+        if self._pending_log_data:
+            self._schedule_log_flush(LOG_FLUSH_INTERVAL_MS)
+
+    def _build_log_html(self, data: dict) -> str:
         message = data.get('message', '')
         if message == "---SEPARATOR---":
-            separator_html = "<br><hr style='border: 1px dashed #4d5666;'><br>"
-            cursor = self.log_view.textCursor()
-            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-            cursor.insertHtml(separator_html)
-            return
+            return "<br><hr style='border: 1px dashed #4d5666;'><br>"
 
         current_time = time.strftime("%H:%M:%S", time.localtime())
         formatted_line = f"[{current_time}] {message}"
@@ -227,10 +265,21 @@ class LogWidget(QWidget):
         if links_html:
             html_line += " " + " ".join(links_html)
         html_line += "<br>"
+        return html_line
 
-        cursor = self.log_view.textCursor()
-        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        cursor.insertHtml(html_line)
+    def _insert_html_batch(self, html_batch: str):
+        if not html_batch:
+            return
+
+        self.log_view.setUpdatesEnabled(False)
+        try:
+            cursor = self.log_view.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+            cursor.beginEditBlock()
+            cursor.insertHtml(html_batch)
+            cursor.endEditBlock()
+        finally:
+            self.log_view.setUpdatesEnabled(True)
 
         if self.autoscroll_checkbox.isChecked():
             self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
@@ -239,6 +288,17 @@ class LogWidget(QWidget):
         """Очищает лог."""
         self.log_view.clear()
         self._details_map.clear()
+        self._pending_log_data.clear()
+        self._log_flush_timer.stop()
+
+    def hideEvent(self, event):
+        self._log_flush_timer.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pending_log_data:
+            self._schedule_log_flush(LOG_FLUSH_INTERVAL_MS)
 
     def closeEvent(self, event):
         """Отписываемся от шины при закрытии/уничтожении виджета."""

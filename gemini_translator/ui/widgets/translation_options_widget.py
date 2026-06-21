@@ -9,7 +9,13 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QCheckBox, QGridLayout, QGroupBox, QLabel, QVBoxLayout
 
 from ...api import config as api_config
-from ...utils.epub_tools import get_epub_chapter_sizes_with_cache
+from ...utils.epub_tools import (
+    CHAPTER_SIZE_CACHE_METRIC,
+    CHAPTER_SIZE_CACHE_VERSION,
+    estimate_epub_chapter_input_tokens,
+    get_epub_chapter_sizes_with_cache,
+)
+from ...utils.helpers import estimate_gemini_tokens
 from ...utils.language_tools import LanguageDetector
 from .common_widgets import NoScrollSpinBox
 
@@ -88,7 +94,7 @@ class TranslationOptionsWidget(QGroupBox):
             "\u0432\u0445\u043e\u0434\u043d\u044b\u0445 \u0434\u0430\u043d\u043d\u044b\u0445 "
             "\u0434\u043b\u044f \u043e\u0434\u043d\u043e\u0439 \u0437\u0430\u0434\u0430\u0447\u0438 "
             "(\u043f\u0430\u043a\u0435\u0442\u0430 \u0438\u043b\u0438 \u0447\u0430\u043d\u043a\u0430) "
-            "\u0432 \u0441\u0438\u043c\u0432\u043e\u043b\u0430\u0445."
+            "\u0432 Gemini-\u0442\u043e\u043a\u0435\u043d\u0430\u0445."
         )
         self._recommended_task_size = self.task_size_spin.value()
 
@@ -113,7 +119,7 @@ class TranslationOptionsWidget(QGroupBox):
         self.info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
 
         settings_layout.addWidget(
-            QLabel("\u0420\u0430\u0437\u043c\u0435\u0440 \u0437\u0430\u0434\u0430\u0447\u0438 (\u0441\u0438\u043c\u0432\u043e\u043b\u044b):"),
+            QLabel("\u0420\u0430\u0437\u043c\u0435\u0440 \u0437\u0430\u0434\u0430\u0447\u0438 (Gemini-\u0442\u043e\u043a\u0435\u043d\u044b):"),
             0,
             0,
         )
@@ -249,6 +255,8 @@ class TranslationOptionsWidget(QGroupBox):
             "epub_name": os.path.basename(epub_path),
             "epub_size": epub_stat.st_size,
             "content_checksum": sum(size for _, size in chapter_info_list),
+            "metric": CHAPTER_SIZE_CACHE_METRIC,
+            "version": CHAPTER_SIZE_CACHE_VERSION,
         }
 
     def _load_cached_chapter_analysis(self, project_manager, epub_path):
@@ -306,13 +314,26 @@ class TranslationOptionsWidget(QGroupBox):
                 cached_entry = cached_chapters.get(file_name)
                 if isinstance(cached_entry, dict):
                     total_size = int(
-                        cached_entry.get("total_size", chapter_sizes.get(file_name, 0)) or 0
+                        cached_entry.get(
+                            "input_tokens",
+                            cached_entry.get("total_size", chapter_sizes.get(file_name, 0)),
+                        )
+                        or 0
+                    )
+                    code_size = int(
+                        cached_entry.get("code_tokens", cached_entry.get("code_size", 0)) or 0
+                    )
+                    text_size = int(
+                        cached_entry.get("text_tokens", cached_entry.get("text_size", 0)) or 0
                     )
                     self.chapter_compositions[file_name] = {
-                        "code_size": int(cached_entry.get("code_size", 0) or 0),
-                        "text_size": int(cached_entry.get("text_size", 0) or 0),
+                        "code_size": code_size,
+                        "text_size": text_size,
                         "is_cjk": bool(cached_entry.get("is_cjk", False)),
                         "total_size": total_size,
+                        "code_tokens": code_size,
+                        "text_tokens": text_size,
+                        "input_tokens": total_size,
                     }
                 else:
                     missing_files.append(file_name)
@@ -324,15 +345,20 @@ class TranslationOptionsWidget(QGroupBox):
                         soup = BeautifulSoup(content_str, "html.parser")
                         visible_text = soup.get_text()
 
-                        text_size = len(visible_text)
+                        text_size = estimate_gemini_tokens(visible_text)
                         total_size = int(
-                            chapter_sizes.get(file_name, len(content_str)) or len(content_str)
+                            chapter_sizes.get(file_name, 0)
+                            or estimate_epub_chapter_input_tokens(content_str)
                         )
+                        code_size = max(0, total_size - text_size)
                         chapter_data = {
-                            "code_size": max(0, total_size - text_size),
+                            "code_size": code_size,
                             "text_size": text_size,
                             "is_cjk": LanguageDetector.is_cjk_text(visible_text),
                             "total_size": total_size,
+                            "code_tokens": code_size,
+                            "text_tokens": text_size,
+                            "input_tokens": total_size,
                         }
                         self.chapter_compositions[file_name] = chapter_data
                         merged_cached_chapters[file_name] = chapter_data
@@ -377,9 +403,15 @@ class TranslationOptionsWidget(QGroupBox):
             else api_config.ALPHABETIC_EXPANSION_FACTOR
         )
 
+        source_chars_per_text_token = (
+            1.5 if is_any_cjk else api_config.CHARS_PER_ASCII_TOKEN
+        )
+        translated_text_tokens_per_input_token = (
+            source_chars_per_text_token * expansion_factor
+        ) / api_config.CHARS_PER_CYRILLIC_TOKEN
         output_token_weight = (
-            (avg_code_ratio / api_config.CHARS_PER_ASCII_TOKEN)
-            + ((1 - avg_code_ratio) * expansion_factor / api_config.CHARS_PER_CYRILLIC_TOKEN)
+            avg_code_ratio
+            + ((1 - avg_code_ratio) * translated_text_tokens_per_input_token)
         )
 
         recommended_input_size = (
@@ -387,7 +419,7 @@ class TranslationOptionsWidget(QGroupBox):
             if output_token_weight > 0
             else 30000
         )
-        recommended_input_size = max(5000, min(recommended_input_size, 300000))
+        recommended_input_size = max(500, min(recommended_input_size, 300000))
         self._recommended_task_size = recommended_input_size
 
         if not self._task_size_user_defined:

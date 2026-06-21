@@ -58,7 +58,7 @@ except ImportError:
     LEVENSHTEIN_AVAILABLE = False
     
 # --- Импорты из нашего проекта ---
-from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed, EpubCreator, get_epub_chapter_sizes_with_cache
+from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed, EpubCreator, estimate_epub_chapter_input_tokens, get_epub_chapter_sizes_with_cache, extract_epub_heading_text
 from ...utils.text import unify_paragraphs_for_ai
 from ...utils.project_manager import TranslationProjectManager
 from ...utils.project_migrator import ProjectMigrator, SyncThread
@@ -1301,6 +1301,7 @@ class EpubHtmlSelectorDialog(QDialog):
         self.unvalidated_chapters = set()
         self.untranslated_chapters = []
         self._size_cache = {}
+        self._chapter_title_cache = {}
         self._current_filter_mode = self._show_all_chapters
         self._is_virtual_file_dirty = False # Флаг, что виртуальный файл был изменен
         self.deep_cleanup_settings = load_deep_cleanup_settings()
@@ -1534,6 +1535,7 @@ class EpubHtmlSelectorDialog(QDialog):
             # --- НАЧАЛО НОВОЙ ЛОГИКИ ---
             # Вызываем централизованную функцию, передавая ей виртуальный путь
             self.all_chapters = get_epub_chapter_order(self.virtual_epub_path)
+            self._load_chapter_title_cache()
             # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
         except Exception as e:
@@ -1551,6 +1553,7 @@ class EpubHtmlSelectorDialog(QDialog):
             display_text = f"{os.path.basename(file_path)}"
             item = QListWidgetItem(display_text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, file_path)
+            self._apply_chapter_item_tooltip(item, file_path)
             self.list_widget.addItem(item)
         
         if not self.pre_selected_chapters:
@@ -1601,16 +1604,16 @@ class EpubHtmlSelectorDialog(QDialog):
                         if median_bytes > 0:
                             try:
                                 content_sample = zf.read(median_name).decode('utf-8', errors='ignore')
-                                chars_count = len(content_sample)
-                                ratio = chars_count / median_bytes
+                                tokens_count = estimate_epub_chapter_input_tokens(content_sample)
+                                ratio = tokens_count / median_bytes
                             except Exception:
                                 pass # Оставляем ratio = 1.0
                         
                         # 4. Применяем коэффициент ко всем файлам
                         for name, b_size in temp_byte_sizes:
                             # Округляем до целого
-                            estimated_chars = int(b_size * ratio)
-                            self._size_cache[name] = estimated_chars
+                            estimated_tokens = max(1, int(b_size * ratio)) if b_size > 0 else 0
+                            self._size_cache[name] = estimated_tokens
 
             except Exception as e:
                 print(f"Ошибка чтения размеров: {e}")
@@ -1639,11 +1642,12 @@ class EpubHtmlSelectorDialog(QDialog):
         self.list_widget.clear()
         for i, file_path in enumerate(chapters_to_show):
             # self._size_cache теперь хранит напрямую {path: total_chars}
-            size_chars = self._size_cache.get(file_path, 0)
+            size_tokens = self._size_cache.get(file_path, 0)
             
-            display_text = f"{os.path.basename(file_path)} ({size_chars:,} симв.)"
+            display_text = f"{os.path.basename(file_path)} ({size_tokens:,} ток.)"
             item = QListWidgetItem(display_text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, file_path)
+            self._apply_chapter_item_tooltip(item, file_path)
             
             if file_path in self.validated_chapters:
                 item.setBackground(QtGui.QColor(46, 75, 62, 80))
@@ -1651,6 +1655,52 @@ class EpubHtmlSelectorDialog(QDialog):
                 item.setBackground(QtGui.QColor(58, 75, 95, 80))
             
             self.list_widget.addItem(item)
+
+    @staticmethod
+    def _extract_h1_title(html_content):
+        if not html_content:
+            return ""
+
+        if BS4_AVAILABLE and BeautifulSoup:
+            try:
+                soup = BeautifulSoup(html_content, "html.parser")
+                return extract_epub_heading_text(soup.find("h1"))
+            except Exception:
+                return ""
+
+        match = re.search(r"<h1\b[^>]*>(.*?)</h1>", str(html_content), re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        raw_title = re.sub(r"<(?:br|hr)\b[^>]*>", " ", match.group(1), flags=re.IGNORECASE)
+        raw_title = re.sub(r"<[^>]+>", " ", raw_title)
+        return re.sub(r"\s+", " ", html_lib.unescape(raw_title)).strip()
+
+    def _load_chapter_title_cache(self):
+        self._chapter_title_cache = {}
+        if not self.virtual_epub_path or not self.all_chapters:
+            return
+
+        try:
+            with zipfile.ZipFile(open(self.virtual_epub_path, "rb"), "r") as zf:
+                for file_path in self.all_chapters:
+                    try:
+                        content = zf.read(file_path).decode("utf-8", errors="ignore")
+                    except Exception as e:
+                        print(f"[WARN] Failed to read chapter title for '{file_path}': {e}")
+                        continue
+
+                    title = self._extract_h1_title(content)
+                    if title:
+                        self._chapter_title_cache[file_path] = title
+        except Exception as e:
+            print(f"[WARN] Failed to load EPUB chapter titles: {e}")
+
+    def _apply_chapter_item_tooltip(self, item, file_path):
+        chapter_title = (self._chapter_title_cache.get(file_path) or "").strip()
+        if chapter_title:
+            item.setToolTip(f"H1: {chapter_title}\n{file_path}")
+        else:
+            item.setToolTip(file_path)
     
     def _filter_show_untranslated(self):
         self._current_filter_mode = self._filter_show_untranslated
@@ -2020,6 +2070,7 @@ class EpubHtmlSelectorDialog(QDialog):
         self.unvalidated_chapters.clear()
         self.untranslated_chapters = []
         self._size_cache = {}
+        self._chapter_title_cache = {}
         
         # Показываем заглушку
         self.main_content_widget.setVisible(False)

@@ -107,6 +107,12 @@ except Exception:
     TokenCounter = None
 
 try:
+    from gemini_translator.utils.epub_tools import extract_epub_heading_text, normalize_epub_chapter_heading_to_h1
+except Exception:
+    extract_epub_heading_text = None
+    normalize_epub_chapter_heading_to_h1 = None
+
+try:
     from gemini_translator.utils.settings import SettingsManager
 except Exception:
     SettingsManager = None
@@ -153,6 +159,11 @@ CHAPTER_TRIM_KEEP_MS = 70
 READER_LOG_FLUSH_INTERVAL_MS = 120
 READER_PROGRESS_FLUSH_INTERVAL_MS = 100
 READER_PROGRESS_EMIT_INTERVAL_SEC = 0.12
+READER_PROGRESS_SAVE_INTERVAL_SEC = 2.0
+READER_LIVE_MP3_AUTOSAVE_INTERVAL_SEC = 45.0
+READER_LIVE_MP3_AUTOSAVE_MIN_STEPS = 5
+READER_SETTINGS_SAVE_DEBOUNCE_MS = 250
+READER_CHAPTER_SCOPE_DEBOUNCE_MS = 80
 READER_LOG_MAX_BLOCKS = 2000
 READER_WORKER_SLEEP_STEP_SEC = 0.5
 READER_LIVE_CONNECT_TIMEOUT_SEC = 30
@@ -2623,6 +2634,24 @@ def _reader_fallback_title(raw_title, fallback):
     return title or fallback
 
 
+def _reader_element_text(element):
+    if not element:
+        return ""
+    tag_name = str(getattr(element, "name", "") or "").lower()
+    if tag_name in ("h1", "h2", "h3") and extract_epub_heading_text is not None:
+        return extract_epub_heading_text(element)
+    try:
+        return element.get_text(" ", strip=True)
+    except TypeError:
+        return element.get_text().strip()
+
+
+def _reader_normalize_epub_html(content):
+    if normalize_epub_chapter_heading_to_h1 is None:
+        return content
+    return normalize_epub_chapter_heading_to_h1(content)
+
+
 def _reader_natural_sort_key(value):
     return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", value)]
 
@@ -2660,15 +2689,16 @@ def _reader_parse_epub_chapters(filepath):
     for item_ref in book.spine:
         item = book.get_item_with_id(item_ref[0])
         if item and (item.get_type() == ebooklib.ITEM_DOCUMENT or item.get_name().lower().endswith((".xhtml", ".html", ".htm"))):
+            item_content = _reader_normalize_epub_html(item.get_content())
             raw_title = ""
             if BeautifulSoup is not None:
-                soup = BeautifulSoup(item.get_content(), "html.parser")
+                soup = BeautifulSoup(item_content, "html.parser")
                 heading = soup.find(["h1", "h2", "h3"])
                 if heading:
-                    raw_title = heading.get_text(" ", strip=True)
+                    raw_title = _reader_element_text(heading)
             chapter = Chapter(
                 _reader_fallback_title(raw_title, f"Chapter {len(chapters) + 1}"),
-                item.get_content(),
+                item_content,
             )
             if chapter.flat_sentences:
                 chapters.append(chapter)
@@ -2731,6 +2761,7 @@ def _reader_parse_html_chapters(filepath):
 
     with open(filepath, "r", encoding="utf-8", errors="ignore") as file_obj:
         markup = file_obj.read()
+    markup = _reader_normalize_epub_html(markup)
 
     soup = BeautifulSoup(markup, "html.parser")
     headings = soup.find_all(["h1", "h2"])
@@ -2738,7 +2769,7 @@ def _reader_parse_html_chapters(filepath):
 
     if not headings:
         content = _reader_paragraphs_to_html(
-            [tag.get_text(" ", strip=True) for tag in soup.find_all(["p", "div", "li"]) if tag.get_text(" ", strip=True)]
+            [_reader_element_text(tag) for tag in soup.find_all(["p", "div", "li"]) if _reader_element_text(tag)]
         )
         if content:
             raw_title = soup.title.get_text(" ", strip=True) if soup.title else os.path.splitext(os.path.basename(filepath))[0]
@@ -2746,12 +2777,12 @@ def _reader_parse_html_chapters(filepath):
         return chapters
 
     for index, heading in enumerate(headings, start=1):
-        raw_title = heading.get_text(" ", strip=True)
+        raw_title = _reader_element_text(heading)
         content_lines = []
         for sibling in heading.find_next_siblings():
             if sibling.name in ("h1", "h2"):
                 break
-            text = sibling.get_text(" ", strip=True)
+            text = _reader_element_text(sibling)
             if text:
                 content_lines.append(text)
         content = _reader_paragraphs_to_html(content_lines)
@@ -2790,7 +2821,7 @@ class Chapter:
 
         lines =[]
         for el in soup.find_all(['p', 'h1', 'h2', 'h3', 'div', 'li']):
-            t = el.get_text().strip()
+            t = _reader_element_text(el)
             if t:
                 lines.append(t)
 
@@ -2846,6 +2877,8 @@ class BookManager:
         self.title = "Unknown"
         self.book_dir = ""
         self.lock = threading.Lock()
+        self._last_progress_save_payload = None
+        self._last_progress_save_at = 0.0
         if filepath:
             self._import_book(filepath)
 
@@ -2898,13 +2931,32 @@ class BookManager:
     def get_paths(self):
         return os.path.join(self.book_dir, "progress_v19.json")
 
-    def save_progress(self, c, s):
+    def save_progress(self, c, s, force=False):
+        payload = (int(c), int(s))
         with self.lock:
+            now = time.monotonic()
+            if (
+                not force
+                and self._last_progress_save_payload == payload
+                and (now - self._last_progress_save_at) < READER_PROGRESS_SAVE_INTERVAL_SEC
+            ):
+                return False
+            if (
+                not force
+                and self._last_progress_save_payload is not None
+                and (now - self._last_progress_save_at) < READER_PROGRESS_SAVE_INTERVAL_SEC
+            ):
+                self._last_progress_save_payload = payload
+                return False
             try:
                 with open(self.get_paths(), 'w') as f:
-                    json.dump({"chapter": c, "sentence": s}, f)
+                    json.dump({"chapter": payload[0], "sentence": payload[1]}, f)
+                self._last_progress_save_payload = payload
+                self._last_progress_save_at = now
+                return True
             except Exception as e:
                 print(f"Save progress error: {e}")
+                return False
 
     def load_progress(self):
         with self.lock:
@@ -3463,6 +3515,8 @@ class GeminiWorker(QThread):
         self.request_rpd_limit = _lookup_model_limit(self.model_id, "rpd", 0)
         self._last_progress_emit_payload = None
         self._last_progress_emit_at = 0.0
+        self._last_live_mp3_autosave_at = 0.0
+        self._last_live_mp3_autosave_step = 0
         self._finished_emitted = False
 
     def _emit_finished(self):
@@ -3492,6 +3546,27 @@ class GeminiWorker(QThread):
             self.chunk = max(1, int(round(float(v))))
         except Exception:
             self.chunk = 1
+
+    def _reset_live_mp3_autosave(self):
+        self._last_live_mp3_autosave_at = time.monotonic()
+        self._last_live_mp3_autosave_step = max(0, int(getattr(self, "s_idx", 0) or 0))
+
+    def _should_autosave_live_mp3(self, total_steps):
+        if not self.record or self.c_idx < 0 or self.s_idx <= 0:
+            return False
+        if total_steps > 0 and self.s_idx >= total_steps:
+            return False
+        if (self.s_idx - self._last_live_mp3_autosave_step) < READER_LIVE_MP3_AUTOSAVE_MIN_STEPS:
+            return False
+        return (time.monotonic() - self._last_live_mp3_autosave_at) >= READER_LIVE_MP3_AUTOSAVE_INTERVAL_SEC
+
+    async def _autosave_live_mp3_if_due(self, total_steps):
+        if not self._should_autosave_live_mp3(total_steps):
+            return False
+        await self.save_file()
+        self._last_live_mp3_autosave_at = time.monotonic()
+        self._last_live_mp3_autosave_step = self.s_idx
+        return True
 
     def _emit_worker_progress(self, chapter_index, step_index, total_steps, force=False):
         payload = (self.worker_id, chapter_index, step_index, total_steps)
@@ -4036,6 +4111,7 @@ class GeminiWorker(QThread):
                 try:
                     self.c_idx = self.manager_chapter_queue.get_nowait()
                     self.s_idx = 0 
+                    self._reset_live_mp3_autosave()
                     single_sentence_mode_remaining = 0
                     fail_count = 0
                     gemini_retry_count = 0
@@ -4199,11 +4275,11 @@ class GeminiWorker(QThread):
                     
                 self._emit_worker_progress(self.c_idx, self.s_idx, total_sent, force=self.s_idx >= total_sent)
                 
-                if self.worker_id == 0: 
-                    self.bm.save_progress(self.c_idx, self.s_idx)
+                if self.worker_id == 0:
+                    self.bm.save_progress(self.c_idx, self.s_idx, force=self.s_idx >= total_sent)
                 
-                if self.record and self.s_idx % 5 == 0: 
-                    await self.save_file()
+                if self.record:
+                    await self._autosave_live_mp3_if_due(total_sent)
             else:
                 # Сюда программа дойдет только если даже Edge TTS не смог сгенерировать звук
                 fail_count += 1
@@ -5686,6 +5762,12 @@ class MainWindow(QMainWindow):
         self._progress_flush_timer = QTimer(self)
         self._progress_flush_timer.setSingleShot(True)
         self._progress_flush_timer.timeout.connect(self._flush_worker_progress)
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.timeout.connect(self.save_settings)
+        self._chapter_scope_refresh_timer = QTimer(self)
+        self._chapter_scope_refresh_timer.setSingleShot(True)
+        self._chapter_scope_refresh_timer.timeout.connect(self._flush_chapter_scope_refresh)
         self._initial_show_done = False
         self._reader_full_ui_ready = False
         self._reader_log_connected = False
@@ -5875,7 +5957,7 @@ class MainWindow(QMainWindow):
         self.combo_engine.currentIndexChanged.connect(self._on_engine_changed)
         self.combo_engine.currentIndexChanged.connect(self._update_worker_spinbox_limit)
         self.combo_engine.currentIndexChanged.connect(self._update_key_state_ui)
-        self.combo_engine.currentIndexChanged.connect(self.save_settings)
+        self.combo_engine.currentIndexChanged.connect(self._schedule_save_settings)
         top_controls.addWidget(QLabel("Движок:"))
         top_controls.addWidget(self.combo_engine)
 
@@ -5883,7 +5965,7 @@ class MainWindow(QMainWindow):
         self.combo_model.currentIndexChanged.connect(self._update_worker_spinbox_limit)
         self.combo_model.currentIndexChanged.connect(self._update_key_state_ui)
         self.combo_model.currentIndexChanged.connect(self._refresh_live_segment_controls)
-        self.combo_model.currentTextChanged.connect(self.save_settings)
+        self.combo_model.currentTextChanged.connect(self._schedule_save_settings)
         top_controls.addWidget(QLabel("Модель TTS:"))
         top_controls.addWidget(self.combo_model)
 
@@ -5891,7 +5973,7 @@ class MainWindow(QMainWindow):
         for label, mode_id in VOICE_MODE_OPTIONS.items():
             self.combo_voice_mode.addItem(label, mode_id)
         self.combo_voice_mode.currentIndexChanged.connect(self._on_voice_mode_changed)
-        self.combo_voice_mode.currentIndexChanged.connect(self.save_settings)
+        self.combo_voice_mode.currentIndexChanged.connect(self._schedule_save_settings)
         top_controls.addWidget(QLabel("Голоса:"))
         top_controls.addWidget(self.combo_voice_mode)
         top_controls.addStretch(1)
@@ -5905,9 +5987,9 @@ class MainWindow(QMainWindow):
             self.combo_voice_secondary.addItem(display_text, voice_id)
             self.combo_voice_tertiary.addItem(display_text, voice_id)
 
-        self.combo_voices.currentIndexChanged.connect(self.save_settings)
-        self.combo_voice_secondary.currentIndexChanged.connect(self.save_settings)
-        self.combo_voice_tertiary.currentIndexChanged.connect(self.save_settings)
+        self.combo_voices.currentIndexChanged.connect(self._schedule_save_settings)
+        self.combo_voice_secondary.currentIndexChanged.connect(self._schedule_save_settings)
+        self.combo_voice_tertiary.currentIndexChanged.connect(self._schedule_save_settings)
         self.lbl_voice_primary = QLabel("Voice A:")
         middle_controls.addWidget(self.lbl_voice_primary)
         middle_controls.addWidget(self.combo_voices)
@@ -5926,7 +6008,7 @@ class MainWindow(QMainWindow):
         self.combo_speed = QComboBox()
         self.combo_speed.addItems(list(SPEED_PROMPTS.keys()))
         self.combo_speed.setCurrentText("Normal")
-        self.combo_speed.currentTextChanged.connect(self.save_settings)
+        self.combo_speed.currentTextChanged.connect(self._schedule_save_settings)
         middle_controls.addWidget(QLabel("Скорость:"))
         middle_controls.addWidget(self.combo_speed)
 
@@ -5934,7 +6016,7 @@ class MainWindow(QMainWindow):
         for label, mode_id in LIVE_SEGMENT_OPTIONS.items():
             self.combo_live_segment_mode.addItem(label, mode_id)
         self.combo_live_segment_mode.currentIndexChanged.connect(self._refresh_live_segment_controls)
-        self.combo_live_segment_mode.currentIndexChanged.connect(self.save_settings)
+        self.combo_live_segment_mode.currentIndexChanged.connect(self._schedule_save_settings)
         self.lbl_live_segment_mode = QLabel("Live:")
         middle_controls.addWidget(self.lbl_live_segment_mode)
         middle_controls.addWidget(self.combo_live_segment_mode)
@@ -5944,7 +6026,7 @@ class MainWindow(QMainWindow):
         self.spin_chunk.setRange(0.5, 50.0)
         self.spin_chunk.setSingleStep(0.5)
         self.spin_chunk.setValue(FLASH_TTS_DEFAULT_BLOCK_UNITS)
-        self.spin_chunk.valueChanged.connect(self.save_settings)
+        self.spin_chunk.valueChanged.connect(self._schedule_save_settings)
         self.lbl_chunk = QLabel("Блок:")
         middle_controls.addWidget(self.lbl_chunk)
         middle_controls.addWidget(self.spin_chunk)
@@ -5956,7 +6038,7 @@ class MainWindow(QMainWindow):
             "Максимальное число параллельных воркеров. "
             "Фактический запуск дополнительно ограничивается доступными ключами и числом глав."
         )
-        self.spin_workers.valueChanged.connect(self.save_settings)
+        self.spin_workers.valueChanged.connect(self._schedule_save_settings)
         middle_controls.addWidget(QLabel("Воркеры:"))
         middle_controls.addWidget(self.spin_workers)
 
@@ -5977,14 +6059,14 @@ class MainWindow(QMainWindow):
             self.combo_preprocess_model.addItem(display_name, model_id)
         self.combo_preprocess_model.currentIndexChanged.connect(self._update_worker_spinbox_limit)
         self.combo_preprocess_model.currentIndexChanged.connect(self._update_key_state_ui)
-        self.combo_preprocess_model.currentIndexChanged.connect(self.save_settings)
+        self.combo_preprocess_model.currentIndexChanged.connect(self._schedule_save_settings)
         script_controls.addWidget(QLabel("AI сценарий:"))
         script_controls.addWidget(self.combo_preprocess_model)
 
         self.combo_preprocess_profile = QComboBox()
         for label, profile_prompt in PREPROCESS_PROFILE_OPTIONS.items():
             self.combo_preprocess_profile.addItem(label, profile_prompt)
-        self.combo_preprocess_profile.currentIndexChanged.connect(self.save_settings)
+        self.combo_preprocess_profile.currentIndexChanged.connect(self._schedule_save_settings)
         script_controls.addWidget(QLabel("Профиль:"))
         script_controls.addWidget(self.combo_preprocess_profile)
 
@@ -5993,7 +6075,7 @@ class MainWindow(QMainWindow):
             self.combo_pipeline_mode.addItem(label, mode_id)
         self.combo_pipeline_mode.currentIndexChanged.connect(self._update_worker_spinbox_limit)
         self.combo_pipeline_mode.currentIndexChanged.connect(self._update_key_state_ui)
-        self.combo_pipeline_mode.currentIndexChanged.connect(self.save_settings)
+        self.combo_pipeline_mode.currentIndexChanged.connect(self._schedule_save_settings)
         script_controls.addWidget(QLabel("Pipeline:"))
         script_controls.addWidget(self.combo_pipeline_mode)
 
@@ -6020,22 +6102,22 @@ class MainWindow(QMainWindow):
 
         self.chk_mp3 = QCheckBox("Запись MP3")
         self.chk_mp3.setChecked(True)
-        self.chk_mp3.stateChanged.connect(self.save_settings)
+        self.chk_mp3.stateChanged.connect(self._schedule_save_settings)
         self.chk_fast = QCheckBox("Только экспорт")
-        self.chk_fast.stateChanged.connect(self.save_settings)
+        self.chk_fast.stateChanged.connect(self._schedule_save_settings)
         self.chk_edge_fallback = QCheckBox("Edge fallback")
         self.chk_edge_fallback.setChecked(True)
         self.chk_edge_fallback.setToolTip("Если отключено, reader не будет использовать Microsoft Edge TTS как аварийную озвучку.")
-        self.chk_edge_fallback.stateChanged.connect(self.save_settings)
+        self.chk_edge_fallback.stateChanged.connect(self._schedule_save_settings)
         self.chk_selected_only = QCheckBox("Только отмеченные главы")
-        self.chk_selected_only.stateChanged.connect(self.save_settings)
+        self.chk_selected_only.stateChanged.connect(self._schedule_save_settings)
         self.chk_selected_only.stateChanged.connect(self._on_chapter_selection_changed)
         self.chk_parallel_single_chapter = QCheckBox("1 глава = много воркеров")
         self.chk_parallel_single_chapter.setToolTip(
             "Только для Live API. Если выбрана одна глава, reader разделит её на блоки и "
             "раздаст их нескольким воркерам с последующей автоматической сборкой."
         )
-        self.chk_parallel_single_chapter.stateChanged.connect(self.save_settings)
+        self.chk_parallel_single_chapter.stateChanged.connect(self._schedule_save_settings)
         option_controls.addWidget(self.chk_mp3)
         option_controls.addWidget(self.chk_fast)
         option_controls.addWidget(self.chk_edge_fallback)
@@ -6859,20 +6941,13 @@ class MainWindow(QMainWindow):
         return sorted(dict.fromkeys(prepared))
 
     def _checked_chapter_indices(self):
-        if not hasattr(self, "list_chapters"):
+        if not self.bm:
             return sorted(self._checked_chapter_indices_state)
-        checked_indices = []
-        for row in range(self.list_chapters.count()):
-            item = self.list_chapters.item(row)
-            if item is None or item.checkState() != Qt.CheckState.Checked:
-                continue
-            idx = item.data(Qt.ItemDataRole.UserRole)
-            if isinstance(idx, int):
-                checked_indices.append(idx)
-        prepared = sorted(dict.fromkeys(checked_indices))
-        if prepared or not self._checked_chapter_indices_state:
-            return prepared
-        return sorted(self._checked_chapter_indices_state)
+        chapter_count = len(self.bm.chapters)
+        return sorted(
+            idx for idx in self._checked_chapter_indices_state
+            if isinstance(idx, int) and 0 <= idx < chapter_count
+        )
 
     def _on_chapter_item_pressed(self, item):
         idx = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
@@ -6884,16 +6959,26 @@ class MainWindow(QMainWindow):
             return
         start_idx = min(anchor_idx, current_idx)
         end_idx = max(anchor_idx, current_idx)
+        changed_indices = set()
         self._chapter_check_state_refresh = True
+        self.list_chapters.setUpdatesEnabled(False)
         try:
             for row in range(start_idx, end_idx + 1):
                 item = self.list_chapters.item(row)
                 if item is None:
                     continue
+                idx = item.data(Qt.ItemDataRole.UserRole)
+                if isinstance(idx, int):
+                    changed_indices.add(idx)
                 if item.checkState() != desired_state:
                     item.setCheckState(desired_state)
         finally:
+            self.list_chapters.setUpdatesEnabled(True)
             self._chapter_check_state_refresh = False
+        if desired_state == Qt.CheckState.Checked:
+            self._checked_chapter_indices_state.update(changed_indices)
+        else:
+            self._checked_chapter_indices_state.difference_update(changed_indices)
 
     def _set_checked_chapter_indices(self, indices):
         normalized = {
@@ -6906,6 +6991,7 @@ class MainWindow(QMainWindow):
             return
 
         self._chapter_check_state_refresh = True
+        self.list_chapters.setUpdatesEnabled(False)
         try:
             for row in range(self.list_chapters.count()):
                 item = self.list_chapters.item(row)
@@ -6916,6 +7002,7 @@ class MainWindow(QMainWindow):
                 if item.checkState() != desired_state:
                     item.setCheckState(desired_state)
         finally:
+            self.list_chapters.setUpdatesEnabled(True)
             self._chapter_check_state_refresh = False
 
     def _on_chapter_item_changed(self, item):
@@ -6923,6 +7010,10 @@ class MainWindow(QMainWindow):
             return
         idx = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
         if isinstance(idx, int):
+            if item.checkState() == Qt.CheckState.Checked:
+                self._checked_chapter_indices_state.add(idx)
+            else:
+                self._checked_chapter_indices_state.discard(idx)
             modifiers = QApplication.keyboardModifiers()
             if modifiers == Qt.KeyboardModifier.NoModifier:
                 modifiers = self._chapter_last_press_modifiers
@@ -6933,9 +7024,8 @@ class MainWindow(QMainWindow):
             self._chapter_check_anchor_index = idx
         self._chapter_last_press_index = None
         self._chapter_last_press_modifiers = Qt.KeyboardModifier.NoModifier
-        self._checked_chapter_indices_state = set(self._checked_chapter_indices())
-        self._on_chapter_selection_changed()
-        self.save_settings()
+        self._schedule_chapter_scope_refresh()
+        self._schedule_save_settings()
 
     def _selected_chapter_indices(self):
         selected_indices = []
@@ -6963,6 +7053,17 @@ class MainWindow(QMainWindow):
             start = prev = number
         ranges.append(f"{start}-{prev}" if start != prev else str(start))
         return ", ".join(ranges)
+
+    def _schedule_chapter_scope_refresh(self):
+        if not hasattr(self, "lbl_chapter_scope"):
+            return
+        if hasattr(self, "_chapter_scope_refresh_timer"):
+            self._chapter_scope_refresh_timer.start(READER_CHAPTER_SCOPE_DEBOUNCE_MS)
+        else:
+            self._flush_chapter_scope_refresh()
+
+    def _flush_chapter_scope_refresh(self):
+        self._on_chapter_selection_changed()
 
     def _selected_scope_summary(self):
         checked_indices = self._checked_chapter_indices()
@@ -8887,11 +8988,21 @@ class MainWindow(QMainWindow):
 
 
 
+    def _schedule_save_settings(self):
+        if not getattr(self, "_reader_full_ui_ready", False) or self._loading_settings:
+            return
+        if hasattr(self, "_settings_save_timer"):
+            self._settings_save_timer.start(READER_SETTINGS_SAVE_DEBOUNCE_MS)
+        else:
+            self.save_settings()
+
     def save_settings(self):
         if not getattr(self, "_reader_full_ui_ready", False):
             return
         if self._loading_settings:
             return
+        if hasattr(self, "_settings_save_timer") and self._settings_save_timer.isActive():
+            self._settings_save_timer.stop()
         data = self._reader_ui_settings_payload()
         if self.settings_manager is not None:
             self.settings_manager.save_ui_state({READER_SETTINGS_KEY: data})

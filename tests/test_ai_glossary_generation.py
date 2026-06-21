@@ -347,7 +347,7 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         with patch.object(api_config, "all_models", return_value={"test-model": {"context_length": 230000}}):
             harness._calculate_optimal_batch_size()
 
-        self.assertEqual(harness.translation_options_widget.task_size_spin.value(), 69000)
+        self.assertEqual(harness.translation_options_widget.task_size_spin.value(), 17250)
         self.assertEqual(harness.translation_options_widget.info_updates, 0)
 
 

@@ -46,7 +46,7 @@ class FilterPackagingDialog(QDialog):
         grid_layout = QGridLayout(settings_group)
 
         grid_layout.addWidget(QLabel("Рекомендуемый размер задачи:"), 0, 0, 1, 2)
-        size_info_label = QLabel(f"<b>{self.recommended_size:,}</b> символов")
+        size_info_label = QLabel(f"<b>{self.recommended_size:,}</b> токенов")
         size_info_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         grid_layout.addWidget(size_info_label, 0, 2)
 

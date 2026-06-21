@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import os
+import zipfile
 
 from PyQt6 import QtCore
 
@@ -29,14 +30,42 @@ def choose_preferred_translation_rel_path(versions: dict) -> str | None:
     return next(iter(versions.values()), None)
 
 
-def load_project_chapters_for_consistency(project_manager) -> list[dict]:
+def load_project_chapters_for_consistency(
+    project_manager,
+    *,
+    original_epub_path: str | None = None,
+    include_original: bool = False,
+) -> list[dict]:
     if not project_manager:
         return []
 
     chapters_to_analyze = []
     project_folder = project_manager.project_folder
+    original_by_path = {}
+    all_originals = list(project_manager.get_all_originals())
 
-    for internal_path in project_manager.get_all_originals():
+    if include_original and original_epub_path and os.path.exists(original_epub_path):
+        original_paths = [
+            str(path or "").replace("\\", "/")
+            for path in all_originals
+            if str(path or "").strip()
+        ]
+        try:
+            with open(original_epub_path, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
+                available_names = {name.replace("\\", "/"): name for name in epub_zip.namelist()}
+                for internal_path in original_paths:
+                    zip_name = available_names.get(internal_path)
+                    if not zip_name:
+                        continue
+                    try:
+                        original_by_path[internal_path] = epub_zip.read(zip_name).decode("utf-8", "ignore")
+                    except (KeyError, OSError, UnicodeError):
+                        continue
+        except (OSError, zipfile.BadZipFile):
+            original_by_path = {}
+
+    for internal_path in all_originals:
+        normalized_internal_path = str(internal_path or "").replace("\\", "/")
         versions = project_manager.get_versions_for_original(internal_path)
         rel_path = choose_preferred_translation_rel_path(versions)
         if not rel_path:
@@ -52,11 +81,17 @@ def load_project_chapters_for_consistency(project_manager) -> list[dict]:
         except OSError:
             continue
 
-        chapters_to_analyze.append({
-            "name": os.path.basename(internal_path),
+        chapter = {
+            "name": os.path.basename(normalized_internal_path),
             "content": content,
             "path": full_path,
-        })
+        }
+        original_content = original_by_path.get(normalized_internal_path)
+        if original_content:
+            chapter["source_content"] = original_content
+            chapter["source_path"] = normalized_internal_path
+
+        chapters_to_analyze.append(chapter)
 
     return chapters_to_analyze
 

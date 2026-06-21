@@ -26,6 +26,22 @@ logger = logging.getLogger(__name__)
 
 CONSISTENCY_CONFIDENCE_LEVELS = ("high", "medium", "low")
 
+DEFAULT_SOURCE_REFERENCE_PROMPT = {
+    "intro": [
+        "SOURCE ORIGINAL blocks are untranslated EPUB chapters. Use them only as reference "
+        "for meaning, roles, names, terms and factual continuity. Analyze and report problems "
+        "only in TRANSLATED TEXT TO ANALYZE blocks; do not demand literal translation."
+    ],
+    "chapter": [
+        "--- CHAPTER: {chapter_name} ---",
+        "### SOURCE ORIGINAL (reference only; do not report problems in this block){source_path_suffix}",
+        "{source_content}",
+        "",
+        "### TRANSLATED TEXT TO ANALYZE",
+        "{translated_content}",
+    ],
+}
+
 
 def normalize_consistency_confidence(value: Any, default: str = "medium") -> str:
     normalized = str(value or "").strip().lower()
@@ -1004,31 +1020,109 @@ class ConsistencyEngine(QObject):
             'next_chunk_focus': self.glossary_session.next_chunk_focus
         }
 
+    def _load_consistency_prompts_data(self) -> Dict[str, Any]:
+        from ..api.config import get_resource_path
+        prompts_file = get_resource_path("config/consistency_prompts.json")
+        if not prompts_file.exists():
+            return {}
+
+        try:
+            with open(prompts_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"Failed to load consistency prompts: {e}")
+            return {}
+
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _join_prompt_template(value: Any, default_lines: List[str]) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(str(line) for line in value)
+        return "\n".join(default_lines)
+
+    @staticmethod
+    def _replace_prompt_placeholders(template: str, values: Dict[str, str]) -> str:
+        result = str(template or "")
+        for key, value in values.items():
+            result = result.replace("{" + key + "}", str(value))
+        return result
+
+    def _source_reference_prompt_config(self) -> Dict[str, str]:
+        prompts_data = self._load_consistency_prompts_data()
+        source_reference = prompts_data.get("source_reference")
+        if not isinstance(source_reference, dict):
+            source_reference = {}
+
+        return {
+            "intro": self._join_prompt_template(
+                source_reference.get("intro"),
+                DEFAULT_SOURCE_REFERENCE_PROMPT["intro"],
+            ),
+            "chapter": self._join_prompt_template(
+                source_reference.get("chapter"),
+                DEFAULT_SOURCE_REFERENCE_PROMPT["chapter"],
+            ),
+        }
+
+    def _build_chapters_prompt_text(self, chunk: List[Dict[str, Any]]) -> tuple[str, str, str]:
+        chapters_text = ""
+        translated_text = ""
+        source_text = ""
+        has_source_reference = False
+        source_reference_config = self._source_reference_prompt_config()
+
+        for ch in chunk:
+            if not isinstance(ch, dict):
+                continue
+
+            chapter_name = str(ch.get('name') or 'Unknown')
+            chapter_content = str(ch.get('content') or "")
+            original_content = str(ch.get('source_content') or "")
+            translated_text += f"\n--- CHAPTER: {chapter_name} ---\n{chapter_content}\n"
+
+            if original_content.strip():
+                has_source_reference = True
+                source_path = str(ch.get('source_path') or "").strip()
+                source_path_suffix = f": {source_path}" if source_path else ""
+                chapters_text += "\n" + self._replace_prompt_placeholders(
+                    source_reference_config["chapter"],
+                    {
+                        "chapter_name": chapter_name,
+                        "source_path": source_path,
+                        "source_path_suffix": source_path_suffix,
+                        "source_content": original_content,
+                        "translated_content": chapter_content,
+                    },
+                )
+                chapters_text += "\n"
+                source_text += f"\n--- SOURCE: {chapter_name} ---\n{original_content}\n"
+            else:
+                chapters_text += f"\n--- CHAPTER: {chapter_name} ---\n{chapter_content}\n"
+
+        if has_source_reference:
+            intro = source_reference_config["intro"].rstrip()
+            chapters_text = (intro + "\n" if intro else "") + chapters_text
+
+        return chapters_text, translated_text, source_text
+
     def _build_analysis_prompt(self, chunk: List[Dict[str, Any]], config: Dict[str, Any]) -> str:
         """Формирует промпт для анализа."""
-        chapters_text = ""
-        for ch in chunk:
-            chapters_text += f"\n--- CHAPTER: {ch['name']} ---\n{ch['content']}\n"
+        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk)
 
         # Умная фильтрация глоссария
-        filtered_glossary = self._filter_glossary_for_text(chapters_text)
+        filtered_glossary = self._filter_glossary_for_text(translated_text, source_text)
         
         context_json = json.dumps(
             filtered_glossary, ensure_ascii=False, indent=2)
 
-        # Загружаем промпт из файла
-        from ..api.config import get_resource_path
-        prompts_file = get_resource_path("config/consistency_prompts.json")
         system_prompt = ""
         
-        if prompts_file.exists():
-            try:
-                with open(prompts_file, 'r', encoding='utf-8') as f:
-                    prompts_data = json.load(f)
-                    system_prompt = "\n".join(
-                        prompts_data.get("consistency_analysis", []))
-            except Exception as e:
-                logger.error(f"Failed to load consistency prompts: {e}")
+        prompts_data = self._load_consistency_prompts_data()
+        system_prompt = "\n".join(
+            prompts_data.get("consistency_analysis", []))
 
         if not system_prompt:
             system_prompt = config.get(
@@ -1042,29 +1136,19 @@ class ConsistencyEngine(QObject):
 
     def _build_glossary_collection_prompt(self, chunk: List[Dict[str, Any]], config: Dict[str, Any]) -> str:
         """Формирует промпт для сбора глоссария (первый проход двухпроходного режима)."""
-        chapters_text = ""
-        for ch in chunk:
-            chapters_text += f"\n--- CHAPTER: {ch['name']} ---\n{ch['content']}\n"
+        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk)
 
         # Умная фильтрация глоссария
-        filtered_glossary = self._filter_glossary_for_text(chapters_text)
+        filtered_glossary = self._filter_glossary_for_text(translated_text, source_text)
         
         context_json = json.dumps(
             filtered_glossary, ensure_ascii=False, indent=2)
 
-        # Загружаем промпт для сбора глоссария
-        from ..api.config import get_resource_path
-        prompts_file = get_resource_path("config/consistency_prompts.json")
         system_prompt = ""
         
-        if prompts_file.exists():
-            try:
-                with open(prompts_file, 'r', encoding='utf-8') as f:
-                    prompts_data = json.load(f)
-                    system_prompt = "\n".join(
-                        prompts_data.get("glossary_collection", []))
-            except Exception as e:
-                logger.error(f"Failed to load glossary collection prompts: {e}")
+        prompts_data = self._load_consistency_prompts_data()
+        system_prompt = "\n".join(
+            prompts_data.get("glossary_collection", []))
 
         if not system_prompt:
             # Fallback: используем обычный промпт, но попросим не искать проблемы
