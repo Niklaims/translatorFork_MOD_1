@@ -54,6 +54,7 @@ class SettingsManager(QObject):
         self.file_lock = PatientLock()
         self._cache = {}
         self._is_dirty = False
+        self._last_save_error = None
         
         # Таймер для отложенной записи (debouncing)
         self._save_timer = QtCore.QTimer(self)
@@ -152,9 +153,23 @@ class SettingsManager(QObject):
     @pyqtSlot()
     def _perform_save(self):
         """[Слот, GUI-поток] Если кэш 'грязный', атомарно сохраняет его на диск."""
+        save_error = None
         if self._is_dirty:
             with self.file_lock:
-                self._save_to_disk_unsafe()
+                try:
+                    self._save_to_disk_unsafe()
+                    self._last_save_error = None
+                except OSError as e:
+                    self._last_save_error = e
+                    save_error = e
+
+        if save_error:
+            print(f"[SettingsManager ERROR] Автосохранение настроек не выполнено: {save_error}")
+            self._post_event('settings_save_failed', {
+                'message': str(save_error),
+                'errno': getattr(save_error, 'errno', None),
+                'filename': getattr(save_error, 'filename', None) or self.config_file,
+            })
 
     @pyqtSlot()
     def _schedule_save(self):
