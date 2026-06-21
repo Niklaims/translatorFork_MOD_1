@@ -14,6 +14,9 @@ from gemini_translator.api.handlers.workascii_chatgpt import WorkAsciiChatGptApi
 
 
 class WorkAsciiRuntimeConfigTests(unittest.TestCase):
+    def assertSamePath(self, actual, expected):
+        self.assertEqual(Path(actual).resolve(strict=False), Path(expected).resolve(strict=False))
+
     @unittest.skipUnless(sys.platform == "win32", "Windows-specific asyncio policy regression")
     def test_worker_loop_uses_subprocess_capable_loop_under_selector_policy(self):
         original_policy = asyncio.get_event_loop_policy()
@@ -1659,7 +1662,7 @@ print(json.dumps(payload, ensure_ascii=False))
                  patch.object(api_config, "get_executable_dir", return_value=dist_root), \
                  patch.object(api_config, "get_internal_resource_dir", return_value=None), \
                  patch.object(api_config, "get_dev_project_root", return_value=project_root):
-                self.assertEqual(api_config.default_workascii_runtime_root(), dist_root)
+                self.assertSamePath(api_config.default_workascii_runtime_root(), dist_root)
 
     def test_find_playwright_package_root_finds_bundled_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1675,7 +1678,7 @@ print(json.dumps(payload, ensure_ascii=False))
                  patch.object(api_config, "get_internal_resource_dir", return_value=None), \
                  patch.object(api_config, "_python_playwright_driver_dir", return_value=None), \
                  patch.dict(api_config.os.environ, {"PLAYWRIGHT_PACKAGE_ROOT": str(external_package_root)}, clear=True):
-                self.assertEqual(api_config.find_playwright_package_root(), package_root)
+                self.assertSamePath(api_config.find_playwright_package_root(), package_root)
 
     def test_find_node_and_browser_cache_use_bundled_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1700,8 +1703,8 @@ print(json.dumps(payload, ensure_ascii=False))
                      {"PLAYWRIGHT_BROWSERS_PATH": str(external_browsers)},
                      clear=True,
                     ):
-                self.assertEqual(api_config.find_node_executable(), node_path)
-                self.assertEqual(api_config.find_playwright_browsers_path(), browsers_path)
+                self.assertSamePath(api_config.find_node_executable(), node_path)
+                self.assertSamePath(api_config.find_playwright_browsers_path(), browsers_path)
 
     def test_find_playwright_browsers_path_skips_incomplete_bundled_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1735,7 +1738,7 @@ print(json.dumps(payload, ensure_ascii=False))
                  patch.object(api_config, "get_dev_project_root", return_value=None), \
                  patch.object(api_config, "_python_playwright_driver_dir", return_value=None), \
                  patch.dict(api_config.os.environ, {"LOCALAPPDATA": str(localappdata)}, clear=True):
-                self.assertEqual(api_config.find_playwright_browsers_path(), fallback_browsers)
+                self.assertSamePath(api_config.find_playwright_browsers_path(), fallback_browsers)
 
     def test_runtime_helpers_fall_back_to_dev_project_runtime_when_legacy_root_has_no_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1758,9 +1761,9 @@ print(json.dumps(payload, ensure_ascii=False))
                  patch.object(api_config, "_python_playwright_driver_dir", return_value=None), \
                  patch.object(api_config.shutil, "which", return_value=None), \
                  patch.dict(api_config.os.environ, {}, clear=True):
-                self.assertEqual(api_config.find_node_executable(legacy_root), node_path)
-                self.assertEqual(api_config.find_playwright_package_root(legacy_root), package_root)
-                self.assertEqual(api_config.find_playwright_browsers_path(legacy_root), browsers_path)
+                self.assertSamePath(api_config.find_node_executable(legacy_root), node_path)
+                self.assertSamePath(api_config.find_playwright_package_root(legacy_root), package_root)
+                self.assertSamePath(api_config.find_playwright_browsers_path(legacy_root), browsers_path)
 
     def test_handler_ignores_saved_path_overrides_and_uses_project_runtime(self):
         class DummyWorker:
