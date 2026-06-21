@@ -39,3 +39,16 @@ def test_validation_analysis_allows_fewer_paragraph_tags_without_unwrapped_text(
     analyzed = _worker()._analyze_html_content(original, translated, result)
 
     assert "structural_errors" not in analyzed
+
+
+def test_validation_analysis_allows_body_only_translation_without_html_shell():
+    result = {
+        "path": "Text/chapter.xhtml",
+        "internal_html_path": "Text/chapter.xhtml",
+    }
+    original = '<html><body><p>Один.</p></body></html>'
+    translated = '<body><p>Один.</p></body>'
+
+    analyzed = _worker()._analyze_html_content(original, translated, result)
+
+    assert "structural_errors" not in analyzed

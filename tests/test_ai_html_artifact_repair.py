@@ -10,7 +10,9 @@ from gemini_translator.utils.text import (
     find_stray_angle_bracket_snippets,
     find_unwrapped_body_text_snippets,
     is_well_formed_xml,
+    normalize_xhtml_tag_case,
     repair_ai_html_artifacts,
+    validate_html_structure,
 )
 
 
@@ -46,6 +48,38 @@ def test_repair_ai_html_artifacts_wraps_body_text_and_escapes_angles():
     assert '<p>Two &gt;</p>' in repaired
     assert find_unwrapped_body_text_snippets(repaired) == []
     assert find_stray_angle_bracket_snippets(repaired) == []
+
+
+def test_repair_ai_html_artifacts_normalizes_xhtml_tag_case():
+    original = '<html><body><p>Один.</p></body></html>'
+    translated = '<html><body><p>Один.</P></body></html>'
+
+    repaired = repair_ai_html_artifacts(original, translated)
+
+    assert '<p>Один.</p>' in repaired
+    assert '</P>' not in repaired
+    assert is_well_formed_xml(repaired)
+
+
+def test_validate_html_structure_repairs_uppercase_closing_tag():
+    original = '<html><body><p>Один.</p></body></html>'
+    translated = '<html><body><p>Один.</P></body></html>'
+
+    valid, reason, final_html = validate_html_structure(original, translated)
+
+    assert valid, reason
+    assert '</P>' not in final_html
+    assert is_well_formed_xml(final_html)
+
+
+def test_normalize_xhtml_tag_case_preserves_unknown_tags_and_attributes():
+    html = '<BODY class="main"><CustomTag Data-ID="1">x</CustomTag><P>y</P></BODY>'
+
+    normalized = normalize_xhtml_tag_case(html)
+
+    assert '<body class="main">' in normalized
+    assert '<p>y</p>' in normalized
+    assert '<CustomTag Data-ID="1">x</CustomTag>' in normalized
 
 
 def test_validation_analysis_flags_stray_angle_brackets():

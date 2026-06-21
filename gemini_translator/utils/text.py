@@ -474,6 +474,48 @@ def is_well_formed_xml(content: str, validate=False) -> bool:
         return False
 
 
+XHTML_TAG_CASE_NORMALIZE_NAMES = {
+    'a', 'abbr', 'address', 'area', 'article', 'aside', 'audio',
+    'b', 'base', 'bdi', 'bdo', 'blockquote', 'body', 'br', 'button',
+    'caption', 'cite', 'code', 'col', 'colgroup',
+    'data', 'dd', 'del', 'details', 'dfn', 'dialog', 'div', 'dl', 'dt',
+    'em', 'figcaption', 'figure', 'footer', 'form',
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'head', 'header', 'hr', 'html',
+    'i', 'img', 'input', 'ins', 'kbd', 'label', 'legend', 'li', 'link',
+    'main', 'mark', 'meta', 'nav', 'ol', 'option', 'p', 'pre', 'q',
+    'rp', 'rt', 'ruby', 's', 'samp', 'script', 'section', 'select',
+    'small', 'source', 'span', 'strong', 'style', 'sub', 'summary',
+    'sup', 'table', 'tbody', 'td', 'textarea', 'tfoot', 'th', 'thead',
+    'time', 'title', 'tr', 'track', 'u', 'ul', 'var', 'video',
+}
+
+
+def normalize_xhtml_tag_case(html_content: str) -> str:
+    """
+    Normalize known XHTML tag names to lowercase without touching attributes,
+    XML declarations, doctypes, comments, or unknown/custom tags.
+    """
+    if not isinstance(html_content, str) or '<' not in html_content:
+        return html_content
+
+    tag_pattern = re.compile(
+        r'<\s*(/?)\s*([A-Za-z][A-Za-z0-9:_-]*)([^<>]*?)(/?)\s*>',
+        flags=re.DOTALL,
+    )
+
+    def replace_tag(match: re.Match) -> str:
+        slash, tag_name, attrs, self_close = match.groups()
+        normalized_name = tag_name.lower()
+        local_name = normalized_name.split(':', 1)[-1]
+        if local_name not in XHTML_TAG_CASE_NORMALIZE_NAMES:
+            return match.group(0)
+        if slash:
+            return f"</{normalized_name}>"
+        return f"<{normalized_name}{attrs}{self_close}>"
+
+    return tag_pattern.sub(replace_tag, html_content)
+
+
 def oper_dash_symbol(html_content: str) -> str:
     
     
@@ -1755,6 +1797,7 @@ def repair_ai_html_artifacts(original_html: str, translated_html: str) -> str:
 
     original_html = original_html if isinstance(original_html, str) else ""
     repaired = normalize_translated_body_wrapper(original_html, translated_html)
+    repaired = normalize_xhtml_tag_case(repaired)
     repaired = escape_stray_angle_brackets(repaired)
     repaired = optimize_headings(repaired)
     repaired = repair_unbalanced_paragraphs(repaired)
@@ -3012,6 +3055,7 @@ def validate_html_structure(original_html, translated_html):
     normalized_orig = prettify_html_for_ai(original_html)
     orig_lower = normalized_orig.lower().strip()
     final_translated_html = normalize_translated_body_wrapper(original_html, final_translated_html)
+    final_translated_html = normalize_xhtml_tag_case(final_translated_html)
     final_translated_html = _coerce_first_heading_level(original_html, final_translated_html)
     trans_lower = final_translated_html.lower().strip()
 
@@ -3034,10 +3078,12 @@ def validate_html_structure(original_html, translated_html):
         # Пока парсим оригинал перевода
         soup_trans = BeautifulSoup(final_translated_html, 'html.parser')
 
-        # ПРОВЕРКА 2.1: Фундаментальные теги (html, body)
+        # ПРОВЕРКА 2.1: Фундаментальные теги. Body-only output is valid here:
+        # the pipeline intentionally coerces translated XHTML to a <body> block.
         tags_to_check = {'<html>': '<html', '</html>': '</html>'}
         for display_name, search_string in tags_to_check.items():
-            if (search_string in orig_lower) and not (search_string in trans_lower):
+            trans_has_body_wrapper = bool(re.search(r'<body\b', trans_lower)) and bool(re.search(r'</body>', trans_lower))
+            if (search_string in orig_lower) and not (search_string in trans_lower) and not trans_has_body_wrapper:
                 return False, f"Потерян фундаментальный тег {display_name.replace('<', '&lt;')}. Ответ API поврежден.", final_translated_html
 
         # ПРОВЕРКА 2.2: Умный баланс тегов <p> через Regex

@@ -1261,8 +1261,11 @@ class ValidationThread(QThread):
         tags_to_check = {'<html>': '<html', '</html>': '</html>', '<body>': '<body', '</body>': '</body>'}
         fundamental_tag_results = {}
         has_fundamental_error = False
+        trans_has_body_wrapper = bool(re.search(r'<body\b', clean_trans_content)) and ('</body>' in clean_trans_content)
         for display_name, search_string in tags_to_check.items():
             orig_found, trans_found = (search_string in original_content.lower(), search_string in clean_trans_content)
+            if display_name in {'<html>', '</html>'} and orig_found and trans_has_body_wrapper:
+                trans_found = True
             fundamental_tag_results[display_name] = (orig_found, trans_found)
             if orig_found != trans_found: has_fundamental_error = True
         
