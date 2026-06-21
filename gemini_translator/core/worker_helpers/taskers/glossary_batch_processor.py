@@ -16,6 +16,37 @@ from gemini_translator.utils.language_tools import SmartGlossaryFilter
 from gemini_translator.api import config as api_config
 
 
+def filter_glossary_items_for_source_text(
+    glossary_items,
+    source_text,
+    *,
+    use_jieba_for_glossary_search=True,
+):
+    if not glossary_items:
+        return [], 0
+    if not source_text:
+        return [], len(glossary_items)
+
+    text_validator = SmartGlossaryFilter()
+    ai_glossary_as_dict = {
+        item['original']: {'rus': item['rus'], 'note': item['note']}
+        for item in glossary_items
+        if item.get('original')
+    }
+    found_terms_dict = text_validator.filter_glossary_for_text(
+        full_glossary=ai_glossary_as_dict,
+        text=source_text,
+        fuzzy_threshold=99,
+        use_jieba_for_glossary_search=use_jieba_for_glossary_search,
+        find_embedded_subterms=True
+    )
+    filtered_items = [
+        term_data for term_data in glossary_items
+        if term_data.get('original') in found_terms_dict
+    ]
+    return filtered_items, len(glossary_items) - len(filtered_items)
+
+
 class GlossaryBatchProcessor(BaseTaskProcessor):
     async def execute(self, task_info, use_stream=False):
         task_id, task_payload = task_info
@@ -146,24 +177,11 @@ class GlossaryBatchProcessor(BaseTaskProcessor):
 
             truly_validated_glossary_list = []
             if not force_accept:
-                text_validator = SmartGlossaryFilter()
-                ai_glossary_as_dict = {
-                    item['original']: {'rus': item['rus'], 'note': item['note']}
-                    for item in pre_validated_glossary_list
-                    if item.get('original')
-                }
-                found_terms_dict = text_validator.filter_glossary_for_text(
-                    full_glossary=ai_glossary_as_dict,
-                    text=user_prompt,
-                    fuzzy_threshold=99,
+                truly_validated_glossary_list, discarded_count = filter_glossary_items_for_source_text(
+                    pre_validated_glossary_list,
+                    full_text_for_api,
                     use_jieba_for_glossary_search=self.worker.context_manager.use_jieba_for_glossary,
-                    find_embedded_subterms=True
                 )
-                truly_validated_glossary_list = [
-                    term_data for term_data in pre_validated_glossary_list
-                    if term_data.get('original') in found_terms_dict
-                ]
-                discarded_count = len(pre_validated_glossary_list) - len(truly_validated_glossary_list)
                 if discarded_count > 0:
                     self.worker._post_event('log_message', {'message': f"🔎 [Глоссарий] Отфильтровано {discarded_count} терминов (нет в тексте)."})
             else:

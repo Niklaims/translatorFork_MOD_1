@@ -679,6 +679,20 @@ class TaskPreparer:
 
     def _prepare_individual_and_chunked_tasks(self, chapter_list):
         """Готовит ПЕЙЛОАДЫ для индивидуальных или разделенных задач."""
+        def plain_payload(chapter_file):
+            return ('epub', self.epub_path, chapter_file)
+
+        if not self.use_chunking:
+            return [plain_payload(chapter_file) for chapter_file in chapter_list]
+
+        needs_chunking = {
+            chapter_file
+            for chapter_file in chapter_list
+            if self.real_chapter_sizes.get(chapter_file, 0) > self.task_input_size_limit
+        }
+        if not needs_chunking:
+            return [plain_payload(chapter_file) for chapter_file in chapter_list]
+
         from ..utils.text import split_text_into_chunks
         from ..api import config as api_config
 
@@ -687,8 +701,8 @@ class TaskPreparer:
             for chapter_file in chapter_list:
                 real_size = self.real_chapter_sizes.get(chapter_file, 0)
 
-                if not self.use_chunking or real_size <= self.task_input_size_limit:
-                    final_payloads.append(('epub', self.epub_path, chapter_file))
+                if chapter_file not in needs_chunking:
+                    final_payloads.append(plain_payload(chapter_file))
                     continue
 
                 try:

@@ -48,6 +48,38 @@ UNORDERED_WORDS_THRESHOLD = 98     # Уровень 3: Разрешаем пер
 CHAR_SIMILARITY_THRESHOLD = 96     # Уровень 4: Разрешаем опечатки/схожие слова
 FUZZY_SEARCH_THRESHOLD = 94        # Уровень 5: Включаем "тяжелый" fuzzy-поиск
 
+
+PUNCTUATION_NORMALIZATION_TABLE = str.maketrans({
+    "\u2010": "-",
+    "\u2011": "-",
+    "\u2012": "-",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\ufe58": "-",
+    "\ufe63": "-",
+    "\uff0d": "-",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u201b": "'",
+    "\u2032": "'",
+    "\uff07": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u2033": '"',
+    "\uff02": '"',
+})
+
+
+def normalize_glossary_search_text(text):
+    normalized = unicodedata.normalize("NFKC", "" if text is None else str(text))
+    return normalized.translate(PUNCTUATION_NORMALIZATION_TABLE)
+
+
 def _glossary_text(value):
     return "" if value is None else str(value).strip()
 
@@ -292,21 +324,22 @@ class GlossaryRegexService:
 
         for original in sorted_keys:
             if not original.strip(): continue
+            normalized_original = normalize_glossary_search_text(original)
             
-            if LanguageDetector.is_cjk_text(original):
+            if LanguageDetector.is_cjk_text(normalized_original):
                 # Для CJK: вычищаем всё, оставляя только иероглифы/буквы
-                for script_variant in get_chinese_script_variants(original):
+                for script_variant in get_chinese_script_variants(normalized_original):
                     clean_term = self._cleaner.sub('', script_variant).strip()
                     if clean_term:
                         self.cjk_map[clean_term].add(original)
                         cjk_clean_terms.add(re.escape(clean_term))
             else:
                 # Для Alpha: нижний регистр
-                lower_term = original.lower()
+                lower_term = normalized_original.casefold()
                 if lower_term not in self.alpha_map:
                     self.alpha_map[lower_term] = set()
                 self.alpha_map[lower_term].add(original)
-                alpha_terms.add(re.escape(original))
+                alpha_terms.add(re.escape(normalized_original))
 
         # 2. Компиляция CJK (по "чистым" терминам)
         if cjk_clean_terms:
@@ -325,10 +358,11 @@ class GlossaryRegexService:
         Возвращает множество оригинальных ключей глоссария.
         """
         found_originals = set()
+        normalized_text = normalize_glossary_search_text(text)
         
         # Поиск CJK: Ищем в "стене текста" (без пробелов и пунктуации)
         if self.cjk_pattern:
-            clean_text_wall = self._cleaner.sub('', text)
+            clean_text_wall = self._cleaner.sub('', normalized_text)
             matches = self.cjk_pattern.findall(clean_text_wall)
             for match in matches:
                 if match in self.cjk_map:
@@ -336,9 +370,9 @@ class GlossaryRegexService:
 
         # Поиск Alpha: Ищем в оригинальном тексте (нужны пробелы для \b)
         if self.alpha_pattern:
-            matches = self.alpha_pattern.findall(text)
+            matches = self.alpha_pattern.findall(normalized_text)
             for match in matches:
-                lower_match = match.lower()
+                lower_match = match.casefold()
                 if lower_match in self.alpha_map:
                     found_originals.update(self.alpha_map[lower_match])
                     
@@ -347,18 +381,19 @@ class GlossaryRegexService:
     def count_matches(self, text):
         """Подсчитывает реальные вхождения терминов в тексте."""
         found_counts = Counter()
+        normalized_text = normalize_glossary_search_text(text)
 
         if self.cjk_pattern:
-            clean_text_wall = self._cleaner.sub('', text)
+            clean_text_wall = self._cleaner.sub('', normalized_text)
             matches = self.cjk_pattern.findall(clean_text_wall)
             for match in matches:
                 for original in self.cjk_map.get(match, ()):
                     found_counts[original] += 1
 
         if self.alpha_pattern:
-            matches = self.alpha_pattern.findall(text)
+            matches = self.alpha_pattern.findall(normalized_text)
             for match in matches:
-                lower_match = match.lower()
+                lower_match = match.casefold()
                 for original in self.alpha_map.get(lower_match, ()):
                     found_counts[original] += 1
 
