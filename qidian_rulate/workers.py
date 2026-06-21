@@ -49,6 +49,19 @@ RULATE_BOOK_TYPE_DESCRIPTION = "Публикуйте свои произведе
 RULATE_BOOK_TYPE_SELECTOR = 'a.create-card.card-book[href*="typ=A"]'
 RULATE_CHINESE_CATEGORY_TITLE = "Китайские"
 
+QIDIAN_DESCRIPTION_HEADER = "作品简介"
+QIDIAN_DESCRIPTION_STOP_LINES = {
+    "月票",
+    "推荐票",
+    "打赏",
+    "本月票数",
+    "本周打赏人数",
+    "包含本书的书单",
+    "目录",
+    "书友互动",
+    "本书荣誉",
+}
+
 RULATE_GENRES = [
     "боевик",
     "боевые искусства",
@@ -77,19 +90,6 @@ RULATE_GENRES = [
 ]
 
 FALLBACK_GENRES = ["фэнтези", "мистика", "приключения"]
-FALLBACK_TAG_CANDIDATES = [
-    "sci-fi",
-    "мистика",
-    "мистические тайны",
-    "тайны",
-    "сверхъестественное",
-    "потусторонний мир",
-    "путешествие в другой мир",
-    "путешествие между мирами",
-    "путешествия по измерениям",
-    "современный мир",
-    "китай",
-]
 TAGS_FILE_ENV = "RULATE_TAGS_FILE"
 _RULATE_TAGS_CACHE: list[str] | None = None
 
@@ -158,14 +158,7 @@ def load_rulate_tags() -> list[str]:
 
 
 def _fallback_tags_from_allowed(allowed_tags: list[str]) -> list[str]:
-    by_lower = {tag.lower(): tag for tag in allowed_tags}
     result = []
-    for candidate in FALLBACK_TAG_CANDIDATES:
-        tag = by_lower.get(candidate.lower())
-        if tag and tag not in result:
-            result.append(tag)
-        if len(result) >= 3:
-            return result
     for tag in allowed_tags:
         if tag not in result:
             result.append(tag)
@@ -378,6 +371,130 @@ def _clean_text(value: str | None) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+def _clean_qidian_description(value: str | None, *, title: str = "", author: str = "") -> str:
+    description = _clean_multiline(value)
+    if not description:
+        return ""
+
+    title = _clean_text(title)
+    author = _clean_text(author)
+    escaped_title = re.escape(title) if title else r"[^》]+"
+
+    seo_prefix_patterns = [
+        rf"^.{0,80}?创作的[^。]{{0,120}}?《{escaped_title}》[^。]{{0,160}}?最新章节[:：][^。]*。",
+        rf"^.{0,80}?创作的[^。]{{0,120}}?《{escaped_title}》，已更新[^。]*。",
+    ]
+    if author:
+        escaped_author = re.escape(author)
+        seo_prefix_patterns.insert(
+            0,
+            rf"^{escaped_author}创作的[^。]{{0,120}}?《{escaped_title}》[^。]{{0,160}}?最新章节[:：][^。]*。",
+        )
+
+    for pattern in seo_prefix_patterns:
+        description = re.sub(pattern, "", description, count=1).strip()
+
+    seo_suffix_patterns = [
+        r"\s*本书的主要角色有.*$",
+        r"\s*本书主要角色有.*$",
+        r"\s*本书又名.*$",
+        r"\s*本书关键词.*$",
+        r"\s*本书标签.*$",
+    ]
+    for pattern in seo_suffix_patterns:
+        description = re.sub(pattern, "", description).strip()
+
+    return _clean_multiline(description)
+
+
+def _is_qidian_description_stop_line(line: str) -> bool:
+    line = _clean_text(line)
+    if line in QIDIAN_DESCRIPTION_STOP_LINES:
+        return True
+    return any(line.startswith(prefix) for prefix in ("包含本书的书单", "目录 ", "目录\t", "目录 连载"))
+
+
+def _is_likely_qidian_book_tag_line(line: str) -> bool:
+    line = _clean_text(line)
+    if not line or len(line) > 8:
+        return False
+    if re.search(r"[。！？!?…，、；;：:《》“”\"'（）()]", line):
+        return False
+    return bool(re.search(r"[\u4e00-\u9fff]", line))
+
+
+def _extract_qidian_description_from_body(body_text: str | None) -> str:
+    body_text = str(body_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if QIDIAN_DESCRIPTION_HEADER not in body_text:
+        return ""
+
+    lines = [re.sub(r"[ \t\u00a0]+", " ", line).strip() for line in body_text.split("\n")]
+    try:
+        start_index = next(index for index, line in enumerate(lines) if line == QIDIAN_DESCRIPTION_HEADER)
+    except StopIteration:
+        return ""
+
+    entries: list[str | None] = []
+    stop_reached = False
+    for line in lines[start_index + 1:]:
+        if not line:
+            if entries and entries[-1] is not None:
+                entries.append(None)
+            continue
+        if _is_qidian_description_stop_line(line):
+            stop_reached = True
+            break
+        entries.append(line)
+
+    while entries and entries[0] is None:
+        entries.pop(0)
+    while entries and entries[-1] is None:
+        entries.pop()
+
+    if stop_reached and len(entries) >= 2 and entries[-2] is None and isinstance(entries[-1], str):
+        if _is_likely_qidian_book_tag_line(entries[-1]):
+            entries = entries[:-2]
+
+    result_lines: list[str] = []
+    for entry in entries:
+        if entry is None:
+            if result_lines and result_lines[-1] != "":
+                result_lines.append("")
+        else:
+            result_lines.append(entry)
+
+    while result_lines and not result_lines[0]:
+        result_lines.pop(0)
+    while result_lines and not result_lines[-1]:
+        result_lines.pop()
+
+    return _clean_multiline("\n".join(result_lines))
+
+
+def _is_truncated_qidian_description(value: str) -> bool:
+    value = _clean_text(value)
+    if not value:
+        return False
+    return (
+        value.endswith("…")
+        or bool(re.search(r"最新章节[:：]", value))
+        or bool(re.search(r"已更新\d+章", value))
+    )
+
+
+def _select_qidian_description(payload: dict, *, title: str = "", author: str = "") -> str:
+    candidates = [
+        _extract_qidian_description_from_body(payload.get("body_text")),
+        payload.get("description"),
+        payload.get("meta_description"),
+    ]
+    for candidate in candidates:
+        description = _clean_qidian_description(candidate, title=title, author=author)
+        if description and not _is_truncated_qidian_description(description):
+            return description
+    return ""
+
+
 def _normalize_url(value: str | None, base_url: str) -> str:
     value = (value or "").strip()
     if not value:
@@ -500,7 +617,7 @@ def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
 - translated_title: литературное название на русском.
 - translated_description: литературный русский перевод описания. Не вставляй название отдельной строкой.
 - genres: от 3 до 5 жанров строго из списка допустимых жанров.
-- tags: от 3 до 8 существующих тегов Rulate. Не придумывай новые теги; ориентируйся на уже используемые теги вроде: sci-fi, мистика, мистические тайны, тайны, сверхъестественное, потусторонний мир, путешествие в другой мир, путешествие между мирами, путешествия по измерениям, современный мир, китай.
+- tags: от 3 до 8 существующих тегов Rulate по смыслу описания. Не придумывай новые теги и не используй заготовленный список.
 
 Допустимые жанры Rulate:
 {allowed_genres}
@@ -551,17 +668,32 @@ class QidianFetchWorker(QThread):
                 )
                 try:
                     page.goto(self.qidian_url, wait_until="domcontentloaded", timeout=60000)
-                    page.wait_for_timeout(2500)
+                    try:
+                        page.wait_for_function(
+                            """() => {
+                                const body = document.body && document.body.innerText;
+                                return body && body.includes("作品简介") && body.length > 1000;
+                            }""",
+                            timeout=12000,
+                        )
+                    except Exception:
+                        page.wait_for_timeout(2500)
                     payload = page.evaluate(_QIDIAN_EXTRACT_SCRIPT)
                 finally:
                     browser.close()
 
+            title_original = _clean_text(payload.get("title"))
+            author_name = _clean_text(payload.get("author"))
             cover_url = _normalize_url(payload.get("cover_url"), self.qidian_url)
             metadata = QidianBookMetadata(
                 source_url=self.qidian_url,
-                title_original=_clean_text(payload.get("title")),
-                author_name=_clean_text(payload.get("author")),
-                description=_clean_multiline(payload.get("description")),
+                title_original=title_original,
+                author_name=author_name,
+                description=_select_qidian_description(
+                    payload,
+                    title=title_original,
+                    author=author_name,
+                ),
                 cover_url=cover_url,
                 cover_image_data=_download_cover_image(cover_url, referer=self.qidian_url),
             )
@@ -1088,11 +1220,43 @@ _QIDIAN_EXTRACT_SCRIPT = r"""() => {
     };
     const descriptionFromBody = () => {
         const body = bodyText();
-        const match = body.match(/作品简介\s*([\s\S]*?)(?:\n\s*(?:男生月票榜|女生月票榜|月票|推荐票|包含本书的书单|目录|书友互动|本书荣誉))/);
-        if (!match) return "";
-        return match[1]
-            .replace(/[ \t]+\n/g, "\n")
-            .replace(/\n[ \t]+/g, "\n")
+        const lines = body.replace(/\r/g, "").split("\n").map((line) => line.replace(/[ \t\u00a0]+/g, " ").trim());
+        const start = lines.findIndex((line) => line === "作品简介");
+        if (start < 0) return "";
+        const stopLines = new Set(["月票", "推荐票", "打赏", "本月票数", "本周打赏人数", "包含本书的书单", "目录", "书友互动", "本书荣誉"]);
+        const isStopLine = (line) => stopLines.has(line) || line.startsWith("包含本书的书单") || line.startsWith("目录 ");
+        const isLikelyTag = (line) => (
+            line &&
+            line.length <= 8 &&
+            /[\u4e00-\u9fff]/.test(line) &&
+            !/[。！？!?…，、；;：:《》“”"'（）()]/.test(line)
+        );
+        let stopReached = false;
+        let entries = [];
+        for (const line of lines.slice(start + 1)) {
+            if (!line) {
+                if (entries.length && entries[entries.length - 1] !== null) entries.push(null);
+                continue;
+            }
+            if (isStopLine(line)) {
+                stopReached = true;
+                break;
+            }
+            entries.push(line);
+        }
+        while (entries.length && entries[0] === null) entries.shift();
+        while (entries.length && entries[entries.length - 1] === null) entries.pop();
+        if (
+            stopReached &&
+            entries.length >= 2 &&
+            entries[entries.length - 2] === null &&
+            isLikelyTag(entries[entries.length - 1])
+        ) {
+            entries = entries.slice(0, -2);
+        }
+        return entries
+            .map((entry) => entry === null ? "" : entry)
+            .join("\n")
             .replace(/\n{3,}/g, "\n\n")
             .trim();
     };
@@ -1129,11 +1293,14 @@ _QIDIAN_EXTRACT_SCRIPT = r"""() => {
             "[class*='intro'] p",
             "[class*='desc']"
         ]) ||
-        meta("description");
+        "";
+    const fullBodyText = bodyText();
     return {
         title: firstText(["h1", ".book-info h1", ".book-name", "[class*='bookName']"]) || meta("og:title"),
         author,
         description,
-        cover_url: cover
+        cover_url: cover,
+        body_text: fullBodyText,
+        meta_description: meta("description")
     };
 }"""

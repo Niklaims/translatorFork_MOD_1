@@ -6,6 +6,9 @@ from gemini_translator.ui.dialogs import qidian_rulate_creator as creator_module
 from gemini_translator.ui.dialogs.qidian_rulate_creator import QidianRulateCreatorWindow
 from qidian_rulate.workers import (
     _is_browser_missing_error,
+    _clean_qidian_description,
+    _extract_qidian_description_from_body,
+    _select_qidian_description,
     _tag_file_candidates,
     RULATE_BOOK_TYPE_DESCRIPTION,
     RULATE_BOOK_TYPE_SELECTOR,
@@ -135,7 +138,72 @@ def test_normalize_rulate_tags_requires_tags_from_allowed_file(monkeypatch):
 
     tags = normalize_rulate_tags(["SCI-FI", "\u0447\u0443\u0436\u043e\u0439 \u0442\u0435\u0433"])
 
-    assert tags == ["sci-fi", "\u043c\u0438\u0441\u0442\u0438\u043a\u0430", "\u0442\u0430\u0439\u043d\u044b"]
+    assert tags == ["sci-fi", "\u0442\u0430\u0439\u043d\u044b", "\u043c\u0438\u0441\u0442\u0438\u043a\u0430"]
+
+
+def test_clean_qidian_description_strips_seo_metadata():
+    raw_description = (
+        "盲候创作的奇幻小说《冒牌领主》，已更新227章，"
+        "最新章节：第226章 瑟银要塞陷落。"
+        "罗南穿越而来，成了贵族大少的背锅替身。"
+        "此刻他正替那位刚凌辱了帝国名将夫人的本尊，被皇帝发配去往南境边陲的途中。"
+        "旧神、尸鬼、灵能、义体，蒸汽与火枪...这是一个超凡世界。"
+        "罗南从冒牌领主开始，一点点开拓荒地，发掘遗迹，航海探索。"
+        "直到有一天，他登…本书的主要角色有罗南"
+    )
+
+    cleaned = _clean_qidian_description(raw_description, title="冒牌领主", author="盲候")
+
+    assert cleaned.startswith("罗南穿越而来")
+    assert "最新章节" not in cleaned
+    assert "本书的主要角色" not in cleaned
+
+
+def test_extract_qidian_description_from_body_removes_trailing_book_tag():
+    body_text = (
+        "作品简介\n\n"
+        "罗南穿越而来，成了贵族大少的背锅替身。\n"
+        "此刻他正替那位刚凌辱了帝国名将夫人的本尊，被皇帝发配去往南境边陲的途中。\n"
+        "旧神、尸鬼、灵能、义体，蒸汽与火枪...\n"
+        "这是一个超凡世界。\n"
+        "罗南从冒牌领主开始，一点点开拓荒地，发掘遗迹，航海探索。\n"
+        "直到有一天，他登通天塔而上。\n"
+        "那些隐藏黑雾中的旧日主宰，尽皆匍匐，颤栗低语：“天灾之王”。\n"
+        "我叫罗南，我即天灾。\n"
+        "PS.《灾变卡皇》《机械炼金术士》相近题材，书荒可以看看两本300W+万定老书。\n\n"
+        "龙\n\n"
+        "月票\n推荐票"
+    )
+
+    description = _extract_qidian_description_from_body(body_text)
+
+    assert "登通天塔而上" in description
+    assert "龙" not in description.splitlines()[-1]
+    assert "月票" not in description
+
+
+def test_select_qidian_description_prefers_full_body_over_truncated_meta():
+    payload = {
+        "body_text": (
+            "作品简介\n\n"
+            "罗南穿越而来，成了贵族大少的背锅替身。\n"
+            "直到有一天，他登通天塔而上。\n"
+            "我叫罗南，我即天灾。\n\n"
+            "月票"
+        ),
+        "description": (
+            "盲候创作的奇幻小说《冒牌领主》，已更新227章，"
+            "最新章节：第226章 瑟银要塞陷落。罗南穿越而来，直到有一天，他登…"
+        ),
+        "meta_description": (
+            "盲候创作的奇幻小说《冒牌领主》，已更新227章，"
+            "最新章节：第226章 瑟银要塞陷落。罗南穿越而来，直到有一天，他登…"
+        ),
+    }
+
+    description = _select_qidian_description(payload, title="冒牌领主", author="盲候")
+
+    assert description == "罗南穿越而来，成了贵族大少的背锅替身。\n直到有一天，他登通天塔而上。\n我叫罗南，我即天灾。"
 
 
 def test_build_ai_prompt_contains_source_context_and_description_rule():
@@ -152,6 +220,21 @@ def test_build_ai_prompt_contains_source_context_and_description_rule():
     assert "\u8fdc\u77b3" in prompt
     assert "Otherworldly Inn" in prompt
     assert "\u041d\u0435 \u0432\u0441\u0442\u0430\u0432\u043b\u044f\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435" in prompt
+
+
+def test_build_ai_prompt_does_not_include_hardcoded_tag_examples():
+    metadata = QidianBookMetadata(
+        source_url="https://www.qidian.com/book/1041604040/",
+        title_original="\u5f02\u5ea6\u65c5\u793e",
+        author_name="\u8fdc\u77b3",
+        description="\u63cf\u8ff0",
+    )
+
+    prompt = build_ai_prompt(metadata, "Otherworldly Inn")
+
+    assert "sci-fi, \u043c\u0438\u0441\u0442\u0438\u043a\u0430" not in prompt
+    assert "\u043f\u0443\u0442\u0435\u0448\u0435\u0441\u0442\u0432\u0438\u0435 \u043c\u0435\u0436\u0434\u0443 \u043c\u0438\u0440\u0430\u043c\u0438" not in prompt
+    assert "\u0441\u043e\u0432\u0440\u0435\u043c\u0435\u043d\u043d\u044b\u0439 \u043c\u0438\u0440, \u043a\u0438\u0442\u0430\u0439" not in prompt
 
 
 def test_browser_missing_error_is_detected_for_playwright_install_message():
