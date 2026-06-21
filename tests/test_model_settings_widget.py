@@ -210,6 +210,70 @@ class ModelSettingsWidgetTests(unittest.TestCase):
         self.assertAlmostEqual(widget.get_settings()["temperature"], 0.8)
         self.assertTrue(widget.get_settings()["temperature_override_enabled"])
 
+    def test_hidden_parent_does_not_clear_warmup_or_system_instruction(self):
+        widget = self._create_widget()
+
+        widget.warmup_checkbox.setVisible(True)
+        widget.warmup_checkbox.setChecked(True)
+        widget.system_instruction_editor_dialog.set_prompt("system prompt")
+        widget.system_instruction_checkbox.setChecked(True)
+
+        settings = widget.get_settings()
+
+        self.assertTrue(settings["use_warmup"])
+        self.assertTrue(settings["use_system_instruction"])
+        self.assertEqual(settings["system_instruction"], "system prompt")
+
+    def test_hidden_parent_does_not_convert_thinking_level_to_budget(self):
+        widget = self._create_widget()
+
+        widget.thinking_level_combo.addItems(["LOW", "HIGH"])
+        widget.thinking_level_combo.setVisible(True)
+        widget.thinking_level_combo.setCurrentText("HIGH")
+        widget.thinking_checkbox.setChecked(True)
+
+        settings = widget.get_settings()
+
+        self.assertEqual(settings["thinking_level"], "HIGH")
+        self.assertIsNone(settings["thinking_budget"])
+
+    def test_set_settings_restores_thinking_level_after_model_rebuild(self):
+        widget = self._create_widget()
+        level_model = {
+            "id": "level-model",
+            "provider": "level_provider",
+            "rpm": 10,
+            "max_concurrent_requests": 1,
+            "thinkingLevel": ["low", "high"],
+        }
+        provider_config = {
+            "level_provider": {
+                "needs_warmup": True,
+                "models": {"Level Model": level_model},
+            }
+        }
+
+        with patch.object(api_config, "ensure_dynamic_provider_models"), \
+             patch.object(api_config, "api_providers", return_value=provider_config), \
+             patch.object(api_config, "all_models", return_value={"Level Model": level_model}):
+            widget.set_available_models("level_provider")
+            widget.thinking_level_combo.setVisible(False)
+            widget.set_settings(
+                {
+                    "provider": "level_provider",
+                    "model": "Level Model",
+                    "thinking_enabled": True,
+                    "thinking_level": "HIGH",
+                    "use_warmup": True,
+                }
+            )
+
+            settings = widget.get_settings()
+
+        self.assertEqual(widget.thinking_level_combo.currentText(), "HIGH")
+        self.assertEqual(settings["thinking_level"], "HIGH")
+        self.assertTrue(settings["use_warmup"])
+
     def test_chatgpt_auth_buttons_launch_saved_profile_browser(self):
         widget = self._create_widget()
 

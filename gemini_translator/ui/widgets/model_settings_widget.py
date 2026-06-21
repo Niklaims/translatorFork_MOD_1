@@ -664,7 +664,7 @@ class ModelSettingsWidget(QGroupBox):
         current_display_name = self.model_combo.currentText()
         
         system_instruction_text = None
-        if self.system_instruction_checkbox.isVisible() and self.system_instruction_checkbox.isChecked():
+        if self.system_instruction_checkbox.isChecked():
             system_instruction_text = self.system_instruction_editor_dialog.get_prompt()
     
         # Определяем, какой режим Thinking активен (уровни или бюджет)
@@ -672,7 +672,7 @@ class ModelSettingsWidget(QGroupBox):
         thinking_budget = None
         
         if self.thinking_checkbox.isChecked():
-            if self.thinking_level_combo.isVisible():
+            if not self.thinking_level_combo.isHidden():
                 # Если видим комбобокс уровней - берем значение оттуда
                 thinking_level = self.thinking_level_combo.currentText()
             else:
@@ -698,7 +698,7 @@ class ModelSettingsWidget(QGroupBox):
             'force_accept': self.force_accept_checkbox.isChecked(),
             'use_json_epub_pipeline': self.use_json_epub_pipeline_checkbox.isChecked(),
             'use_prettify': self.prettify_checkbox.isChecked(),
-            'use_warmup': self.warmup_checkbox.isVisible() and self.warmup_checkbox.isChecked(),
+            'use_warmup': not self.warmup_checkbox.isHidden() and self.warmup_checkbox.isChecked(),
             'workascii_workspace_name': self.workascii_workspace_name_edit.text().strip(),
             'workascii_workspace_index': self.workascii_workspace_index_spin.value(),
             'workascii_timeout_sec': self.workascii_timeout_spin.value(),
@@ -754,7 +754,7 @@ class ModelSettingsWidget(QGroupBox):
             
             # Восстанавливаем уровень (если виджет видим и есть в настройках)
             t_level = settings.get('thinking_level')
-            if t_level and self.thinking_level_combo.isVisible():
+            if t_level and not self.thinking_level_combo.isHidden():
                 idx = self.thinking_level_combo.findText(t_level)
                 if idx != -1:
                     self.thinking_level_combo.setCurrentIndex(idx)
@@ -770,10 +770,10 @@ class ModelSettingsWidget(QGroupBox):
             self.fuzzy_threshold_spin.setValue(settings.get('fuzzy_threshold', 100))
             
             system_instruction_text = settings.get('system_instruction')
-            is_checked = bool(system_instruction_text)
+            is_checked = bool(settings.get('use_system_instruction', bool(system_instruction_text)))
             self.system_instruction_checkbox.setChecked(is_checked)
             self.system_instruction_btn.setEnabled(is_checked)
-            if is_checked:
+            if system_instruction_text:
                 self.system_instruction_editor_dialog.set_prompt(system_instruction_text)
     
             self.force_accept_checkbox.setChecked(settings.get('force_accept', False))
@@ -797,6 +797,15 @@ class ModelSettingsWidget(QGroupBox):
     
         self._update_system_instruction_button_text()
         self._on_model_changed(self.model_combo.currentIndex(), apply_recommended_limits=False)
+        t_level = settings.get('thinking_level')
+        if t_level and not self.thinking_level_combo.isHidden():
+            self.thinking_level_combo.blockSignals(True)
+            try:
+                idx = self.thinking_level_combo.findText(str(t_level))
+                if idx != -1:
+                    self.thinking_level_combo.setCurrentIndex(idx)
+            finally:
+                self.thinking_level_combo.blockSignals(False)
     
     # --- ИЗМЕНЕНИЕ 2: Новый слот для прослушки шины ---
     @pyqtSlot(dict)
