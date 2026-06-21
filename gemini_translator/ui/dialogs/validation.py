@@ -411,9 +411,124 @@ def _review_line_text(value):
     return str(value).rstrip("\r\n")
 
 
+LINE_REVIEW_BLOCK_TAGS = (
+    'html', 'head', 'body', 'title',
+    'section', 'article', 'div', 'blockquote',
+    'p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'ul', 'ol', 'li', 'table', 'thead', 'tbody', 'tfoot',
+    'tr', 'td', 'th',
+)
+LINE_REVIEW_BLOCK_TAG_RE = '|'.join(LINE_REVIEW_BLOCK_TAGS)
+
+
+def _split_line_review_text(text: str) -> list[str]:
+    """
+    Split HTML into review units. AI repair often serializes a whole body into
+    one long line; splitting around block tags keeps unchanged paragraphs
+    aligned instead of presenting them as deletions.
+    """
+    normalized = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        return []
+
+    normalized = re.sub(
+        fr'\s*(<(?!(?:/|\?|!))(?:{LINE_REVIEW_BLOCK_TAG_RE})(?:\s|>|/))',
+        r'\n\1',
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    normalized = re.sub(
+        fr'(</(?:{LINE_REVIEW_BLOCK_TAG_RE})>)\s*',
+        r'\1\n',
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    lines = normalized.splitlines(keepends=True)
+    if lines and not lines[0].strip():
+        lines = lines[1:]
+    return lines
+
+
+def _line_review_visible_text(value) -> str:
+    if not value:
+        return ""
+    try:
+        text = BeautifulSoup(str(value), 'html.parser').get_text(" ", strip=True)
+    except Exception:
+        text = str(value)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def ai_repair_candidate_warning(original_html: str, repaired_html: str) -> str:
+    old_text = _line_review_visible_text(original_html)
+    new_text = _line_review_visible_text(repaired_html)
+    if len(old_text) >= 120 and len(new_text) < len(old_text) * 0.75:
+        return "после автоправки заметно меньше видимого текста"
+
+    try:
+        old_soup = BeautifulSoup(original_html or "", 'html.parser')
+        new_soup = BeautifulSoup(repaired_html or "", 'html.parser')
+        block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']
+        old_blocks = len(old_soup.find_all(block_tags))
+        new_blocks = len(new_soup.find_all(block_tags))
+    except Exception:
+        old_blocks = 0
+        new_blocks = 0
+
+    if old_blocks >= 4 and new_blocks < max(1, int(old_blocks * 0.65)):
+        return "после автоправки заметно меньше текстовых блоков"
+    return ""
+
+
+def line_review_change_risk(change) -> str:
+    kind = change.get("kind")
+    old_text = change.get("old_text")
+    new_text = change.get("new_text")
+    old_visible = _line_review_visible_text(old_text)
+    new_visible = _line_review_visible_text(new_text)
+
+    if kind == "delete":
+        return "удаление строки"
+    if old_visible and not new_visible:
+        return "новая строка пустая"
+    if len(old_visible) >= 40 and len(new_visible) < len(old_visible) * 0.45:
+        return "сильное сокращение текста"
+    return ""
+
+
+def should_auto_accept_line_review_change(change, candidate_risky: bool = False) -> bool:
+    if candidate_risky:
+        return False
+    return not line_review_change_risk(change)
+
+
+def _line_review_display_to_line_text(display_text: str, original_new_text) -> str:
+    text = str(display_text or "")
+    if original_new_text is None:
+        return text
+
+    original = str(original_new_text)
+    ending = ""
+    if original.endswith("\r\n"):
+        ending = "\r\n"
+    elif original.endswith("\n"):
+        ending = "\n"
+    elif original.endswith("\r"):
+        ending = "\r"
+
+    if ending and text and not text.endswith(("\r", "\n")):
+        return text + ending
+    return text
+
+
+LINE_REVIEW_DEFAULT_ROLE = Qt.ItemDataRole.UserRole.value + 1
+LINE_REVIEW_RISK_ROLE = Qt.ItemDataRole.UserRole.value + 2
+
+
 def build_line_review_segments(old_text: str, new_text: str):
-    old_lines = (old_text or "").splitlines(keepends=True)
-    new_lines = (new_text or "").splitlines(keepends=True)
+    old_lines = _split_line_review_text(old_text)
+    new_lines = _split_line_review_text(new_text)
     matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
 
     segments = []
@@ -431,27 +546,61 @@ def build_line_review_segments(old_text: str, new_text: str):
         segment_changes = []
         old_count = old_end - old_start
         new_count = new_end - new_start
-        for offset in range(max(old_count, new_count)):
-            old_line = old_lines[old_start + offset] if offset < old_count else None
-            new_line = new_lines[new_start + offset] if offset < new_count else None
-            if old_line is None:
-                kind = "insert"
-            elif new_line is None:
-                kind = "delete"
-            else:
-                kind = "replace"
+        if tag == "replace":
+            for offset in range(min(old_count, new_count)):
+                change = {
+                    "id": change_id,
+                    "kind": "replace",
+                    "old_line_no": old_start + offset + 1,
+                    "new_line_no": new_start + offset + 1,
+                    "old_text": old_lines[old_start + offset],
+                    "new_text": new_lines[new_start + offset],
+                }
+                change_id += 1
+                segment_changes.append(change)
+                changes.append(change)
 
-            change = {
-                "id": change_id,
-                "kind": kind,
-                "old_line_no": old_start + offset + 1 if old_line is not None else old_start + 1,
-                "new_line_no": new_start + offset + 1 if new_line is not None else new_start + 1,
-                "old_text": old_line,
-                "new_text": new_line,
-            }
-            change_id += 1
-            segment_changes.append(change)
-            changes.append(change)
+            for offset in range(min(old_count, new_count), old_count):
+                change = {
+                    "id": change_id,
+                    "kind": "delete",
+                    "old_line_no": old_start + offset + 1,
+                    "new_line_no": new_start + min(old_count, new_count) + 1,
+                    "old_text": old_lines[old_start + offset],
+                    "new_text": None,
+                }
+                change_id += 1
+                segment_changes.append(change)
+                changes.append(change)
+
+            for offset in range(min(old_count, new_count), new_count):
+                change = {
+                    "id": change_id,
+                    "kind": "insert",
+                    "old_line_no": old_start + min(old_count, new_count) + 1,
+                    "new_line_no": new_start + offset + 1,
+                    "old_text": None,
+                    "new_text": new_lines[new_start + offset],
+                }
+                change_id += 1
+                segment_changes.append(change)
+                changes.append(change)
+        else:
+            source_count = new_count if tag == "insert" else old_count
+            for offset in range(source_count):
+                old_line = old_lines[old_start + offset] if tag == "delete" else None
+                new_line = new_lines[new_start + offset] if tag == "insert" else None
+                change = {
+                    "id": change_id,
+                    "kind": tag,
+                    "old_line_no": old_start + offset + 1 if old_line is not None else old_start + 1,
+                    "new_line_no": new_start + offset + 1 if new_line is not None else new_start + 1,
+                    "old_text": old_line,
+                    "new_text": new_line,
+                }
+                change_id += 1
+                segment_changes.append(change)
+                changes.append(change)
 
         segments.append({
             "kind": "change",
@@ -461,8 +610,9 @@ def build_line_review_segments(old_text: str, new_text: str):
     return segments, changes
 
 
-def apply_line_review_selection(segments, accepted_change_ids):
+def apply_line_review_selection(segments, accepted_change_ids, edited_new_text_by_change_id=None):
     accepted_change_ids = set(accepted_change_ids or [])
+    edited_new_text_by_change_id = edited_new_text_by_change_id or {}
     result_lines = []
 
     for segment in segments:
@@ -473,7 +623,7 @@ def apply_line_review_selection(segments, accepted_change_ids):
         for change in segment.get("changes") or []:
             accepted = change.get("id") in accepted_change_ids
             if accepted:
-                new_text = change.get("new_text")
+                new_text = edited_new_text_by_change_id.get(change.get("id"), change.get("new_text"))
                 if new_text is not None:
                     result_lines.append(new_text)
             else:
@@ -488,35 +638,82 @@ class AIRepairReviewDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
         self.candidates = candidates or []
+        self._populating_table = False
+        self._syncing_detail_editor = False
+        self._change_lookup = {}
         self.setWindowTitle("Построчная проверка автоправки")
-        self.setMinimumSize(1000, 620)
+        self.setMinimumSize(1280, 760)
+        self.resize(1480, 840)
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Выберите строки, которые нужно применить. Неподтверждённые строки останутся как были."
+            "Выберите строки, которые нужно применить. Удаления и сильные сокращения сняты по умолчанию; "
+            "неподтверждённые строки останутся как были. Ячейки «Стало» можно редактировать вручную."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+
         self.table = QTableWidget()
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Применить", "Файл", "Строка", "Было", "Стало"])
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Применить", "Тип", "Файл", "Строка/блок", "Было", "Стало"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.setWordWrap(False)
+        self.table.itemSelectionChanged.connect(self._sync_detail_editor_from_selection)
+        self.table.itemChanged.connect(self._on_table_item_changed)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.table, 1)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.splitter.addWidget(self.table)
+
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(0, 6, 0, 0)
+
+        detail_title_layout = QHBoxLayout()
+        detail_title_layout.addWidget(QLabel("Контекст выбранного изменения"))
+        detail_title_layout.addStretch()
+        detail_title_layout.addWidget(QLabel("Ручная правка выбранной строки «Стало»"))
+        detail_layout.addLayout(detail_title_layout)
+
+        detail_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.context_view = QTextEdit()
+        self.context_view.setReadOnly(True)
+        self.context_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.context_view.setMinimumHeight(130)
+        self.new_text_editor = QTextEdit()
+        self.new_text_editor.setAcceptRichText(False)
+        self.new_text_editor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.new_text_editor.setMinimumHeight(130)
+        self.new_text_editor.textChanged.connect(self._on_detail_editor_changed)
+        detail_splitter.addWidget(self.context_view)
+        detail_splitter.addWidget(self.new_text_editor)
+        detail_splitter.setSizes([760, 560])
+        detail_layout.addWidget(detail_splitter)
+        self.splitter.addWidget(detail_widget)
+        self.splitter.setSizes([560, 210])
+        layout.addWidget(self.splitter, 1)
 
         select_layout = QHBoxLayout()
-        self.btn_select_all = QPushButton("Выбрать всё")
+        self.btn_select_recommended = QPushButton("Выбрать рекомендуемые")
+        self.btn_select_all = QPushButton("Выбрать все изменения")
         self.btn_select_none = QPushButton("Снять всё")
+        self.btn_select_recommended.clicked.connect(self._set_recommended_checked)
         self.btn_select_all.clicked.connect(lambda: self._set_all_checked(True))
         self.btn_select_none.clicked.connect(lambda: self._set_all_checked(False))
+        select_layout.addWidget(self.btn_select_recommended)
         select_layout.addWidget(self.btn_select_all)
         select_layout.addWidget(self.btn_select_none)
         select_layout.addStretch()
@@ -525,19 +722,26 @@ class AIRepairReviewDialog(QDialog):
         button_box = QDialogButtonBox()
         apply_button = button_box.addButton("Применить выбранное", QDialogButtonBox.ButtonRole.AcceptRole)
         cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
-        apply_button.clicked.connect(self.accept)
+        apply_button.clicked.connect(self._accept_with_risk_check)
         cancel_button.clicked.connect(self.reject)
         layout.addWidget(button_box)
 
         self._populate_table()
 
     def _populate_table(self):
+        self._populating_table = True
         self.table.setRowCount(0)
+        self._change_lookup.clear()
         for candidate_index, candidate in enumerate(self.candidates):
             chapter = candidate.get("chapter") or f"Строка {candidate.get('row')}"
+            candidate_risky = bool(candidate.get("warning"))
             for change in candidate.get("changes") or []:
                 row = self.table.rowCount()
                 self.table.insertRow(row)
+                change_id = change.get("id")
+                self._change_lookup[(candidate_index, change_id)] = change
+                risk_reason = line_review_change_risk(change)
+                default_checked = should_auto_accept_line_review_change(change, candidate_risky)
 
                 check_item = QTableWidgetItem("")
                 check_item.setFlags(
@@ -545,12 +749,15 @@ class AIRepairReviewDialog(QDialog):
                     | Qt.ItemFlag.ItemIsSelectable
                     | Qt.ItemFlag.ItemIsUserCheckable
                 )
-                check_item.setCheckState(Qt.CheckState.Checked)
-                check_item.setData(Qt.ItemDataRole.UserRole, (candidate_index, change.get("id")))
+                check_item.setCheckState(Qt.CheckState.Checked if default_checked else Qt.CheckState.Unchecked)
+                check_item.setData(Qt.ItemDataRole.UserRole, (candidate_index, change_id))
+                check_item.setData(LINE_REVIEW_DEFAULT_ROLE, default_checked)
+                check_item.setData(LINE_REVIEW_RISK_ROLE, risk_reason or candidate.get("warning") or "")
                 self.table.setItem(row, 0, check_item)
 
                 line_label = self._format_line_label(change)
                 values = [
+                    self._format_kind_label(change, risk_reason, candidate.get("warning")),
                     chapter,
                     line_label,
                     _review_line_text(change.get("old_text")),
@@ -559,9 +766,19 @@ class AIRepairReviewDialog(QDialog):
                 for col, value in enumerate(values, start=1):
                     item = QTableWidgetItem(value)
                     item.setToolTip(value)
+                    flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                    if col == 5:
+                        flags |= Qt.ItemFlag.ItemIsEditable
+                        item.setData(Qt.ItemDataRole.UserRole, (candidate_index, change_id))
+                    item.setFlags(flags)
+                    if risk_reason or candidate.get("warning"):
+                        item.setBackground(QBrush(QColor(255, 193, 7, 38)))
                     self.table.setItem(row, col, item)
 
         self.table.resizeRowsToContents()
+        self._populating_table = False
+        if self.table.rowCount() > 0:
+            self.table.selectRow(0)
 
     def _format_line_label(self, change):
         kind = change.get("kind")
@@ -571,6 +788,113 @@ class AIRepairReviewDialog(QDialog):
             return f"-{change.get('old_line_no', '')}"
         return f"{change.get('old_line_no', '')} -> {change.get('new_line_no', '')}"
 
+    def _format_kind_label(self, change, risk_reason="", candidate_warning=""):
+        kind = change.get("kind")
+        labels = {
+            "insert": "вставка",
+            "delete": "удаление",
+            "replace": "замена",
+        }
+        label = labels.get(kind, kind or "")
+        reason = risk_reason or candidate_warning
+        if reason:
+            return f"{label} / проверить"
+        return label
+
+    def _selected_row(self):
+        indexes = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not indexes:
+            return None
+        return indexes[0].row()
+
+    def _change_for_row(self, row):
+        check_item = self.table.item(row, 0)
+        if not check_item:
+            return None, None, None
+        candidate_index, change_id = check_item.data(Qt.ItemDataRole.UserRole)
+        candidate = self.candidates[candidate_index] if 0 <= candidate_index < len(self.candidates) else None
+        change = self._change_lookup.get((candidate_index, change_id))
+        return candidate_index, candidate, change
+
+    def _context_lines(self, text, line_no, radius=3):
+        lines = _split_line_review_text(text)
+        if not lines:
+            return []
+        index = max(0, int(line_no or 1) - 1)
+        start = max(0, index - radius)
+        end = min(len(lines), index + radius + 1)
+        result = []
+        for line_index in range(start, end):
+            marker = ">" if line_index == index else " "
+            result.append(f"{marker} {line_index + 1}: {_review_line_text(lines[line_index])}")
+        return result
+
+    def _format_context_text(self, candidate, change):
+        if not candidate or not change:
+            return ""
+        blocks = [f"Файл: {candidate.get('chapter') or candidate.get('row')}"]
+        warning = candidate.get("warning") or line_review_change_risk(change)
+        if warning:
+            blocks.append(f"Проверить вручную: {warning}")
+
+        old_context = self._context_lines(candidate.get("original_html") or "", change.get("old_line_no"))
+        new_context = self._context_lines(candidate.get("repaired_html") or "", change.get("new_line_no"))
+        if old_context:
+            blocks.append("Было:\n" + "\n".join(old_context))
+        if new_context:
+            blocks.append("Стало:\n" + "\n".join(new_context))
+        return "\n\n".join(blocks)
+
+    def _sync_detail_editor_from_selection(self):
+        if self._populating_table:
+            return
+        row = self._selected_row()
+        self._syncing_detail_editor = True
+        try:
+            if row is None:
+                self.context_view.clear()
+                self.new_text_editor.clear()
+                self.new_text_editor.setEnabled(False)
+                return
+
+            _, candidate, change = self._change_for_row(row)
+            self.context_view.setPlainText(self._format_context_text(candidate, change))
+            new_item = self.table.item(row, 5)
+            self.new_text_editor.setEnabled(True)
+            self.new_text_editor.setPlainText(new_item.text() if new_item else "")
+        finally:
+            self._syncing_detail_editor = False
+
+    def _on_detail_editor_changed(self):
+        if self._syncing_detail_editor:
+            return
+        row = self._selected_row()
+        if row is None:
+            return
+        item = self.table.item(row, 5)
+        check_item = self.table.item(row, 0)
+        if not item:
+            return
+        self._populating_table = True
+        try:
+            item.setText(self.new_text_editor.toPlainText())
+            if check_item:
+                check_item.setCheckState(Qt.CheckState.Checked)
+        finally:
+            self._populating_table = False
+
+    def _on_table_item_changed(self, item):
+        if self._populating_table or not item:
+            return
+        if item.column() != 5:
+            return
+        row = item.row()
+        check_item = self.table.item(row, 0)
+        if check_item:
+            check_item.setCheckState(Qt.CheckState.Checked)
+        if row == self._selected_row():
+            self._sync_detail_editor_from_selection()
+
     def _set_all_checked(self, checked: bool):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for row in range(self.table.rowCount()):
@@ -578,8 +902,69 @@ class AIRepairReviewDialog(QDialog):
             if item:
                 item.setCheckState(state)
 
+    def _set_recommended_checked(self):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if not item:
+                continue
+            default_checked = bool(item.data(LINE_REVIEW_DEFAULT_ROLE))
+            item.setCheckState(Qt.CheckState.Checked if default_checked else Qt.CheckState.Unchecked)
+
+    def _selected_risky_rows(self):
+        rows = []
+        for row in range(self.table.rowCount()):
+            check_item = self.table.item(row, 0)
+            if not check_item or check_item.checkState() != Qt.CheckState.Checked:
+                continue
+            reason = check_item.data(LINE_REVIEW_RISK_ROLE)
+            if reason:
+                rows.append((row, reason))
+        return rows
+
+    def _accept_with_risk_check(self):
+        risky_rows = self._selected_risky_rows()
+        if risky_rows:
+            preview = "\n".join(
+                f"- строка {row + 1}: {reason}"
+                for row, reason in risky_rows[:8]
+            )
+            if len(risky_rows) > 8:
+                preview += f"\n... ещё {len(risky_rows) - 8}"
+            result = QMessageBox.question(
+                self,
+                "Есть рискованные изменения",
+                "Вы выбрали удаления или сильные сокращения.\n\n"
+                f"{preview}\n\n"
+                "Применить их всё равно?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if result != QMessageBox.StandardButton.Yes:
+                return
+        self.accept()
+
+    def _edited_new_texts_by_candidate(self):
+        edited_by_candidate = {}
+        for row in range(self.table.rowCount()):
+            check_item = self.table.item(row, 0)
+            new_item = self.table.item(row, 5)
+            if not check_item or not new_item:
+                continue
+            candidate_index, change_id = check_item.data(Qt.ItemDataRole.UserRole)
+            change = self._change_lookup.get((candidate_index, change_id))
+            if not change:
+                continue
+            display_text = new_item.text()
+            original_display_text = _review_line_text(change.get("new_text"))
+            if display_text == original_display_text:
+                continue
+            edited_text = _line_review_display_to_line_text(display_text, change.get("new_text"))
+            edited_by_candidate.setdefault(candidate_index, {})[change_id] = edited_text
+        return edited_by_candidate
+
     def selected_html_by_row(self):
         accepted_by_candidate = {index: set() for index in range(len(self.candidates))}
+        edited_by_candidate = self._edited_new_texts_by_candidate()
 
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 0)
@@ -593,6 +978,7 @@ class AIRepairReviewDialog(QDialog):
             selected_html = apply_line_review_selection(
                 candidate.get("segments") or [],
                 accepted_by_candidate.get(candidate_index, set()),
+                edited_by_candidate.get(candidate_index, {}),
             )
             if selected_html != candidate.get("original_html"):
                 result[candidate["row"]] = selected_html
@@ -2287,6 +2673,7 @@ class TranslationValidatorDialog(QDialog):
                 if repaired_html != translated_html:
                     segments, changes = build_line_review_segments(translated_html, repaired_html)
                     if changes:
+                        warning = ai_repair_candidate_warning(translated_html, repaired_html)
                         review_candidates.append({
                             "row": row,
                             "chapter": os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}"),
@@ -2294,6 +2681,7 @@ class TranslationValidatorDialog(QDialog):
                             "repaired_html": repaired_html,
                             "segments": segments,
                             "changes": changes,
+                            "warning": warning,
                         })
                     else:
                         unchanged_count += 1
