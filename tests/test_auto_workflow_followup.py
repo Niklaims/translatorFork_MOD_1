@@ -5,7 +5,10 @@ import zipfile
 from unittest.mock import patch
 
 from gemini_translator.core.consistency_engine import filter_consistency_problems_by_confidence
-from gemini_translator.ui.dialogs.auto_workflow import AutoConsistencyWorker
+from gemini_translator.ui.dialogs.auto_workflow import (
+    AutoConsistencyWorker,
+    load_project_chapters_for_consistency,
+)
 from gemini_translator.ui.dialogs.setup import InitialSetupDialog
 
 
@@ -325,6 +328,22 @@ class _AutoTranslationOptionsHarness:
         return int(token_limit) * 2, "stub-profile"
 
 
+class _ConsistencyProjectManagerStub:
+    def __init__(self, project_folder, originals, versions_map):
+        self.project_folder = project_folder
+        self._originals = list(originals)
+        self._versions_map = {
+            original: dict(versions)
+            for original, versions in versions_map.items()
+        }
+
+    def get_all_originals(self):
+        return list(self._originals)
+
+    def get_versions_for_original(self, original_path):
+        return dict(self._versions_map.get(original_path, {}))
+
+
 class AutoWorkflowFollowupTests(unittest.TestCase):
     def test_auto_translation_options_include_chapter_limit_and_source_context(self):
         harness = _AutoTranslationOptionsHarness()
@@ -351,6 +370,65 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
         self.assertTrue(options["sequential_original_context_enabled"])
         self.assertEqual(options["sequential_original_context_chapters"], 2)
         self.assertEqual(options["sequential_original_context_char_limit"], 40000)
+
+    def test_load_project_chapters_for_consistency_can_include_original_epub_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = os.path.join(temp_dir, "book.epub")
+            translated_rel_path = os.path.join("Text", "chapter1.html")
+            translated_full_path = os.path.join(temp_dir, translated_rel_path)
+            os.makedirs(os.path.dirname(translated_full_path), exist_ok=True)
+            with open(translated_full_path, "w", encoding="utf-8") as handle:
+                handle.write("<html><body><p>Он вошёл в зал.</p></body></html>")
+
+            internal_path = "Text/chapter1.xhtml"
+            with zipfile.ZipFile(epub_path, "w") as epub_zip:
+                epub_zip.writestr(internal_path, "<html><body><p>他走进大厅。</p></body></html>")
+
+            project_manager = _ConsistencyProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": translated_rel_path}},
+            )
+
+            chapters = load_project_chapters_for_consistency(
+                project_manager,
+                original_epub_path=epub_path,
+                include_original=True,
+            )
+
+            self.assertEqual(len(chapters), 1)
+            self.assertEqual(chapters[0]["name"], "chapter1.xhtml")
+            self.assertIn("Он вошёл", chapters[0]["content"])
+            self.assertIn("他走进大厅", chapters[0]["source_content"])
+            self.assertEqual(chapters[0]["source_path"], internal_path)
+
+    def test_load_project_chapters_for_consistency_omits_original_without_flag(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = os.path.join(temp_dir, "book.epub")
+            translated_rel_path = os.path.join("Text", "chapter1.html")
+            translated_full_path = os.path.join(temp_dir, translated_rel_path)
+            os.makedirs(os.path.dirname(translated_full_path), exist_ok=True)
+            with open(translated_full_path, "w", encoding="utf-8") as handle:
+                handle.write("<p>Перевод</p>")
+
+            internal_path = "Text/chapter1.xhtml"
+            with zipfile.ZipFile(epub_path, "w") as epub_zip:
+                epub_zip.writestr(internal_path, "<p>原文</p>")
+
+            project_manager = _ConsistencyProjectManagerStub(
+                temp_dir,
+                [internal_path],
+                {internal_path: {"": translated_rel_path}},
+            )
+
+            chapters = load_project_chapters_for_consistency(
+                project_manager,
+                original_epub_path=epub_path,
+                include_original=False,
+            )
+
+            self.assertEqual(len(chapters), 1)
+            self.assertNotIn("source_content", chapters[0])
 
     def test_auto_short_ratio_uses_cjk_limit_from_flag(self):
         harness = _AutoRatioHarness()
@@ -730,6 +808,7 @@ class _AutoConsistencyFollowupHarness:
     def __init__(self):
         self.project_manager = object()
         self.settings_manager = object()
+        self.selected_file = "C:/project/book.epub"
         self.key_management_widget = _KeyManagementWidgetStub()
         self.start_btn = _ButtonStub()
         self.logs = []
@@ -863,6 +942,42 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         self.assertEqual(harness.start_btn.enabled_values, [False])
         self.assertTrue(
             any("AI-consistency автофикс по уровням уверенности: high." in entry["message"] for entry in harness.logs)
+        )
+
+    def test_run_auto_consistency_followup_passes_original_flag_to_loader(self):
+        harness = _AutoConsistencyFollowupHarness()
+        chapters = [
+            {
+                "name": "chapter1.xhtml",
+                "content": "<p>one</p>",
+                "source_content": "<p>一</p>",
+                "path": "C:/temp/ch1.xhtml",
+            }
+        ]
+        auto_settings = {
+            "ai_consistency_auto_fix": False,
+            "ai_consistency_use_original": True,
+            "ai_consistency_chunk_size": 1,
+        }
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.load_project_chapters_for_consistency",
+            return_value=chapters,
+        ) as loader, patch(
+            "gemini_translator.ui.dialogs.setup.AutoConsistencyWorker",
+            _AutoConsistencyWorkerStub,
+        ):
+            harness._run_auto_consistency_followup(auto_settings)
+
+        loader.assert_called_once_with(
+            harness.project_manager,
+            original_epub_path=harness.selected_file,
+            include_original=True,
+        )
+        worker = _AutoConsistencyWorkerStub.instances[0]
+        self.assertTrue(worker.config["consistency_include_original"])
+        self.assertTrue(
+            any("будет сверять перевод с оригиналом EPUB" in entry["message"] for entry in harness.logs)
         )
 
     def test_run_auto_consistency_followup_keeps_empty_level_selection(self):

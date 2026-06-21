@@ -5725,7 +5725,12 @@ class InitialSetupDialog(QDialog):
         self.check_ready()
 
     def _run_auto_consistency_followup(self, auto_settings: dict):
-        chapters_to_analyze = load_project_chapters_for_consistency(self.project_manager)
+        include_original = bool(auto_settings.get('ai_consistency_use_original', False))
+        chapters_to_analyze = load_project_chapters_for_consistency(
+            self.project_manager,
+            original_epub_path=getattr(self, 'selected_file', None),
+            include_original=include_original,
+        )
         active_keys = self.key_management_widget.get_active_keys()
 
         if not chapters_to_analyze:
@@ -5753,11 +5758,18 @@ class InitialSetupDialog(QDialog):
             'provider': self.key_management_widget.get_selected_provider(),
             'chunk_size': int(auto_settings.get('ai_consistency_chunk_size', 3)),
             'consistency_fix_confidences': list(selected_confidences),
+            'consistency_include_original': include_original,
         })
 
         self._auto_followup_running = True
         self.start_btn.setEnabled(False)
         self._auto_log("Запускаю AI-проверку согласованности…", force=True)
+        if include_original:
+            chapters_with_original = sum(1 for chapter in chapters_to_analyze if chapter.get('source_content'))
+            self._auto_log(
+                f"AI-consistency будет сверять перевод с оригиналом EPUB: "
+                f"{chapters_with_original}/{len(chapters_to_analyze)} глав с исходным текстом.",
+            )
         self._auto_log(
             f"AI-consistency анализирует {len(chapters_to_analyze)} глав: "
             f"{self._format_auto_chapter_list([chapter.get('name') for chapter in chapters_to_analyze], limit=10, preserve_order=True)}",

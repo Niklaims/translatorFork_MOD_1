@@ -54,6 +54,7 @@ AUTO_TRANSLATION_DEFAULTS = {
     "retry_network_failed_delay_sec": 60,
     "ai_consistency_enabled": False,
     "ai_consistency_auto_fix": True,
+    "ai_consistency_use_original": False,
     "ai_consistency_fix_confidences": ["high", "medium", "low"],
     "ai_consistency_mode": "standard",
     "ai_consistency_chunk_size": 3,
@@ -405,6 +406,11 @@ class AutoTranslateWidget(QWidget):
         self.ai_consistency_checkbox = QCheckBox("Запускать AI-проверку согласованности после успешного пайплайна")
         self.ai_consistency_auto_fix_checkbox = QCheckBox("Сразу применять и сохранять AI-исправления")
         self.ai_consistency_auto_fix_checkbox.setChecked(True)
+        self.ai_consistency_use_original_checkbox = QCheckBox("Сверять перевод с оригинальными главами EPUB")
+        self.ai_consistency_use_original_checkbox.setToolTip(
+            "Добавляет исходный непереведённый HTML/XHTML текущей главы в prompt AI-consistency как reference-only блок. "
+            "Увеличивает входной контекст и расход токенов."
+        )
         self.ai_consistency_mode_combo = NoScrollComboBox()
         self.ai_consistency_mode_combo.addItem("Обычный анализ", userData="standard")
         self.ai_consistency_mode_combo.addItem("Сначала собрать контекст/глоссарий", userData="glossary_first")
@@ -430,19 +436,20 @@ class AutoTranslateWidget(QWidget):
 
         consistency_layout.addWidget(self.ai_consistency_checkbox, 0, 0, 1, 2)
         consistency_layout.addWidget(self.ai_consistency_auto_fix_checkbox, 1, 0, 1, 2)
-        consistency_layout.addWidget(QLabel("Режим:"), 2, 0)
-        consistency_layout.addWidget(self.ai_consistency_mode_combo, 2, 1)
-        consistency_layout.addWidget(QLabel("Автоисправление по уровням:"), 3, 0)
-        consistency_layout.addLayout(confidence_fix_levels_layout, 3, 1)
-        consistency_layout.addWidget(QLabel("Глав в чанке:"), 4, 0)
-        consistency_layout.addWidget(self.ai_consistency_chunk_spin, 4, 1)
+        consistency_layout.addWidget(self.ai_consistency_use_original_checkbox, 2, 0, 1, 2)
+        consistency_layout.addWidget(QLabel("Режим:"), 3, 0)
+        consistency_layout.addWidget(self.ai_consistency_mode_combo, 3, 1)
+        consistency_layout.addWidget(QLabel("Автоисправление по уровням:"), 4, 0)
+        consistency_layout.addLayout(confidence_fix_levels_layout, 4, 1)
+        consistency_layout.addWidget(QLabel("Глав в чанке:"), 5, 0)
+        consistency_layout.addWidget(self.ai_consistency_chunk_spin, 5, 1)
         consistency_hint = QLabel(
             "AI-consistency всегда анализирует все найденные проблемы. Эти флажки управляют только тем, "
             "какие уровни уверенности будут автоматически исправляться и сохраняться."
         )
         consistency_hint.setWordWrap(True)
         consistency_hint.setStyleSheet("color: #9aa4b2;")
-        consistency_layout.addWidget(consistency_hint, 5, 0, 1, 2)
+        consistency_layout.addWidget(consistency_hint, 6, 0, 1, 2)
         content_layout.addWidget(consistency_group)
 
         footer_label = QLabel(
@@ -495,6 +502,7 @@ class AutoTranslateWidget(QWidget):
             self.retry_network_delay_spin,
             self.ai_consistency_checkbox,
             self.ai_consistency_auto_fix_checkbox,
+            self.ai_consistency_use_original_checkbox,
             self.ai_consistency_mode_combo,
             self.ai_consistency_fix_high_checkbox,
             self.ai_consistency_fix_medium_checkbox,
@@ -904,6 +912,7 @@ class AutoTranslateWidget(QWidget):
         consistency_enabled = self.ai_consistency_checkbox.isChecked()
         auto_fix_enabled = consistency_enabled and self.ai_consistency_auto_fix_checkbox.isChecked()
         self.ai_consistency_auto_fix_checkbox.setEnabled(consistency_enabled)
+        self.ai_consistency_use_original_checkbox.setEnabled(consistency_enabled)
         self.ai_consistency_mode_combo.setEnabled(consistency_enabled)
         self.ai_consistency_fix_high_checkbox.setEnabled(auto_fix_enabled)
         self.ai_consistency_fix_medium_checkbox.setEnabled(auto_fix_enabled)
@@ -952,6 +961,7 @@ class AutoTranslateWidget(QWidget):
             "retry_network_failed_delay_sec": int(self.retry_network_delay_spin.value()),
             "ai_consistency_enabled": self.ai_consistency_checkbox.isChecked(),
             "ai_consistency_auto_fix": self.ai_consistency_auto_fix_checkbox.isChecked(),
+            "ai_consistency_use_original": self.ai_consistency_use_original_checkbox.isChecked(),
             "ai_consistency_fix_confidences": self._get_ai_consistency_fix_confidences(),
             "ai_consistency_mode": self.ai_consistency_mode_combo.currentData() or "standard",
             "ai_consistency_chunk_size": int(self.ai_consistency_chunk_spin.value()),
@@ -1011,6 +1021,7 @@ class AutoTranslateWidget(QWidget):
             self.retry_network_delay_spin.setValue(int(merged.get("retry_network_failed_delay_sec", 60)))
             self.ai_consistency_checkbox.setChecked(bool(merged.get("ai_consistency_enabled", False)))
             self.ai_consistency_auto_fix_checkbox.setChecked(bool(merged.get("ai_consistency_auto_fix", True)))
+            self.ai_consistency_use_original_checkbox.setChecked(bool(merged.get("ai_consistency_use_original", False)))
             confidence_values = merged.get("ai_consistency_fix_confidences")
             if not isinstance(confidence_values, (list, tuple, set)):
                 confidence_values = AUTO_TRANSLATION_DEFAULTS["ai_consistency_fix_confidences"]
