@@ -8,6 +8,9 @@ from PyQt6.QtCore import pyqtSignal, Qt, pyqtSlot
 # Импортируем наш же виджет списка глав
 from .chapter_list_widget import ChapterListWidget
 
+IDLE_REDRAW_INTERVAL_MS = 35
+ACTIVE_SESSION_REDRAW_INTERVAL_MS = 500
+
 class TaskManagementWidget(QWidget):
     """
     Виджет-вкладка для управления списком задач: отображение, пересборка, фильтрация.
@@ -47,11 +50,12 @@ class TaskManagementWidget(QWidget):
         self._is_session_active = False # <--- НОВАЯ СТРОКА
         self._pending_ui_state = None
         self._pending_changed_ids = None  # set[str] | None — partial-event filter from TaskManager
+        self._redraw_pending = False  # a redraw was requested while the tab was hidden
         self._uses_topic_subscription = False
         self.bus = None
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setSingleShot(True)
-        self._redraw_timer.setInterval(35)
+        self._redraw_timer.setInterval(IDLE_REDRAW_INTERVAL_MS)
         self._redraw_timer.timeout.connect(self._do_redraw)
         self._init_ui()
         # --- ВСЕ СВЯЗИ ТЕПЕРЬ ВНУТРИ И ОНИ ПОЛНЫЕ ---
@@ -191,16 +195,27 @@ class TaskManagementWidget(QWidget):
         self._redraw_timer.start()
 
 
+    def showEvent(self, event):
+        """When the tab becomes visible again, run any redraw that was deferred
+        while it was hidden. Force a full rebuild (changed_ids=None): we skipped
+        the intermediate updates, so a selective update would touch only a few
+        rows of a now-stale table."""
+        super().showEvent(event)
+        if self._redraw_pending:
+            self._redraw_pending = False
+            self._pending_changed_ids = None
+            self.redraw_ui()
+
     def _apply_active_session_redraw_tuning(self, active: bool):
         """During an active translation session, slow the redraw debounce
-        from 35 ms (PreciseTimer) to 150 ms (CoarseTimer). The list updates
+        from 35 ms (PreciseTimer) to 500 ms (CoarseTimer). The list updates
         are not user-driven during a session, so the slack is invisible to
         the user but lets macOS coalesce Qt timer wake-ups."""
         if active:
-            self._redraw_timer.setInterval(150)
+            self._redraw_timer.setInterval(ACTIVE_SESSION_REDRAW_INTERVAL_MS)
             self._redraw_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
         else:
-            self._redraw_timer.setInterval(35)
+            self._redraw_timer.setInterval(IDLE_REDRAW_INTERVAL_MS)
             self._redraw_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
 
     def set_session_mode(self, is_session_active):
@@ -273,6 +288,13 @@ class TaskManagementWidget(QWidget):
         QtCore.QTimer.singleShot(100, self.check_and_update_retry_button_visibility)
 
     def _do_redraw(self):
+        # Hidden QTabWidget page: rebuilding the invisible task table (setCellWidget
+        # churn on every status reorder) wastes CPU and screen compositing while the
+        # user is looking at another tab. Defer until the tab is shown again.
+        # Mirrors the log widget's isVisible() guard.
+        if not self.isVisible():
+            self._redraw_pending = True
+            return
         try:
             app = QtWidgets.QApplication.instance()
             if not (hasattr(app, 'engine') and app.engine and app.engine.task_manager):
@@ -307,7 +329,8 @@ class TaskManagementWidget(QWidget):
                     self.chapter_list_widget.update_list(ui_state_list, self._pending_changed_ids)
                     self._pending_changed_ids = None
 
-                self.check_and_update_retry_button_visibility()
+                if not self._is_session_active:
+                    self.check_and_update_retry_button_visibility()
         except Exception as e:
             self._log_ui_error("_do_redraw", e)
 

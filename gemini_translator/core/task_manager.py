@@ -1346,11 +1346,14 @@ class ChapterQueueManager(QObject):
             self._in_flight_snapshot = None
             return
 
-        prev_cache_by_id = {str(e[0][0]): e for e in self._ui_state_list_cache}
+        prev_cache = self._ui_state_list_cache
+        prev_cache_by_id = {str(e[0][0]): e for e in prev_cache}
+        should_post_event = False
+        changed_ids = None
         if mode == "full":
             self._ui_state_list_cache = result["entries"]
             self._sort_keys = result["sort_keys"]
-            changed_ids = None
+            should_post_event = self._ui_state_list_cache != prev_cache
         elif mode == "partial":
             new_entries = result["entries"]
             new_by_id = {str(e[0][0]): e for e in new_entries}
@@ -1360,7 +1363,14 @@ class ChapterQueueManager(QObject):
             for tid in (snapshot["ids"] if snapshot else ()):
                 if new_by_id.get(tid) != prev_cache_by_id.get(tid):
                     changed.append(tid)
-            changed_ids = changed
+            if changed:
+                changed_ids = changed
+                should_post_event = True
+            elif new_entries != prev_cache:
+                # No row payload changed, but ordering/structure did. Let UI do
+                # a full redraw instead of a selective update against stale rows.
+                changed_ids = None
+                should_post_event = True
         else:
             # Unknown mode — treat as failure.
             self._recover_failed_worker(snapshot, result)
@@ -1369,10 +1379,11 @@ class ChapterQueueManager(QObject):
             self._in_flight_snapshot = None
             return
 
-        self._post_event('task_state_changed', {
-            'full_state': self._ui_state_list_cache,
-            'changed_ids': changed_ids,
-        })
+        if should_post_event:
+            self._post_event('task_state_changed', {
+                'full_state': self._ui_state_list_cache,
+                'changed_ids': changed_ids,
+            })
 
         self._is_updating_cache = False
         self._cache_update_worker = None

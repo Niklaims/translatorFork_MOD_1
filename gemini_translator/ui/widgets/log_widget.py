@@ -7,7 +7,7 @@ import uuid
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import pyqtSlot
-from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QTextBrowser, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QCheckBox, QHBoxLayout, QTextBrowser, QTextEdit, QVBoxLayout, QWidget
 
 
 LOG_STYLES = [
@@ -60,7 +60,13 @@ MAX_STORED_DETAILS = 200
 MAX_DETAIL_TEXT_CHARS = 16000
 MAX_PENDING_LOG_MESSAGES = 2000
 MAX_LOG_FLUSH_BATCH_SIZE = 300
-LOG_FLUSH_INTERVAL_MS = 250
+LOG_FLUSH_INTERVAL_MS = 1000
+# Smooth catch-up: when a backlog larger than one chunk is waiting (e.g. the user
+# just switched to the log tab after being away), drain it in small chunks at a
+# fast cadence so lines stream in instead of arriving in one jerk. Bounded,
+# one-time burst that self-terminates once drained; the live trickle stays calm.
+CATCHUP_FLUSH_BATCH_SIZE = 25
+CATCHUP_FLUSH_INTERVAL_MS = 60
 
 
 class LogWidget(QWidget):
@@ -74,6 +80,7 @@ class LogWidget(QWidget):
         self._init_ui()
         self._log_flush_timer = QtCore.QTimer(self)
         self._log_flush_timer.setSingleShot(True)
+        self._log_flush_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
         self._log_flush_timer.timeout.connect(self._flush_pending_messages)
 
         self.bus = event_bus
@@ -97,6 +104,8 @@ class LogWidget(QWidget):
         self.log_view = QTextBrowser()
         self.log_view.setReadOnly(True)
         self.log_view.setOpenLinks(False)
+        self.log_view.setUndoRedoEnabled(False)
+        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self.log_view.document().setMaximumBlockCount(MAX_LOG_BLOCKS)
         self.log_view.anchorClicked.connect(self._on_anchor_clicked)
 
@@ -203,15 +212,20 @@ class LogWidget(QWidget):
         if not self._pending_log_data:
             return
 
-        batch = self._pending_log_data[:MAX_LOG_FLUSH_BATCH_SIZE]
-        del self._pending_log_data[:MAX_LOG_FLUSH_BATCH_SIZE]
+        catching_up = len(self._pending_log_data) > CATCHUP_FLUSH_BATCH_SIZE
+        batch_size = CATCHUP_FLUSH_BATCH_SIZE if catching_up else MAX_LOG_FLUSH_BATCH_SIZE
+
+        batch = self._pending_log_data[:batch_size]
+        del self._pending_log_data[:batch_size]
 
         html_batch = "".join(self._build_log_html(data) for data in batch)
         if html_batch:
             self._insert_html_batch(html_batch)
 
         if self._pending_log_data:
-            self._schedule_log_flush(LOG_FLUSH_INTERVAL_MS)
+            self._schedule_log_flush(
+                CATCHUP_FLUSH_INTERVAL_MS if catching_up else LOG_FLUSH_INTERVAL_MS
+            )
 
     def _build_log_html(self, data: dict) -> str:
         message = data.get('message', '')
@@ -298,7 +312,12 @@ class LogWidget(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         if self._pending_log_data:
-            self._schedule_log_flush(LOG_FLUSH_INTERVAL_MS)
+            # If a backlog piled up while hidden, start the smooth catch-up
+            # promptly (fast cadence) instead of waiting a full second.
+            catching_up = len(self._pending_log_data) > CATCHUP_FLUSH_BATCH_SIZE
+            self._schedule_log_flush(
+                CATCHUP_FLUSH_INTERVAL_MS if catching_up else LOG_FLUSH_INTERVAL_MS
+            )
 
     def closeEvent(self, event):
         """Отписываемся от шины при закрытии/уничтожении виджета."""

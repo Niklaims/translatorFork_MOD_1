@@ -165,6 +165,8 @@ class ChapterListWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._is_session_active = False
+        self._reorder_up_icon = None
+        self._reorder_down_icon = None
         self._init_ui()
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
     
@@ -269,6 +271,13 @@ class ChapterListWidget(QWidget):
         
         main_layout.addWidget(self.table, 1)
             
+    def _get_reorder_icons(self):
+        if self._reorder_up_icon is None or self._reorder_down_icon is None:
+            style = self.style()
+            self._reorder_up_icon = style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp)
+            self._reorder_down_icon = style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+        return self._reorder_up_icon, self._reorder_down_icon
+
     def _create_reorder_cell_widget(self, row):
         """
         Создает виджет с "умными" кнопками, которые определяют свою строку
@@ -278,13 +287,14 @@ class ChapterListWidget(QWidget):
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(4)
-        
-        btn_up = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp), "")
+
+        up_icon, down_icon = self._get_reorder_icons()
+        btn_up = QPushButton(up_icon, "")
         btn_up.setFixedSize(24, 24)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_up.clicked.connect(lambda: self._emit_reorder_from_button('up', self.sender()))
-        
-        btn_down = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown), "")
+
+        btn_down = QPushButton(down_icon, "")
         btn_down.setFixedSize(24, 24)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_down.clicked.connect(lambda: self._emit_reorder_from_button('down', self.sender()))

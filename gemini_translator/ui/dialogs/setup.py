@@ -1027,6 +1027,7 @@ class InitialSetupDialog(QDialog):
         }
         self.bus.event_posted.emit(event)
 
+    @pyqtSlot()
     def _handle_geoblock_detected(self):
         """
         Показывает пользователю кастомный, терапевтический диалог о геоблокировке,
@@ -1230,7 +1231,11 @@ class InitialSetupDialog(QDialog):
 
         # Логика для geoblock остается здесь, так как она показывает модальное окно
         if self.is_session_active and event_name == 'geoblock_detected':
-            self._handle_geoblock_detected()
+            QtCore.QMetaObject.invokeMethod(
+                self,
+                "_handle_geoblock_detected",
+                QtCore.Qt.ConnectionType.QueuedConnection
+            )
 
     def _connect_event_bus(self):
         if not self.bus:

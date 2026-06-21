@@ -771,16 +771,10 @@ def global_excepthook(exc_type, exc_value, exc_tb):
     # Сценарий 1: Приложение "живо" и может показать окно само.
     if app:
         try:
-            # Даем приложению 100мс на обработку события перед показом окна
-            # Это может помочь, если ошибка произошла в момент отрисовки
-            QtCore.QTimer.singleShot(100, lambda: (
-                QtWidgets.QMessageBox.critical(
-                    None, "Критическая Ошибка Приложения", error_message
-                ),
-                # Запрашиваем штатное завершение, которое вызовет все aboutToQuit сигналы
-                QtCore.QTimer.singleShot(0, app.quit)
-            ))
-            return
+            dispatcher = getattr(app, "critical_error_requested", None)
+            if dispatcher and hasattr(dispatcher, "emit"):
+                dispatcher.emit(error_message)
+                return
         except Exception as e:
             print(
                 f"[CRITICAL] Не удалось показать QMessageBox, даже при живом app: {e}")
@@ -837,11 +831,26 @@ class ApplicationWithContext(QtWidgets.QApplication):
     """
     Расширенный класс QApplication для управления активным контекстом настроек.
     """
+    critical_error_requested = QtCore.pyqtSignal(str)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._true_global_settings_manager = None
         self._active_settings_manager = None
+        self.critical_error_requested.connect(
+            self._show_critical_error,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+
+    @QtCore.pyqtSlot(str)
+    def _show_critical_error(self, error_message: str):
+        def show_and_quit():
+            QtWidgets.QMessageBox.critical(
+                None, "Критическая Ошибка Приложения", error_message
+            )
+            QtCore.QTimer.singleShot(0, self.quit)
+
+        QtCore.QTimer.singleShot(100, show_and_quit)
 
     def initialize_managers(self):
         """Инициализирует менеджеры после создания основного объекта."""

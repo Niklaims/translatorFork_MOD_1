@@ -343,6 +343,25 @@ class OnCacheUpdatedTests(unittest.TestCase):
         self.assertFalse(tm._is_updating_cache)
         self.assertIsNone(tm._in_flight_snapshot)
 
+    def test_full_success_noops_without_event_when_cache_unchanged(self):
+        tm = self._make_stub()
+        existing_entries = [(("uuid-x", ("epub",)), "in_progress", {})]
+        existing_sort_keys = {"x": (10, 1)}
+        tm._ui_state_list_cache = existing_entries
+        tm._sort_keys = existing_sort_keys
+        worker = self._make_worker({
+            "mode": "full",
+            "entries": list(existing_entries),
+            "sort_keys": dict(existing_sort_keys),
+        })
+
+        tm._on_cache_updated(worker)
+
+        self.assertEqual(tm._posted_events, [],
+                         "No-op full refresh must not wake UI subscribers")
+        self.assertFalse(tm._is_updating_cache)
+        self.assertIsNone(tm._in_flight_snapshot)
+
     def test_partial_success_emits_changed_ids_excluding_unchanged(self):
         tm = self._make_stub()
         import uuid
@@ -367,6 +386,51 @@ class OnCacheUpdatedTests(unittest.TestCase):
                          "Only b actually changed; a's entry equals the old one and is excluded")
         self.assertIsInstance(data["changed_ids"], list,
                               "Payload must carry list[str], not set")
+
+    def test_partial_success_noops_without_event_when_entries_unchanged(self):
+        tm = self._make_stub()
+        import uuid
+        a = uuid.UUID("00000000-0000-0000-0000-00000000000a")
+        entries = [((a, ("epub",)), "pending", {})]
+        tm._ui_state_list_cache = entries
+        tm._sort_keys = {str(a): (0, 1)}
+        tm._in_flight_snapshot = {"ids": (str(a),), "structural": False}
+        worker = self._make_worker({
+            "mode": "partial",
+            "entries": list(entries),
+            "sort_keys_delta": {str(a): (0, 1)},
+        })
+
+        tm._on_cache_updated(worker)
+
+        self.assertEqual(tm._posted_events, [],
+                         "No-op partial refresh must not wake UI subscribers")
+        self.assertFalse(tm._is_updating_cache)
+        self.assertIsNone(tm._in_flight_snapshot)
+
+    def test_partial_success_reorder_emits_full_redraw(self):
+        tm = self._make_stub()
+        import uuid
+        a = uuid.UUID("00000000-0000-0000-0000-00000000000a")
+        b = uuid.UUID("00000000-0000-0000-0000-00000000000b")
+        old_entries = [((a, ("epub",)), "pending", {}), ((b, ("epub",)), "pending", {})]
+        new_entries = [old_entries[1], old_entries[0]]
+        tm._ui_state_list_cache = old_entries
+        tm._sort_keys = {str(a): (0, 1), str(b): (0, 2)}
+        tm._in_flight_snapshot = {"ids": (str(a), str(b)), "structural": False}
+        worker = self._make_worker({
+            "mode": "partial",
+            "entries": new_entries,
+            "sort_keys_delta": {str(a): (0, 2), str(b): (0, 1)},
+        })
+
+        tm._on_cache_updated(worker)
+
+        self.assertEqual(len(tm._posted_events), 1)
+        _, data = tm._posted_events[0]
+        self.assertIsNone(data["changed_ids"],
+                          "Pure reorder needs a full redraw, not a selective row update")
+        self.assertEqual(data["full_state"], new_entries)
 
     def test_structural_retry_restores_snapshot_and_sets_structural(self):
         tm = self._make_stub()
