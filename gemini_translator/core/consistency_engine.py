@@ -1067,12 +1067,30 @@ class ConsistencyEngine(QObject):
             ),
         }
 
-    def _build_chapters_prompt_text(self, chunk: List[Dict[str, Any]]) -> tuple[str, str, str]:
+    @staticmethod
+    def _safe_non_negative_int(value: Any, default: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(0, parsed)
+
+    def _build_chapters_prompt_text(
+        self,
+        chunk: List[Dict[str, Any]],
+        config: Dict[str, Any] | None = None,
+    ) -> tuple[str, str, str]:
         chapters_text = ""
         translated_text = ""
         source_text = ""
         has_source_reference = False
         source_reference_config = self._source_reference_prompt_config()
+        config = config if isinstance(config, dict) else {}
+        source_chapter_limit = self._safe_non_negative_int(
+            config.get("consistency_original_chapter_limit", 0),
+            default=0,
+        )
+        included_source_chapters = 0
 
         for ch in chunk:
             if not isinstance(ch, dict):
@@ -1083,7 +1101,15 @@ class ConsistencyEngine(QObject):
             original_content = str(ch.get('source_content') or "")
             translated_text += f"\n--- CHAPTER: {chapter_name} ---\n{chapter_content}\n"
 
-            if original_content.strip():
+            include_source = (
+                bool(original_content.strip())
+                and (
+                    source_chapter_limit <= 0
+                    or included_source_chapters < source_chapter_limit
+                )
+            )
+            if include_source:
+                included_source_chapters += 1
                 has_source_reference = True
                 source_path = str(ch.get('source_path') or "").strip()
                 source_path_suffix = f": {source_path}" if source_path else ""
@@ -1110,7 +1136,7 @@ class ConsistencyEngine(QObject):
 
     def _build_analysis_prompt(self, chunk: List[Dict[str, Any]], config: Dict[str, Any]) -> str:
         """Формирует промпт для анализа."""
-        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk)
+        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk, config)
 
         # Умная фильтрация глоссария
         filtered_glossary = self._filter_glossary_for_text(translated_text, source_text)
@@ -1136,7 +1162,7 @@ class ConsistencyEngine(QObject):
 
     def _build_glossary_collection_prompt(self, chunk: List[Dict[str, Any]], config: Dict[str, Any]) -> str:
         """Формирует промпт для сбора глоссария (первый проход двухпроходного режима)."""
-        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk)
+        chapters_text, translated_text, source_text = self._build_chapters_prompt_text(chunk, config)
 
         # Умная фильтрация глоссария
         filtered_glossary = self._filter_glossary_for_text(translated_text, source_text)

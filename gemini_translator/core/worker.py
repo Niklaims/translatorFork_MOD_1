@@ -252,10 +252,6 @@ class UniversalWorker(QObject):
             sequential_chapter_order=getattr(self, 'sequential_chapter_order', []),
             sequential_chain_starts=getattr(self, 'sequential_chain_starts', []),
             sequential_reference_char_limit=getattr(self, 'sequential_reference_char_limit', 60000),
-            source_epub_path=getattr(self, 'file_path', None),
-            sequential_original_context_enabled=getattr(self, 'sequential_original_context_enabled', False),
-            sequential_original_context_chapters=getattr(self, 'sequential_original_context_chapters', 0),
-            sequential_original_context_char_limit=getattr(self, 'sequential_original_context_char_limit', 60000),
         )
 
         # D. ResponseParser

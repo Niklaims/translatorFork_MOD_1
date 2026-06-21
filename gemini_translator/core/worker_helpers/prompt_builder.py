@@ -54,10 +54,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         sequential_chapter_order=None,
         sequential_chain_starts=None,
         sequential_reference_char_limit=60000,
-        source_epub_path=None,
-        sequential_original_context_enabled=False,
-        sequential_original_context_chapters=0,
-        sequential_original_context_char_limit=60000,
     ):
         self.custom_prompt = custom_prompt
         self.context_manager = context_manager
@@ -72,16 +68,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
             if self._normalize_chapter_path(path)
         }
         self.sequential_reference_char_limit = max(0, int(sequential_reference_char_limit or 0))
-        self.source_epub_path = source_epub_path
-        self.sequential_original_context_enabled = bool(sequential_original_context_enabled)
-        self.sequential_original_context_chapters = self._safe_non_negative_int(
-            sequential_original_context_chapters,
-            default=0,
-        )
-        self.sequential_original_context_char_limit = self._safe_non_negative_int(
-            sequential_original_context_char_limit,
-            default=60000,
-        )
         self.system_instruction = None
         self.media_map = {}
 
@@ -89,14 +75,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         if self.sequential_mode:
             return api_config.default_sequential_prompt()
         return self.custom_prompt
-
-    @staticmethod
-    def _safe_non_negative_int(value, default=0):
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            parsed = default
-        return max(0, parsed)
 
     def _normalize_chapter_path(self, chapter_path):
         return str(chapter_path or "").replace("\\", "/").strip()
@@ -134,69 +112,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         if current_index <= 0:
             return None
         return normalized_order[current_index - 1]
-
-    def _source_chapter_candidates_before(self, current_chapters_list=None):
-        if not self.sequential_mode or not self.sequential_original_context_enabled:
-            return []
-        if self.sequential_original_context_chapters <= 0:
-            return []
-
-        first_current = self._first_current_chapter(current_chapters_list)
-        if not first_current:
-            return []
-
-        normalized_order = self._normalized_chapter_order()
-        try:
-            current_index = normalized_order.index(first_current)
-        except ValueError:
-            return []
-        if current_index <= 0:
-            return []
-
-        start_index = max(0, current_index - self.sequential_original_context_chapters)
-        return normalized_order[start_index:current_index]
-
-    def _load_source_chapter_text(self, chapter_path):
-        if not chapter_path or not self.source_epub_path:
-            return ""
-        if not os.path.exists(self.source_epub_path):
-            return ""
-
-        try:
-            with zipfile.ZipFile(self.source_epub_path, "r") as epub_zip:
-                source_text = epub_zip.read(chapter_path).decode("utf-8", "ignore")
-        except (OSError, KeyError, zipfile.BadZipFile):
-            return ""
-
-        return normalize_epub_chapter_heading_to_h1(source_text)
-
-    def _build_previous_original_context(self, current_chapters_list=None):
-        chapter_paths = self._source_chapter_candidates_before(current_chapters_list)
-        if not chapter_paths:
-            return ""
-
-        blocks = []
-        for chapter_path in chapter_paths:
-            source_text = self._load_source_chapter_text(chapter_path)
-            if not source_text.strip():
-                continue
-            blocks.append(
-                f"Previous original source chapter: {chapter_path}\n\n{source_text.strip()}"
-            )
-
-        context_text = "\n\n---\n\n".join(blocks).strip()
-        if not context_text:
-            return ""
-
-        limit = self.sequential_original_context_char_limit
-        if limit and len(context_text) > limit:
-            omitted = len(context_text) - limit
-            context_text = (
-                context_text[-limit:]
-                + f"\n\n[previous original source context truncated: {omitted} chars omitted from the beginning]"
-            )
-
-        return context_text
 
     def _load_translation_reference(self, previous_chapter_path):
         if not previous_chapter_path or not self.project_manager:
@@ -504,14 +419,12 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         final_text_for_api = safe_format(template, full_text_for_api=full_text_for_api)
 
         previous_reference = self._build_previous_chapter_reference(chapter_list)
-        previous_original_context = self._build_previous_original_context(chapter_list)
         user_prompt, _, debug_report = self._build_with_placeholders(
             final_text_for_api,
             glossary_string,
             system_instruction_text,
             batch_mode=True,
             previous_chapter_reference=previous_reference,
-            previous_original_context=previous_original_context,
         )
         return user_prompt, self.system_instruction, debug_report, original_contents
 
@@ -525,13 +438,11 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         payload_text = json.dumps(transport_payload, ensure_ascii=False, indent=2)
         base_text_for_api = f"\n```json\n{payload_text}\n```\n"
         previous_reference = self._build_previous_chapter_reference(current_chapters_list)
-        previous_original_context = self._build_previous_original_context(current_chapters_list)
         user_prompt, _, debug_report = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,
             system_instruction_text,
             previous_chapter_reference=previous_reference,
-            previous_original_context=previous_original_context,
         )
         debug_report = f"{debug_report}\nTRANSPORT: JSON"
         return f"{user_prompt}\n\n{self.JSON_CONTRACT}", self.system_instruction, debug_report, source_payload
@@ -545,14 +456,12 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
         base_text_for_api = f"\n```json\n{payload_text}\n```\n"
         previous_reference = self._build_previous_chapter_reference(current_chapters_list)
-        previous_original_context = self._build_previous_original_context(current_chapters_list)
         user_prompt, _, debug_report = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,
             system_instruction_text,
             batch_mode=True,
             previous_chapter_reference=previous_reference,
-            previous_original_context=previous_original_context,
         )
         debug_report = f"{debug_report}\nTRANSPORT: JSON_BATCH"
         return f"{user_prompt}\n\n{self.JSON_BATCH_CONTRACT}", self.system_instruction, debug_report, payload
@@ -582,13 +491,11 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         # Эта часть будет одинаковой и для первого, и для второго запуска
         base_text_for_api = f"\n```html\n{prettified_content}\n```\n"
         previous_reference = self._build_previous_chapter_reference(current_chapters_list)
-        previous_original_context = self._build_previous_original_context(current_chapters_list)
         user_prompt_base, _, _ = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,
             system_instruction_text,
             previous_chapter_reference=previous_reference,
-            previous_original_context=previous_original_context,
         )
 
         # --- Если это задача на завершение, ДОБАВЛЯЕМ "ХВОСТ" ---
@@ -631,7 +538,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         system_instruction_text,
         batch_mode=False,
         previous_chapter_reference=None,
-        previous_original_context=None,
     ):
         """
         Собирает промпт. Версия с прямой поддержкой системных инструкций.
@@ -686,7 +592,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
             glossary=glossary_string if glossary_string and "Глоссарий пуст" not in glossary_string else "",
             format_examples=examples_content, # <-- Вставляем динамические примеры
             previous_chapter_reference=previous_chapter_reference or "",
-            previous_original_context=previous_original_context or "",
         )
         
         # 3. Собираем отчет (без изменений)
@@ -705,9 +610,6 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         if self.sequential_mode:
             reference_tokens = token_estimator.estimate_tokens(previous_chapter_reference or "")
             report_lines.append(f"SEQUENTIAL REFERENCE: ~{reference_tokens:,} tokens")
-            source_context_tokens = token_estimator.estimate_tokens(previous_original_context or "")
-            if source_context_tokens:
-                report_lines.append(f"SEQUENTIAL ORIGINAL CONTEXT: ~{source_context_tokens:,} tokens")
         report_lines.append(f"ИТОГО НА ВХОД: ~{(est_sys_tokens if self.system_instruction else 0) + est_user_tokens:,} токенов")
         
         debug_report = "\n".join(report_lines)

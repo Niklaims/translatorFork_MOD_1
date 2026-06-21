@@ -253,49 +253,6 @@ class SequentialTranslationTests(unittest.TestCase):
         self.assertIn("Готовая первая глава.", user_prompt)
         self.assertIn("<p>Current</p>", user_prompt)
 
-    def test_prompt_builder_can_include_previous_original_source_context(self):
-        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as epub_file:
-            epub_path = epub_file.name
-        self.addCleanup(lambda: os.path.exists(epub_path) and os.remove(epub_path))
-
-        with zipfile.ZipFile(epub_path, "w") as epub_zip:
-            epub_zip.writestr(
-                "Text/ch1.xhtml",
-                "<html><body><p>Original Alpha Context.</p></body></html>",
-            )
-            epub_zip.writestr(
-                "Text/ch2.xhtml",
-                "<html><body><p>Current Source.</p></body></html>",
-            )
-
-        builder = PromptBuilder(
-            custom_prompt="CUSTOM {text}",
-            context_manager=None,
-            use_system_instruction=False,
-            sequential_mode=True,
-            source_epub_path=epub_path,
-            sequential_chapter_order=["Text/ch1.xhtml", "Text/ch2.xhtml"],
-            sequential_original_context_enabled=True,
-            sequential_original_context_chapters=1,
-        )
-
-        with patch.object(
-            api_config,
-            "default_sequential_prompt",
-            return_value="ORIG={previous_original_context}\nTEXT={text}",
-        ), patch.object(api_config, "internal_prompts", return_value={"translation_output_examples": {}}):
-            user_prompt, _, debug_report = builder._build_with_placeholders(
-                "<p>Current</p>",
-                "",
-                "",
-                previous_original_context=builder._build_previous_original_context(["Text/ch2.xhtml"]),
-            )
-
-        self.assertIn("Previous original source chapter: Text/ch1.xhtml", user_prompt)
-        self.assertIn("Original Alpha Context.", user_prompt)
-        self.assertIn("<p>Current</p>", user_prompt)
-        self.assertIn("SEQUENTIAL ORIGINAL CONTEXT", debug_report)
-
     def test_prompt_builder_treats_chain_start_as_no_previous_reference(self):
         builder = PromptBuilder(
             custom_prompt="CUSTOM {text}",

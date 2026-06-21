@@ -4371,20 +4371,6 @@ class InitialSetupDialog(QDialog):
             translation_options['max_chapters_per_batch'] = chapter_limit
             has_override = True
 
-        if auto_settings.get('source_context_enabled'):
-            source_context_chapters = max(
-                1,
-                _safe_int(auto_settings.get('source_context_chapters', 1) or 1, default=1),
-            )
-            source_context_char_limit = max(
-                1000,
-                _safe_int(auto_settings.get('source_context_char_limit', 60000) or 60000, default=60000),
-            )
-            translation_options['sequential_original_context_enabled'] = True
-            translation_options['sequential_original_context_chapters'] = source_context_chapters
-            translation_options['sequential_original_context_char_limit'] = source_context_char_limit
-            has_override = True
-
         return translation_options, mode, has_override, batch_token_limit, batch_task_limit, token_profile
 
     def _build_sequential_chapter_chains(self, chapters: list, split_count: int) -> list[list]:
@@ -5664,7 +5650,20 @@ class InitialSetupDialog(QDialog):
         self.check_ready()
 
     def _run_auto_consistency_followup(self, auto_settings: dict):
-        include_original = bool(auto_settings.get('ai_consistency_use_original', False))
+        include_original = bool(
+            auto_settings.get('ai_consistency_use_original', False)
+            or auto_settings.get('source_context_enabled', False)
+        )
+        try:
+            original_chapter_limit = int(auto_settings.get('ai_consistency_original_chapter_limit', 0) or 0)
+        except (TypeError, ValueError):
+            original_chapter_limit = 0
+        if original_chapter_limit <= 0 and auto_settings.get('source_context_enabled'):
+            try:
+                original_chapter_limit = int(auto_settings.get('source_context_chapters', 0) or 0)
+            except (TypeError, ValueError):
+                original_chapter_limit = 0
+        original_chapter_limit = max(0, original_chapter_limit)
         chapters_to_analyze = load_project_chapters_for_consistency(
             self.project_manager,
             original_epub_path=getattr(self, 'selected_file', None),
@@ -5698,6 +5697,7 @@ class InitialSetupDialog(QDialog):
             'chunk_size': int(auto_settings.get('ai_consistency_chunk_size', 3)),
             'consistency_fix_confidences': list(selected_confidences),
             'consistency_include_original': include_original,
+            'consistency_original_chapter_limit': original_chapter_limit,
         })
 
         self._auto_followup_running = True
@@ -5705,9 +5705,14 @@ class InitialSetupDialog(QDialog):
         self._auto_log("Запускаю AI-проверку согласованности…", force=True)
         if include_original:
             chapters_with_original = sum(1 for chapter in chapters_to_analyze if chapter.get('source_content'))
+            limit_text = (
+                f", не больше {original_chapter_limit} исходных глав на запрос"
+                if original_chapter_limit > 0
+                else ""
+            )
             self._auto_log(
                 f"AI-consistency будет сверять перевод с оригиналом EPUB: "
-                f"{chapters_with_original}/{len(chapters_to_analyze)} глав с исходным текстом.",
+                f"{chapters_with_original}/{len(chapters_to_analyze)} глав с исходным текстом{limit_text}.",
             )
         self._auto_log(
             f"AI-consistency анализирует {len(chapters_to_analyze)} глав: "

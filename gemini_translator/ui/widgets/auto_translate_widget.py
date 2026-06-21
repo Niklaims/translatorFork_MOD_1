@@ -37,9 +37,6 @@ AUTO_TRANSLATION_DEFAULTS = {
     "thinking_mode_override": "inherit",
     "batch_token_limit_override": 0,
     "batch_chapter_limit_override": 0,
-    "source_context_enabled": False,
-    "source_context_chapters": 1,
-    "source_context_char_limit": 60000,
     "retry_short_enabled": True,
     "retry_short_ratio": 0.70,
     "retry_short_ratio_mode": "translation_over_original",
@@ -55,6 +52,7 @@ AUTO_TRANSLATION_DEFAULTS = {
     "ai_consistency_enabled": False,
     "ai_consistency_auto_fix": True,
     "ai_consistency_use_original": False,
+    "ai_consistency_original_chapter_limit": 0,
     "ai_consistency_fix_confidences": ["high", "medium", "low"],
     "ai_consistency_mode": "standard",
     "ai_consistency_chunk_size": 3,
@@ -245,18 +243,6 @@ class AutoTranslateWidget(QWidget):
             "0 = не ограничивать количество глав в одном запросе.\n"
             "Ненулевое значение ограничивает пакет основного автоперевода по числу глав."
         )
-        self.source_context_checkbox = QCheckBox("Добавлять исходные главы как контекст")
-        self.source_context_checkbox.setToolTip(
-            "В последовательном переводе добавляет предыдущие главы из оригинального EPUB в промпт.\n"
-            "Это контекст до перевода: модель не должна переводить его как текущий фрагмент."
-        )
-        self.source_context_chapters_spin = NoScrollSpinBox()
-        self.source_context_chapters_spin.setRange(1, 10)
-        self.source_context_chapters_spin.setValue(1)
-        self.source_context_chapters_spin.setToolTip(
-            "Сколько предыдущих исходных глав прикладывать к sequential-промпту."
-        )
-
         profile_group = QGroupBox("Профиль основного прогона")
         profile_layout = QGridLayout(profile_group)
         profile_layout.addWidget(QLabel("Режим очереди:"), 0, 0)
@@ -269,9 +255,6 @@ class AutoTranslateWidget(QWidget):
         profile_layout.addWidget(self.batch_tokens_spin, 3, 1)
         profile_layout.addWidget(QLabel("Глав в одном запросе:"), 4, 0)
         profile_layout.addWidget(self.batch_chapters_spin, 4, 1)
-        profile_layout.addWidget(self.source_context_checkbox, 5, 0, 1, 2)
-        profile_layout.addWidget(QLabel("Исходных глав контекста:"), 6, 0)
-        profile_layout.addWidget(self.source_context_chapters_spin, 6, 1)
 
         self.translation_profile_hint = QLabel(
             "0 в лимите пакета = наследовать общий размер задачи. Значение в токенах "
@@ -282,7 +265,7 @@ class AutoTranslateWidget(QWidget):
         self.translation_profile_hint.setText(
             "0 in batch limit inherits the common task size. Non-zero values are Gemini input tokens and are used directly."
         )
-        profile_layout.addWidget(self.translation_profile_hint, 7, 0, 1, 2)
+        profile_layout.addWidget(self.translation_profile_hint, 5, 0, 1, 2)
 
         self.translation_summary_frame = QFrame()
         self.translation_summary_frame.setObjectName("autoTranslationSummaryFrame")
@@ -411,6 +394,13 @@ class AutoTranslateWidget(QWidget):
             "Добавляет исходный непереведённый HTML/XHTML текущей главы в prompt AI-consistency как reference-only блок. "
             "Увеличивает входной контекст и расход токенов."
         )
+        self.ai_consistency_original_chapters_spin = NoScrollSpinBox()
+        self.ai_consistency_original_chapters_spin.setRange(0, 10)
+        self.ai_consistency_original_chapters_spin.setValue(0)
+        self.ai_consistency_original_chapters_spin.setToolTip(
+            "Сколько оригинальных глав прикладывать к одному запросу AI-согласованности.\n"
+            "0 = прикладывать оригинал для всех глав текущего чанка согласованности."
+        )
         self.ai_consistency_mode_combo = NoScrollComboBox()
         self.ai_consistency_mode_combo.addItem("Обычный анализ", userData="standard")
         self.ai_consistency_mode_combo.addItem("Сначала собрать контекст/глоссарий", userData="glossary_first")
@@ -437,19 +427,21 @@ class AutoTranslateWidget(QWidget):
         consistency_layout.addWidget(self.ai_consistency_checkbox, 0, 0, 1, 2)
         consistency_layout.addWidget(self.ai_consistency_auto_fix_checkbox, 1, 0, 1, 2)
         consistency_layout.addWidget(self.ai_consistency_use_original_checkbox, 2, 0, 1, 2)
-        consistency_layout.addWidget(QLabel("Режим:"), 3, 0)
-        consistency_layout.addWidget(self.ai_consistency_mode_combo, 3, 1)
-        consistency_layout.addWidget(QLabel("Автоисправление по уровням:"), 4, 0)
-        consistency_layout.addLayout(confidence_fix_levels_layout, 4, 1)
-        consistency_layout.addWidget(QLabel("Глав в чанке:"), 5, 0)
-        consistency_layout.addWidget(self.ai_consistency_chunk_spin, 5, 1)
+        consistency_layout.addWidget(QLabel("Исходных глав в запросе:"), 3, 0)
+        consistency_layout.addWidget(self.ai_consistency_original_chapters_spin, 3, 1)
+        consistency_layout.addWidget(QLabel("Режим:"), 4, 0)
+        consistency_layout.addWidget(self.ai_consistency_mode_combo, 4, 1)
+        consistency_layout.addWidget(QLabel("Автоисправление по уровням:"), 5, 0)
+        consistency_layout.addLayout(confidence_fix_levels_layout, 5, 1)
+        consistency_layout.addWidget(QLabel("Глав в чанке:"), 6, 0)
+        consistency_layout.addWidget(self.ai_consistency_chunk_spin, 6, 1)
         consistency_hint = QLabel(
             "AI-consistency всегда анализирует все найденные проблемы. Эти флажки управляют только тем, "
             "какие уровни уверенности будут автоматически исправляться и сохраняться."
         )
         consistency_hint.setWordWrap(True)
         consistency_hint.setStyleSheet("color: #9aa4b2;")
-        consistency_layout.addWidget(consistency_hint, 6, 0, 1, 2)
+        consistency_layout.addWidget(consistency_hint, 7, 0, 1, 2)
         content_layout.addWidget(consistency_group)
 
         footer_label = QLabel(
@@ -487,8 +479,6 @@ class AutoTranslateWidget(QWidget):
             self.thinking_override_combo,
             self.batch_tokens_spin,
             self.batch_chapters_spin,
-            self.source_context_checkbox,
-            self.source_context_chapters_spin,
             self.retry_short_checkbox,
             self.retry_short_ratio_spin,
             self.retry_untranslated_checkbox,
@@ -503,6 +493,7 @@ class AutoTranslateWidget(QWidget):
             self.ai_consistency_checkbox,
             self.ai_consistency_auto_fix_checkbox,
             self.ai_consistency_use_original_checkbox,
+            self.ai_consistency_original_chapters_spin,
             self.ai_consistency_mode_combo,
             self.ai_consistency_fix_high_checkbox,
             self.ai_consistency_fix_medium_checkbox,
@@ -892,11 +883,6 @@ class AutoTranslateWidget(QWidget):
                 if "символ" not in note.lower() and "СЃРёРј" not in note
             ]
             notes.append("The token limit is used directly when building tasks.")
-        if self.source_context_checkbox.isChecked():
-            notes.append(
-                "В sequential-режиме будет добавлен оригинальный контекст: "
-                f"{int(self.source_context_chapters_spin.value())} предыдущ. глав."
-            )
         self.translation_summary_note.setText(" ".join(notes))
 
     def _update_control_states(self):
@@ -913,12 +899,14 @@ class AutoTranslateWidget(QWidget):
         auto_fix_enabled = consistency_enabled and self.ai_consistency_auto_fix_checkbox.isChecked()
         self.ai_consistency_auto_fix_checkbox.setEnabled(consistency_enabled)
         self.ai_consistency_use_original_checkbox.setEnabled(consistency_enabled)
+        self.ai_consistency_original_chapters_spin.setEnabled(
+            consistency_enabled and self.ai_consistency_use_original_checkbox.isChecked()
+        )
         self.ai_consistency_mode_combo.setEnabled(consistency_enabled)
         self.ai_consistency_fix_high_checkbox.setEnabled(auto_fix_enabled)
         self.ai_consistency_fix_medium_checkbox.setEnabled(auto_fix_enabled)
         self.ai_consistency_fix_low_checkbox.setEnabled(auto_fix_enabled)
         self.ai_consistency_chunk_spin.setEnabled(consistency_enabled)
-        self.source_context_chapters_spin.setEnabled(self.source_context_checkbox.isChecked())
 
     def _get_ai_consistency_fix_confidences(self):
         selected = []
@@ -944,9 +932,6 @@ class AutoTranslateWidget(QWidget):
             "thinking_mode_override": self.thinking_override_combo.currentData() or "inherit",
             "batch_token_limit_override": int(self.batch_tokens_spin.value()),
             "batch_chapter_limit_override": int(self.batch_chapters_spin.value()),
-            "source_context_enabled": self.source_context_checkbox.isChecked(),
-            "source_context_chapters": int(self.source_context_chapters_spin.value()),
-            "source_context_char_limit": int(AUTO_TRANSLATION_DEFAULTS["source_context_char_limit"]),
             "retry_short_enabled": self.retry_short_checkbox.isChecked(),
             "retry_short_ratio": round(float(self.retry_short_ratio_spin.value()), 2),
             "retry_short_ratio_mode": "translation_over_original",
@@ -962,6 +947,7 @@ class AutoTranslateWidget(QWidget):
             "ai_consistency_enabled": self.ai_consistency_checkbox.isChecked(),
             "ai_consistency_auto_fix": self.ai_consistency_auto_fix_checkbox.isChecked(),
             "ai_consistency_use_original": self.ai_consistency_use_original_checkbox.isChecked(),
+            "ai_consistency_original_chapter_limit": int(self.ai_consistency_original_chapters_spin.value()),
             "ai_consistency_fix_confidences": self._get_ai_consistency_fix_confidences(),
             "ai_consistency_mode": self.ai_consistency_mode_combo.currentData() or "standard",
             "ai_consistency_chunk_size": int(self.ai_consistency_chunk_spin.value()),
@@ -995,10 +981,6 @@ class AutoTranslateWidget(QWidget):
             self._rebuild_thinking_override_combo(selected_override=selected_thinking)
             self.batch_tokens_spin.setValue(int(merged.get("batch_token_limit_override", 0) or 0))
             self.batch_chapters_spin.setValue(int(merged.get("batch_chapter_limit_override", 0) or 0))
-            self.source_context_checkbox.setChecked(bool(merged.get("source_context_enabled", False)))
-            self.source_context_chapters_spin.setValue(
-                max(1, int(merged.get("source_context_chapters", 1) or 1))
-            )
 
             legacy_ratio_value = None
             if isinstance(settings, dict) and "retry_short_ratio" in settings:
@@ -1021,7 +1003,20 @@ class AutoTranslateWidget(QWidget):
             self.retry_network_delay_spin.setValue(int(merged.get("retry_network_failed_delay_sec", 60)))
             self.ai_consistency_checkbox.setChecked(bool(merged.get("ai_consistency_enabled", False)))
             self.ai_consistency_auto_fix_checkbox.setChecked(bool(merged.get("ai_consistency_auto_fix", True)))
-            self.ai_consistency_use_original_checkbox.setChecked(bool(merged.get("ai_consistency_use_original", False)))
+            legacy_source_context_enabled = bool(merged.get("source_context_enabled", False))
+            self.ai_consistency_use_original_checkbox.setChecked(
+                bool(merged.get("ai_consistency_use_original", False) or legacy_source_context_enabled)
+            )
+            original_chapter_limit = merged.get("ai_consistency_original_chapter_limit")
+            has_explicit_original_limit = (
+                isinstance(settings, dict)
+                and "ai_consistency_original_chapter_limit" in settings
+            )
+            if not has_explicit_original_limit and legacy_source_context_enabled:
+                original_chapter_limit = merged.get("source_context_chapters", 0)
+            self.ai_consistency_original_chapters_spin.setValue(
+                max(0, int(original_chapter_limit or 0))
+            )
             confidence_values = merged.get("ai_consistency_fix_confidences")
             if not isinstance(confidence_values, (list, tuple, set)):
                 confidence_values = AUTO_TRANSLATION_DEFAULTS["ai_consistency_fix_confidences"]

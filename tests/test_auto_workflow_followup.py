@@ -349,7 +349,7 @@ class _ConsistencyProjectManagerStub:
 
 
 class AutoWorkflowFollowupTests(unittest.TestCase):
-    def test_auto_translation_options_include_chapter_limit_and_source_context(self):
+    def test_auto_translation_options_include_chapter_limit(self):
         harness = _AutoTranslationOptionsHarness()
 
         options, mode, has_override, batch_tokens, batch_task_limit, profile = (
@@ -357,9 +357,6 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
                 "translation_mode_override": "batch",
                 "batch_token_limit_override": 2000,
                 "batch_chapter_limit_override": 3,
-                "source_context_enabled": True,
-                "source_context_chapters": 2,
-                "source_context_char_limit": 40000,
             })
         )
 
@@ -371,9 +368,9 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
         self.assertTrue(options["use_batching"])
         self.assertFalse(options["chunking"])
         self.assertEqual(options["max_chapters_per_batch"], 3)
-        self.assertTrue(options["sequential_original_context_enabled"])
-        self.assertEqual(options["sequential_original_context_chapters"], 2)
-        self.assertEqual(options["sequential_original_context_char_limit"], 40000)
+        self.assertNotIn("sequential_original_context_enabled", options)
+        self.assertNotIn("sequential_original_context_chapters", options)
+        self.assertNotIn("sequential_original_context_char_limit", options)
 
     def test_load_project_chapters_for_consistency_can_include_original_epub_text(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -961,6 +958,7 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         auto_settings = {
             "ai_consistency_auto_fix": False,
             "ai_consistency_use_original": True,
+            "ai_consistency_original_chapter_limit": 2,
             "ai_consistency_chunk_size": 1,
         }
 
@@ -980,9 +978,44 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         )
         worker = _AutoConsistencyWorkerStub.instances[0]
         self.assertTrue(worker.config["consistency_include_original"])
+        self.assertEqual(worker.config["consistency_original_chapter_limit"], 2)
         self.assertTrue(
             any("будет сверять перевод с оригиналом EPUB" in entry["message"] for entry in harness.logs)
         )
+
+    def test_run_auto_consistency_followup_migrates_legacy_source_context_setting(self):
+        harness = _AutoConsistencyFollowupHarness()
+        chapters = [
+            {
+                "name": "chapter1.xhtml",
+                "content": "<p>one</p>",
+                "source_content": "<p>source</p>",
+                "path": "C:/temp/ch1.xhtml",
+            }
+        ]
+        auto_settings = {
+            "ai_consistency_auto_fix": False,
+            "source_context_enabled": True,
+            "source_context_chapters": 4,
+        }
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.load_project_chapters_for_consistency",
+            return_value=chapters,
+        ) as loader, patch(
+            "gemini_translator.ui.dialogs.setup.AutoConsistencyWorker",
+            _AutoConsistencyWorkerStub,
+        ):
+            harness._run_auto_consistency_followup(auto_settings)
+
+        loader.assert_called_once_with(
+            harness.project_manager,
+            original_epub_path=harness.selected_file,
+            include_original=True,
+        )
+        worker = _AutoConsistencyWorkerStub.instances[0]
+        self.assertTrue(worker.config["consistency_include_original"])
+        self.assertEqual(worker.config["consistency_original_chapter_limit"], 4)
 
     def test_run_auto_consistency_followup_keeps_empty_level_selection(self):
         harness = _AutoConsistencyFollowupHarness()

@@ -103,6 +103,32 @@ class ConsistencyResponseNormalizationTests(unittest.TestCase):
         self.assertIn("他走进大厅", prompt)
         self.assertIn("Он вошёл", prompt)
 
+    def test_analysis_prompt_limits_original_source_chapters_per_request(self):
+        engine = ConsistencyEngine(object())
+
+        prompt = engine._build_analysis_prompt(
+            [
+                {
+                    "name": "chapter_01.xhtml",
+                    "content": "<p>Translated one.</p>",
+                    "source_content": "<p>SOURCE ONE</p>",
+                    "source_path": "Text/chapter_01.xhtml",
+                },
+                {
+                    "name": "chapter_02.xhtml",
+                    "content": "<p>Translated two.</p>",
+                    "source_content": "<p>SOURCE TWO</p>",
+                    "source_path": "Text/chapter_02.xhtml",
+                },
+            ],
+            {"consistency_original_chapter_limit": 1},
+        )
+
+        self.assertIn("SOURCE ORIGINAL", prompt)
+        self.assertIn("SOURCE ONE", prompt)
+        self.assertNotIn("SOURCE TWO", prompt)
+        self.assertIn("Translated two.", prompt)
+
     def test_source_reference_prompt_can_be_configured(self):
         engine = ConsistencyEngine(object())
 
