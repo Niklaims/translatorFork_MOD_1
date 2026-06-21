@@ -149,6 +149,33 @@ class DiffGateTests(unittest.TestCase):
         userrole_calls = [c for c in data_calls if c[0] == QtCore.Qt.ItemDataRole.UserRole]
         self.assertEqual(userrole_calls, [], "UserRole setData should be skipped when value unchanged")
 
+    def test_reorder_cell_reuses_standard_icons(self):
+        widget = self._make_widget()
+
+        class _StyleSpy:
+            def __init__(self):
+                self.calls = []
+            def standardIcon(self, pixmap):
+                self.calls.append(pixmap)
+                return QtGui.QIcon()
+
+        style = _StyleSpy()
+        widget.style = lambda: style
+
+        first = widget._create_reorder_cell_widget(0)
+        second = widget._create_reorder_cell_widget(1)
+        self.addCleanup(first.deleteLater)
+        self.addCleanup(second.deleteLater)
+
+        self.assertEqual(
+            style.calls,
+            [
+                QtWidgets.QStyle.StandardPixmap.SP_ArrowUp,
+                QtWidgets.QStyle.StandardPixmap.SP_ArrowDown,
+            ],
+            "Reorder buttons should reuse cached icons across rows",
+        )
+
 
 import uuid
 

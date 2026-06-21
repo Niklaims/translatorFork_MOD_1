@@ -1,9 +1,10 @@
 import os
+import types
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from gemini_translator.ui.widgets.task_management_widget import TaskManagementWidget
 
@@ -18,15 +19,15 @@ class RedrawTuningTests(unittest.TestCase):
         self.addCleanup(w.deleteLater)
         return w
 
-    def test_set_session_mode_active_uses_150ms_coarse_timer(self):
+    def test_set_session_mode_active_uses_500ms_coarse_timer(self):
         widget = self._make_widget()
         widget.set_session_mode(True)
 
-        self.assertEqual(widget._redraw_timer.interval(), 150)
+        self.assertEqual(widget._redraw_timer.interval(), 500)
         self.assertEqual(
             widget._redraw_timer.timerType(),
             QtCore.Qt.TimerType.CoarseTimer,
-            "Use CoarseTimer (5% slack) for 150ms — VeryCoarseTimer would round to 1s.",
+            "Use CoarseTimer so active-session table redraws can be coalesced by macOS.",
         )
 
     def test_set_session_mode_inactive_restores_35ms_precise(self):
@@ -39,6 +40,35 @@ class RedrawTuningTests(unittest.TestCase):
             widget._redraw_timer.timerType(),
             QtCore.Qt.TimerType.PreciseTimer,
         )
+
+    def test_do_redraw_skips_retry_visibility_scan_during_active_session(self):
+        widget = self._make_widget()
+        widget.isVisible = lambda: True  # exercise the visible redraw path
+        widget._is_session_active = True
+        widget._pending_ui_state = []
+
+        update_calls = []
+        retry_scan_calls = []
+        widget.chapter_list_widget = types.SimpleNamespace(
+            update_list=lambda *args: update_calls.append(args)
+        )
+        widget.check_and_update_retry_button_visibility = lambda: retry_scan_calls.append(True)
+
+        app = QtWidgets.QApplication.instance()
+        previous_engine = getattr(app, "engine", "__missing__")
+        app.engine = types.SimpleNamespace(
+            task_manager=types.SimpleNamespace(get_ui_state_list=lambda: [])
+        )
+        if previous_engine == "__missing__":
+            self.addCleanup(lambda: delattr(app, "engine"))
+        else:
+            self.addCleanup(lambda: setattr(app, "engine", previous_engine))
+
+        widget._do_redraw()
+
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(retry_scan_calls, [],
+                         "Retry-button visibility scan is idle/end-of-session UI work")
 
     def test_on_filter_changed_clears_pending_changed_ids(self):
         widget = self._make_widget()
@@ -119,6 +149,48 @@ class RedrawTuningTests(unittest.TestCase):
         })
         self.assertIsNone(widget._pending_changed_ids,
                           "Once a full refresh is pending, a later partial must not downgrade it")
+
+    def test_do_redraw_deferred_when_tab_hidden(self):
+        widget = self._make_widget()  # never shown → not visible
+        self.assertFalse(widget.isVisible())
+        rebuilds = []
+        widget.chapter_list_widget = types.SimpleNamespace(
+            update_list=lambda *args, **kwargs: rebuilds.append((args, kwargs))
+        )
+        widget._pending_ui_state = [(("u", ("epub",)), "pending", {})]
+
+        widget._do_redraw()
+
+        self.assertEqual(rebuilds, [],
+                         "Hidden task tab must not rebuild the table (setCellWidget churn).")
+        self.assertTrue(widget._redraw_pending)
+        self.assertIsNotNone(widget._pending_ui_state,
+                             "Pending state must be preserved for the deferred redraw.")
+
+    def test_show_event_runs_deferred_full_redraw(self):
+        widget = self._make_widget()
+        widget._redraw_pending = True
+        widget._pending_changed_ids = {"x"}
+        redraw_calls = []
+        widget.redraw_ui = lambda: redraw_calls.append(True)
+
+        widget.showEvent(QtGui.QShowEvent())
+
+        self.assertFalse(widget._redraw_pending)
+        self.assertIsNone(widget._pending_changed_ids,
+                          "A redraw deferred while hidden must rebuild fully, not selectively.")
+        self.assertEqual(redraw_calls, [True])
+
+    def test_show_event_noop_when_nothing_pending(self):
+        widget = self._make_widget()
+        widget._redraw_pending = False
+        redraw_calls = []
+        widget.redraw_ui = lambda: redraw_calls.append(True)
+
+        widget.showEvent(QtGui.QShowEvent())
+
+        self.assertEqual(redraw_calls, [],
+                         "No redraw on show if nothing changed while hidden.")
 
 
 if __name__ == "__main__":
