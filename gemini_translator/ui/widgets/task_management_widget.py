@@ -46,6 +46,9 @@ class TaskManagementWidget(QWidget):
         super().__init__(parent)
         self._is_session_active = False # <--- НОВАЯ СТРОКА
         self._pending_ui_state = None
+        self._pending_changed_ids = None  # set[str] | None — partial-event filter from TaskManager
+        self._uses_topic_subscription = False
+        self.bus = None
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.setInterval(35)
@@ -63,7 +66,13 @@ class TaskManagementWidget(QWidget):
         # ---------------------------------------------
         app = QtWidgets.QApplication.instance()
         if hasattr(app, 'event_bus'):
-            app.event_bus.event_posted.connect(self.on_event)
+            self.bus = app.event_bus
+            if hasattr(self.bus, "subscribe"):
+                self.bus.subscribe("task_state_changed", self._on_task_state_changed)
+                self.bus.subscribe("session_finished", self._on_session_finished)
+                self._uses_topic_subscription = True
+            elif hasattr(self.bus, "event_posted"):
+                self.bus.event_posted.connect(self.on_event)
         # --- КОНЕЦ ИЗМЕНЕНИЙ ---
     
     def _init_ui(self):
@@ -76,7 +85,7 @@ class TaskManagementWidget(QWidget):
         self.category_filter_combo = QComboBox()
         self.category_filter_combo.addItems(self.ERROR_FILTERS.keys())
         self.category_filter_combo.setToolTip("Фильтр задач по типу возникшей ошибки (история ошибок)")
-        self.category_filter_combo.currentTextChanged.connect(self.redraw_ui)
+        self.category_filter_combo.currentTextChanged.connect(self._on_filter_changed)
         self.category_filter_combo.setMinimumWidth(150)
         action_panel_layout.addWidget(self.category_filter_combo)
         
@@ -164,6 +173,15 @@ class TaskManagementWidget(QWidget):
         if visible and not self._is_session_active:
             self.retry_filtered_btn.setEnabled(True)
         
+    def _on_filter_changed(self, _text):
+        """Filter combobox changed — drop any pending partial update and force a
+        fresh full redraw. Otherwise a partial task_state_changed pending from
+        before the filter change would touch only its rows in a freshly filtered
+        list, leaving the filtered view inconsistent."""
+        self._pending_changed_ids = None
+        self._pending_ui_state = None
+        self.redraw_ui()
+
     def redraw_ui(self):
         """
         С НЕБОЛЬШОЙ ЗАДЕРЖКОЙ запрашивает актуальный список состояния
@@ -173,10 +191,23 @@ class TaskManagementWidget(QWidget):
         self._redraw_timer.start()
 
 
+    def _apply_active_session_redraw_tuning(self, active: bool):
+        """During an active translation session, slow the redraw debounce
+        from 35 ms (PreciseTimer) to 150 ms (CoarseTimer). The list updates
+        are not user-driven during a session, so the slack is invisible to
+        the user but lets macOS coalesce Qt timer wake-ups."""
+        if active:
+            self._redraw_timer.setInterval(150)
+            self._redraw_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
+        else:
+            self._redraw_timer.setInterval(35)
+            self._redraw_timer.setTimerType(QtCore.Qt.TimerType.PreciseTimer)
+
     def set_session_mode(self, is_session_active):
         """
         Переключает доступность кнопок управления списком.
         """
+        self._apply_active_session_redraw_tuning(is_session_active)
         self._is_session_active = is_session_active # <--- ЗАПОМИНАЕМ СОСТОЯНИЕ
         
         # --- Кнопки, которые меняют структуру задач (блокируются) ---
@@ -207,15 +238,39 @@ class TaskManagementWidget(QWidget):
             event_name = event_data.get('event')
 
             if event_name == 'task_state_changed':
-                full_state = event_data.get('data', {}).get('full_state')
-                if isinstance(full_state, list):
-                    self._pending_ui_state = full_state
-                self.redraw_ui()
+                self._on_task_state_changed(event_data)
 
             if event_name == 'session_finished':
-                QtCore.QTimer.singleShot(100, self.check_and_update_retry_button_visibility)
+                self._on_session_finished(event_data)
         except Exception as e:
             self._log_ui_error("on_event", e)
+
+    def _on_task_state_changed(self, event_data: dict):
+        data = event_data.get('data', {})
+        full_state = data.get('full_state')
+        if isinstance(full_state, list):
+            self._pending_ui_state = full_state
+
+        changed_ids = data.get('changed_ids')
+        new_set = None if changed_ids is None else set(changed_ids)
+
+        # Coalesce changed_ids across events that land within one debounce window.
+        # The single-shot _redraw_timer is INACTIVE only on a clean slate (no
+        # pending redraw); ACTIVE means we are mid-window and must merge rather
+        # than overwrite. None means "full redraw" and is sticky within a window:
+        # a full refresh must never be downgraded to a partial, and a partial must
+        # never clobber a pending full.
+        if not self._redraw_timer.isActive():
+            self._pending_changed_ids = new_set
+        elif new_set is None or self._pending_changed_ids is None:
+            self._pending_changed_ids = None
+        else:
+            self._pending_changed_ids |= new_set
+
+        self.redraw_ui()
+
+    def _on_session_finished(self, _event_data: dict):
+        QtCore.QTimer.singleShot(100, self.check_and_update_retry_button_visibility)
 
     def _do_redraw(self):
         try:
@@ -243,9 +298,14 @@ class TaskManagementWidget(QWidget):
                         errors_map = details.get('errors', {})
                         if filter_key in errors_map:
                             filtered_list.append(item)
+                    # When a filter is applied, changed_ids may point at rows excluded
+                    # from filtered_list; safer to force a full update on this branch.
                     self.chapter_list_widget.update_list(filtered_list)
+                    self._pending_changed_ids = None
                 else:
-                    self.chapter_list_widget.update_list(ui_state_list)
+                    # NOTE: interim two-arg call — Task 16 extends update_list signature.
+                    self.chapter_list_widget.update_list(ui_state_list, self._pending_changed_ids)
+                    self._pending_changed_ids = None
 
                 self.check_and_update_retry_button_visibility()
         except Exception as e:
@@ -275,10 +335,13 @@ class TaskManagementWidget(QWidget):
 
     def closeEvent(self, event):
         """Отписываемся от шины при закрытии/уничтожении виджета."""
-        app = QtWidgets.QApplication.instance()
-        if hasattr(app, 'event_bus'):
+        if self.bus:
             try:
-                app.event_bus.event_posted.disconnect(self.on_event)
-            except (TypeError, RuntimeError):
+                if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
+                    self.bus.unsubscribe("task_state_changed", self._on_task_state_changed)
+                    self.bus.unsubscribe("session_finished", self._on_session_finished)
+                elif hasattr(self.bus, "event_posted"):
+                    self.bus.event_posted.disconnect(self.on_event)
+            except (TypeError, RuntimeError, ValueError):
                 pass
         super().closeEvent(event)

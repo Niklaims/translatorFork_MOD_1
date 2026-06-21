@@ -865,12 +865,149 @@ class ApplicationWithContext(QtWidgets.QApplication):
 
 class EventBus(QtCore.QObject):
     import threading
+    class _TopicEmitter(QtCore.QObject):
+        event_posted = QtCore.pyqtSignal(dict)
+
     event_posted = QtCore.pyqtSignal(dict)
+    _subscribe_requested = QtCore.pyqtSignal(str, object, object, object)
+    _unsubscribe_requested = QtCore.pyqtSignal(str, object, object, object)
+    _unsubscribe_all_requested = QtCore.pyqtSignal(object, object, object)
     # Новые атрибуты и методы для "шины с инерцией"
     # Сигнал, который передает ключ измененных данных
     data_changed = QtCore.pyqtSignal(str)
     _data_store = {}
     _lock = threading.Lock()
+
+    def __init__(self):
+        super().__init__()
+        self._topic_subscribers = {}
+        self._topic_lock = self.threading.Lock()
+        self.event_posted.connect(self._dispatch_to_topics)
+        self._subscribe_requested.connect(self._subscribe_in_bus_thread)
+        self._unsubscribe_requested.connect(self._unsubscribe_in_bus_thread)
+        self._unsubscribe_all_requested.connect(self._unsubscribe_all_in_bus_thread)
+
+    def subscribe(self, event_name: str, callback):
+        """Подписывает callback только на конкретный тип события."""
+        self._subscribe_impl(event_name, callback)
+
+    def _subscribe_impl(self, event_name: str, callback):
+        with self._topic_lock:
+            subscribers = self._topic_subscribers.setdefault(event_name, [])
+            if any(item[0] == callback for item in subscribers):
+                return
+            emitter = self._TopicEmitter()
+            if emitter.thread() != self.thread():
+                emitter.moveToThread(self.thread())
+            receiver = getattr(callback, "__self__", None)
+            connection_type = (
+                QtCore.Qt.ConnectionType.AutoConnection
+                if isinstance(receiver, QtCore.QObject)
+                else QtCore.Qt.ConnectionType.DirectConnection
+            )
+            emitter.event_posted.connect(callback, connection_type)
+            subscribers.append((callback, emitter))
+
+    @QtCore.pyqtSlot(str, object, object, object)
+    def _subscribe_in_bus_thread(self, event_name: str, callback, done, errors):
+        self._complete_thread_hop(
+            done,
+            errors,
+            lambda: self._subscribe_impl(event_name, callback),
+        )
+
+    def unsubscribe(self, event_name: str, callback):
+        """Убирает callback из конкретной topic-подписки."""
+        self._unsubscribe_impl(event_name, callback)
+
+    def _unsubscribe_impl(self, event_name: str, callback):
+        with self._topic_lock:
+            subscribers = self._topic_subscribers.get(event_name)
+            if not subscribers:
+                return
+            remaining = []
+            for subscribed_callback, emitter in subscribers:
+                if subscribed_callback == callback:
+                    try:
+                        emitter.event_posted.disconnect(callback)
+                    except (TypeError, RuntimeError):
+                        pass
+                    emitter.deleteLater()
+                else:
+                    remaining.append((subscribed_callback, emitter))
+            subscribers[:] = remaining
+            if not subscribers:
+                self._topic_subscribers.pop(event_name, None)
+
+    @QtCore.pyqtSlot(str, object, object, object)
+    def _unsubscribe_in_bus_thread(self, event_name: str, callback, done, errors):
+        self._complete_thread_hop(
+            done,
+            errors,
+            lambda: self._unsubscribe_impl(event_name, callback),
+        )
+
+    def unsubscribe_all(self, callback):
+        """Убирает callback из всех topic-подписок."""
+        self._unsubscribe_all_impl(callback)
+
+    def _unsubscribe_all_impl(self, callback):
+        with self._topic_lock:
+            empty_topics = []
+            for event_name, subscribers in self._topic_subscribers.items():
+                remaining = []
+                for subscribed_callback, emitter in subscribers:
+                    if subscribed_callback == callback:
+                        try:
+                            emitter.event_posted.disconnect(callback)
+                        except (TypeError, RuntimeError):
+                            pass
+                        emitter.deleteLater()
+                    else:
+                        remaining.append((subscribed_callback, emitter))
+                subscribers[:] = remaining
+                if not subscribers:
+                    empty_topics.append(event_name)
+            for event_name in empty_topics:
+                self._topic_subscribers.pop(event_name, None)
+
+    @QtCore.pyqtSlot(object, object, object)
+    def _unsubscribe_all_in_bus_thread(self, callback, done, errors):
+        self._complete_thread_hop(
+            done,
+            errors,
+            lambda: self._unsubscribe_all_impl(callback),
+        )
+
+    def _run_in_bus_thread(self, signal, *args):
+        done = self.threading.Event()
+        errors = []
+        signal.emit(*args, done, errors)
+        if not done.wait(timeout=5):
+            raise RuntimeError("Timed out while updating EventBus topic subscription.")
+        if errors:
+            raise errors[0]
+
+    def _complete_thread_hop(self, done, errors, operation):
+        try:
+            operation()
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    def _dispatch_to_topics(self, event: dict):
+        event_name = event.get('event') if isinstance(event, dict) else None
+        if not event_name:
+            return
+        with self._topic_lock:
+            emitters = [emitter for _callback, emitter in self._topic_subscribers.get(event_name, [])]
+        for emitter in emitters:
+            emitter.event_posted.emit(event)
+
+    def emit_event(self, event: dict):
+        """Совместимый способ отправки: topics + старый event_posted сигнал."""
+        self.event_posted.emit(event)
 
     def set_data(self, key: str, value):
         """Потокобезопасно сохраняет данные и испускает сигнал."""

@@ -1,6 +1,7 @@
 ﻿# ======================================== Файл: .\gemini_translator\core\task_manager.py (ФИНАЛЬНАЯ ВЕРСИЯ) ========================================
 
 import threading
+from threading import Lock
 
 try:
     import os_patch
@@ -75,6 +76,24 @@ def tuple_deserializer(dct):
     if '__tuple__' in dct: return tuple(dct['items'])
     return dct
 
+
+# Mirrors the SQL CASE in _get_ui_state_list_background. Cache entries store
+# *UI* statuses (line ~1282 maps completed -> success, failed -> error), so
+# the constant carries both DB names and their UI aliases pointing at the
+# same group number. Sort key: (STATUS_GROUP_ORDER.get(status, 6), -priority, sequence).
+STATUS_GROUP_ORDER = {
+    'in_progress': 1,
+    'pending':     2,
+    'held':        3,
+    'completed':   4,
+    'success':     4,  # UI alias for completed
+    'failed':      5,
+    'error':       5,  # UI alias for failed
+}
+
+PARTIAL_REFRESH_THRESHOLD = 0.5  # if len(dirty_ids) > threshold * len(cache), use full path
+
+
 class ChapterQueueManager(QObject):
     """
     Менеджер очереди задач на базе In-Memory SQLite.
@@ -111,13 +130,26 @@ class ChapterQueueManager(QObject):
             self.bus = app.event_bus
         
         self.session_id = None
-        self.bus.event_posted.connect(self.on_event)
+        if hasattr(self.bus, "subscribe"):
+            self.bus.subscribe("session_finished", self.on_event)
+        else:
+            self.bus.event_posted.connect(self.on_event)
 
         self._chancellor_lock = PatientLock()
         self._ui_state_list_cache = []
         self._is_updating_cache = False
         self._cache_update_worker = None
-        
+
+        # Dirty-tracking state for active-session energy reduction.
+        # _dirty_state_lock guards _dirty_task_ids and _structural_dirty only.
+        # It is a plain threading.Lock (NOT the _chancellor_lock RLock) to keep
+        # the scope minimal and avoid deadlock with DB-path acquires.
+        self._dirty_state_lock = Lock()
+        self._dirty_task_ids: set[str] = set()
+        self._structural_dirty: bool = True  # first run is always full
+        self._sort_keys: dict[str, tuple[int, int]] = {}  # task_id_str -> (priority, sequence)
+        self._in_flight_snapshot = None  # holds the snapshot passed to the active worker, for failure recovery
+
         # Воркер для фоновой очистки при завершении сессии
         self._cleanup_worker = None
         # Особый воркер для глоссария, чтобы не блокировать основной поток
@@ -310,7 +342,10 @@ class ChapterQueueManager(QObject):
         event = {
             'event': name, 'source': 'ChapterQueueManager', 'session_id': self.session_id, 'data': data or {}
         }
-        self.bus.event_posted.emit(event)
+        if hasattr(self.bus, "emit_event"):
+            self.bus.emit_event(event)
+        else:
+            self.bus.event_posted.emit(event)
     
     def _handle_session_finished_background(self):
         """
@@ -503,7 +538,7 @@ class ChapterQueueManager(QObject):
 
     def promote_held_task(self, task_id: uuid.UUID, new_payload: tuple):
         task_infos = self.update_task(task_id, new_status='pending', new_payload=new_payload, new_priority=1)
-        self._safe_request_ui_update()
+        self.notify_task_dirty(task_id)
         return task_infos
         
     def add_pending_tasks(self, tasks: list):
@@ -519,12 +554,19 @@ class ChapterQueueManager(QObject):
                 tasks_to_insert.append((str(task_id), json.dumps(payload, default=tuple_serializer), 'pending', start_seq + i))
             conn.executemany("INSERT OR IGNORE INTO tasks (task_id, payload, status, sequence) VALUES (?, ?, ?, ?)", tasks_to_insert)
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'add_pending_tasks',
+            })
     
     def get_next_task(self, worker_id: str) -> tuple | None:
         task_for_work = self.update_task(task_id=None, worker_id=worker_id, new_status='in_progress')
         if task_for_work:
             self._log(f"[TASK] →→ Задача '{self._get_task_display_name(task_for_work[1])}' отдана воркеру …{worker_id[-4:]} в работу.")
-        self._safe_request_ui_update()    
+            self.notify_task_dirty(task_for_work[0])
+        else:
+            self._safe_request_ui_update()
         return task_for_work
     
     def update_task(self, task_id: uuid.UUID = None, worker_id: str = None, new_status: str = None, new_payload: tuple = None, new_priority: int = None, new_sequence: int = None, unsafe_mode=False, **conditions) -> tuple | None:
@@ -594,7 +636,7 @@ class ChapterQueueManager(QObject):
                     log_payload['details_title'] = success_payload.get('success_details_title') or f"Полученный пакет для '{display_name}'"
                     log_payload['details_text'] = success_details
             self._log(log_payload)
-            self._safe_request_ui_update()
+            self.notify_task_dirty(task_info[0])
 
     def task_done_with_content(self, worker_id: str, task_info: tuple, translated_content, provider_id: str):
         """
@@ -646,8 +688,8 @@ class ChapterQueueManager(QObject):
                     'chunk_index': int(task_payload[4]),
                     'total_chunks': int(task_payload[5]),
                 })
-            self._safe_request_ui_update()
-    
+            self.notify_task_dirty(task_info[0])
+
     def replace_batch_with_results(self, original_batch_task_id: str, epub_path: str, successful_chapters: list, failed_chapters: list, success_details_map=None):
         """
         Атомарно обновляет пакет: сохраняет успехи и обновляет/удаляет исходную задачу.
@@ -730,7 +772,7 @@ class ChapterQueueManager(QObject):
         )
         if updated:
             self._log(f"[TASK] ❌ Задача '{self._get_task_display_name(task_info[1])}' провалена.")
-            self._safe_request_ui_update()
+            self.notify_task_dirty(task_info[0])
 
     def mark_tasks_completed(self, task_ids) -> int:
         normalized_ids = []
@@ -785,8 +827,8 @@ class ChapterQueueManager(QObject):
 
         if done:
             self._log(f"[TASK] 🔄 Задача '{self._get_task_display_name(task_info[1])}' возвращена в НАЧАЛО очереди.")
-            self._safe_request_ui_update()
-    
+            self.notify_task_dirty(task_info[0])
+
     def save_glossary_batch(self, task_id: str, timestamp: float, chapters_json: str, glossary_list: list) -> dict:
         """
         Сохраняет пакет терминов.
@@ -877,7 +919,7 @@ class ChapterQueueManager(QObject):
                 
         if done:
             self._log(f"[TASK] 🔄 Задача '{self._get_task_display_name(payload)}' возвращена для повтора.")
-            self._safe_request_ui_update()
+            self.notify_task_dirty(task_info[0])
 
     def split_in_progress_batch_into_chapters(self, task_info: tuple, worker_id: str | None = None, priority: int = 1) -> bool:
         """
@@ -1233,19 +1275,46 @@ class ChapterQueueManager(QObject):
         """
         self._update_timer.start()
     
-    def _safe_request_ui_update(self):
-        """
-        Безопасный метод для запроса обновления UI из ЛЮБОГО потока.
-        Он просто испускает сигнал.
-        """
+    def notify_task_dirty(self, task_id):
+        """Mark a single task as dirty. Thread-safe: callable from worker threads.
+        Does NOT start the redraw timer — that happens in the main-thread slot
+        connected to _ui_update_requested. QTimer is owned by the main (Qt GUI)
+        thread; starting it from a worker thread is undefined behaviour."""
+        task_id_str = str(task_id)
+        with self._dirty_state_lock:
+            self._dirty_task_ids.add(task_id_str)
         self._ui_update_requested.emit()
+
+    def notify_structural_change(self):
+        """Mark the cache as needing a full refresh (add/remove/reorder/import).
+        Thread-safe: callable from worker threads. Same thread-hop discipline
+        as notify_task_dirty."""
+        with self._dirty_state_lock:
+            self._structural_dirty = True
+        self._ui_update_requested.emit()
+
+    def _safe_request_ui_update(self):
+        """Backward-compat alias for notify_structural_change. Every unmigrated
+        callsite routes here, so worst case = today's full-fetch behaviour."""
+        self.notify_structural_change()
     
     def _trigger_cache_update(self):
-        """Этот метод вызывается таймером и запускает фоновое обновление."""
+        """Runs in the main (Qt GUI) thread (debounced by _update_timer).
+        Snapshots the dirty state under lock, resets it, and hands the snapshot
+        to the worker. _in_flight_snapshot keeps the snapshot retrievable so
+        _on_cache_updated can restore the dirty ids on worker failure."""
         if self._is_updating_cache:
             return
+        with self._dirty_state_lock:
+            snapshot = {
+                "ids": tuple(self._dirty_task_ids),
+                "structural": self._structural_dirty,
+            }
+            self._dirty_task_ids.clear()
+            self._structural_dirty = False
+        self._in_flight_snapshot = snapshot
         self._is_updating_cache = True
-        worker = TaskDBWorker(self._get_ui_state_list_background)
+        worker = TaskDBWorker(self._get_ui_state_list_background, snapshot)
         worker.finished.connect(lambda: self._on_cache_updated(worker))
         self._cache_update_worker = worker
         worker.start()
@@ -1255,60 +1324,195 @@ class ChapterQueueManager(QObject):
         return self._ui_state_list_cache
 
     def _on_cache_updated(self, worker):
-        """Слот, который вызывается по завершении фонового обновления кэша."""
-        if hasattr(worker, 'result') and worker.result is not None:
-            new_state = worker.result
-            if new_state != self._ui_state_list_cache:
-                self._ui_state_list_cache = new_state
-                self._post_event('task_state_changed', {'full_state': self._ui_state_list_cache})
+        """Runs in the main (Qt GUI) thread (via worker.finished signal).
+        Handles three success modes (full, partial) and the structural_retry /
+        error escalation paths. Never raises — failures are recovered by
+        restoring the in-flight snapshot's ids and forcing a structural refresh."""
+        result = getattr(worker, 'result', None)
+        snapshot = self._in_flight_snapshot
+
+        if result is None or not isinstance(result, dict) or result.get("mode") in ("error", None):
+            self._recover_failed_worker(snapshot, result)
+            self._is_updating_cache = False
+            self._cache_update_worker = None
+            self._in_flight_snapshot = None
+            return
+
+        mode = result["mode"]
+        if mode == "structural_retry":
+            self._recover_failed_worker(snapshot, result)
+            self._is_updating_cache = False
+            self._cache_update_worker = None
+            self._in_flight_snapshot = None
+            return
+
+        prev_cache_by_id = {str(e[0][0]): e for e in self._ui_state_list_cache}
+        if mode == "full":
+            self._ui_state_list_cache = result["entries"]
+            self._sort_keys = result["sort_keys"]
+            changed_ids = None
+        elif mode == "partial":
+            new_entries = result["entries"]
+            new_by_id = {str(e[0][0]): e for e in new_entries}
+            self._ui_state_list_cache = new_entries
+            self._sort_keys.update(result["sort_keys_delta"])
+            changed = []
+            for tid in (snapshot["ids"] if snapshot else ()):
+                if new_by_id.get(tid) != prev_cache_by_id.get(tid):
+                    changed.append(tid)
+            changed_ids = changed
+        else:
+            # Unknown mode — treat as failure.
+            self._recover_failed_worker(snapshot, result)
+            self._is_updating_cache = False
+            self._cache_update_worker = None
+            self._in_flight_snapshot = None
+            return
+
+        self._post_event('task_state_changed', {
+            'full_state': self._ui_state_list_cache,
+            'changed_ids': changed_ids,
+        })
+
         self._is_updating_cache = False
         self._cache_update_worker = None
+        self._in_flight_snapshot = None
+        self._restart_timer_if_dirty()
+
+    def _recover_failed_worker(self, snapshot, result):
+        """Worker returned None / error / structural_retry. Put the snapshot's
+        ids back into the dirty set and force a structural refresh next pass."""
+        with self._dirty_state_lock:
+            self._structural_dirty = True
+            if snapshot:
+                for tid in snapshot["ids"]:
+                    self._dirty_task_ids.add(tid)
+        self._update_timer.start()
+
+    def _restart_timer_if_dirty(self):
+        """If notifications accumulated during the worker run, schedule another pass.
+        Also fixes the latent silent-drop bug at the _is_updating_cache guard."""
+        with self._dirty_state_lock:
+            needs_followup = bool(self._dirty_task_ids) or self._structural_dirty
+        if needs_followup:
+            self._update_timer.start()
     
-    def _get_ui_state_list_background(self):
+    def _get_ui_state_list_background(self, snapshot):
+        """Runs in worker thread. Returns a result dict — never mutates
+        main-thread-owned state directly. Main thread (in _on_cache_updated)
+        assigns the result into self._ui_state_list_cache / _sort_keys.
+
+        Result shape (success):
+          full:    {"mode": "full",    "entries": [...], "sort_keys": {...}}
+          partial: {"mode": "partial", "entries": [...], "sort_keys_delta": {...}}
+        Result shape (failure / escalation):
+          {"mode": "structural_retry"} or {"mode": "error", "error": "..."}
         """
-        Этот метод выполняется в отдельном потоке!
-        Он атомарно читает данные из in-memory клона.
-        """
-        ui_state_list = []
-        # Получаем соединение с клоном, которое будет жить только внутри этого метода
-        with self._get_read_only_conn() as conn:
-            try:
-                # Все операции чтения теперь происходят внутри одной транзакции на клоне
-                cursor = conn.execute("""
-                    SELECT task_id, payload, status FROM tasks
-                    ORDER BY CASE status WHEN 'in_progress' THEN 1 WHEN 'pending' THEN 2 WHEN 'held' THEN 3 WHEN 'completed' THEN 4 WHEN 'failed' THEN 5 ELSE 6 END, priority DESC, sequence ASC
-                """)
-                all_rows = cursor.fetchall()
-                
-                failed_task_ids = [row['task_id'] for row in all_rows if row['status'] == 'failed']
-                error_histories = {}
-                if failed_task_ids:
-                    placeholders = ','.join('?' for _ in failed_task_ids)
-                    error_cursor = conn.execute(
-                        f"SELECT task_id, error_type, COUNT(*) as count FROM task_errors WHERE task_id IN ({placeholders}) GROUP BY task_id, error_type",
-                        failed_task_ids
-                    )
-                    for row in error_cursor:
-                        task_id = row['task_id']
-                        if task_id not in error_histories:
-                            error_histories[task_id] = {'total_count': 0, 'errors': {}}
-                        error_histories[task_id]['errors'][row['error_type']] = row['count']
-                        error_histories[task_id]['total_count'] += row['count']
-    
-            except Exception as e:
-                print(f"[CRITICAL DB WORKER] Ошибка в _get_ui_state_list_background: {e}")
-                return None
-        # Обработка данных происходит уже после закрытия соединения с клоном
+        cache = self._ui_state_list_cache
+        is_structural = snapshot["structural"] or not cache
+        if not is_structural:
+            # Threshold: if dirty set is too big, partial isn't worth it.
+            if len(snapshot["ids"]) > PARTIAL_REFRESH_THRESHOLD * max(len(cache), 1):
+                is_structural = True
+
+        try:
+            with self._get_read_only_conn() as conn:
+                if is_structural:
+                    return self._fetch_full_ui_state(conn)
+                return self._fetch_partial_ui_state(conn, snapshot["ids"])
+        except Exception as e:
+            print(f"[CRITICAL DB WORKER] Ошибка в _get_ui_state_list_background: {e}")
+            return {"mode": "error", "error": repr(e)}
+
+    def _fetch_full_ui_state(self, conn):
+        cursor = conn.execute("""
+            SELECT task_id, payload, status, priority, sequence FROM tasks
+            ORDER BY CASE status WHEN 'in_progress' THEN 1 WHEN 'pending' THEN 2 WHEN 'held' THEN 3 WHEN 'completed' THEN 4 WHEN 'failed' THEN 5 ELSE 6 END, priority DESC, sequence ASC
+        """)
+        all_rows = cursor.fetchall()
+        failed_task_ids = [row['task_id'] for row in all_rows if row['status'] == 'failed']
+        error_histories = self._fetch_error_histories(conn, failed_task_ids)
+        entries = []
+        sort_keys = {}
         for row in all_rows:
-            task_id_str, payload_json, status = row['task_id'], row['payload'], row['status']
-            payload = json.loads(payload_json, object_hook=tuple_deserializer)
-            payload = self._payload_for_ui(payload)
-            ui_status = {'completed': 'success', 'failed': 'error'}.get(status, status)
-            task_tuple_for_ui = (uuid.UUID(task_id_str), payload)
-            details = error_histories.get(task_id_str, {})
-            ui_state_list.append((task_tuple_for_ui, ui_status, details))
-        return ui_state_list
-    
+            entry, sort_key = self._build_ui_entry(row, error_histories)
+            entries.append(entry)
+            sort_keys[row['task_id']] = sort_key
+        return {"mode": "full", "entries": entries, "sort_keys": sort_keys}
+
+    def _fetch_error_histories(self, conn, failed_task_ids):
+        error_histories = {}
+        if not failed_task_ids:
+            return error_histories
+        placeholders = ','.join('?' for _ in failed_task_ids)
+        error_cursor = conn.execute(
+            f"SELECT task_id, error_type, COUNT(*) as count FROM task_errors WHERE task_id IN ({placeholders}) GROUP BY task_id, error_type",
+            failed_task_ids
+        )
+        for row in error_cursor:
+            tid = row['task_id']
+            if tid not in error_histories:
+                error_histories[tid] = {'total_count': 0, 'errors': {}}
+            error_histories[tid]['errors'][row['error_type']] = row['count']
+            error_histories[tid]['total_count'] += row['count']
+        return error_histories
+
+    def _build_ui_entry(self, row, error_histories):
+        """Returns ((task_tuple_for_ui, ui_status, details), (priority, sequence))."""
+        import json
+        task_id_str = row['task_id']
+        payload = json.loads(row['payload'], object_hook=tuple_deserializer)
+        payload = self._payload_for_ui(payload)
+        ui_status = {'completed': 'success', 'failed': 'error'}.get(row['status'], row['status'])
+        task_tuple_for_ui = (uuid.UUID(task_id_str), payload)
+        details = error_histories.get(task_id_str, {})
+        return ((task_tuple_for_ui, ui_status, details), (row['priority'], row['sequence']))
+
+    def _fetch_partial_ui_state(self, conn, dirty_ids):
+        if not dirty_ids:
+            return {"mode": "partial", "entries": list(self._ui_state_list_cache),
+                    "sort_keys_delta": {}}
+
+        placeholders = ','.join('?' for _ in dirty_ids)
+        cursor = conn.execute(
+            f"""SELECT task_id, payload, status, priority, sequence FROM tasks
+                WHERE task_id IN ({placeholders})""",
+            tuple(dirty_ids),
+        )
+        rows = cursor.fetchall()
+        fetched_ids = {row['task_id'] for row in rows}
+        missing = set(dirty_ids) - fetched_ids
+        if missing:
+            # Row was deleted outside dirty-tracking path; escalate to full refresh.
+            return {"mode": "structural_retry"}
+
+        failed_in_partial = [row['task_id'] for row in rows if row['status'] == 'failed']
+        error_histories = self._fetch_error_histories(conn, failed_in_partial)
+
+        new_by_id = {}
+        sort_keys_delta = {}
+        for row in rows:
+            entry, sort_key = self._build_ui_entry(row, error_histories)
+            new_by_id[row['task_id']] = entry
+            sort_keys_delta[row['task_id']] = sort_key
+
+        # Merge: keep existing entries, replace dirty ones.
+        merged_by_id = {str(e[0][0]): e for e in self._ui_state_list_cache}
+        merged_by_id.update(new_by_id)
+
+        # Effective sort_keys = cache keys overlaid with delta.
+        effective_sort_keys = dict(self._sort_keys)
+        effective_sort_keys.update(sort_keys_delta)
+
+        def _sort_key(entry):
+            tid = str(entry[0][0])
+            status = entry[1]
+            prio, seq = effective_sort_keys.get(tid, (0, 0))
+            return (STATUS_GROUP_ORDER.get(status, 6), -prio, seq)
+
+        entries = sorted(merged_by_id.values(), key=_sort_key)
+        return {"mode": "partial", "entries": entries, "sort_keys_delta": sort_keys_delta}
+
     def get_all_tasks_for_rebuild(self) -> list[tuple]:
         """
         Возвращает АБСОЛЮТНО ВСЕ задачи из базы, независимо от их статуса,
@@ -1337,8 +1541,8 @@ class ChapterQueueManager(QObject):
             # [FIX] Игнорируем ошибку, если задача была удалена из базы
             # до того, как воркер успел сообщить о проблеме.
             pass
-        
-        self._safe_request_ui_update()
+
+        self.notify_task_dirty(task_info[0])
         
     def _get_task_display_name(self, task_payload: tuple) -> str:
         if not task_payload: return "Неизвестная задача"
@@ -1536,7 +1740,7 @@ class ChapterQueueManager(QObject):
             f"[TASK MANAGER] Обновлен порядок глав внутри пакета: "
             f"{os.path.basename(new_chapter_order[0])} -> {os.path.basename(new_chapter_order[-1])}."
         )
-        self._safe_request_ui_update()
+        self.notify_task_dirty(task_id)
         return True
     
     def duplicate_tasks(self, task_ids: list) -> bool:
@@ -1754,6 +1958,11 @@ class ChapterQueueManager(QObject):
         
         # --- ЭТАП 3: Уведомление UI (вне транзакции) ---
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'set_pending_tasks',
+            })
 
     def set_pending_task_chains(self, task_chains: list[list], initial_history: dict = None):
         """
@@ -1818,6 +2027,11 @@ class ChapterQueueManager(QObject):
                 )
 
         self._safe_request_ui_update()
+        if tasks_to_insert:
+            self._post_event('tasks_added', {
+                'count': len(tasks_to_insert),
+                'reason': 'set_pending_task_chains',
+            })
 
 
     def fetch_and_clean_glossary(self, mode: str = 'supplement', cleanup_threshold: float = 0.3, min_count: int = 500, return_raw: bool = False) -> list:
