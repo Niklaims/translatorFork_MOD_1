@@ -13,7 +13,39 @@ from .base_processor import BaseTaskProcessor
 from gemini_translator.api.errors import ValidationFailedError, PartialGenerationError
 from gemini_translator.utils.text import clean_html_content, repair_json_string
 from gemini_translator.utils.language_tools import SmartGlossaryFilter
+from gemini_translator.utils.term_frequency_tools import (
+    calculate_term_frequency_payload,
+    get_epub_signature,
+    get_term_frequency_map,
+)
 from gemini_translator.api import config as api_config
+
+
+def limit_glossary_terms_by_frequency(glossary_items, new_terms_limit, frequency_counts):
+    glossary_items = list(glossary_items or [])
+    try:
+        new_terms_limit = int(new_terms_limit)
+    except (TypeError, ValueError):
+        new_terms_limit = 0
+
+    if new_terms_limit <= 0 or len(glossary_items) <= new_terms_limit:
+        return glossary_items, []
+
+    frequency_counts = frequency_counts or {}
+
+    def _count_for(item):
+        try:
+            return int(frequency_counts.get(item.get("original"), 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked_terms = sorted(
+        enumerate(glossary_items),
+        key=lambda indexed_item: (-_count_for(indexed_item[1]), indexed_item[0]),
+    )
+    limited_terms = [item for _, item in ranked_terms[:new_terms_limit]]
+    discarded_terms = [item for _, item in ranked_terms[new_terms_limit:]]
+    return limited_terms, discarded_terms
 
 
 def filter_glossary_items_for_source_text(
@@ -48,6 +80,47 @@ def filter_glossary_items_for_source_text(
 
 
 class GlossaryBatchProcessor(BaseTaskProcessor):
+    def _get_book_frequency_counts(self, epub_path, glossary_items):
+        original_terms = [
+            str(item.get("original") or "").strip()
+            for item in glossary_items or []
+            if str(item.get("original") or "").strip()
+        ]
+        if not original_terms:
+            return {}
+
+        try:
+            signature = json.dumps(
+                get_epub_signature(epub_path),
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            cache = getattr(self.worker, "_new_term_frequency_cache", None)
+            if not isinstance(cache, dict) or cache.get("signature") != signature:
+                cache = {"signature": signature, "counts": {}}
+                setattr(self.worker, "_new_term_frequency_cache", cache)
+
+            cached_counts = cache.setdefault("counts", {})
+            missing_terms = [term for term in original_terms if term not in cached_counts]
+            if missing_terms:
+                payload = calculate_term_frequency_payload(
+                    epub_path,
+                    [{"original": term} for term in missing_terms],
+                )
+                frequency_map = get_term_frequency_map(payload)
+                for term in missing_terms:
+                    cached_counts[term] = int(
+                        frequency_map.get(term, {}).get("count", 0) or 0
+                    )
+
+            return {term: int(cached_counts.get(term, 0) or 0) for term in original_terms}
+        except Exception as exc:
+            self.worker._post_event(
+                'log_message',
+                {'message': f"⚠️ [Глоссарий] Частотный отбор по книге недоступен: {exc}. Использую порядок ответа AI."}
+            )
+            return {}
+
     async def execute(self, task_info, use_stream=False):
         task_id, task_payload = task_info
 
@@ -199,9 +272,16 @@ class GlossaryBatchProcessor(BaseTaskProcessor):
                         updated_terms.append(term)
                     else:
                         new_terms.append(term)
-                limited_new_terms = new_terms[:new_terms_limit]
-                if len(new_terms) > len(limited_new_terms):
-                    self.worker._post_event('log_message', {'message': f"📖 [Глоссарий] Лимит в {new_terms_limit} новых терминов. Отброшено: {len(new_terms) - len(limited_new_terms)}."})
+                frequency_counts = {}
+                if len(new_terms) > new_terms_limit:
+                    frequency_counts = self._get_book_frequency_counts(epub_path_or_object, new_terms)
+                limited_new_terms, discarded_new_terms = limit_glossary_terms_by_frequency(
+                    new_terms,
+                    new_terms_limit,
+                    frequency_counts,
+                )
+                if discarded_new_terms:
+                    self.worker._post_event('log_message', {'message': f"📖 [Глоссарий] Лимит в {new_terms_limit} новых терминов. Отброшено наименее частотных по книге: {len(discarded_new_terms)}."})
                 if merge_mode == 'supplement':
                     updated_terms = []
                     num_updated_override = len(updated_terms)

@@ -1,10 +1,17 @@
 import tempfile
 import unittest
 import zipfile
+import os
 from pathlib import Path
 
+from fs import path as fs_path
+
 from gemini_translator.utils.language_tools import GlossaryRegexService
-from gemini_translator.utils.term_frequency_tools import GlossaryFrequencyWorker
+from gemini_translator.utils.term_frequency_tools import (
+    GlossaryFrequencyWorker,
+    calculate_term_frequency_payload,
+    get_epub_signature,
+)
 
 
 def _write_epub(path, chapters):
@@ -28,6 +35,63 @@ def _run_frequency_worker(epub_path, glossary):
 
 
 class TermFrequencyToolsTests(unittest.TestCase):
+    def test_get_epub_signature_tolerates_path_module_without_normcase(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            _write_epub(epub_path, {"OEBPS/ch1.xhtml": "<html><body>Text</body></html>"})
+            expected_size = epub_path.stat().st_size
+
+            original_path_module = os.path
+            try:
+                os.path = fs_path
+                signature = get_epub_signature(str(epub_path))
+            finally:
+                os.path = original_path_module
+
+        self.assertTrue(signature["exists"])
+        self.assertEqual(signature["size"], expected_size)
+
+    def test_calculate_term_frequency_payload_counts_terms_across_whole_epub(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            _write_epub(
+                epub_path,
+                {
+                    "OEBPS/ch1.xhtml": "<html><body>High High Low</body></html>",
+                    "OEBPS/ch2.xhtml": "<html><body>High Medium Medium</body></html>",
+                },
+            )
+
+            payload = calculate_term_frequency_payload(
+                epub_path,
+                [
+                    {"original": "High", "rus": "", "note": ""},
+                    {"original": "Medium", "rus": "", "note": ""},
+                    {"original": "Low", "rus": "", "note": ""},
+                ],
+            )
+
+        self.assertEqual(payload["terms"]["High"]["count"], 3)
+        self.assertEqual(payload["terms"]["Medium"]["count"], 2)
+        self.assertEqual(payload["terms"]["Low"]["count"], 1)
+
+    def test_calculate_term_frequency_payload_tolerates_path_module_without_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            _write_epub(epub_path, {"OEBPS/ch1.xhtml": "<html><body>High High</body></html>"})
+
+            original_path_module = os.path
+            try:
+                os.path = fs_path
+                payload = calculate_term_frequency_payload(
+                    str(epub_path),
+                    [{"original": "High", "rus": "", "note": ""}],
+                )
+            finally:
+                os.path = original_path_module
+
+        self.assertEqual(payload["terms"]["High"]["count"], 2)
+
     def test_frequency_worker_counts_single_occurrence_in_utf16_epub(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             epub_path = Path(temp_dir) / "book.epub"

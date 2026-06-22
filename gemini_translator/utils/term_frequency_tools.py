@@ -2,7 +2,9 @@
 
 import hashlib
 import json
+import ntpath
 import os
+import posixpath
 import re
 import time
 import zipfile
@@ -20,6 +22,7 @@ except ImportError:
 
 
 TERM_FREQUENCY_CACHE_VERSION = 3
+VIRTUAL_PATH_PREFIX = "mem://"
 
 
 def collect_glossary_originals(glossary_source):
@@ -38,9 +41,23 @@ def collect_glossary_originals(glossary_source):
 
 
 def get_epub_signature(epub_path):
-    normalized_path = os.path.normcase(os.path.abspath(epub_path)) if epub_path else None
+    normalized_path = _normalize_signature_path(epub_path)
     if not normalized_path:
         return {"path": None, "exists": False}
+
+    if str(normalized_path).startswith(VIRTUAL_PATH_PREFIX):
+        exists = False
+        exists_func = getattr(os.path, "exists", None)
+        if callable(exists_func):
+            try:
+                exists = bool(exists_func(normalized_path))
+            except Exception:
+                exists = False
+        return {
+            "path": normalized_path,
+            "exists": exists,
+            "virtual": True,
+        }
 
     try:
         stat_result = os.stat(normalized_path)
@@ -53,6 +70,36 @@ def get_epub_signature(epub_path):
         "size": int(stat_result.st_size),
         "mtime_ns": int(getattr(stat_result, "st_mtime_ns", stat_result.st_mtime * 1_000_000_000)),
     }
+
+
+def _epub_source_exists(epub_path):
+    if not epub_path:
+        return False
+
+    path_text = str(epub_path)
+    if path_text.startswith(VIRTUAL_PATH_PREFIX):
+        return True
+
+    try:
+        os.stat(_normalize_signature_path(path_text))
+        return True
+    except OSError:
+        return False
+
+
+def _normalize_signature_path(path):
+    if not path:
+        return None
+
+    path_text = str(path)
+    if path_text.startswith(VIRTUAL_PATH_PREFIX):
+        return path_text
+
+    native_path = ntpath if os.name == "nt" else posixpath
+    try:
+        return native_path.normcase(native_path.abspath(path_text))
+    except Exception:
+        return path_text
 
 
 def build_term_frequency_fingerprint(glossary_source, epub_path):
@@ -295,6 +342,73 @@ class GlossaryFrequencyVariantMatcher:
         return found_counts
 
 
+def calculate_term_frequency_payload(
+    epub_path,
+    glossary_data,
+    *,
+    progress_callback=None,
+    should_continue=None,
+):
+    glossary_terms = collect_glossary_originals(glossary_data)
+    glossary_dict = {term: {} for term in glossary_terms}
+
+    if not _epub_source_exists(epub_path):
+        raise FileNotFoundError(f"Файл не найден: {epub_path}")
+
+    if not glossary_terms:
+        return build_term_frequency_payload(glossary_terms, epub_path, {})
+
+    regex_service = GlossaryRegexService(glossary_dict)
+    variant_matcher = GlossaryFrequencyVariantMatcher(glossary_terms)
+    term_occurrences = Counter()
+    term_distribution = defaultdict(set)
+
+    with zipfile.ZipFile(epub_path, "r") as archive:
+        html_files = [
+            name
+            for name in archive.namelist()
+            if name.lower().endswith((".html", ".xhtml", ".htm"))
+            and not name.startswith("__MACOSX")
+        ]
+        total_files = len(html_files)
+
+        for index, filename in enumerate(html_files):
+            if should_continue is not None and not should_continue():
+                return None
+
+            if progress_callback is not None:
+                progress_callback(index + 1, total_files, os.path.basename(filename))
+
+            try:
+                raw_content = archive.read(filename)
+                clean_text = _extract_text_from_html(raw_content)
+                match_counts = regex_service.count_matches(clean_text)
+                variant_counts = variant_matcher.count_matches(clean_text)
+                for term, count in variant_counts.items():
+                    match_counts[term] = max(int(match_counts.get(term, 0) or 0), int(count or 0))
+
+                for term, count in match_counts.items():
+                    count = int(count or 0)
+                    if count <= 0:
+                        continue
+                    term_occurrences[term] += count
+                    term_distribution[term].add(filename)
+            except Exception as exc:
+                print(f"[FreqAnalyzer] Ошибка чтения {filename}: {exc}")
+                continue
+
+    aggregated = aggregate_term_frequency_stats(
+        glossary_terms,
+        term_occurrences,
+        term_distribution,
+    )
+    return build_term_frequency_payload(
+        glossary_terms,
+        epub_path,
+        aggregated,
+    )
+
+
 class GlossaryFrequencyWorker(QThread):
     """Фоновый анализатор частоты терминов по EPUB."""
 
@@ -306,73 +420,18 @@ class GlossaryFrequencyWorker(QThread):
         super().__init__(parent)
         self.epub_path = epub_path
         self.glossary_terms = collect_glossary_originals(glossary_data)
-        self.glossary_dict = {term: {} for term in self.glossary_terms}
         self._is_running = True
 
     def run(self):
         try:
-            if not self.epub_path or not os.path.exists(self.epub_path):
-                self.error_occurred.emit(f"Файл не найден: {self.epub_path}")
-                return
-
-            if not self.glossary_terms:
-                self.analysis_finished.emit(
-                    build_term_frequency_payload(self.glossary_terms, self.epub_path, {})
-                )
-                return
-
-            regex_service = GlossaryRegexService(self.glossary_dict)
-            variant_matcher = GlossaryFrequencyVariantMatcher(self.glossary_terms)
-            term_occurrences = Counter()
-            term_distribution = defaultdict(set)
-
-            with zipfile.ZipFile(self.epub_path, "r") as archive:
-                html_files = [
-                    name
-                    for name in archive.namelist()
-                    if name.lower().endswith((".html", ".xhtml", ".htm"))
-                    and not name.startswith("__MACOSX")
-                ]
-                total_files = len(html_files)
-
-                for index, filename in enumerate(html_files):
-                    if not self._is_running:
-                        break
-
-                    self.progress_update.emit(index + 1, total_files, os.path.basename(filename))
-
-                    try:
-                        raw_content = archive.read(filename)
-                        clean_text = _extract_text_from_html(raw_content)
-                        match_counts = regex_service.count_matches(clean_text)
-                        variant_counts = variant_matcher.count_matches(clean_text)
-                        for term, count in variant_counts.items():
-                            match_counts[term] = max(int(match_counts.get(term, 0) or 0), int(count or 0))
-
-                        for term, count in match_counts.items():
-                            count = int(count or 0)
-                            if count <= 0:
-                                continue
-                            term_occurrences[term] += count
-                            term_distribution[term].add(filename)
-                    except Exception as exc:
-                        print(f"[FreqAnalyzer] Ошибка чтения {filename}: {exc}")
-                        continue
-
-            if not self._is_running:
-                return
-
-            aggregated = aggregate_term_frequency_stats(
-                self.glossary_terms,
-                term_occurrences,
-                term_distribution,
-            )
-            payload = build_term_frequency_payload(
-                self.glossary_terms,
+            payload = calculate_term_frequency_payload(
                 self.epub_path,
-                aggregated,
+                self.glossary_terms,
+                progress_callback=self.progress_update.emit,
+                should_continue=lambda: self._is_running,
             )
-            self.analysis_finished.emit(payload)
+            if payload is not None:
+                self.analysis_finished.emit(payload)
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
