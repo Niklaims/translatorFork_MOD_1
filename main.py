@@ -874,12 +874,7 @@ class ApplicationWithContext(QtWidgets.QApplication):
 
 class EventBus(QtCore.QObject):
     import threading
-    class _TopicEmitter(QtCore.QObject):
-        event_posted = QtCore.pyqtSignal(dict)
-
     event_posted = QtCore.pyqtSignal(dict)
-    # Новые атрибуты и методы для "шины с инерцией"
-    # Сигнал, который передает ключ измененных данных
     data_changed = QtCore.pyqtSignal(str)
     _data_store = {}
     _lock = threading.Lock()
@@ -897,14 +892,9 @@ class EventBus(QtCore.QObject):
     def _subscribe_impl(self, event_name: str, callback):
         with self._topic_lock:
             subscribers = self._topic_subscribers.setdefault(event_name, [])
-            if any(item[0] == callback for item in subscribers):
+            if any(item == callback for item in subscribers):
                 return
-            receiver = getattr(callback, "__self__", None)
-            needs_emitter = isinstance(receiver, QtCore.QObject)
-            # Store a sentinel marker: emitter=None means "not yet wired".
-            # We defer QObject creation to _dispatch_to_topics to ensure
-            # it always runs on the bus thread, preventing Windows access violations.
-            subscribers.append((callback, None, needs_emitter))
+            subscribers.append(callback)
 
     def unsubscribe(self, event_name: str, callback):
         """Убирает callback из конкретной topic-подписки."""
@@ -915,20 +905,8 @@ class EventBus(QtCore.QObject):
             subscribers = self._topic_subscribers.get(event_name)
             if not subscribers:
                 return
-            remaining = []
-            for entry in subscribers:
-                subscribed_callback = entry[0]
-                emitter = entry[1]
-                if subscribed_callback == callback:
-                    if emitter is not None:
-                        try:
-                            emitter.event_posted.disconnect(callback)
-                        except (TypeError, RuntimeError):
-                            pass
-                        emitter.deleteLater()
-                else:
-                    remaining.append(entry)
-            subscribers[:] = remaining
+            if callback in subscribers:
+                subscribers.remove(callback)
             if not subscribers:
                 self._topic_subscribers.pop(event_name, None)
 
@@ -940,20 +918,8 @@ class EventBus(QtCore.QObject):
         with self._topic_lock:
             empty_topics = []
             for event_name, subscribers in self._topic_subscribers.items():
-                remaining = []
-                for entry in subscribers:
-                    subscribed_callback = entry[0]
-                    emitter = entry[1]
-                    if subscribed_callback == callback:
-                        if emitter is not None:
-                            try:
-                                emitter.event_posted.disconnect(callback)
-                            except (TypeError, RuntimeError):
-                                pass
-                            emitter.deleteLater()
-                    else:
-                        remaining.append(entry)
-                subscribers[:] = remaining
+                if callback in subscribers:
+                    subscribers.remove(callback)
                 if not subscribers:
                     empty_topics.append(event_name)
             for event_name in empty_topics:
@@ -965,25 +931,11 @@ class EventBus(QtCore.QObject):
             return
         with self._topic_lock:
             entries = list(self._topic_subscribers.get(event_name, []))
-        for i, entry in enumerate(entries):
-            callback = entry[0]
-            emitter = entry[1]
-            needs_emitter = entry[2]
-            if needs_emitter and emitter is None:
-                emitter = self._TopicEmitter()
-                emitter.event_posted.connect(
-                    callback, QtCore.Qt.ConnectionType.AutoConnection
-                )
-                with self._topic_lock:
-                    subs = self._topic_subscribers.get(event_name, [])
-                    for j, s in enumerate(subs):
-                        if s[0] == callback:
-                            subs[j] = (callback, emitter, True)
-                            break
-            if emitter is not None:
-                emitter.event_posted.emit(event)
-            else:
+        for callback in entries:
+            try:
                 callback(event)
+            except Exception:
+                pass
 
     def emit_event(self, event: dict):
         """Совместимый способ отправки: topics + старый event_posted сигнал."""
