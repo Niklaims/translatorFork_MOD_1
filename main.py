@@ -905,17 +905,21 @@ class EventBus(QtCore.QObject):
             subscribers = self._topic_subscribers.setdefault(event_name, [])
             if any(item[0] == callback for item in subscribers):
                 return
-            emitter = self._TopicEmitter()
-            if emitter.thread() != self.thread():
-                emitter.moveToThread(self.thread())
             receiver = getattr(callback, "__self__", None)
-            connection_type = (
-                QtCore.Qt.ConnectionType.AutoConnection
-                if isinstance(receiver, QtCore.QObject)
-                else QtCore.Qt.ConnectionType.DirectConnection
-            )
-            emitter.event_posted.connect(callback, connection_type)
-            subscribers.append((callback, emitter))
+            if isinstance(receiver, QtCore.QObject):
+                # QObject-bound method: use Qt signal/slot for thread-safe delivery
+                emitter = self._TopicEmitter()
+                if emitter.thread() != self.thread():
+                    emitter.moveToThread(self.thread())
+                emitter.event_posted.connect(
+                    callback, QtCore.Qt.ConnectionType.AutoConnection
+                )
+                subscribers.append((callback, emitter))
+            else:
+                # Plain Python callable: direct call, no QObject needed.
+                # This avoids creating a QObject in a foreign thread,
+                # which causes access violations on Windows.
+                subscribers.append((callback, None))
 
     @QtCore.pyqtSlot(str, object, object, object)
     def _subscribe_in_bus_thread(self, event_name: str, callback, done, errors):
@@ -937,11 +941,12 @@ class EventBus(QtCore.QObject):
             remaining = []
             for subscribed_callback, emitter in subscribers:
                 if subscribed_callback == callback:
-                    try:
-                        emitter.event_posted.disconnect(callback)
-                    except (TypeError, RuntimeError):
-                        pass
-                    emitter.deleteLater()
+                    if emitter is not None:
+                        try:
+                            emitter.event_posted.disconnect(callback)
+                        except (TypeError, RuntimeError):
+                            pass
+                        emitter.deleteLater()
                 else:
                     remaining.append((subscribed_callback, emitter))
             subscribers[:] = remaining
@@ -967,11 +972,12 @@ class EventBus(QtCore.QObject):
                 remaining = []
                 for subscribed_callback, emitter in subscribers:
                     if subscribed_callback == callback:
-                        try:
-                            emitter.event_posted.disconnect(callback)
-                        except (TypeError, RuntimeError):
-                            pass
-                        emitter.deleteLater()
+                        if emitter is not None:
+                            try:
+                                emitter.event_posted.disconnect(callback)
+                            except (TypeError, RuntimeError):
+                                pass
+                            emitter.deleteLater()
                     else:
                         remaining.append((subscribed_callback, emitter))
                 subscribers[:] = remaining
@@ -1010,9 +1016,12 @@ class EventBus(QtCore.QObject):
         if not event_name:
             return
         with self._topic_lock:
-            emitters = [emitter for _callback, emitter in self._topic_subscribers.get(event_name, [])]
-        for emitter in emitters:
-            emitter.event_posted.emit(event)
+            entries = list(self._topic_subscribers.get(event_name, []))
+        for callback, emitter in entries:
+            if emitter is not None:
+                emitter.event_posted.emit(event)
+            else:
+                callback(event)
 
     def emit_event(self, event: dict):
         """Совместимый способ отправки: topics + старый event_posted сигнал."""
