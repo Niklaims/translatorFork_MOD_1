@@ -781,11 +781,32 @@ class ConsistencyValidatorDialog(QDialog):
             # Инициализируем модели
             self._on_provider_changed(self.key_management_widget.provider_combo.currentText())
 
+    def _current_consistency_mode(self) -> str:
+        mode_combo = getattr(self, 'consistency_mode_combo', None)
+        if mode_combo is None:
+            return DEEP_CONSISTENCY_MODE
+        try:
+            return mode_combo.currentData() or DEEP_CONSISTENCY_MODE
+        except Exception:
+            return DEEP_CONSISTENCY_MODE
+
+    def _apply_restored_consistency_mode(self, restored_mode: str):
+        mode_combo = getattr(self, 'consistency_mode_combo', None)
+        if mode_combo is None:
+            return
+        mode_index = mode_combo.findData(restored_mode or DEEP_CONSISTENCY_MODE)
+        if mode_index != -1:
+            mode_combo.setCurrentIndex(mode_index)
+            ConsistencyValidatorDialog._on_consistency_mode_changed(self)
+
     def _on_consistency_mode_changed(self, *_args):
-        is_fast = self.consistency_mode_combo.currentData() == FAST_PROOFREAD_MODE
-        self.glossary_first_checkbox.setEnabled(not is_fast)
+        is_fast = ConsistencyValidatorDialog._current_consistency_mode(self) == FAST_PROOFREAD_MODE
+        glossary_first_checkbox = getattr(self, 'glossary_first_checkbox', None)
+        if glossary_first_checkbox is None:
+            return
+        glossary_first_checkbox.setEnabled(not is_fast)
         if is_fast:
-            self.glossary_first_checkbox.setChecked(False)
+            glossary_first_checkbox.setChecked(False)
 
     def _on_provider_changed(self, provider_display_name):
         """Обновляет список моделей при смене провайдера."""
@@ -1005,7 +1026,7 @@ class ConsistencyValidatorDialog(QDialog):
         config.update({
             'provider': provider_id,
             'chunk_size': self.chunk_size_spin.value(),
-            'consistency_mode': self.consistency_mode_combo.currentData() or DEEP_CONSISTENCY_MODE,
+            'consistency_mode': ConsistencyValidatorDialog._current_consistency_mode(self),
         })
         
         return config
@@ -2272,7 +2293,7 @@ class ConsistencyValidatorDialog(QDialog):
 
         return {
             'timestamp': str(datetime.now()),
-            'consistency_mode': self.consistency_mode_combo.currentData() or DEEP_CONSISTENCY_MODE,
+            'consistency_mode': ConsistencyValidatorDialog._current_consistency_mode(self),
             'glossary': self.engine.glossary_session.to_dict(),
             'processed_chapters': self.engine.glossary_session.processed_chapters,
             'problems': problems_data,
@@ -2357,10 +2378,7 @@ class ConsistencyValidatorDialog(QDialog):
 
             # 1. Восстанавливаем глоссарий
             restored_mode = data.get('consistency_mode') or DEEP_CONSISTENCY_MODE
-            mode_index = self.consistency_mode_combo.findData(restored_mode)
-            if mode_index != -1:
-                self.consistency_mode_combo.setCurrentIndex(mode_index)
-                self._on_consistency_mode_changed()
+            ConsistencyValidatorDialog._apply_restored_consistency_mode(self, restored_mode)
 
             glossary_data = data.get('glossary', {})
             self.engine.glossary_session.clear()
