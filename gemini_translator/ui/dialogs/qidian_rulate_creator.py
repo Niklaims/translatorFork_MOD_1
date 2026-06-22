@@ -121,7 +121,7 @@ class QidianRulateCreatorWindow(QMainWindow):
         self.fetch_qidian_btn.clicked.connect(self._fetch_qidian)
         action_row.addWidget(self.fetch_qidian_btn)
 
-        self.prepare_ai_btn = QPushButton("Подготовить перевод, жанры и теги")
+        self.prepare_ai_btn = QPushButton("Подготовить перевод, жанры, теги и промпт")
         self.prepare_ai_btn.clicked.connect(self._prepare_ai)
         action_row.addWidget(self.prepare_ai_btn)
 
@@ -297,6 +297,7 @@ class QidianRulateCreatorWindow(QMainWindow):
             model_settings,
             active_keys,
             self.settings_manager,
+            visible_browser=self.visible_qidian_checkbox.isChecked(),
         )
         worker.log_signal.connect(self._log)
         worker.prepared_ready.connect(self._apply_prepared_metadata)
@@ -400,6 +401,8 @@ class QidianRulateCreatorWindow(QMainWindow):
         self.translated_description_edit.setPlainText(prepared.translated_description)
         self.genres_edit.setText(", ".join(prepared.genres))
         self.tags_edit.setText(", ".join(prepared.tags))
+        if prepared.cover_prompt:
+            self.cover_prompt_edit.setPlainText(prepared.cover_prompt)
         self._update_action_state()
 
     def _apply_cover_prompt(self, prompt: str) -> None:
@@ -422,6 +425,7 @@ class QidianRulateCreatorWindow(QMainWindow):
             translated_description=self.translated_description_edit.toPlainText().strip(),
             genres=_split_csv(self.genres_edit.text()),
             tags=_split_csv(self.tags_edit.text()),
+            cover_prompt=self.cover_prompt_edit.toPlainText().strip(),
         )
 
     def _update_action_state(self) -> None:

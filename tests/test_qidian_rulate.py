@@ -183,6 +183,7 @@ def test_parse_prepared_metadata_strips_json_fence_and_normalizes_lists(monkeypa
             "\u0422\u0430\u0439\u043d\u044b",
             "\u043d\u0435\u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u044e\u0449\u0438\u0439 \u0442\u0435\u0433",
         ],
+        "cover_prompt": "```text\nA cinematic cover. Typography: The text \"\u0418\u043d\u043e\u043c\u0435\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430\" written in glowing serif letters. --ar 2:3\n```",
     }
     prepared = parse_prepared_metadata(f"```json\n{json.dumps(payload, ensure_ascii=False)}\n```")
 
@@ -195,6 +196,9 @@ def test_parse_prepared_metadata_strips_json_fence_and_normalizes_lists(monkeypa
         "\u0442\u0430\u0439\u043d\u044b",
         "\u043c\u0438\u0441\u0442\u0438\u043a\u0430",
     ]
+    assert prepared.cover_prompt == (
+        "A cinematic cover. Typography: The text \"\u0418\u043d\u043e\u043c\u0435\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430\" written in glowing serif letters. --ar 2:3"
+    )
 
 
 def test_normalize_rulate_tags_requires_tags_from_allowed_file(monkeypatch):
@@ -311,12 +315,15 @@ def test_build_ai_prompt_contains_source_context_and_description_rule():
         description="\u63cf\u8ff0",
     )
 
-    prompt = build_ai_prompt(metadata, "Otherworldly Inn")
+    prompt = build_ai_prompt(metadata, "Otherworldly Inn", "\u7b2c1\u7ae0 \u96e8\n\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0\u3002")
 
     assert "\u5f02\u5ea6\u65c5\u793e" in prompt
     assert "\u8fdc\u77b3" in prompt
     assert "Otherworldly Inn" in prompt
     assert "\u041d\u0435 \u0432\u0441\u0442\u0430\u0432\u043b\u044f\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435" in prompt
+    assert "cover_prompt" in prompt
+    assert "\u0422\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0432\u044b\u0445 \u0433\u043b\u0430\u0432" in prompt
+    assert "\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0" in prompt
 
 
 def test_build_ai_prompt_does_not_include_hardcoded_tag_examples():

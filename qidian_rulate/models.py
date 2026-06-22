@@ -22,6 +22,7 @@ class PreparedRulateMetadata:
     translated_description: str = ""
     genres: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    cover_prompt: str = ""
 
 
 @dataclass(slots=True)

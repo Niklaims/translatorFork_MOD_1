@@ -603,6 +603,7 @@ def parse_prepared_metadata(raw_response: str) -> PreparedRulateMetadata:
         translated_description=_clean_multiline(payload.get("translated_description")),
         genres=genres,
         tags=tags,
+        cover_prompt=clean_cover_prompt_response(payload.get("cover_prompt")),
     )
 
 
@@ -643,9 +644,10 @@ def _clean_multiline(value: str | None) -> str:
     return value.strip()
 
 
-def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
+def build_ai_prompt(metadata: QidianBookMetadata, english_title: str, chapters_text: str = "") -> str:
     allowed_genres = ", ".join(RULATE_GENRES)
-    return f"""Ты готовишь карточку китайской веб-новеллы для Rulate.
+    chapters_text = _truncate_cover_source_text(chapters_text)
+    return f"""Ты готовишь карточку китайской веб-новеллы для Rulate и промпт для генерации обложки.
 
 Верни только JSON без markdown.
 
@@ -655,6 +657,7 @@ def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
 - translated_description: литературный русский перевод описания. Не вставляй название отдельной строкой.
 - genres: от 3 до 5 жанров строго из списка допустимых жанров.
 - tags: от 3 до 8 существующих тегов Rulate по смыслу описания. Не придумывай новые теги и не используй заготовленный список.
+- cover_prompt: единый промпт на английском для генерации обложки в DALL-E 3 / Ideogram. Используй русское название из translated_title внутри блока Typography в кавычках. Формат значения строго такой: [Subject & Action], [Background & Atmosphere], [Typography: The text "[translated_title]" written in [Font Style Description], placed at the [bottom/top], professional book cover typography, legible, high contrast], [Visual Style: Manhwa style, Riot Games Splash Art, 8k, masterpiece], --ar 2:3
 
 Допустимые жанры Rulate:
 {allowed_genres}
@@ -664,6 +667,9 @@ def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
 Автор: {metadata.author_name}
 Описание:
 {metadata.description}
+
+Текст первых глав для понимания визуала и жанра:
+{chapters_text or "[текст глав не найден]"}
 """
 
 
@@ -718,7 +724,7 @@ A dark necromancer raising skeletons, green fire aura, dark dungeon background. 
 
 
 def clean_cover_prompt_response(raw_response: str) -> str:
-    response = (raw_response or "").strip()
+    response = str(raw_response or "").strip()
     response = re.sub(r"^```(?:text|prompt)?\s*", "", response, flags=re.IGNORECASE)
     response = re.sub(r"\s*```$", "", response)
     return response.strip().strip("`").strip()
@@ -917,6 +923,91 @@ class RulateLoginWorker(QThread):
             self.finished_signal.emit()
 
 
+def _fetch_qidian_cover_context(
+    qidian_url: str,
+    *,
+    visible_browser: bool = False,
+    original_description: str = "",
+    log_callback=None,
+) -> tuple[str, str]:
+    configure_playwright_runtime()
+    from playwright.sync_api import sync_playwright
+
+    def log(level: str, message: str) -> None:
+        if callable(log_callback):
+            log_callback(level, message)
+
+    description = _clean_multiline(original_description)
+    log("INFO", "Qidian: ищу первые главы для контекста обложки...")
+    chapters = []
+    with sync_playwright() as playwright:
+        browser = _launch_chromium(
+            playwright,
+            headless=not visible_browser,
+            log_callback=log,
+        )
+        page = browser.new_page(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+        )
+        try:
+            page.goto(qidian_url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_function(
+                    "() => Array.from(document.querySelectorAll('a[href]')).some(a => a.href.includes('/chapter/'))",
+                    timeout=12000,
+                )
+            except Exception:
+                page.wait_for_timeout(3000)
+
+            if not description:
+                try:
+                    payload = page.evaluate(_QIDIAN_EXTRACT_SCRIPT)
+                    title_original = _clean_text(payload.get("title"))
+                    author_name = _clean_text(payload.get("author"))
+                    description = _select_qidian_description(
+                        payload,
+                        title=title_original,
+                        author=author_name,
+                    )
+                    if description:
+                        log("SUCCESS", "Qidian: описание добавлено в контекст обложки.")
+                except Exception as error:
+                    log("WARNING", f"Qidian: не удалось получить описание для контекста обложки: {error}")
+
+            links = page.evaluate(_QIDIAN_CHAPTER_LINKS_SCRIPT, QIDIAN_COVER_PROMPT_CHAPTER_COUNT)
+            if not links:
+                raise ValueError("На странице книги не найдены ссылки на главы.")
+
+            for index, link in enumerate(links[:QIDIAN_COVER_PROMPT_CHAPTER_COUNT], start=1):
+                href = link.get("href") if isinstance(link, dict) else ""
+                if not href:
+                    continue
+                title = _clean_text(link.get("title") if isinstance(link, dict) else "") or f"Глава {index}"
+                log("INFO", f"Qidian: читаю {title}...")
+                page.goto(href, wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.wait_for_selector(".content-text, main[id^='c-'], main.content", timeout=12000)
+                except Exception:
+                    page.wait_for_timeout(2500)
+                payload = page.evaluate(_QIDIAN_CHAPTER_TEXT_SCRIPT)
+                chapter_title = title or _clean_text(payload.get("title")) or f"Глава {index}"
+                chapter_text = _clean_qidian_chapter_text(payload.get("text"))
+                if not chapter_text:
+                    log("WARNING", f"Qidian: текст главы '{title}' не найден, пропускаю.")
+                    continue
+                chapters.append(f"{chapter_title}\n{chapter_text}")
+        finally:
+            browser.close()
+
+    log("SUCCESS", f"Qidian: получено глав для контекста обложки: {len(chapters)}.")
+    return _truncate_cover_source_text("\n\n".join(chapters)), description
+
+
 class AiPrepareWorker(QThread):
     log_signal = pyqtSignal(str, str)
     prepared_ready = pyqtSignal(object)
@@ -929,6 +1020,8 @@ class AiPrepareWorker(QThread):
         model_settings: dict,
         active_keys: list[str],
         settings_manager,
+        *,
+        visible_browser: bool = False,
     ):
         super().__init__()
         self.metadata = metadata
@@ -936,6 +1029,7 @@ class AiPrepareWorker(QThread):
         self.model_settings = model_settings or {}
         self.active_keys = active_keys or []
         self.settings_manager = settings_manager
+        self.visible_browser = visible_browser
 
     def log(self, level: str, message: str) -> None:
         self.log_signal.emit(level, message)
@@ -955,7 +1049,23 @@ class AiPrepareWorker(QThread):
             if not self.active_keys:
                 raise ValueError("Не выбран активный ключ или сессия для AI-сервиса.")
 
-            prompt = build_ai_prompt(self.metadata, english_title)
+            chapters_text = ""
+            if validate_qidian_url(self.metadata.source_url):
+                try:
+                    chapters_text, original_description = _fetch_qidian_cover_context(
+                        self.metadata.source_url,
+                        visible_browser=self.visible_browser,
+                        original_description=self.metadata.description,
+                        log_callback=self.log,
+                    )
+                    if original_description and not self.metadata.description:
+                        self.metadata.description = original_description
+                except Exception as error:
+                    self.log("WARNING", f"Qidian: главы для промпта обложки не получены, продолжаю без них: {error}")
+            else:
+                self.log("WARNING", "Qidian: ссылка на оригинал не задана, промпт обложки будет без текста глав.")
+
+            prompt = build_ai_prompt(self.metadata, english_title, chapters_text)
             raw_response = self._run_ai_request(prompt)
             prepared = parse_prepared_metadata(raw_response)
             if english_title and not prepared.english_title:
@@ -964,6 +1074,8 @@ class AiPrepareWorker(QThread):
                 raise ValueError("AI не вернул название на русском.")
             if not prepared.translated_description:
                 raise ValueError("AI не вернул описание на русском.")
+            if not prepared.cover_prompt:
+                self.log("WARNING", "AI не вернул промпт для обложки, его можно сгенерировать отдельной кнопкой.")
 
             self.prepared_ready.emit(prepared)
             self.log("SUCCESS", "AI: данные для Rulate подготовлены.")
@@ -1059,77 +1171,14 @@ class CoverPromptWorker(QThread):
             self.finished_signal.emit()
 
     def _fetch_chapters_text(self) -> str:
-        configure_playwright_runtime()
-        from playwright.sync_api import sync_playwright
-
-        self.log("INFO", "Qidian: ищу первые главы для промпта обложки...")
-        chapters = []
-        with sync_playwright() as playwright:
-            browser = _launch_chromium(
-                playwright,
-                headless=not self.visible_browser,
-                log_callback=self.log,
-            )
-            page = browser.new_page(
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-            )
-            try:
-                page.goto(self.qidian_url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    page.wait_for_function(
-                        "() => Array.from(document.querySelectorAll('a[href]')).some(a => a.href.includes('/chapter/'))",
-                        timeout=12000,
-                    )
-                except Exception:
-                    page.wait_for_timeout(3000)
-
-                if not self.original_description:
-                    try:
-                        payload = page.evaluate(_QIDIAN_EXTRACT_SCRIPT)
-                        title_original = _clean_text(payload.get("title"))
-                        author_name = _clean_text(payload.get("author"))
-                        self.original_description = _select_qidian_description(
-                            payload,
-                            title=title_original,
-                            author=author_name,
-                        )
-                        if self.original_description:
-                            self.log("SUCCESS", "Qidian: описание добавлено в контекст промпта обложки.")
-                    except Exception as error:
-                        self.log("WARNING", f"Qidian: не удалось получить описание для промпта обложки: {error}")
-
-                links = page.evaluate(_QIDIAN_CHAPTER_LINKS_SCRIPT, QIDIAN_COVER_PROMPT_CHAPTER_COUNT)
-                if not links:
-                    raise ValueError("На странице книги не найдены ссылки на главы.")
-
-                for index, link in enumerate(links[:QIDIAN_COVER_PROMPT_CHAPTER_COUNT], start=1):
-                    href = link.get("href") if isinstance(link, dict) else ""
-                    if not href:
-                        continue
-                    title = _clean_text(link.get("title") if isinstance(link, dict) else "") or f"Глава {index}"
-                    self.log("INFO", f"Qidian: читаю {title}...")
-                    page.goto(href, wait_until="domcontentloaded", timeout=60000)
-                    try:
-                        page.wait_for_selector(".content-text, main[id^='c-'], main.content", timeout=12000)
-                    except Exception:
-                        page.wait_for_timeout(2500)
-                    payload = page.evaluate(_QIDIAN_CHAPTER_TEXT_SCRIPT)
-                    chapter_title = title or _clean_text(payload.get("title")) or f"Глава {index}"
-                    chapter_text = _clean_qidian_chapter_text(payload.get("text"))
-                    if not chapter_text:
-                        self.log("WARNING", f"Qidian: текст главы '{title}' не найден, пропускаю.")
-                        continue
-                    chapters.append(f"{chapter_title}\n{chapter_text}")
-            finally:
-                browser.close()
-
-        self.log("SUCCESS", f"Qidian: получено глав для промпта обложки: {len(chapters)}.")
-        return _truncate_cover_source_text("\n\n".join(chapters))
+        chapters_text, original_description = _fetch_qidian_cover_context(
+            self.qidian_url,
+            visible_browser=self.visible_browser,
+            original_description=self.original_description,
+            log_callback=self.log,
+        )
+        self.original_description = original_description
+        return chapters_text
 
 
 class RulateFillWorker(QThread):
