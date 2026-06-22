@@ -30,6 +30,12 @@ class ExpandingTextEdit(QtWidgets.QTextEdit):
     def resizeEvent(self, event: QtGui.QResizeEvent):
         """Перехватываем изменение размера, чтобы обновить компоновку."""
         super().resizeEvent(event)
+        
+        # Защита от Access Violation: если сигналы заблокированы (например, в destroyEditor перед удалением),
+        # мы не должны вызывать updateGeometry, так как виджет находится в процессе C++ деструкции (DeferredDelete).
+        if self.signalsBlocked():
+            return
+            
         # Этот вызов заставит sizeHint пересчитаться с новой шириной
         self.updateGeometry()
         # И сообщаем об этом, чтобы таблица тоже обновилась
