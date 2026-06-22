@@ -3,6 +3,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 
 from gemini_translator.api import config as api_config
+from gemini_translator.ui.dialogs.glossary_dialogs import ai_generation as ai_generation_module
 from gemini_translator.ui.dialogs.glossary_dialogs.ai_generation import (
     GenerationSessionDialog,
     SequentialTaskProvider,
@@ -290,6 +291,21 @@ class _GlossaryBatchSizeHarness:
         self.new_terms_limit_updates += 1
 
 
+class _BottomStatusBarHarness:
+    _create_bottom_status_bar = GenerationSessionDialog._create_bottom_status_bar
+
+    def __init__(self):
+        self.bus = object()
+        self.engine = object()
+
+
+class _StatusBarStub:
+    def __init__(self, parent=None, event_bus=None, engine=None):
+        self.parent = parent
+        self.event_bus = event_bus
+        self.engine = engine
+
+
 class AiGlossaryGenerationTests(unittest.TestCase):
     def _provider_for_finish_tests(self):
         bus = _EventBusStub()
@@ -322,6 +338,16 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertIn("manual_stop_requested", event_names)
         self.assertIn("generation_finished", event_names)
         self.assertNotIn("managed_session_completed", event_names)
+
+    def test_bottom_status_bar_uses_generation_session_bus_and_engine(self):
+        harness = _BottomStatusBarHarness()
+
+        with patch.object(ai_generation_module, "StatusBarWidget", _StatusBarStub, create=True):
+            status_bar = harness._create_bottom_status_bar()
+
+        self.assertIs(status_bar.parent, harness)
+        self.assertIs(status_bar.event_bus, harness.bus)
+        self.assertIs(status_bar.engine, harness.engine)
 
     def test_initial_settings_restore_saved_instances_after_loading_active_keys(self):
         harness = _GenerationSettingsHarness()
