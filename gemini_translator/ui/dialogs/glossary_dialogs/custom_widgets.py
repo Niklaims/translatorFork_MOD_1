@@ -45,9 +45,14 @@ class ExpandingTextEditDelegate(QtWidgets.QStyledItemDelegate):
         editor = ExpandingTextEdit(parent)
         table = self.parent()
         if isinstance(table, QtWidgets.QTableWidget):
+            table_ref = weakref.ref(table)
             row = index.row()
-            # Соединяем сигнал от редактора с методом таблицы
-            editor.geometryChangeRequested.connect(lambda: table.resizeRowToContents(row))
+            # Соединяем сигнал от редактора с методом таблицы безопасно
+            editor.geometryChangeRequested.connect(
+                lambda: (tbl := table_ref()) and 
+                (0 <= row < tbl.rowCount()) and 
+                tbl.resizeRowToContents(row)
+            )
         
         editor.installEventFilter(self)
         return editor
