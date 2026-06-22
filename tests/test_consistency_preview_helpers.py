@@ -83,10 +83,10 @@ class _ResolvedProblemHarness:
 class _SessionSaveHarness:
     _problem_key = ConsistencyValidatorDialog._problem_key
     _is_problem_resolved = ConsistencyValidatorDialog._is_problem_resolved
+    _build_session_payload = ConsistencyValidatorDialog._build_session_payload
     _save_session = ConsistencyValidatorDialog._save_session
 
     def __init__(self, session_file):
-        self.resolved_problem_keys = {"id:p1"}
         self.session_file = Path(session_file)
         self.engine = SimpleNamespace(
             chapter_problems_map={
@@ -99,8 +99,13 @@ class _SessionSaveHarness:
                 processed_chapters=[],
                 to_dict=lambda: {"characters": [], "terms": [], "plots": []},
             ),
+            get_completed_chunk_keys=lambda: {"analysis": ["chunk-key-1"]},
+            get_request_response_trace=lambda: [{"phase": "analysis", "prompt": "p", "response": "r"}],
         )
         self.selected_chapter_ids = set()
+        self.resolved_problem_keys = {
+            self._problem_key({"id": "p1", "chapter": "chapter.xhtml"})
+        }
 
 
 class ConsistencyPreviewHelpersTests(unittest.TestCase):
@@ -165,6 +170,45 @@ class ConsistencyPreviewHelpersTests(unittest.TestCase):
         self.assertEqual(harness._count_visible_checked_problems(), (0, 0))
         self.assertEqual(harness.batch_fix_updates, 1)
 
+    def test_same_id_in_different_problem_type_is_not_resolved_together(self):
+        harness = _ResolvedProblemHarness()
+        typo_problem = {
+            "id": "2",
+            "chapter": "chapter.xhtml",
+            "type": "typo",
+            "quote": "teh",
+            "description": "typo",
+            "suggestion": "the",
+        }
+        gender_problem = {
+            "id": "2",
+            "chapter": "chapter.xhtml",
+            "type": "gender_mismatch",
+            "quote": "она сказал",
+            "description": "gender",
+            "suggestion": "она сказала",
+        }
+        harness.problems_table.item(0, 1).setData(Qt.ItemDataRole.UserRole, typo_problem)
+        harness.problems_table.setRowCount(2)
+        check_item = QTableWidgetItem()
+        check_item.setCheckState(Qt.CheckState.Checked)
+        harness.problems_table.setItem(1, 0, check_item)
+        id_item = QTableWidgetItem("2")
+        id_item.setData(Qt.ItemDataRole.UserRole, gender_problem)
+        harness.problems_table.setItem(1, 1, id_item)
+        for col in range(2, 8):
+            harness.problems_table.setItem(1, col, QTableWidgetItem(""))
+
+        harness._mark_problem_resolved(typo_problem, row=0)
+
+        self.assertTrue(harness._is_problem_resolved(typo_problem))
+        self.assertFalse(harness._is_problem_resolved(gender_problem))
+        self.assertEqual(
+            harness.problems_table.item(1, 0).checkState(),
+            Qt.CheckState.Checked,
+        )
+        self.assertEqual(harness._count_visible_checked_problems(), (1, 1))
+
     def test_incomplete_problem_row_is_ignored_during_batch_count(self):
         harness = _ResolvedProblemHarness()
         harness.problems_table.setRowCount(2)
@@ -187,6 +231,11 @@ class ConsistencyPreviewHelpersTests(unittest.TestCase):
         self.assertEqual(
             payload["problems"],
             [{"id": "p2", "chapter": "chapter.xhtml"}],
+        )
+        self.assertEqual(payload["completed_chunks"], {"analysis": ["chunk-key-1"]})
+        self.assertEqual(
+            payload["request_response_trace"],
+            [{"phase": "analysis", "prompt": "p", "response": "r"}],
         )
 
 

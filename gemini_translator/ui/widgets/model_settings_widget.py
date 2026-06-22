@@ -19,6 +19,9 @@ from ...utils import markdown_viewer
 
 CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
 CHATGPT_SIGNUP_URL = "https://chatgpt.com/auth/login?mode=signup"
+MODEL_COMBO_MIN_WIDTH = 280
+MODEL_COMBO_POPUP_MIN_WIDTH = 460
+MODEL_COMBO_POPUP_MAX_WIDTH = 760
 
 
 class CustomModelDialog(QDialog):
@@ -204,11 +207,28 @@ class ModelSettingsWidget(QGroupBox):
         main_layout = QHBoxLayout(self)
         
         left_column_widget = QWidget()
+        left_column_widget.setMinimumWidth(380)
+        left_column_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         left_layout = QGridLayout(left_column_widget)
         left_layout.setContentsMargins(0, 9, 10, 0)
+        left_layout.setColumnMinimumWidth(1, MODEL_COMBO_MIN_WIDTH)
+        left_layout.setColumnStretch(1, 1)
         
         left_layout.addWidget(QLabel("Модель:"), 0, 0)
         self.model_combo = NoScrollComboBox()
+        self.model_combo.setMinimumWidth(MODEL_COMBO_MIN_WIDTH)
+        self.model_combo.setMinimumContentsLength(32)
+        self.model_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.model_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.model_combo.view().setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         left_layout.addWidget(self.model_combo, 0, 1)
         self.refresh_models_btn = QPushButton("↻")
         self.refresh_models_btn.setFixedWidth(34)
@@ -389,6 +409,10 @@ class ModelSettingsWidget(QGroupBox):
         
         right_column_widget = QWidget()
         right_column_widget.setObjectName("right_column_widget")
+        right_column_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
         right_layout = QVBoxLayout(right_column_widget)
         right_layout.setContentsMargins(10, 0, 0, 0)
     
@@ -645,8 +669,8 @@ class ModelSettingsWidget(QGroupBox):
         right_layout.addWidget(self.debug_group)
         right_layout.addStretch(1)
     
-        main_layout.addWidget(left_column_widget, 1)
-        main_layout.addWidget(right_column_widget, 1)
+        main_layout.addWidget(left_column_widget, 3)
+        main_layout.addWidget(right_column_widget, 2)
         
         self.update_temperature_indicator(self.temperature_spin.value())
         self._update_provider_specific_controls(None)
@@ -774,6 +798,30 @@ class ModelSettingsWidget(QGroupBox):
         self.refresh_models_btn.setEnabled(is_local_provider)
         can_add_custom_model = bool(provider_id and api_config.api_providers().get(provider_id))
         self.add_custom_model_btn.setEnabled(can_add_custom_model)
+
+    def _update_model_combo_popup_width(self):
+        if not hasattr(self, "model_combo"):
+            return
+
+        widest_item = 0
+        metrics = self.model_combo.fontMetrics()
+        for index in range(self.model_combo.count()):
+            item_text = self.model_combo.itemText(index)
+            widest_item = max(widest_item, metrics.horizontalAdvance(item_text))
+            self.model_combo.setItemData(
+                index,
+                item_text,
+                QtCore.Qt.ItemDataRole.ToolTipRole,
+            )
+
+        popup_width = max(
+            MODEL_COMBO_POPUP_MIN_WIDTH,
+            self.model_combo.width(),
+            self.model_combo.minimumWidth(),
+            widest_item + 56,
+        )
+        popup_width = min(popup_width, MODEL_COMBO_POPUP_MAX_WIDTH)
+        self.model_combo.view().setMinimumWidth(popup_width)
     # ----------------------------------------------------
     # Публичные методы
     # ----------------------------------------------------
@@ -1086,6 +1134,7 @@ class ModelSettingsWidget(QGroupBox):
                 # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Сохраняем ID в userData ---
                 for display_name, config in models.items():
                     self.model_combo.addItem(display_name, userData=config.get('id'))
+        self._update_model_combo_popup_width()
         
         if self.model_combo.count() > 0:
             preferred_index = self._find_model_index(model_id=current_model_id)

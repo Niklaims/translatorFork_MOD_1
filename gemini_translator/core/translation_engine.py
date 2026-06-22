@@ -419,7 +419,8 @@ class TranslationEngine(QObject):
             self._handle_fatal_error(worker_id, data.get('payload'), worker_session=event_session)
         
         events_that_change_state = {
-            'task_finished', 'assembly_finished', 'fatal_error', 'tasks_added'
+            'task_finished', 'assembly_finished', 'fatal_error', 'tasks_added',
+            'managed_session_completed'
         }
         if event_name in events_that_change_state:
             

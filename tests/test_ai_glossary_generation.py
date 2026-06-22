@@ -1,8 +1,43 @@
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from gemini_translator.api import config as api_config
-from gemini_translator.ui.dialogs.glossary_dialogs.ai_generation import GenerationSessionDialog
+from gemini_translator.ui.dialogs.glossary_dialogs.ai_generation import (
+    GenerationSessionDialog,
+    SequentialTaskProvider,
+)
+
+
+class _LineEditStub:
+    def __init__(self):
+        self.textEdited = _SignalStub()
+
+
+class _SignalStub:
+    def __init__(self):
+        self.emitted = []
+
+    def connect(self, _callback):
+        return None
+
+    def emit(self, event):
+        self.emitted.append(event)
+
+
+class _EventBusStub:
+    def __init__(self):
+        self.event_posted = _SignalStub()
+        self._data_store = {}
+
+    def set_data(self, key, value):
+        self._data_store[key] = value
+
+    def get_data(self, key, default=None):
+        return self._data_store.get(key, default)
+
+    def pop_data(self, key, default=None):
+        return self._data_store.pop(key, default)
 
 
 class _KeyWidgetStub:
@@ -29,6 +64,8 @@ class _SpinBoxStub:
         self._minimum = 1
         self._maximum = 1
         self._value = 1
+        self.valueChanged = _SignalStub()
+        self._line_edit = _LineEditStub()
 
     def minimum(self):
         return self._minimum
@@ -58,6 +95,9 @@ class _SpinBoxStub:
 
     def blockSignals(self, _value):
         return None
+
+    def lineEdit(self):
+        return self._line_edit
 
 
 class _ModelSettingsWidgetStub:
@@ -112,20 +152,28 @@ class _GenerationSettingsHarness:
     _apply_initial_settings = GenerationSessionDialog._apply_initial_settings
     _apply_instances_value = GenerationSessionDialog._apply_instances_value
     _apply_new_terms_limit_value = GenerationSessionDialog._apply_new_terms_limit_value
+    _set_new_terms_limit_value = GenerationSessionDialog._set_new_terms_limit_value
+    _mark_new_terms_limit_user_defined = GenerationSessionDialog._mark_new_terms_limit_user_defined
+    _new_terms_limit_user_defined_from_settings = GenerationSessionDialog._new_terms_limit_user_defined_from_settings
     _merge_initial_ui_settings = GenerationSessionDialog._merge_initial_ui_settings
     _save_persistent_ui_settings = GenerationSessionDialog._save_persistent_ui_settings
     _get_available_session_capacity = GenerationSessionDialog._get_available_session_capacity
     _update_instances_spinbox_limit = GenerationSessionDialog._update_instances_spinbox_limit
+    _update_new_terms_limit_from_current_size = GenerationSessionDialog._update_new_terms_limit_from_current_size
+    round_up_to_tens = GenerationSessionDialog.round_up_to_tens
 
     def __init__(self):
         self.settings_manager = _SettingsManagerStub()
         self._restore_saved_ui_settings = True
         self._persist_ui_settings = True
         self._pending_new_terms_limit = None
+        self._pending_new_terms_limit_user_defined = True
+        self._new_terms_limit_user_defined = False
+        self._changing_new_terms_limit_programmatically = False
         self.key_widget = _KeyWidgetStub()
         self.instances_spin = _SpinBoxStub()
         self.new_terms_limit_spin = _SpinBoxStub()
-        self.new_terms_limit_spin.setRange(5, 500)
+        self.new_terms_limit_spin.setRange(0, 1000)
         self.model_settings_widget = _ModelSettingsWidgetStub()
         self.translation_options_widget = _TranslationOptionsWidgetStub()
         self.prompt_widget = _PromptWidgetStub()
@@ -168,6 +216,7 @@ class _GenerationSettingsHarness:
             "merge_mode": self.get_merge_mode(),
             "num_instances": self.instances_spin.value(),
             "new_terms_limit": self.new_terms_limit_spin.value(),
+            "new_terms_limit_user_defined": self._new_terms_limit_user_defined,
         }
 
     def get_merge_mode(self):
@@ -242,6 +291,38 @@ class _GlossaryBatchSizeHarness:
 
 
 class AiGlossaryGenerationTests(unittest.TestCase):
+    def _provider_for_finish_tests(self):
+        bus = _EventBusStub()
+        provider = SequentialTaskProvider(
+            settings_getter=lambda: {},
+            event_bus=bus,
+            translate_engine=SimpleNamespace(task_manager=None, session_id=None),
+        )
+        provider._is_running = True
+        bus.set_data(provider.MANAGED_SESSION_FLAG_KEY, True)
+        return provider, bus
+
+    def test_sequential_provider_success_does_not_request_manual_stop(self):
+        provider, bus = self._provider_for_finish_tests()
+
+        provider._finish_session(was_cancelled=False)
+
+        event_names = [event["event"] for event in bus.event_posted.emitted]
+        self.assertIn("managed_session_completed", event_names)
+        self.assertIn("generation_finished", event_names)
+        self.assertNotIn("manual_stop_requested", event_names)
+        self.assertFalse(bus.get_data(provider.MANAGED_SESSION_FLAG_KEY, False))
+
+    def test_sequential_provider_cancel_still_requests_manual_stop(self):
+        provider, bus = self._provider_for_finish_tests()
+
+        provider._finish_session(was_cancelled=True)
+
+        event_names = [event["event"] for event in bus.event_posted.emitted]
+        self.assertIn("manual_stop_requested", event_names)
+        self.assertIn("generation_finished", event_names)
+        self.assertNotIn("managed_session_completed", event_names)
+
     def test_initial_settings_restore_saved_instances_after_loading_active_keys(self):
         harness = _GenerationSettingsHarness()
 
@@ -311,6 +392,7 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         harness.instances_spin.setMaximum(4)
         harness.instances_spin.setValue(3)
         harness.new_terms_limit_spin.setValue(88)
+        harness._mark_new_terms_limit_user_defined()
 
         harness._save_persistent_ui_settings()
 
@@ -319,6 +401,37 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertFalse(harness.settings_manager.persisted["send_notes_in_sequence"])
         self.assertEqual(harness.settings_manager.persisted["num_instances"], 3)
         self.assertEqual(harness.settings_manager.persisted["new_terms_limit"], 88)
+        self.assertTrue(harness.settings_manager.persisted["new_terms_limit_user_defined"])
+
+    def test_auto_new_terms_limit_has_practical_floor(self):
+        harness = _GenerationSettingsHarness()
+        harness.translation_options_widget = _TranslationOptionsForBatchSizeStub(value=20000)
+
+        harness._update_new_terms_limit_from_current_size()
+
+        self.assertEqual(harness.new_terms_limit_spin.value(), 100)
+        self.assertFalse(harness._new_terms_limit_user_defined)
+
+    def test_manual_new_terms_limit_is_not_overwritten_by_auto_recalc(self):
+        harness = _GenerationSettingsHarness()
+        harness.translation_options_widget = _TranslationOptionsForBatchSizeStub(value=30000)
+        harness._apply_new_terms_limit_value(100, user_defined=True)
+
+        harness._update_new_terms_limit_from_current_size()
+
+        self.assertEqual(harness.new_terms_limit_spin.value(), 100)
+        self.assertTrue(harness._new_terms_limit_user_defined)
+
+    def test_legacy_auto_new_terms_limit_below_default_is_recomputed(self):
+        harness = _GenerationSettingsHarness()
+        harness.translation_options_widget = _TranslationOptionsForBatchSizeStub(value=20000)
+        user_defined = harness._new_terms_limit_user_defined_from_settings({"new_terms_limit": 40})
+        harness._apply_new_terms_limit_value(40, user_defined=user_defined)
+
+        harness._update_new_terms_limit_from_current_size()
+
+        self.assertEqual(harness.new_terms_limit_spin.value(), 100)
+        self.assertFalse(harness._new_terms_limit_user_defined)
 
     def test_initial_settings_do_not_treat_inherited_task_size_as_glossary_user_size(self):
         harness = _GenerationSettingsHarness()

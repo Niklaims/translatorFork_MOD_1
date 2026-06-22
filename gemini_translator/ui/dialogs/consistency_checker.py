@@ -231,6 +231,7 @@ class ConsistencyValidatorDialog(QDialog):
         self.resolved_problem_keys = set()
         self.current_problem = None
         self.current_chapter = None
+        self._restored_session_data = None
 
         # Файл сессии
         self.session_file = Path(os.getcwd()) / "consistency_session.json"
@@ -1054,6 +1055,16 @@ class ConsistencyValidatorDialog(QDialog):
             QMessageBox.warning(self, "Не выбраны главы", "Выберите хотя бы одну главу для анализа.")
             return
 
+        config = self._get_current_config()
+        
+        # Определяем режим анализа
+        mode = 'glossary_first' if self.glossary_first_checkbox.isChecked() else 'standard'
+        resume_state = self._build_session_payload()
+        if not self._has_resumable_progress(mode, selected_chapters, config, resume_state):
+            resume_state = None
+        if resume_state:
+            config['_consistency_resume_state'] = resume_state
+
         self.problems_table.setRowCount(0)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -1073,11 +1084,17 @@ class ConsistencyValidatorDialog(QDialog):
         self.skip_btn.setEnabled(False)
         self.log_text.clear()
 
-        config = self._get_current_config()
-        
-        # Определяем режим анализа
-        mode = 'glossary_first' if self.glossary_first_checkbox.isChecked() else 'standard'
-        
+        if resume_state and resume_state.get('problems'):
+            self.on_chunk_done({'problems': resume_state.get('problems', [])})
+            self._log(
+                f"♻️ Восстановлено проблем из сохраненной сессии: "
+                f"{len(resume_state.get('problems', []))}"
+            )
+        if resume_state:
+            completed_chunks = resume_state.get('completed_chunks', {})
+            completed_count = sum(len(keys or []) for keys in completed_chunks.values())
+            self._log(f"♻️ Resume: найдено завершенных чанков: {completed_count}")
+         
         self._log(f"▶ Начало анализа: {len(selected_chapters)} из {len(self.chapters)} глав, "
                   f"провайдер: {config['provider']}, модель: {config['model']}")
         self._log(f"  Активных ключей: {len(active_keys)}, глав в чанке: {config['chunk_size']}")
@@ -1281,14 +1298,15 @@ class ConsistencyValidatorDialog(QDialog):
         if not isinstance(problem, dict):
             return ""
 
-        raw_id = str(problem.get('id') or "").strip()
-        if raw_id:
-            return f"id:{raw_id}"
-
         payload = {
             key: str(problem.get(key) or "")
             for key in ('chapter', 'type', 'quote', 'description', 'suggestion')
         }
+        raw_id = str(problem.get('id') or "").strip()
+        if raw_id:
+            payload['id'] = raw_id
+            return "idmeta:" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
         return "meta:" + json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
     def _is_problem_resolved(self, problem: dict) -> bool:
@@ -1470,6 +1488,7 @@ class ConsistencyValidatorDialog(QDialog):
         # Статистика токенов глоссария
         token_count = self.engine.get_glossary_token_count()
         self._log(f"   Токенов в глоссарии: ~{token_count}")
+        self._save_session()
 
     @pyqtSlot(str)
     def on_engine_error(self, error_msg):
@@ -2160,11 +2179,18 @@ class ConsistencyValidatorDialog(QDialog):
                 data = json.load(f)
         except Exception:
             return # Битая сессия или пустой файл
-            
+
+        completed_chunks = data.get('completed_chunks', {})
+        if isinstance(completed_chunks, dict):
+            completed_chunk_count = sum(len(keys or []) for keys in completed_chunks.values())
+        else:
+            completed_chunk_count = 0
+
         reply = QMessageBox.question(
             self, "Восстановление сессии",
             f"Найдена предыдущая сессия ({data.get('timestamp', 'н/д')}).\n"
             f"- Обработано глав: {len(data.get('processed_chapters', []))}\n"
+            f"- Завершено чанков: {completed_chunk_count}\n"
             f"- Найдено проблем: {len(data.get('problems', []))}\n"
             f"- Персонажей в глоссарии: {len(data.get('glossary', {}).get('characters', []))}\n\n"
             "Восстановить работу с места остановки?",
@@ -2204,23 +2230,88 @@ class ConsistencyValidatorDialog(QDialog):
         # except Exception as e:
             # logger.error(f"Error loading project glossary: {e}")
 
-    def _save_session(self):
-        """Сохраняет текущее состояние сессии (только AI-контекст) в consistency_session.json."""
-        try:
-            problems_data = []
-            for probs_list in self.engine.chapter_problems_map.values():
-                problems_data.extend(
-                    prob for prob in probs_list
-                    if not self._is_problem_resolved(prob)
-                )
-                
-            data = {
-                'timestamp': str(datetime.now()),
-                'glossary': self.engine.glossary_session.to_dict(),
-                'processed_chapters': self.engine.glossary_session.processed_chapters,
-                'problems': problems_data,
-                'selected_chapter_ids': sorted(self.selected_chapter_ids),
+    def _build_session_payload(self) -> dict:
+        problems_data = []
+        for probs_list in self.engine.chapter_problems_map.values():
+            problems_data.extend(
+                prob for prob in probs_list
+                if not self._is_problem_resolved(prob)
+            )
+
+        completed_getter = getattr(self.engine, 'get_completed_chunk_keys', None)
+        completed_chunks = completed_getter() if callable(completed_getter) else {}
+
+        trace_getter = getattr(self.engine, 'get_request_response_trace', None)
+        request_response_trace = trace_getter() if callable(trace_getter) else []
+
+        return {
+            'timestamp': str(datetime.now()),
+            'glossary': self.engine.glossary_session.to_dict(),
+            'processed_chapters': self.engine.glossary_session.processed_chapters,
+            'problems': problems_data,
+            'selected_chapter_ids': sorted(self.selected_chapter_ids),
+            'completed_chunks': completed_chunks,
+            'request_response_trace': request_response_trace,
+        }
+
+    def _has_resumable_progress(
+        self,
+        mode: str,
+        selected_chapters: list[dict],
+        config: dict,
+        resume_state: dict | None,
+    ) -> bool:
+        if not isinstance(resume_state, dict):
+            return False
+
+        chunk_size = int(config.get('chunk_size') or 3)
+        chunks = self.engine._split_into_chunks(selected_chapters, chunk_size)
+        completed_chunks = resume_state.get('completed_chunks')
+        has_completed_chunk_match = False
+        required_phases = ['analysis']
+        if mode == 'glossary_first':
+            required_phases.insert(0, 'glossary_collection')
+
+        if isinstance(completed_chunks, dict) and completed_chunks:
+            for phase in required_phases:
+                completed = {
+                    str(key).strip()
+                    for key in completed_chunks.get(phase, [])
+                    if str(key).strip()
+                }
+                if not completed:
+                    continue
+                for chunk in chunks:
+                    if self.engine.chunk_resume_key(chunk) in completed:
+                        has_completed_chunk_match = True
+                        break
+                if has_completed_chunk_match:
+                    break
+
+        if has_completed_chunk_match:
+            return True
+
+        if mode != 'glossary_first':
+            processed = {
+                str(chapter).strip()
+                for chapter in resume_state.get('processed_chapters', [])
+                if str(chapter).strip()
             }
+            if processed:
+                for chunk in chunks:
+                    if all(
+                        self.engine._chapter_resume_id_candidates(chapter) & processed
+                        for chapter in chunk
+                    ):
+                        return True
+
+        return False
+
+    def _save_session(self):
+        """Сохраняет текущее состояние сессии в consistency_session.json."""
+        try:
+            data = self._build_session_payload()
+            self._restored_session_data = data
             
             # Сохраняем ТОЛЬКО в файл сессии чекера, не трогая основной глоссарий проекта
             with open(self.session_file, 'w', encoding='utf-8') as f:
@@ -2253,6 +2344,16 @@ class ConsistencyValidatorDialog(QDialog):
                     'next_chunk_focus': glossary_data.get('next_chunk_focus', []),
                 },
             )
+            completed_restore = getattr(self.engine, '_restore_completed_chunk_keys', None)
+            if callable(completed_restore):
+                completed_restore(data.get('completed_chunks'))
+            trace = data.get('request_response_trace', [])
+            if isinstance(trace, list):
+                self.engine.request_response_trace = [
+                    dict(item)
+                    for item in trace
+                    if isinstance(item, dict)
+                ]
             
             # 2. Восстанавливаем проблемы
             problems = data.get('problems', [])
@@ -2272,6 +2373,7 @@ class ConsistencyValidatorDialog(QDialog):
             
             # 3. Обновляем UI
             self._update_glossary_button_state()
+            self._restored_session_data = data
             
             self._log("♻️ Сессия успешно восстановлена.")
             

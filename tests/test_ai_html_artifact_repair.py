@@ -4,6 +4,7 @@ from gemini_translator.ui.dialogs.validation import (
     apply_line_review_selection,
     build_line_review_segments,
     should_auto_accept_line_review_change,
+    _replace_all_literal_text,
 )
 from gemini_translator.utils.text import (
     escape_stray_angle_brackets,
@@ -156,6 +157,13 @@ def test_line_review_selection_uses_manual_edit_text():
 
     assert "<p>Manual.</p>" in selected_html
     assert "<p>Good.</p>" not in selected_html
+
+
+def test_manual_replace_all_can_ignore_case():
+    text, count = _replace_all_literal_text("Alpha alpha ALPHA", "alpha", "beta", match_case=False)
+
+    assert text == "beta beta beta"
+    assert count == 3
 
 
 def test_ai_repair_candidate_warning_flags_large_text_loss():

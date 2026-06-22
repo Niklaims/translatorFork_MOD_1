@@ -469,6 +469,10 @@ class ConsistencyEngine(QObject):
         self.request_response_trace: List[Dict[str, Any]] = []
         self._thread_handler_cache: Dict[int, Dict[tuple, Dict[str, Any]]] = {}
         self._discarded_keys: set[str] = set()
+        self.completed_chunk_keys: Dict[str, set[str]] = {
+            "glossary_collection": set(),
+            "analysis": set(),
+        }
         
         # Индекс текущего ключа для ротации
         self._current_key_index = 0
@@ -485,8 +489,126 @@ class ConsistencyEngine(QObject):
         self.chapter_problems_map.clear()
         self.request_response_trace.clear()
         self._discarded_keys.clear()
+        self.completed_chunk_keys = {
+            "glossary_collection": set(),
+            "analysis": set(),
+        }
         self.is_cancelled = False
         self._current_key_index = 0
+
+    @staticmethod
+    def _chapter_resume_id(chapter: Dict[str, Any]) -> str:
+        for key in ("path", "source_path", "name"):
+            value = str((chapter or {}).get(key) or "").strip()
+            if value:
+                return value
+        return json.dumps(chapter or {}, ensure_ascii=False, sort_keys=True, default=str)
+
+    @classmethod
+    def chunk_resume_key(cls, chunk: List[Dict[str, Any]]) -> str:
+        chapter_ids = [cls._chapter_resume_id(chapter) for chapter in (chunk or [])]
+        return json.dumps(chapter_ids, ensure_ascii=False, separators=(",", ":"))
+
+    def _is_chunk_completed(self, phase: str, chunk: List[Dict[str, Any]]) -> bool:
+        return self.chunk_resume_key(chunk) in self.completed_chunk_keys.get(phase, set())
+
+    def _mark_chunk_completed(self, phase: str, chunk: List[Dict[str, Any]]) -> None:
+        self.completed_chunk_keys.setdefault(phase, set()).add(self.chunk_resume_key(chunk))
+
+    @staticmethod
+    def _chapter_resume_id_candidates(chapter: Dict[str, Any]) -> set[str]:
+        candidates = set()
+        for key in ("path", "source_path", "name"):
+            value = str((chapter or {}).get(key) or "").strip()
+            if value:
+                candidates.add(value)
+        return candidates
+
+    def _backfill_analysis_chunks_from_processed_chapters(self, chunks: List[List[Dict[str, Any]]]) -> None:
+        if self.completed_chunk_keys.get("analysis"):
+            return
+
+        processed = {
+            str(chapter).strip()
+            for chapter in self.glossary_session.processed_chapters
+            if str(chapter).strip()
+        }
+        if not processed:
+            return
+
+        for chunk in chunks:
+            if all(
+                self._chapter_resume_id_candidates(chapter) & processed
+                for chapter in chunk
+            ):
+                self._mark_chunk_completed("analysis", chunk)
+
+    def get_completed_chunk_keys(self) -> Dict[str, List[str]]:
+        return {
+            phase: sorted(keys)
+            for phase, keys in self.completed_chunk_keys.items()
+            if keys
+        }
+
+    def _restore_completed_chunk_keys(self, value: Any) -> None:
+        restored = {
+            "glossary_collection": set(),
+            "analysis": set(),
+        }
+        if isinstance(value, dict):
+            for phase in restored:
+                raw_keys = value.get(phase, [])
+                if isinstance(raw_keys, (list, tuple, set)):
+                    restored[phase] = {
+                        str(item).strip()
+                        for item in raw_keys
+                        if str(item).strip()
+                    }
+        self.completed_chunk_keys = restored
+
+    def _restore_runtime_state(self, state: Dict[str, Any] | None) -> None:
+        if not isinstance(state, dict) or not state:
+            return
+
+        glossary_data = state.get("glossary", {}) if isinstance(state.get("glossary"), dict) else {}
+        self.glossary_session.update_from_response(
+            {
+                "characters": glossary_data.get("characters", []),
+                "terms": glossary_data.get("terms", []),
+                "plots": glossary_data.get("plots", []),
+            },
+            {
+                "processed_chapters": state.get(
+                    "processed_chapters",
+                    glossary_data.get("processed_chapters", []),
+                ),
+                "important_events": glossary_data.get("important_events", []),
+                "next_chunk_focus": glossary_data.get("next_chunk_focus", []),
+            },
+        )
+
+        problems = [
+            problem
+            for problem in state.get("problems", [])
+            if isinstance(problem, dict)
+        ]
+        self.all_problems = list(problems)
+        self.chapter_problems_map = {}
+        for problem in problems:
+            chapter_name = problem.get("chapter")
+            if chapter_name not in self.chapter_problems_map:
+                self.chapter_problems_map[chapter_name] = []
+            self.chapter_problems_map[chapter_name].append(problem)
+
+        trace = state.get("request_response_trace", [])
+        if isinstance(trace, list):
+            self.request_response_trace = [
+                dict(item)
+                for item in trace
+                if isinstance(item, dict)
+            ]
+
+        self._restore_completed_chunk_keys(state.get("completed_chunks"))
 
     def _emit_log_message(self, message: str) -> None:
         text = _sanitize_api_keys(message).strip()
@@ -601,7 +723,10 @@ class ConsistencyEngine(QObject):
             active_keys: список активных API ключей для использования
             mode: 'standard' или 'glossary_first' (двухпроходный режим)
         """
+        config = dict(config or {})
+        resume_state = config.pop("_consistency_resume_state", None)
         self.reset_session()
+        self._restore_runtime_state(resume_state)
 
         if not active_keys:
             self.error_occurred.emit("Нет активных ключей для анализа")
@@ -611,6 +736,8 @@ class ConsistencyEngine(QObject):
         # 1. Разбиение на чанки
         chunks = self._split_into_chunks(chapters, config.get('chunk_size', 3))
         total_chunks = len(chunks)
+        if mode != 'glossary_first':
+            self._backfill_analysis_chunks_from_processed_chapters(chunks)
         
         # Двухпроходный режим: сначала собираем глоссарий
         if mode == 'glossary_first':
@@ -620,6 +747,12 @@ class ConsistencyEngine(QObject):
                     break
                     
                 self.progress_updated.emit(i + 1, total_chunks * 2)  # *2 для двух проходов
+
+                if self._is_chunk_completed("glossary_collection", chunk):
+                    self._emit_log_message(
+                        f"↷ [Glossary] Чанк {i + 1}/{total_chunks} уже есть в сохраненной сессии, пропускаю."
+                    )
+                    continue
                 
                 try:
                     prompt = self._build_glossary_collection_prompt(chunk, config)
@@ -651,6 +784,7 @@ class ConsistencyEngine(QObject):
                             result.get('glossary_update', {}),
                             result.get('context_summary', {})
                         )
+                        self._mark_chunk_completed("glossary_collection", chunk)
                         # Эмитим результат для отображения прогресса в UI
                         self.chunk_analyzed.emit({
                             'problems': [],
@@ -678,6 +812,12 @@ class ConsistencyEngine(QObject):
                 self.progress_updated.emit(total_chunks + i + 1, total_chunks * 2)
             else:
                 self.progress_updated.emit(i + 1, total_chunks)
+
+            if self._is_chunk_completed("analysis", chunk):
+                self._emit_log_message(
+                    f"↷ [Analysis] Чанк {i + 1}/{total_chunks} уже есть в сохраненной сессии, пропускаю."
+                )
+                continue
 
             # 2. Формирование промпта
             prompt = self._build_analysis_prompt(chunk, config)
@@ -727,6 +867,7 @@ class ConsistencyEngine(QObject):
                         analysis_result.get('context_summary', {})
                     )
 
+                    self._mark_chunk_completed("analysis", chunk)
                     self.chunk_analyzed.emit(analysis_result)
 
             except Exception as e:
@@ -755,6 +896,15 @@ class ConsistencyEngine(QObject):
         text = str(exc or "")
         lowered = text.lower()
 
+        geoblock_markers = (
+            "user location is not supported",
+            "location is not supported",
+            "геоблок",
+            "geoblock",
+        )
+        if any(marker in lowered for marker in geoblock_markers):
+            return False
+
         permanent_markers = (
             "suspended",
             "permission denied",
@@ -765,6 +915,21 @@ class ConsistencyEngine(QObject):
             "api_key_invalid",
             "api_key:",
             "api key",
+            "apikey",
+            "x-api-key",
+            "api-ключ",
+            "api ключ",
+            "invalid token",
+            "неверный токен",
+            "невалидный токен",
+            "unauthorized",
+            "authorization",
+            "authentication",
+            "доступ запрещен",
+            "доступ запрещён",
+            "ошибка доступа",
+            "проверьте api",
+            "check api",
             "невалид",
             "заблок",
         )
@@ -773,6 +938,11 @@ class ConsistencyEngine(QObject):
             return True
 
         if any(marker in lowered for marker in ("suspended", "permission denied", "permission_denied")):
+            return True
+
+        if isinstance(exc, RateLimitExceededError) and any(
+            marker in lowered for marker in permanent_markers
+        ):
             return True
 
         quota_markers = (
@@ -786,6 +956,10 @@ class ConsistencyEngine(QObject):
             "недостаточно средств",
         )
         if isinstance(exc, RateLimitExceededError) and any(marker in lowered for marker in quota_markers):
+            return True
+        if any(marker in lowered for marker in quota_markers) and any(
+            key_marker in lowered for key_marker in ("key", "ключ", "token", "токен")
+        ):
             return True
 
         return False
@@ -1480,11 +1654,15 @@ class ConsistencyEngine(QObject):
             prompt = prompt.replace('{glossary_json}', json.dumps(filtered_glossary, ensure_ascii=False, indent=2))
             prompt = prompt.replace('{chapter_content}', chapter_content)
 
-        api_key = self._get_next_key(active_keys)
         self._emit_log_message(
             f"[Fix] {chapter_name or 'без названия'}: {len(problems or [])} проблем"
         )
-        response_text = self._call_api(prompt, config, api_key)
+        response_text = self._call_api_with_transient_chunk_retry(
+            prompt,
+            config,
+            active_keys,
+            retry_label=f"исправления ({chapter_name or 'глава'})",
+        )
         self._record_request_response_trace(
             phase='fix',
             prompt=prompt,
@@ -1554,6 +1732,9 @@ class ConsistencyEngine(QObject):
             except Exception as e:
                 logger.error(f"Error fixing chapter {chapter_name}: {e}")
                 self.error_occurred.emit(f"Ошибка при исправлении {chapter_name}: {e}")
+                if self.is_cancelled or not active_keys:
+                    self.is_cancelled = True
+                    break
         
         return results
 

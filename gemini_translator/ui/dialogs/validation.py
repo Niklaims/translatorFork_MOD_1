@@ -636,6 +636,85 @@ def apply_line_review_selection(segments, accepted_change_ids, edited_new_text_b
     return "".join(result_lines)
 
 
+def _find_flags_for_literal_search(match_case=False):
+    flags = QtGui.QTextDocument.FindFlag(0)
+    if match_case:
+        flags |= QtGui.QTextDocument.FindFlag.FindCaseSensitively
+    return flags
+
+
+def _cursor_selection_text(cursor):
+    return cursor.selectedText().replace('\u2029', '\n')
+
+
+def _text_matches_literal(value, needle, match_case=False):
+    if match_case:
+        return value == needle
+    return value.casefold() == needle.casefold()
+
+
+def _find_literal_in_text_edit(editor, needle, match_case=False):
+    needle = needle or ""
+    if not needle:
+        return False
+
+    flags = _find_flags_for_literal_search(match_case)
+    if editor.find(needle, flags):
+        return True
+
+    cursor = editor.textCursor()
+    cursor.movePosition(QTextCursor.MoveOperation.Start)
+    editor.setTextCursor(cursor)
+    return editor.find(needle, flags)
+
+
+def _replace_current_literal_in_text_edit(editor, needle, replacement, match_case=False):
+    needle = needle or ""
+    if not needle:
+        return False
+
+    cursor = editor.textCursor()
+    if not cursor.hasSelection() or not _text_matches_literal(
+        _cursor_selection_text(cursor),
+        needle,
+        match_case,
+    ):
+        if not _find_literal_in_text_edit(editor, needle, match_case):
+            return False
+        cursor = editor.textCursor()
+
+    cursor.insertText(replacement or "")
+    editor.setTextCursor(cursor)
+    return True
+
+
+def _replace_all_literal_text(text, needle, replacement, match_case=False):
+    needle = needle or ""
+    if not needle:
+        return text, 0
+
+    replacement = replacement or ""
+    if match_case:
+        return text.replace(needle, replacement), text.count(needle)
+
+    pattern = re.compile(re.escape(needle), re.IGNORECASE)
+    return pattern.subn(lambda _match: replacement, text)
+
+
+def _replace_all_literal_in_plain_text_edit(editor, needle, replacement, match_case=False):
+    text = editor.toPlainText()
+    new_text, count = _replace_all_literal_text(text, needle, replacement, match_case)
+    if count <= 0:
+        return 0
+
+    old_position = editor.textCursor().position()
+    editor.setPlainText(new_text)
+    cursor = editor.textCursor()
+    cursor.setPosition(min(old_position, len(new_text)))
+    editor.setTextCursor(cursor)
+    return count
+
+
 class AIRepairReviewDialog(QDialog):
     def __init__(self, candidates, parent=None):
         super().__init__(parent)
@@ -690,6 +769,33 @@ class AIRepairReviewDialog(QDialog):
         detail_title_layout.addWidget(QLabel("Ручная правка выбранной строки «Стало»"))
         detail_layout.addLayout(detail_title_layout)
 
+        detail_find_layout = QHBoxLayout()
+        detail_find_layout.addWidget(QLabel("Поиск/замена в правке:"))
+        self.detail_find_edit = QtWidgets.QLineEdit()
+        self.detail_find_edit.setPlaceholderText("Найти")
+        self.detail_replace_edit = QtWidgets.QLineEdit()
+        self.detail_replace_edit.setPlaceholderText("Заменить на")
+        self.detail_match_case = QCheckBox("Aa")
+        self.detail_match_case.setToolTip("Учитывать регистр")
+        self.btn_detail_find = QPushButton("Найти")
+        self.btn_detail_replace = QPushButton("Заменить")
+        self.btn_detail_replace_all = QPushButton("Заменить все")
+        self.detail_find_edit.returnPressed.connect(self._find_in_detail_editor)
+        self.btn_detail_find.clicked.connect(self._find_in_detail_editor)
+        self.btn_detail_replace.clicked.connect(self._replace_current_in_detail_editor)
+        self.btn_detail_replace_all.clicked.connect(self._replace_all_in_detail_editor)
+        self._detail_find_replace_widgets = [
+            self.detail_find_edit,
+            self.detail_replace_edit,
+            self.detail_match_case,
+            self.btn_detail_find,
+            self.btn_detail_replace,
+            self.btn_detail_replace_all,
+        ]
+        for widget in self._detail_find_replace_widgets:
+            detail_find_layout.addWidget(widget)
+        detail_layout.addLayout(detail_find_layout)
+
         detail_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.context_view = QTextEdit()
         self.context_view.setReadOnly(True)
@@ -729,6 +835,7 @@ class AIRepairReviewDialog(QDialog):
         layout.addWidget(button_box)
 
         self._populate_table()
+        self._set_detail_find_replace_enabled(self.table.rowCount() > 0)
 
     def _populate_table(self):
         self._populating_table = True
@@ -809,6 +916,36 @@ class AIRepairReviewDialog(QDialog):
             return None
         return indexes[0].row()
 
+    def _set_detail_find_replace_enabled(self, enabled):
+        for widget in getattr(self, '_detail_find_replace_widgets', []):
+            widget.setEnabled(enabled)
+
+    def _find_in_detail_editor(self):
+        if not _find_literal_in_text_edit(
+            self.new_text_editor,
+            self.detail_find_edit.text(),
+            self.detail_match_case.isChecked(),
+        ):
+            QMessageBox.information(self, "Поиск", "Совпадений не найдено.")
+
+    def _replace_current_in_detail_editor(self):
+        if not _replace_current_literal_in_text_edit(
+            self.new_text_editor,
+            self.detail_find_edit.text(),
+            self.detail_replace_edit.text(),
+            self.detail_match_case.isChecked(),
+        ):
+            QMessageBox.information(self, "Замена", "Совпадений не найдено.")
+
+    def _replace_all_in_detail_editor(self):
+        count = _replace_all_literal_in_plain_text_edit(
+            self.new_text_editor,
+            self.detail_find_edit.text(),
+            self.detail_replace_edit.text(),
+            self.detail_match_case.isChecked(),
+        )
+        QMessageBox.information(self, "Замена", f"Заменено совпадений: {count}.")
+
     def _change_for_row(self, row):
         check_item = self.table.item(row, 0)
         if not check_item:
@@ -857,12 +994,14 @@ class AIRepairReviewDialog(QDialog):
                 self.context_view.clear()
                 self.new_text_editor.clear()
                 self.new_text_editor.setEnabled(False)
+                self._set_detail_find_replace_enabled(False)
                 return
 
             _, candidate, change = self._change_for_row(row)
             self.context_view.setPlainText(self._format_context_text(candidate, change))
             new_item = self.table.item(row, 5)
             self.new_text_editor.setEnabled(True)
+            self._set_detail_find_replace_enabled(True)
             self.new_text_editor.setPlainText(new_item.text() if new_item else "")
         finally:
             self._syncing_detail_editor = False
@@ -1734,18 +1873,30 @@ class TranslationValidatorDialog(QDialog):
         """Главный метод-оркестратор, собирающий UI из частей."""
         
         self.setWindowTitle(f'Инструмент проверки переводов {self.version}')
-        self.setGeometry(150, 150, 1200, 800)
+        self.resize(1180, 760)
+        self.setMinimumSize(900, 620)
         
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(6)
 
-        main_layout.addWidget(self._create_source_group())
-        main_layout.addWidget(self._create_main_settings_group()) # <-- Теперь это главный контейнер
-        
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.addWidget(self._create_results_widget())
-        splitter.addWidget(self._create_comparison_widget())
-        splitter.setSizes([300, 500])
-        main_layout.addWidget(splitter)
+        self.main_tabs = QtWidgets.QTabWidget()
+        self.main_tabs.setDocumentMode(True)
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(8)
+        settings_layout.addWidget(self._create_source_group())
+        settings_layout.addWidget(self._create_main_settings_group(), 1)
+
+        self.results_tab = self._create_results_widget()
+        self.editor_tab = self._create_comparison_widget()
+
+        self.main_tabs.addTab(settings_tab, "Проверка")
+        self.main_tabs.addTab(self.results_tab, "Главы")
+        self.main_tabs.addTab(self.editor_tab, "Редактор")
+        main_layout.addWidget(self.main_tabs, 1)
 
         main_layout.addLayout(self._create_bottom_buttons())
 
@@ -2126,17 +2277,35 @@ class TranslationValidatorDialog(QDialog):
         self._refresh_previous_problem_paths()
 
     def _create_main_settings_group(self):
-        """Создает главный контейнер и располагает в нем группы слева направо (v5)."""
+        """Создает вкладочную панель настроек без плотной пятиколоночной строки."""
         main_group = QGroupBox("Настройки проверки и Поиск по содержимому")
         main_layout = QHBoxLayout(main_group)
-        main_group.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+        main_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
 
-        # Создаем объединенную панель для первых двух колонок
-        main_layout.addWidget(self._create_combined_checks_panel()) 
-        
-        # Остальные группы остаются без изменений
-        main_layout.addWidget(self._create_group3_options())
-        main_layout.addWidget(self._create_group4_custom_filter(), 1)
+        settings_tabs = QtWidgets.QTabWidget()
+        settings_tabs.setDocumentMode(True)
+
+        checks_tab = QWidget()
+        checks_layout = QHBoxLayout(checks_tab)
+        checks_layout.setContentsMargins(6, 6, 6, 6)
+        checks_layout.setSpacing(10)
+        checks_layout.addWidget(self._create_combined_checks_panel(), 2)
+        checks_layout.addWidget(self._create_group3_options(), 1)
+
+        search_tab = QWidget()
+        search_layout = QVBoxLayout(search_tab)
+        search_layout.setContentsMargins(6, 6, 6, 6)
+        search_layout.addWidget(self._create_group4_custom_filter())
+        search_layout.addStretch(1)
+
+        settings_tabs.addTab(checks_tab, "Проверки")
+        settings_tabs.addTab(search_tab, "Поиск")
+        main_layout.addWidget(settings_tabs, 1)
         main_layout.addWidget(self._create_group5_actions())
 
         return main_group
@@ -2476,8 +2645,14 @@ class TranslationValidatorDialog(QDialog):
     def _create_source_group(self):
         source_group = QGroupBox("Источники анализа")
         source_layout = QVBoxLayout(source_group)
-        source_layout.addWidget(QLabel(f"<b>Исходный EPUB:</b> {self.original_epub_path}"))
-        source_layout.addWidget(QLabel(f"<b>Папка с переводами:</b> {self.translated_folder}"))
+        for text in (
+            f"<b>Исходный EPUB:</b> {self.original_epub_path}",
+            f"<b>Папка с переводами:</b> {self.translated_folder}",
+        ):
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            source_layout.addWidget(label)
         return source_group
 
     def _on_revalidate_ok_toggled(self):
@@ -2505,6 +2680,10 @@ class TranslationValidatorDialog(QDialog):
 
     def _create_results_widget(self):
         results_widget = QWidget()
+        results_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         results_layout = QVBoxLayout(results_widget)
         results_layout.setContentsMargins(0,0,0,0)
         top_bar_layout = QHBoxLayout()
@@ -2514,9 +2693,12 @@ class TranslationValidatorDialog(QDialog):
         self.btn_mark_ok = QPushButton("✅ Пометить как готовый"); self.btn_mark_ok.clicked.connect(lambda: self.mark_selected_rows('mark_ok'))
         self.btn_retry_selected = QPushButton("🔄 Пометить к переотправке"); self.btn_retry_selected.clicked.connect(lambda: self.mark_selected_rows('retry')); self.btn_retry_selected.setVisible(self.retry_is_available)
         self.btn_reset_marks = QPushButton("🚫 Снять пометки"); self.btn_reset_marks.clicked.connect(self.reset_selected_marks)
+        self.btn_show_editor_tab = QPushButton("Редактор")
+        self.btn_show_editor_tab.clicked.connect(self._show_editor_tab)
+        self.btn_show_editor_tab.setEnabled(False)
         self.btn_prev_item = QPushButton("↑"); self.btn_prev_item.setFixedSize(28, 28); self.btn_prev_item.clicked.connect(self._go_to_previous_item); self.btn_prev_item.setEnabled(False)
         self.btn_next_item = QPushButton("↓"); self.btn_next_item.setFixedSize(28, 28); self.btn_next_item.clicked.connect(self._go_to_next_item); self.btn_next_item.setEnabled(False)
-        for btn in [self.btn_mark_delete, self.btn_mark_ok, self.btn_retry_selected, self.btn_reset_marks, self.btn_prev_item, self.btn_next_item]:
+        for btn in [self.btn_mark_delete, self.btn_mark_ok, self.btn_retry_selected, self.btn_reset_marks, self.btn_show_editor_tab, self.btn_prev_item, self.btn_next_item]:
             top_bar_layout.addWidget(btn)
         results_layout.addLayout(top_bar_layout)
         
@@ -2524,6 +2706,7 @@ class TranslationValidatorDialog(QDialog):
         
         
         self.table_results = QTableWidget()
+        self.table_results.setMinimumHeight(360)
         self.table_results.setItemDelegateForColumn(0, ChapterStatusDelegate(self.table_results))
         self.table_results.setColumnCount(4); self.table_results.setHorizontalHeaderLabels(["Исходный файл в EPUB", "Проблемы", "Длина (Ориг|Перевод)", "Статус"])
         
@@ -2546,6 +2729,10 @@ class TranslationValidatorDialog(QDialog):
 
     def _create_comparison_widget(self):
         comparison_widget = QWidget()
+        comparison_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         comparison_layout = QVBoxLayout(comparison_widget)
         comparison_layout.setContentsMargins(0,5,0,0)
         comparison_top_bar = QHBoxLayout()
@@ -2556,14 +2743,102 @@ class TranslationValidatorDialog(QDialog):
         for btn in [self.btn_toggle_compare, self.btn_toggle_code_view, self.btn_save_changes]:
             comparison_top_bar.addWidget(btn)
         comparison_layout.addLayout(comparison_top_bar)
+
+        editor_find_layout = QHBoxLayout()
+        editor_find_layout.addWidget(QLabel("Поиск/замена в переводе:"))
+        self.editor_find_edit = QtWidgets.QLineEdit()
+        self.editor_find_edit.setPlaceholderText("Найти")
+        self.editor_replace_edit = QtWidgets.QLineEdit()
+        self.editor_replace_edit.setPlaceholderText("Заменить на")
+        self.editor_match_case = QCheckBox("Aa")
+        self.editor_match_case.setToolTip("Учитывать регистр")
+        self.btn_editor_find = QPushButton("Найти")
+        self.btn_editor_replace = QPushButton("Заменить")
+        self.btn_editor_replace_all = QPushButton("Заменить все")
+        self.editor_find_edit.returnPressed.connect(self._find_in_translation_editor)
+        self.btn_editor_find.clicked.connect(self._find_in_translation_editor)
+        self.btn_editor_replace.clicked.connect(self._replace_current_in_translation_editor)
+        self.btn_editor_replace_all.clicked.connect(self._replace_all_in_translation_editor)
+        self._translation_find_widgets = [
+            self.editor_find_edit,
+            self.editor_match_case,
+            self.btn_editor_find,
+        ]
+        self._translation_replace_widgets = [
+            self.editor_replace_edit,
+            self.btn_editor_replace,
+            self.btn_editor_replace_all,
+        ]
+        for widget in self._translation_find_widgets + self._translation_replace_widgets:
+            editor_find_layout.addWidget(widget)
+        comparison_layout.addLayout(editor_find_layout)
         
         self.comparison_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.view_original = QTextEdit(); self.view_original.setReadOnly(True)
         self.view_translated = QTextEdit(); self.view_translated.setReadOnly(True); self.view_translated.textChanged.connect(self.on_text_edited)
+        self.view_original.setMinimumHeight(420)
+        self.view_translated.setMinimumHeight(420)
         self.comparison_splitter.addWidget(self.view_original); self.comparison_splitter.addWidget(self.view_translated)
+        self.comparison_splitter.setSizes([1, 1])
         comparison_layout.addWidget(self.comparison_splitter)
+        self._update_translation_find_replace_state()
         
         return comparison_widget
+
+    def _update_translation_find_replace_state(self):
+        has_selection = bool(self.table_results.selectedItems()) if hasattr(self, 'table_results') else False
+        for widget in getattr(self, '_translation_find_widgets', []):
+            widget.setEnabled(has_selection)
+        for widget in getattr(self, '_translation_replace_widgets', []):
+            widget.setEnabled(has_selection and self.is_code_view)
+
+    def _find_in_translation_editor(self):
+        if not _find_literal_in_text_edit(
+            self.view_translated,
+            self.editor_find_edit.text(),
+            self.editor_match_case.isChecked(),
+        ):
+            QMessageBox.information(self, "Поиск", "Совпадений не найдено.")
+
+    def _ensure_translation_replace_mode(self):
+        if not self.is_code_view or self.view_translated.isReadOnly():
+            QMessageBox.information(
+                self,
+                "Замена",
+                "Замена доступна в режиме кода. Нажмите «Показать код»."
+            )
+            return False
+        return True
+
+    def _replace_current_in_translation_editor(self):
+        if not self._ensure_translation_replace_mode():
+            return
+        if not _replace_current_literal_in_text_edit(
+            self.view_translated,
+            self.editor_find_edit.text(),
+            self.editor_replace_edit.text(),
+            self.editor_match_case.isChecked(),
+        ):
+            QMessageBox.information(self, "Замена", "Совпадений не найдено.")
+
+    def _replace_all_in_translation_editor(self):
+        if not self._ensure_translation_replace_mode():
+            return
+        count = _replace_all_literal_in_plain_text_edit(
+            self.view_translated,
+            self.editor_find_edit.text(),
+            self.editor_replace_edit.text(),
+            self.editor_match_case.isChecked(),
+        )
+        QMessageBox.information(self, "Замена", f"Заменено совпадений: {count}.")
+
+    def _show_editor_tab(self):
+        if hasattr(self, 'main_tabs') and hasattr(self, 'editor_tab'):
+            self.main_tabs.setCurrentWidget(self.editor_tab)
+
+    def _show_results_tab(self):
+        if hasattr(self, 'main_tabs') and hasattr(self, 'results_tab'):
+            self.main_tabs.setCurrentWidget(self.results_tab)
 
     def _create_bottom_buttons(self):
         bottom_layout = QHBoxLayout()
@@ -3855,6 +4130,7 @@ class TranslationValidatorDialog(QDialog):
             self.table_results.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
 
         self.update_comparison_view()
+        self._show_editor_tab()
         self.raise_()
         self.activateWindow()
 
@@ -4189,6 +4465,7 @@ class TranslationValidatorDialog(QDialog):
         self.view_translated.blockSignals(False)
     
         self.btn_toggle_code_view.setText("Скрыть код" if self.is_code_view else "Показать код")
+        self._update_translation_find_replace_state()
     
 
 
@@ -4380,6 +4657,9 @@ class TranslationValidatorDialog(QDialog):
         # if self.is_code_view and old_row != -1 …
         
         selected_rows = list(set(item.row() for item in self.table_results.selectedItems()))
+        if hasattr(self, 'btn_show_editor_tab'):
+            self.btn_show_editor_tab.setEnabled(bool(selected_rows))
+        self._update_translation_find_replace_state()
 
         # … (остальной код метода без изменений) …
         can_navigate = len(selected_rows) == 1
@@ -4690,6 +4970,7 @@ class TranslationValidatorDialog(QDialog):
         if self.table_results.rowCount() > 0:
             # Если после сортировки первая строка изменилась, выделяем её визуально
             self.table_results.selectRow(0)
+            self._show_results_tab()
 
         self._recalc_untranslated_stats_ui()
         

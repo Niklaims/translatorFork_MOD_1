@@ -54,6 +54,12 @@ from gemini_translator.utils.text import prettify_html_for_ai
 from ..menu_utils import post_session_separator
 from .numbers_master import NumeralsExtractionWorker
 
+
+DEFAULT_NEW_TERMS_LIMIT = 100
+MAX_NEW_TERMS_LIMIT = 1000
+NEW_TERMS_LIMIT_TOKENS_PER_TERM = 200
+
+
 class SequentialTaskProvider(QObject):
     """
     Класс-оркестратор для последовательной генерации глоссария.
@@ -274,7 +280,10 @@ class SequentialTaskProvider(QObject):
             self._post_event('log_message', {'message': "[ORCHESTRATOR] Флаг управляемой сессии снят."})
         
         self.bus.pop_data(self.MANAGED_SESSION_FLAG_KEY, None)
-        self._post_event('manual_stop_requested')
+        if was_cancelled:
+            self._post_event('manual_stop_requested')
+        else:
+            self._post_event('managed_session_completed')
         
         # Просто сообщаем о факте завершения.
         self._post_event('generation_finished', {'was_cancelled': was_cancelled})
@@ -328,6 +337,9 @@ class GenerationSessionDialog(QDialog):
         self._restore_saved_ui_settings = bool(restore_saved_ui_settings)
         self._persist_ui_settings = bool(persist_ui_settings)
         self._pending_new_terms_limit = None
+        self._pending_new_terms_limit_user_defined = True
+        self._new_terms_limit_user_defined = False
+        self._changing_new_terms_limit_programmatically = False
         
         app = QtWidgets.QApplication.instance()
         self.bus = event_bus
@@ -465,14 +477,18 @@ class GenerationSessionDialog(QDialog):
         
         limit_label = QLabel("Лимит новых терминов:")
         limit_label.setToolTip("Сколько МАКСИМУМ новых терминов брать из ответа AI за один проход. Ноль — без лимита.\n"
-                               "Отбирает те термины, что в начале, отбрасывая те, что в конце ответа.\n"
+                               "Если новых терминов больше лимита, остаются самые частотные по книге.\n"
                                "Термины, которые уже есть в базе (обновление), принимаются всегда без лимита.")
         
         self.new_terms_limit_spin = NoScrollSpinBox()
-        self.new_terms_limit_spin.setRange(5, 500)
-        self.new_terms_limit_spin.setValue(50) # Дефолт, будет пересчитан
+        self.new_terms_limit_spin.setRange(0, MAX_NEW_TERMS_LIMIT)
+        self.new_terms_limit_spin.setValue(DEFAULT_NEW_TERMS_LIMIT)
         self.new_terms_limit_spin.setSuffix(" шт.")
         self.new_terms_limit_spin.setToolTip(limit_label.toolTip())
+        self.new_terms_limit_spin.valueChanged.connect(self._mark_new_terms_limit_user_defined)
+        line_edit = self.new_terms_limit_spin.lineEdit()
+        if line_edit is not None:
+            line_edit.textEdited.connect(self._mark_new_terms_limit_user_defined)
         
         limit_layout.addWidget(limit_label)
         limit_layout.addWidget(self.new_terms_limit_spin)
@@ -1115,23 +1131,48 @@ class GenerationSessionDialog(QDialog):
         """
         if not hasattr(self, 'new_terms_limit_spin') or not hasattr(self, 'translation_options_widget'):
             return
+        if getattr(self, '_new_terms_limit_user_defined', False):
+            return
 
-        current_chars = self.translation_options_widget.task_size_spin.value()
-        
-        # Для токен-оценок используем единый коэффициент, чтобы лимиты не прыгали от языка книги.
-        chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
-
-        # Расчет в токенах: ~1 новый термин на каждые 500 токенов контента
-        estimated_tokens = current_chars / chars_per_token
         estimated_tokens = self.translation_options_widget.task_size_spin.value()
-        recommended_limit = self.round_up_to_tens(max(10, int(estimated_tokens / 500)))
+        recommended_limit = self.round_up_to_tens(
+            max(DEFAULT_NEW_TERMS_LIMIT, int(estimated_tokens / NEW_TERMS_LIMIT_TOKENS_PER_TERM))
+        )
         
         clamped_limit = max(self.new_terms_limit_spin.minimum(), 
                             min(recommended_limit, self.new_terms_limit_spin.maximum()))
         
-        self.new_terms_limit_spin.blockSignals(True)
-        self.new_terms_limit_spin.setValue(clamped_limit)
-        self.new_terms_limit_spin.blockSignals(False)
+        self._set_new_terms_limit_value(clamped_limit, user_defined=False)
+
+    def _set_new_terms_limit_value(self, value, *, user_defined):
+        spin = self.new_terms_limit_spin
+        value = max(spin.minimum(), min(int(value), spin.maximum()))
+        self._changing_new_terms_limit_programmatically = True
+        if hasattr(spin, 'blockSignals'):
+            spin.blockSignals(True)
+        try:
+            spin.setValue(value)
+        finally:
+            if hasattr(spin, 'blockSignals'):
+                spin.blockSignals(False)
+            self._changing_new_terms_limit_programmatically = False
+        self._new_terms_limit_user_defined = bool(user_defined)
+
+    def _mark_new_terms_limit_user_defined(self, *_args):
+        if not getattr(self, '_changing_new_terms_limit_programmatically', False):
+            self._new_terms_limit_user_defined = True
+
+    def _new_terms_limit_user_defined_from_settings(self, settings):
+        if not isinstance(settings, dict):
+            return True
+        if 'new_terms_limit_user_defined' in settings:
+            return bool(settings.get('new_terms_limit_user_defined'))
+        try:
+            value = int(settings.get('new_terms_limit'))
+        except (TypeError, ValueError):
+            return True
+        return value >= DEFAULT_NEW_TERMS_LIMIT
+
     def round_up_to_tens(self, n):
         """
         Округляет число n до ближайшего десятка в большую сторону.
@@ -1152,7 +1193,7 @@ class GenerationSessionDialog(QDialog):
         value = max(1, min(value, self.instances_spin.maximum()))
         self.instances_spin.setValue(value)
 
-    def _apply_new_terms_limit_value(self, value):
+    def _apply_new_terms_limit_value(self, value, *, user_defined=True):
         if value is None or not hasattr(self, 'new_terms_limit_spin'):
             return
         try:
@@ -1162,13 +1203,7 @@ class GenerationSessionDialog(QDialog):
 
         spin = self.new_terms_limit_spin
         value = max(spin.minimum(), min(value, spin.maximum()))
-        if hasattr(spin, 'blockSignals'):
-            spin.blockSignals(True)
-        try:
-            spin.setValue(value)
-        finally:
-            if hasattr(spin, 'blockSignals'):
-                spin.blockSignals(False)
+        self._set_new_terms_limit_value(value, user_defined=user_defined)
   
     def _apply_initial_settings(self, settings: dict):
         """Применяет начальные настройки, принудительно отключая системные инструкции."""
@@ -1233,7 +1268,11 @@ class GenerationSessionDialog(QDialog):
         self._apply_instances_value(initial_settings.get('num_instances'))
         if 'new_terms_limit' in initial_settings:
             self._pending_new_terms_limit = initial_settings.get('new_terms_limit')
-            self._apply_new_terms_limit_value(self._pending_new_terms_limit)
+            self._pending_new_terms_limit_user_defined = self._new_terms_limit_user_defined_from_settings(initial_settings)
+            self._apply_new_terms_limit_value(
+                self._pending_new_terms_limit,
+                user_defined=self._pending_new_terms_limit_user_defined,
+            )
 
         self._update_dependent_widgets()
         self._update_sequential_mode_widgets(self.sequential_mode_checkbox.isChecked())
@@ -1628,7 +1667,11 @@ class GenerationSessionDialog(QDialog):
         self._apply_instances_value(settings.get('num_instances'))
         if 'new_terms_limit' in settings:
             self._pending_new_terms_limit = settings.get('new_terms_limit')
-            self._apply_new_terms_limit_value(self._pending_new_terms_limit)
+            self._pending_new_terms_limit_user_defined = self._new_terms_limit_user_defined_from_settings(settings)
+            self._apply_new_terms_limit_value(
+                self._pending_new_terms_limit,
+                user_defined=self._pending_new_terms_limit_user_defined,
+            )
 
         if 'pipeline_steps' in settings:
             pipeline_payload = settings.get('pipeline_steps')
@@ -2244,7 +2287,8 @@ class GenerationSessionDialog(QDialog):
 
         start_message = (
             f"[PIPELINE] Шаг {step_index}/{total_steps}: {next_step.name} | "
-            f"{summary['merge_mode']} | T={summary['temperature']} | {summary['execution_mode']}"
+            f"{summary['merge_mode']} | T={summary['temperature']} | "
+            f"{summary['execution_mode']} | новых терминов: {summary['new_terms_limit']}"
         )
         self._append_pipeline_log(start_message, step_id=next_step.step_id)
         self._post_event('log_message', {'message': start_message})
@@ -2291,6 +2335,10 @@ class GenerationSessionDialog(QDialog):
 
     def _advance_pipeline_after_session(self):
         if not self.pipeline_run:
+            return
+
+        if self.engine and (self.engine.session_id or getattr(self.engine, 'is_starting', False)):
+            QTimer.singleShot(250, self._advance_pipeline_after_session)
             return
 
         self._pipeline_waiting_for_next_step = False
@@ -2549,8 +2597,12 @@ class GenerationSessionDialog(QDialog):
         # Передаем лимит новых терминов
         if hasattr(self, 'new_terms_limit_spin'):
             settings['new_terms_limit'] = self.new_terms_limit_spin.value()
+            settings['new_terms_limit_user_defined'] = bool(
+                getattr(self, '_new_terms_limit_user_defined', False)
+            )
         else:
-            settings['new_terms_limit'] = 50 # Fallback
+            settings['new_terms_limit'] = DEFAULT_NEW_TERMS_LIMIT
+            settings['new_terms_limit_user_defined'] = False
             
         return settings
 
@@ -2849,8 +2901,12 @@ class GenerationSessionDialog(QDialog):
         # 1. Считаем оптимальный размер пакета (это вызовет расчет лимита терминов через сигнал)
         self._calculate_optimal_batch_size()
         if self._pending_new_terms_limit is not None:
-            self._apply_new_terms_limit_value(self._pending_new_terms_limit)
+            self._apply_new_terms_limit_value(
+                self._pending_new_terms_limit,
+                user_defined=self._pending_new_terms_limit_user_defined,
+            )
             self._pending_new_terms_limit = None
+            self._pending_new_terms_limit_user_defined = True
         # 2. И только теперь строим задачи
         self._rebuild_glossary_tasks()
         # 3. Обновляем визуальные CJK опции

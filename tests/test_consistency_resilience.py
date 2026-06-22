@@ -323,6 +323,168 @@ class ConsistencyKeyRetryTests(unittest.TestCase):
         self.assertEqual(engine.all_problems, [])
         self.assertTrue(any("Повтор анализа" in entry for entry in logs))
 
+    def test_analyze_chapters_discards_invalid_token_and_retries_same_chunk(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+        discarded = []
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(api_key)
+            if api_key == "bad-token-123456":
+                raise RateLimitExceededError("Неверный токен (…3456) DeepSeek.")
+            return (
+                '{"problems":[],"glossary_update":{"characters":[],"terms":[]},'
+                '"context_summary":{"processed_chapters":["chapter_01.xhtml"]}}'
+            )
+
+        engine._call_api = fake_call_api
+        engine.key_discarded.connect(lambda key, reason: discarded.append((key, reason)))
+
+        active_keys = ["bad-token-123456", "good-token-123456"]
+        engine.analyze_chapters(
+            [{"name": "chapter_01.xhtml", "content": "Text", "path": "chapter_01.xhtml"}],
+            {"chunk_size": 1, "provider": "deepseek", "model": "deepseek-chat"},
+            active_keys,
+        )
+
+        self.assertEqual(calls, ["bad-token-123456", "good-token-123456"])
+        self.assertEqual(active_keys, ["good-token-123456"])
+        self.assertEqual(discarded[0][0], "bad-token-123456")
+        self.assertTrue(settings.exhausted)
+        self.assertEqual(engine.glossary_session.processed_chapters, ["chapter_01.xhtml"])
+
+    def test_fix_chapter_discards_bad_key_and_retries_with_next_key(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(api_key)
+            if api_key == "bad-token-123456":
+                raise RateLimitExceededError("Ошибка доступа (401): Неверный токен.")
+            return "Text"
+
+        engine._call_api = fake_call_api
+
+        active_keys = ["bad-token-123456", "good-token-123456"]
+        fixed = engine.fix_chapter(
+            "Text",
+            [{"type": "typo", "description": "Fix typo", "quote": "Text", "suggestion": "Text"}],
+            {"provider": "deepseek", "model": "deepseek-chat"},
+            active_keys,
+            chapter_name="chapter_01.xhtml",
+        )
+
+        self.assertEqual(fixed, "Text")
+        self.assertEqual(calls, ["bad-token-123456", "good-token-123456"])
+        self.assertEqual(active_keys, ["good-token-123456"])
+        self.assertTrue(settings.exhausted)
+
+    def test_analyze_chapters_resume_skips_completed_chunk_and_keeps_saved_problems(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+        chunks_done = []
+        chapters = [
+            {"name": "chapter_01.xhtml", "content": "Text 1", "path": "chapter_01.xhtml"},
+            {"name": "chapter_02.xhtml", "content": "Text 2", "path": "chapter_02.xhtml"},
+        ]
+        saved_problem = {
+            "id": "p1",
+            "chapter": "chapter_01.xhtml",
+            "type": "typo",
+            "quote": "Text 1",
+            "description": "saved",
+        }
+        resume_state = {
+            "glossary": {"characters": [], "terms": []},
+            "processed_chapters": ["chapter_01.xhtml"],
+            "problems": [saved_problem],
+            "completed_chunks": {
+                "analysis": [ConsistencyEngine.chunk_resume_key([chapters[0]])],
+            },
+        }
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(prompt)
+            self.assertIn("chapter_02.xhtml", prompt)
+            return (
+                '{"problems":[],"glossary_update":{"characters":[],"terms":[]},'
+                '"context_summary":{"processed_chapters":["chapter_02.xhtml"]}}'
+            )
+
+        engine._call_api = fake_call_api
+        engine.chunk_analyzed.connect(lambda result: chunks_done.append(result))
+
+        engine.analyze_chapters(
+            chapters,
+            {
+                "chunk_size": 1,
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+                "_consistency_resume_state": resume_state,
+            },
+            ["good-key-123456"],
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(engine.all_problems, [saved_problem])
+        self.assertEqual(
+            engine.glossary_session.processed_chapters,
+            ["chapter_01.xhtml", "chapter_02.xhtml"],
+        )
+        self.assertIn(
+            ConsistencyEngine.chunk_resume_key([chapters[0]]),
+            engine.get_completed_chunk_keys()["analysis"],
+        )
+        self.assertIn(
+            ConsistencyEngine.chunk_resume_key([chapters[1]]),
+            engine.get_completed_chunk_keys()["analysis"],
+        )
+        self.assertEqual(len(chunks_done), 1)
+
+    def test_analyze_chapters_resume_backfills_old_session_processed_chapters(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+        chapters = [
+            {"name": "chapter_01.xhtml", "content": "Text 1", "path": "chapter_01.xhtml"},
+            {"name": "chapter_02.xhtml", "content": "Text 2", "path": "chapter_02.xhtml"},
+        ]
+        resume_state = {
+            "glossary": {"characters": [], "terms": []},
+            "processed_chapters": ["chapter_01.xhtml"],
+            "problems": [],
+        }
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(prompt)
+            self.assertIn("chapter_02.xhtml", prompt)
+            return (
+                '{"problems":[],"glossary_update":{"characters":[],"terms":[]},'
+                '"context_summary":{"processed_chapters":["chapter_02.xhtml"]}}'
+            )
+
+        engine._call_api = fake_call_api
+
+        engine.analyze_chapters(
+            chapters,
+            {
+                "chunk_size": 1,
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+                "_consistency_resume_state": resume_state,
+            },
+            ["good-key-123456"],
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            engine.glossary_session.processed_chapters,
+            ["chapter_01.xhtml", "chapter_02.xhtml"],
+        )
+
     def test_analyze_chapters_retries_network_error_same_chunk(self):
         settings = _RetrySettingsStub()
         engine = ConsistencyEngine(settings)
