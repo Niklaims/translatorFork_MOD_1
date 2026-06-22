@@ -7,6 +7,7 @@ ConsistencyValidatorDialog v2 — UI для проверки согласова�
 import difflib
 import os
 import logging
+import tempfile
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QLabel, QHeaderView, QSplitter, QTextEdit,
@@ -249,6 +250,7 @@ class ConsistencyValidatorPage(ShellPage):
         self.single_fix_thread = None
         self._threads_pending_delete = []
         self._single_fix_in_progress = False
+        self._batch_fix_original_problems_map = None
         
         # Кэш исправлений для применения
         self.pending_fixes = {}  # {path: new_content}
@@ -1575,6 +1577,9 @@ class ConsistencyValidatorPage(ShellPage):
 
     @pyqtSlot(str)
     def on_error(self, error_msg):
+        restore_batch_map = getattr(self, '_restore_batch_fix_problem_map', None)
+        if callable(restore_batch_map):
+            restore_batch_map()
         self._log(f"❌ Ошибка: {error_msg}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -2095,6 +2100,7 @@ class ConsistencyValidatorPage(ShellPage):
         self._log(f"⚡ Начало массового исправления ({count} проблем)...")
         # Временно подменяем карту проблем в движке на отфильтрованную
         old_map = self.engine.chapter_problems_map
+        self._batch_fix_original_problems_map = old_map
         self.engine.chapter_problems_map = selected_problems_map
         
         self.fix_thread = FixWorker(self.engine, self.chapters, config, active_keys)
@@ -2104,12 +2110,24 @@ class ConsistencyValidatorPage(ShellPage):
                 old_map
             )
         )
-        self.fix_thread.error.connect(self.on_error)
+        self.fix_thread.error.connect(self._on_batch_fix_error)
         self.fix_thread.start()
+
+    def _restore_batch_fix_problem_map(self, old_map=None):
+        pending_map = getattr(self, '_batch_fix_original_problems_map', None)
+        restore_map = old_map if old_map is not None else pending_map
+        if restore_map is not None:
+            self.engine.chapter_problems_map = restore_map
+        if pending_map is not None and (old_map is None or pending_map is old_map):
+            self._batch_fix_original_problems_map = None
+
+    def _on_batch_fix_error(self, error_msg):
+        self._restore_batch_fix_problem_map()
+        self.on_error(error_msg)
 
     def _on_batch_fix_finished_wrapper(self, results, old_map):
         """Восстанавливает карту проблем после пакетного исправления."""
-        self.engine.chapter_problems_map = old_map
+        self._restore_batch_fix_problem_map(old_map)
         self.on_batch_fix_finished(results)
 
     @pyqtSlot(int, int, str)
@@ -2409,14 +2427,29 @@ class ConsistencyValidatorPage(ShellPage):
     def _save_session(self):
         """Сохраняет текущее состояние сессии в consistency_session.json."""
         try:
+            tmp_file = None
             data = self._build_session_payload()
             self._restored_session_data = data
             
             # Сохраняем ТОЛЬКО в файл сессии чекера, не трогая основной глоссарий проекта
-            with open(self.session_file, 'w', encoding='utf-8') as f:
+            self.session_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix=f".{self.session_file.name}.",
+                suffix=".tmp",
+                dir=self.session_file.parent,
+            )
+            tmp_file = Path(temp_name)
+            with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+            os.replace(tmp_file, self.session_file)
                     
         except Exception as e:
+            try:
+                if tmp_file is not None and tmp_file.exists():
+                    tmp_file.unlink()
+            except Exception:
+                pass
             logger.error(f"Failed to save session: {e}", exc_info=True)
 
     def _restore_session(self, data):

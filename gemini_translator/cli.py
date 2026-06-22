@@ -864,10 +864,96 @@ def command_status(args) -> dict:
     return payload
 
 
+def _provider_uses_dynamic_model_discovery(api_config, provider_id: str, provider: dict) -> bool:
+    detector = getattr(api_config, "_provider_uses_dynamic_model_discovery", None)
+    if callable(detector):
+        try:
+            return bool(detector(provider_id, provider))
+        except TypeError:
+            return bool(detector(provider_id))
+    return provider_id == "local" or bool((provider or {}).get("dynamic_model_discovery"))
+
+
+def _diagnose_dynamic_provider(api_config, provider_id: str, provider: dict) -> dict:
+    sources_factory = getattr(api_config, "_iter_local_discovery_sources", None)
+    source_discoverer = getattr(api_config, "_discover_models_for_local_source", None)
+
+    if callable(sources_factory) and callable(source_discoverer):
+        sources = []
+        available_source_count = 0
+        discovered_model_count = 0
+        try:
+            discovery_sources = list(sources_factory(provider or {}))
+        except Exception as exc:
+            return {
+                "ok": False,
+                "available": False,
+                "source_count": 0,
+                "available_source_count": 0,
+                "discovered_model_count": 0,
+                "sources": [],
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+
+        for source in discovery_sources:
+            source_payload = {
+                "label": source.get("label"),
+                "root_url": source.get("root_url"),
+                "available": False,
+                "model_count": 0,
+            }
+            try:
+                is_successful, model_entries = source_discoverer(source, include_details=False)
+                source_payload["available"] = bool(is_successful)
+                if is_successful:
+                    model_count = len(model_entries or [])
+                    source_payload["model_count"] = model_count
+                    available_source_count += 1
+                    discovered_model_count += model_count
+            except Exception as exc:
+                source_payload["error"] = f"{type(exc).__name__}: {exc}"
+            sources.append(source_payload)
+
+        return {
+            "ok": True,
+            "available": available_source_count > 0,
+            "source_count": len(sources),
+            "available_source_count": available_source_count,
+            "discovered_model_count": discovered_model_count,
+            "sources": sources,
+        }
+
+    try:
+        try:
+            refreshed = api_config.ensure_dynamic_provider_models(provider_id, force=True)
+        except TypeError:
+            refreshed = api_config.ensure_dynamic_provider_models(provider_id)
+        models = (refreshed or {}).get("models", {}) if isinstance(refreshed, dict) else {}
+        return {
+            "ok": True,
+            "available": bool(models),
+            "source_count": None,
+            "available_source_count": None,
+            "discovered_model_count": len(models) if isinstance(models, dict) else 0,
+            "sources": [],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "source_count": None,
+            "available_source_count": None,
+            "discovered_model_count": 0,
+            "sources": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def command_providers(args) -> dict:
     runtime = HeadlessRuntime()
     app = runtime.bootstrap(include_engine=False)
     api_config = _ensure_api_config_initialized()
+    diagnose = bool(getattr(args, "diagnose", False) and not getattr(args, "no_discovery", False))
     key_statuses = app.settings_manager.load_key_statuses()
     keys_by_provider = Counter(
         item.get("provider")
@@ -878,9 +964,9 @@ def command_providers(args) -> dict:
     for provider_id, provider in api_config.api_providers().items():
         if not getattr(args, "all", False) and not provider.get("visible", True):
             continue
-        api_config.ensure_dynamic_provider_models(provider_id)
+        uses_dynamic_discovery = _provider_uses_dynamic_model_discovery(api_config, provider_id, provider)
         models = provider.get("models", {})
-        providers.append({
+        provider_payload = {
             "id": provider_id,
             "display_name": provider.get("display_name") or provider_id,
             "visible": bool(provider.get("visible", True)),
@@ -889,9 +975,15 @@ def command_providers(args) -> dict:
             "model_count": len(models) if isinstance(models, dict) else 0,
             "file_suffix": provider.get("file_suffix"),
             "browser_based": bool(provider.get("browser_based") or provider.get("use_browser")),
-        })
+            "dynamic_model_discovery": uses_dynamic_discovery,
+            "discovery_checked": False,
+        }
+        if diagnose and uses_dynamic_discovery:
+            provider_payload["discovery_checked"] = True
+            provider_payload["diagnostic"] = _diagnose_dynamic_provider(api_config, provider_id, provider)
+        providers.append(provider_payload)
     runtime.shutdown()
-    return {"ok": True, "providers": providers}
+    return {"ok": True, "providers": providers, "diagnose": diagnose}
 
 
 def command_models(args) -> dict:
@@ -1797,6 +1889,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     providers = subparsers.add_parser("providers", help="List configured providers and key counts.")
     providers.add_argument("--all", action="store_true", help="Include hidden providers.")
+    providers.add_argument(
+        "--no-discovery",
+        action="store_true",
+        help="Do not run network model discovery. This is the default for providers.",
+    )
+    providers.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Probe dynamic provider discovery endpoints and include availability diagnostics.",
+    )
+    providers.add_argument(
+        "--doctor",
+        action="store_true",
+        dest="diagnose",
+        help="Alias for --diagnose.",
+    )
     providers.set_defaults(func=command_providers)
 
     models = subparsers.add_parser("models", help="List models for a provider.")

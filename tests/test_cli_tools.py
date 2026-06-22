@@ -17,6 +17,7 @@ from gemini_translator.cli import (
     build_session_settings,
     build_task_plan,
     command_plan,
+    command_providers,
     command_translate,
     select_chapters,
 )
@@ -256,6 +257,15 @@ def test_new_cli_commands_parse_common_arguments():
 
     args = parser.parse_args(["providers"])
     assert args.func.__name__ == "command_providers"
+    assert args.diagnose is False
+
+    args = parser.parse_args(["providers", "--no-discovery"])
+    assert args.func.__name__ == "command_providers"
+    assert args.no_discovery is True
+
+    args = parser.parse_args(["providers", "--doctor"])
+    assert args.func.__name__ == "command_providers"
+    assert args.diagnose is True
 
     args = parser.parse_args(["models", "--provider", "gemini"])
     assert args.func.__name__ == "command_models"
@@ -280,6 +290,109 @@ def test_new_cli_commands_parse_common_arguments():
     ])
     assert args.func.__name__ == "command_untranslated_fix"
     assert args.dry_run is True
+
+
+def test_command_providers_does_not_run_discovery_by_default(monkeypatch):
+    from gemini_translator import cli
+
+    class FakeRuntime:
+        def bootstrap(self, *, include_engine):
+            assert include_engine is False
+            return Namespace(settings_manager=Namespace(load_key_statuses=lambda: []))
+
+        def shutdown(self):
+            pass
+
+    class FakeApiConfig:
+        def api_providers(self):
+            return {
+                "dynamic": {
+                    "display_name": "Dynamic",
+                    "visible": True,
+                    "dynamic_model_discovery": True,
+                    "models": {"Static": {"id": "static"}},
+                }
+            }
+
+        def provider_requires_api_key(self, provider_id):
+            return False
+
+        def ensure_dynamic_provider_models(self, provider_id, force=False):
+            raise AssertionError("providers must not discover models by default")
+
+    monkeypatch.setattr(cli, "HeadlessRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "_ensure_api_config_initialized", lambda: FakeApiConfig())
+
+    payload = command_providers(Namespace(all=False, diagnose=False, no_discovery=False))
+
+    assert payload["ok"] is True
+    assert payload["diagnose"] is False
+    assert payload["providers"][0]["id"] == "dynamic"
+    assert payload["providers"][0]["dynamic_model_discovery"] is True
+    assert payload["providers"][0]["discovery_checked"] is False
+    assert "diagnostic" not in payload["providers"][0]
+
+    payload = command_providers(Namespace(all=False, diagnose=True, no_discovery=True))
+
+    assert payload["diagnose"] is False
+    assert payload["providers"][0]["discovery_checked"] is False
+    assert "diagnostic" not in payload["providers"][0]
+
+
+def test_command_providers_diagnose_reports_dynamic_provider_availability(monkeypatch):
+    from gemini_translator import cli
+
+    class FakeRuntime:
+        def bootstrap(self, *, include_engine):
+            assert include_engine is False
+            return Namespace(settings_manager=Namespace(load_key_statuses=lambda: []))
+
+        def shutdown(self):
+            pass
+
+    class FakeApiConfig:
+        def api_providers(self):
+            return {
+                "dynamic": {
+                    "display_name": "Dynamic",
+                    "visible": True,
+                    "dynamic_model_discovery": True,
+                    "models": {},
+                },
+                "static": {
+                    "display_name": "Static",
+                    "visible": True,
+                    "models": {"Known": {"id": "known"}},
+                },
+            }
+
+        def provider_requires_api_key(self, provider_id):
+            return False
+
+        def _provider_uses_dynamic_model_discovery(self, provider_id, provider=None):
+            return provider_id == "dynamic"
+
+        def _iter_local_discovery_sources(self, provider):
+            return [{"label": "Local test", "root_url": "http://127.0.0.1:9999"}]
+
+        def _discover_models_for_local_source(self, source, include_details=False):
+            assert include_details is False
+            return True, [{"id": "model-a"}, {"id": "model-b"}]
+
+    monkeypatch.setattr(cli, "HeadlessRuntime", FakeRuntime)
+    monkeypatch.setattr(cli, "_ensure_api_config_initialized", lambda: FakeApiConfig())
+
+    payload = command_providers(Namespace(all=False, diagnose=True, no_discovery=False))
+    providers = {provider["id"]: provider for provider in payload["providers"]}
+
+    assert payload["ok"] is True
+    assert payload["diagnose"] is True
+    assert providers["dynamic"]["discovery_checked"] is True
+    assert providers["dynamic"]["diagnostic"]["available"] is True
+    assert providers["dynamic"]["diagnostic"]["available_source_count"] == 1
+    assert providers["dynamic"]["diagnostic"]["discovered_model_count"] == 2
+    assert providers["static"]["dynamic_model_discovery"] is False
+    assert providers["static"]["discovery_checked"] is False
 
 
 def test_command_plan_shuts_down_when_selection_fails(monkeypatch, tmp_path):

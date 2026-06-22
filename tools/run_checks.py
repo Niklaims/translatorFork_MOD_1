@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -17,8 +18,22 @@ def _run(label: str, command: list[str]) -> int:
     return completed.returncode
 
 
+def _env_release_mode_enabled() -> bool:
+    value = (
+        os.environ.get("GT_RUN_CHECKS_RELEASE")
+        or os.environ.get("GT_RELEASE_METADATA_MODE")
+        or ""
+    ).strip().lower()
+    return value in {"1", "true", "yes", "release", "strict"}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run project smoke checks.")
+    parser.add_argument(
+        "--release",
+        action="store_true",
+        help="Run release metadata checks in strict release mode.",
+    )
     parser.add_argument(
         "--skip-tests",
         action="store_true",
@@ -31,10 +46,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    release_metadata_command = [sys.executable, "-m", "gemini_translator.scripts.check_release_metadata"]
+    if args.release or _env_release_mode_enabled():
+        release_metadata_command.append("--release")
+
     checks = [
         (
             "release metadata",
-            [sys.executable, "-m", "gemini_translator.scripts.check_release_metadata"],
+            release_metadata_command,
         )
     ]
 

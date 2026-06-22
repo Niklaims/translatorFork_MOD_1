@@ -36,6 +36,11 @@ from ...scripts.package_filter_tasks import FilterPackagingDialog
 from ...api import config as api_config
 from ...api.managers import ApiKeyManager
 from ...core import auto_workflow_helpers
+from ...core.consistency_engine import (
+    DEEP_CONSISTENCY_MODE,
+    FAST_PROOFREAD_MODE,
+    normalize_consistency_mode,
+)
 from ...core.translation_engine import TranslationEngine
 from ...core.task_manager import ChapterQueueManager, TaskDBWorker
 from ...utils.settings import SettingsManager
@@ -5665,6 +5670,17 @@ class InitialSetupPage(ShellPage):
             return
 
         config = self._get_effective_auto_model_settings(auto_settings)
+        requested_mode = auto_settings.get('ai_consistency_mode', 'standard')
+        consistency_mode = normalize_consistency_mode(requested_mode)
+        if consistency_mode == FAST_PROOFREAD_MODE:
+            worker_mode = FAST_PROOFREAD_MODE
+        else:
+            worker_mode = (
+                'glossary_first'
+                if str(requested_mode or '').strip().lower() == 'glossary_first'
+                else 'standard'
+            )
+            consistency_mode = DEEP_CONSISTENCY_MODE
         selected_confidences = auto_settings.get('ai_consistency_fix_confidences')
         if not isinstance(selected_confidences, (list, tuple, set)):
             selected_confidences = ['high', 'medium', 'low']
@@ -5676,6 +5692,7 @@ class InitialSetupPage(ShellPage):
         config.update({
             'provider': self.key_management_widget.get_selected_provider(),
             'chunk_size': int(auto_settings.get('ai_consistency_chunk_size', 3)),
+            'consistency_mode': consistency_mode,
             'consistency_fix_confidences': list(selected_confidences),
             'consistency_include_original': include_original,
             'consistency_original_chapter_limit': original_chapter_limit,
@@ -5709,7 +5726,7 @@ class InitialSetupPage(ShellPage):
             config,
             active_keys,
             auto_fix=bool(auto_settings.get('ai_consistency_auto_fix', True)),
-            mode=auto_settings.get('ai_consistency_mode', 'standard'),
+            mode=worker_mode,
             parent=self,
         )
         worker.finished_with_result.connect(self._on_auto_consistency_finished)

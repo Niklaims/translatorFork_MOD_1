@@ -1517,8 +1517,16 @@ class ConsistencyEngine(QObject):
                 'system_prompt', "You are a professional literary editor.")
 
         # Подставляем переменные в промпт
+        chapters_text_for_prompt = chapters_text
+        if (
+            config.get("consistency_mode") == FAST_PROOFREAD_MODE
+            and not source_text.strip()
+            and "TRANSLATED TEXT TO ANALYZE" not in chapters_text_for_prompt
+        ):
+            chapters_text_for_prompt = "### TRANSLATED TEXT TO ANALYZE\n" + translated_text.strip()
+
         prompt = system_prompt.replace('{context_json}', context_json)
-        prompt = prompt.replace('{chapters_text}', chapters_text)
+        prompt = prompt.replace('{chapters_text}', chapters_text_for_prompt)
 
         return prompt
 

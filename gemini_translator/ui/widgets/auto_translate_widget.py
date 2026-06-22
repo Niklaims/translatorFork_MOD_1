@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ...api import config as api_config
+from ...core.consistency_engine import FAST_PROOFREAD_MODE
 from ...utils.settings import SettingsManager
 from .common_widgets import NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSpinBox
 
@@ -404,6 +405,7 @@ class AutoTranslateWidget(QWidget):
         self.ai_consistency_mode_combo = NoScrollComboBox()
         self.ai_consistency_mode_combo.addItem("Обычный анализ", userData="standard")
         self.ai_consistency_mode_combo.addItem("Сначала собрать контекст/глоссарий", userData="glossary_first")
+        self.ai_consistency_mode_combo.addItem("Быстрая вычитка 3.1", userData=FAST_PROOFREAD_MODE)
         self.ai_consistency_fix_high_checkbox = QCheckBox("high")
         self.ai_consistency_fix_high_checkbox.setChecked(True)
         self.ai_consistency_fix_high_checkbox.setToolTip("Исправлять проблемы, в которых модель уверена сильнее всего.")

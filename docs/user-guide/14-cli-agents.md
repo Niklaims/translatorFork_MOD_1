@@ -56,6 +56,7 @@ python -m gemini_translator.cli build-epub `
 ## Команды
 
 - `status` показывает конфигурацию, провайдеры, модели, число сохраненных ключей и историю проектов.
+- `providers` показывает провайдеры и число ключей без сетевого поиска моделей; для проверки dynamic providers используйте `--diagnose`.
 - `plan` выбирает главы, строит задачи через тот же `TaskPreparer`, что и UI, и возвращает сводку очереди.
 - `translate` строит очередь и запускает `TranslationEngine` в headless-режиме.
 - `build-epub` берет `translation_map.json` и заменяет главы в исходном EPUB выбранными переводами.
@@ -84,9 +85,12 @@ python -m gemini_translator.cli build-epub `
 
 ```powershell
 python -m gemini_translator.cli providers
+python -m gemini_translator.cli providers --diagnose
 python -m gemini_translator.cli models --provider gemini
 python -m gemini_translator.cli settings
 ```
+
+`providers` по умолчанию не ходит в локальные discovery endpoints, поэтому команда подходит для быстрых agent-smoke checks. `providers --diagnose` или `providers --doctor` проверяет доступность dynamic providers и добавляет в JSON поле `diagnostic` с доступными источниками и числом найденных моделей.
 
 Сделать одиночный запрос к модели через тот же движок, что использует перевод:
 

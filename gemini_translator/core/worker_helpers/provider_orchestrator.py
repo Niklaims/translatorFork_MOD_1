@@ -24,8 +24,25 @@ from gemini_translator.api.errors import (
 from gemini_translator.api.factory import get_api_handler_class
 
 
-TRANSLATION_TASK_TYPES = {"epub", "epub_chunk", "raw_text_translation"}
+TRANSLATION_TASK_TYPES = {"epub", "epub_batch", "epub_chunk", "raw_text_translation"}
 TRANSLATION_ACTION_PREFIXES = ("translate",)
+INPUT_TOKEN_LIMIT_KEYS = (
+    "input_token_limit",
+    "max_input_tokens",
+    "max_input_token_limit",
+    "max_prompt_tokens",
+)
+CONTEXT_WINDOW_KEYS = (
+    "context_window",
+    "context_length",
+    "max_context_window",
+    "max_context_length",
+    "ctx_length",
+    "n_ctx",
+    "num_ctx",
+)
+TOKEN_ESTIMATE_CHARS_PER_TOKEN = 4
+SYNTHESIS_CONTEXT_BUDGET_HEADROOM = 0.95
 
 
 @dataclass
@@ -138,9 +155,14 @@ def should_orchestrate_api_call(worker, operation_context: dict | None) -> bool:
 
 
 def _provider_info(provider_id: str) -> dict:
-    if provider_id == "local":
-        return api_config.ensure_dynamic_provider_models(provider_id)
-    return api_config.api_providers().get(provider_id, {})
+    provider_id = str(provider_id or "").strip()
+    if not provider_id:
+        return {}
+    try:
+        provider_info = api_config.ensure_dynamic_provider_models(provider_id)
+    except Exception:
+        provider_info = api_config.api_providers().get(provider_id, {})
+    return provider_info if isinstance(provider_info, dict) else {}
 
 
 def _provider_single_profile_fanout_limited(provider_id: str, provider_info: dict) -> bool:
@@ -524,6 +546,86 @@ def _score_result(result: ProviderAttemptResult) -> int:
     return score
 
 
+def _positive_int_from_keys(source: dict | None, keys: tuple[str, ...]) -> tuple[int | None, str | None]:
+    if not isinstance(source, dict):
+        return None, None
+    for key in keys:
+        value = source.get(key)
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            return parsed, key
+    return None, None
+
+
+def _input_token_budget_from_model_config(model_config: dict | None) -> tuple[int | None, str | None]:
+    budget, key = _positive_int_from_keys(model_config, INPUT_TOKEN_LIMIT_KEYS)
+    if budget is not None:
+        return budget, key
+    return _positive_int_from_keys(model_config, CONTEXT_WINDOW_KEYS)
+
+
+def _target_model_config(worker) -> dict:
+    model_config = getattr(worker, "model_config", None)
+    budget, _budget_key = _input_token_budget_from_model_config(model_config)
+    if isinstance(model_config, dict) and budget is not None:
+        return model_config
+
+    provider_id = str(getattr(worker, "api_provider_name", "") or "").strip()
+    model_name = str(getattr(worker, "model", "") or "").strip()
+    if not provider_id and not model_name:
+        return model_config if isinstance(model_config, dict) else {}
+
+    _display_name, resolved = _resolve_model(
+        provider_id,
+        model_name,
+        fallback_model_config=model_config if isinstance(model_config, dict) else None,
+    )
+    if not isinstance(resolved, dict) or not resolved:
+        return model_config if isinstance(model_config, dict) else {}
+
+    merged = deepcopy(resolved)
+    if isinstance(model_config, dict):
+        for key, value in model_config.items():
+            if value not in (None, ""):
+                merged[key] = value
+    return merged
+
+
+def _target_input_token_budget(worker) -> tuple[int | None, str | None]:
+    return _input_token_budget_from_model_config(_target_model_config(worker))
+
+
+def _estimate_input_tokens(text: str) -> int:
+    if not text:
+        return 0
+    compact_pieces = len(re.findall(r"\S+", text))
+    char_estimate = (len(text) + TOKEN_ESTIMATE_CHARS_PER_TOKEN - 1) // TOKEN_ESTIMATE_CHARS_PER_TOKEN
+    return max(1, compact_pieces, char_estimate)
+
+
+def _synthesis_context_budget_exceeded(worker, synthesis_prompt: str) -> tuple[bool, str]:
+    budget, budget_key = _target_input_token_budget(worker)
+    if budget is None:
+        return False, ""
+
+    estimated_tokens = _estimate_input_tokens(synthesis_prompt)
+    usable_budget = max(1, int(budget * SYNTHESIS_CONTEXT_BUDGET_HEADROOM))
+    if estimated_tokens <= usable_budget:
+        return False, ""
+
+    return True, (
+        f"estimated synthesis input {estimated_tokens} tokens exceeds "
+        f"{budget_key} budget {budget} tokens"
+    )
+
+
+def _synthesis_fallback_strategy(strategy: str) -> str:
+    return "best_score" if strategy == "synthesis" else "first_success"
+
+
 def _safe_filename(value: str, fallback: str = "item") -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
     text = text.strip("._-")
@@ -806,6 +908,17 @@ async def execute_orchestrated_api_call(
 
     if strategy in {"merge", "synthesis"} and success_count > 1:
         synthesis_prompt = _build_synthesis_prompt(prompt, results)
+        budget_exceeded, budget_reason = _synthesis_context_budget_exceeded(worker, synthesis_prompt)
+        if budget_exceeded:
+            fallback_strategy = _synthesis_fallback_strategy(strategy)
+            _post_log(
+                worker,
+                f"[ORCH] Synthesis skipped: {budget_reason}; falling back to {fallback_strategy}.",
+            )
+            selected = _select_result(fallback_strategy, results)
+            _post_log(worker, f"[ORCH] Selected result: {selected.attempt.label}.")
+            return selected.text
+
         synthesis_kwargs = dict(call_kwargs)
         synthesis_kwargs["use_stream"] = False
         synthesis_kwargs["allow_incomplete"] = False

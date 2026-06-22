@@ -1,15 +1,22 @@
 import os
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 import zipfile
 from unittest.mock import patch
 
-from gemini_translator.core.consistency_engine import filter_consistency_problems_by_confidence
+from PyQt6 import QtWidgets
+
+from gemini_translator.core.consistency_engine import (
+    FAST_PROOFREAD_MODE,
+    filter_consistency_problems_by_confidence,
+)
 from gemini_translator.ui.dialogs.auto_workflow import (
     AutoConsistencyWorker,
     load_project_chapters_for_consistency,
 )
 from gemini_translator.ui.dialogs.setup import InitialSetupDialog
+from gemini_translator.ui.widgets.auto_translate_widget import AutoTranslateWidget
 
 
 class _AutoTranslateWidgetStub:
@@ -18,6 +25,32 @@ class _AutoTranslateWidgetStub:
 
     def get_settings(self):
         return dict(self._settings)
+
+
+class _AutoTranslateSettingsManagerStub:
+    def load_glossary_prompts(self):
+        return {}
+
+    def get_last_glossary_prompt_text(self):
+        return ""
+
+    def get_last_auto_translation_settings(self):
+        return {}
+
+    def get_last_auto_translation_preset_name(self):
+        return None
+
+    def load_auto_translation_presets(self):
+        return {}
+
+    def save_auto_translation_presets(self, presets):
+        return True
+
+    def save_last_auto_translation_settings(self, settings):
+        self.last_auto_translation_settings = dict(settings)
+
+    def save_last_auto_translation_preset_name(self, name):
+        self.last_auto_translation_preset_name = name
 
 
 class _KeyManagementWidgetStub:
@@ -907,6 +940,22 @@ class _ConsistencyEngineStub:
         return None
 
 
+class AutoTranslateWidgetConsistencyModeTests(unittest.TestCase):
+    def test_ai_consistency_mode_combo_exposes_fast_proofread(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        widget = AutoTranslateWidget(settings_manager=_AutoTranslateSettingsManagerStub())
+        try:
+            fast_index = widget.ai_consistency_mode_combo.findData(FAST_PROOFREAD_MODE)
+
+            self.assertNotEqual(fast_index, -1)
+            widget.ai_consistency_checkbox.setChecked(True)
+            widget.ai_consistency_mode_combo.setCurrentIndex(fast_index)
+            self.assertEqual(widget.get_settings()["ai_consistency_mode"], FAST_PROOFREAD_MODE)
+        finally:
+            widget.deleteLater()
+            self.assertIsNotNone(app)
+
+
 class AutoConsistencyFollowupTests(unittest.TestCase):
     def setUp(self):
         _AutoConsistencyWorkerStub.instances.clear()
@@ -935,6 +984,7 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         self.assertTrue(worker.started)
         self.assertEqual(worker.config["provider"], "stub-provider")
         self.assertEqual(worker.config["chunk_size"], 5)
+        self.assertEqual(worker.config["consistency_mode"], "deep_consistency")
         self.assertEqual(worker.config["consistency_fix_confidences"], ["high"])
         self.assertTrue(worker.auto_fix)
         self.assertEqual(worker.mode, "glossary_first")
@@ -944,6 +994,28 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
         self.assertTrue(
             any("AI-consistency автофикс по уровням уверенности: high." in entry["message"] for entry in harness.logs)
         )
+
+    def test_run_auto_consistency_followup_passes_fast_proofread_mode(self):
+        harness = _AutoConsistencyFollowupHarness()
+        chapters = [{"name": "chapter1.xhtml", "content": "<p>one</p>", "path": "C:/temp/ch1.xhtml"}]
+        auto_settings = {
+            "ai_consistency_auto_fix": False,
+            "ai_consistency_chunk_size": 1,
+            "ai_consistency_mode": FAST_PROOFREAD_MODE,
+        }
+
+        with patch(
+            "gemini_translator.ui.dialogs.setup.load_project_chapters_for_consistency",
+            return_value=chapters,
+        ), patch(
+            "gemini_translator.ui.dialogs.setup.AutoConsistencyWorker",
+            _AutoConsistencyWorkerStub,
+        ):
+            harness._run_auto_consistency_followup(auto_settings)
+
+        worker = _AutoConsistencyWorkerStub.instances[0]
+        self.assertEqual(worker.config["consistency_mode"], FAST_PROOFREAD_MODE)
+        self.assertEqual(worker.mode, FAST_PROOFREAD_MODE)
 
     def test_run_auto_consistency_followup_passes_original_flag_to_loader(self):
         harness = _AutoConsistencyFollowupHarness()

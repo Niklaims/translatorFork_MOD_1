@@ -49,6 +49,8 @@ class _RetrySettingsStub:
 class _ConsistencyDialogHarness:
     on_engine_error = ConsistencyValidatorDialog.on_engine_error
     on_error = ConsistencyValidatorDialog.on_error
+    _restore_batch_fix_problem_map = ConsistencyValidatorDialog._restore_batch_fix_problem_map
+    _on_batch_fix_error = ConsistencyValidatorDialog._on_batch_fix_error
 
     def __init__(
         self,
@@ -70,6 +72,7 @@ class _ConsistencyDialogHarness:
             "fix_thread": bool(fix_running),
             "single_fix_thread": bool(single_fix_running),
         }
+        self._batch_fix_original_problems_map = None
 
     def _log(self, message):
         self.logs.append(message)
@@ -79,6 +82,18 @@ class _ConsistencyDialogHarness:
 
     def _update_batch_fix_button_state(self):
         self.batch_fix_updates += 1
+
+
+class _SaveSessionHarness:
+    _save_session = ConsistencyValidatorDialog._save_session
+
+    def __init__(self, session_file, payload):
+        self.session_file = Path(session_file)
+        self.payload = payload
+        self._restored_session_data = None
+
+    def _build_session_payload(self):
+        return self.payload
 
 
 class ConsistencyResponseNormalizationTests(unittest.TestCase):
@@ -321,6 +336,25 @@ class ConsistencyResponseNormalizationTests(unittest.TestCase):
                 "next_chunk_focus": [],
             },
         )
+
+    def test_fast_proofread_prompt_labels_translated_text_without_source_reference(self):
+        engine = ConsistencyEngine(object())
+
+        prompt = engine._build_analysis_prompt(
+            [
+                {
+                    "name": "chapter_01.xhtml",
+                    "content": "<p>Translated only.</p>",
+                    "path": "chapter_01.xhtml",
+                }
+            ],
+            {"consistency_mode": FAST_PROOFREAD_MODE},
+        )
+
+        self.assertIn("### TRANSLATED TEXT TO ANALYZE", prompt)
+        self.assertIn("--- CHAPTER: chapter_01.xhtml ---", prompt)
+        self.assertIn("<p>Translated only.</p>", prompt)
+        self.assertNotIn("SOURCE ORIGINAL", prompt)
 
 
 class ConsistencyKeyRetryTests(unittest.TestCase):
@@ -744,6 +778,59 @@ class ConsistencyKeyRetryTests(unittest.TestCase):
 
 
 class ConsistencyDialogErrorHandlingTests(unittest.TestCase):
+    def test_save_session_uses_temp_file_and_atomic_replace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_file = Path(temp_dir) / "consistency_session.json"
+            harness = _SaveSessionHarness(session_file, {"problems": [{"id": 1}]})
+            real_replace = os.replace
+            replace_calls = []
+
+            def tracking_replace(src, dst):
+                src_path = Path(src)
+                dst_path = Path(dst)
+                replace_calls.append((src_path, dst_path))
+                self.assertTrue(src_path.exists())
+                self.assertEqual(dst_path, session_file)
+                real_replace(src_path, dst_path)
+
+            with patch(
+                "gemini_translator.ui.dialogs.consistency_checker.os.replace",
+                side_effect=tracking_replace,
+            ):
+                harness._save_session()
+
+            self.assertEqual(len(replace_calls), 1)
+            self.assertTrue(replace_calls[0][0].name.startswith(".consistency_session.json."))
+            self.assertEqual(json.loads(session_file.read_text(encoding="utf-8")), harness.payload)
+            self.assertEqual(list(Path(temp_dir).glob(".consistency_session.json.*.tmp")), [])
+
+    def test_save_session_failure_keeps_existing_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_file = Path(temp_dir) / "consistency_session.json"
+            session_file.write_text('{"stable": true}\n', encoding="utf-8")
+            harness = _SaveSessionHarness(session_file, {"bad": object()})
+
+            harness._save_session()
+
+            self.assertEqual(session_file.read_text(encoding="utf-8"), '{"stable": true}\n')
+            self.assertEqual(list(Path(temp_dir).glob(".consistency_session.json.*.tmp")), [])
+
+    def test_batch_fix_error_restores_original_problem_map(self):
+        harness = _ConsistencyDialogHarness()
+        original_map = {"chapter.xhtml": [{"id": "all"}]}
+        filtered_map = {"chapter.xhtml": [{"id": "selected"}]}
+        harness.engine = type("_EngineStub", (), {})()
+        harness.engine.chapter_problems_map = filtered_map
+        harness._batch_fix_original_problems_map = original_map
+
+        harness._on_batch_fix_error("fatal boom")
+
+        self.assertIs(harness.engine.chapter_problems_map, original_map)
+        self.assertIsNone(harness._batch_fix_original_problems_map)
+        self.assertEqual(len(harness.logs), 1)
+        self.assertTrue(harness.logs[0].endswith(": fatal boom"))
+        self.assertEqual(harness.batch_fix_updates, 1)
+
     def test_engine_error_keeps_stop_enabled_while_analysis_thread_is_running(self):
         harness = _ConsistencyDialogHarness(analysis_running=True)
 

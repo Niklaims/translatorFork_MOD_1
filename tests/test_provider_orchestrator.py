@@ -12,7 +12,51 @@ class _ApiHandlerStub:
         return "synthesis"
 
 
+class _UnexpectedApiHandler:
+    async def execute_api_call(self, prompt, log_prefix, **kwargs):
+        raise AssertionError("synthesis should have been skipped")
+
+
 class ProviderOrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    def test_should_orchestrate_epub_batch_translation_context(self):
+        worker = SimpleNamespace(
+            parallel_providers_enabled=True,
+            multi_pass_enabled=False,
+            multi_pass_chapter_translation=False,
+        )
+
+        self.assertTrue(
+            orchestrator.should_orchestrate_api_call(
+                worker,
+                {"task_type": "epub_batch", "action": "translate_batch_json"},
+            )
+        )
+
+    def test_resolve_model_uses_dynamic_discovery_for_non_local_provider(self):
+        provider_info = {
+            "models": {
+                "Runtime Model": {
+                    "id": "runtime-model-id",
+                    "context_window": 12345,
+                }
+            }
+        }
+
+        with patch.object(
+            orchestrator.api_config,
+            "ensure_dynamic_provider_models",
+            return_value=provider_info,
+        ) as ensure_dynamic:
+            model_name, model_config = orchestrator._resolve_model(
+                "dynamic_provider",
+                "runtime-model-id",
+            )
+
+        ensure_dynamic.assert_called_once_with("dynamic_provider")
+        self.assertEqual(model_name, "Runtime Model")
+        self.assertEqual(model_config["id"], "runtime-model-id")
+        self.assertEqual(model_config["provider"], "dynamic_provider")
+
     async def test_parallel_strategy_is_not_overridden_by_multi_pass_default(self):
         attempts = [
             orchestrator.ProviderAttempt(
@@ -262,6 +306,66 @@ class ProviderOrchestratorTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(result, "synthesis")
+
+    async def test_synthesis_skips_when_target_context_budget_is_exceeded(self):
+        attempts = [
+            orchestrator.ProviderAttempt(
+                provider_id="primary",
+                model_name="Primary",
+                model_config={"id": "primary-model"},
+                api_key="primary-key",
+                label="primary",
+            ),
+            orchestrator.ProviderAttempt(
+                provider_id="secondary",
+                model_name="Secondary",
+                model_config={"id": "secondary-model"},
+                api_key="secondary-key",
+                label="secondary",
+            ),
+        ]
+        results_by_label = {
+            "primary": orchestrator.ProviderAttemptResult(attempt=attempts[0], text="short"),
+            "secondary": orchestrator.ProviderAttemptResult(
+                attempt=attempts[1],
+                text="longer translated chapter text",
+            ),
+        }
+        events = []
+        worker = SimpleNamespace(
+            parallel_provider_strategy="synthesis",
+            multi_pass_strategy="merge",
+            multi_pass_enabled=False,
+            multi_pass_chapter_translation=False,
+            model_config={"id": "tiny-synthesis-model", "context_window": 20},
+            api_handler_instance=_UnexpectedApiHandler(),
+            _post_event=lambda event, payload: events.append((event, payload)),
+        )
+
+        async def fake_run_attempt(_worker, attempt, _prompt, _log_prefix, _call_kwargs):
+            return results_by_label[attempt.label]
+
+        with patch.object(orchestrator, "_build_attempts", return_value=attempts), \
+             patch.object(orchestrator, "_run_attempt", side_effect=fake_run_attempt), \
+             patch.object(orchestrator, "_save_attempt_results"):
+            result = await orchestrator.execute_orchestrated_api_call(
+                worker,
+                "source text " * 80,
+                "[Test]",
+                task_info=("task-1", ("epub",)),
+                operation_context={"task_type": "epub", "action": "translate_chapter"},
+                call_kwargs={},
+            )
+
+        self.assertEqual(result, "longer translated chapter text")
+        self.assertTrue(
+            any(
+                "Synthesis skipped" in payload.get("message", "")
+                and "falling back to best_score" in payload.get("message", "")
+                for event, payload in events
+                if event == "log_message"
+            )
+        )
 
     def test_build_attempts_collapses_browser_single_profile_fanout(self):
         events = []
