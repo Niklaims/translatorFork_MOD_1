@@ -583,6 +583,7 @@ class InitialSetupDialog(QDialog):
         self.model_settings_widget.recalibrate_requested.connect(self._calibrate_cpu)
         self.model_settings_widget.model_combo.currentIndexChanged.connect(self._refresh_auto_translate_runtime_context)
         self.model_settings_widget.settings_changed.connect(self._refresh_auto_translate_runtime_context)
+        self.model_settings_widget.settings_changed.connect(self._update_instances_spinbox_limit)
         self.key_management_widget.active_keys_changed.connect(self._update_instances_spinbox_limit)
         self.key_management_widget.active_keys_changed.connect(self.check_ready)
         self.key_management_widget.provider_combo.currentIndexChanged.connect(self._update_instances_spinbox_limit)
@@ -983,6 +984,20 @@ class InitialSetupDialog(QDialog):
         active_sessions = len(self.key_management_widget.get_active_keys())
         if active_sessions <= 0:
             return 0
+        provider_config = api_config.api_providers().get(provider_id, {})
+        if (
+            not api_config.provider_requires_api_key(provider_id)
+            and api_config.uses_legacy_worker_thread(provider_config)
+            and hasattr(self, 'model_settings_widget')
+        ):
+            try:
+                profile_count = int(
+                    self.model_settings_widget.get_settings().get('browser_profiles_count', 1) or 1
+                )
+            except (TypeError, ValueError):
+                profile_count = 1
+            if profile_count > 1:
+                return max(1, profile_count)
         provider_limit = api_config.provider_max_instances(provider_id)
         if provider_limit is None or provider_limit <= 0:
             provider_limit = active_sessions
@@ -5825,6 +5840,11 @@ class InitialSetupDialog(QDialog):
             'auto_translation': self.auto_translate_widget.get_settings(),
             'auto_start': True,
             'num_instances': self.instances_spin.value(),
+            'active_keys_by_provider': {
+                provider_id: sorted(list(keys))
+                for provider_id, keys in self.key_management_widget.current_active_keys_by_provider.items()
+                if keys
+            },
         }
 
         if self.output_folder:

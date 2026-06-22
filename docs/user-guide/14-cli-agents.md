@@ -77,3 +77,73 @@ python -m gemini_translator.cli build-epub `
 - `--mode sequential --splits N` запускает последовательные цепочки глав.
 
 Дополнительные настройки можно передать через `--settings-json`; этот файл накладывается поверх собранных CLI-настроек последним шагом.
+
+## Расширенное управление
+
+Получить отдельные списки провайдеров и моделей:
+
+```powershell
+python -m gemini_translator.cli providers
+python -m gemini_translator.cli models --provider gemini
+python -m gemini_translator.cli settings
+```
+
+Сделать одиночный запрос к модели через тот же движок, что использует перевод:
+
+```powershell
+python -m gemini_translator.cli generate `
+  --provider gemini `
+  --model "Gemini 3.1 Flash-Lite" `
+  --prompt "Кратко перескажи текст: {text}" `
+  --input ".\chapter.txt"
+```
+
+Сгенерировать AI-глоссарий по всем главам:
+
+```powershell
+python -m gemini_translator.cli glossary-generate `
+  --epub "C:\books\book.epub" `
+  --project "C:\books\book_project" `
+  --provider gemini `
+  --model "Gemini 3.1 Flash-Lite" `
+  --chapters all `
+  --batch-size 2 `
+  --merge-mode supplement
+```
+
+Проверить согласованность в быстром режиме 3.1. Быстрый режим ищет только несоответствие родов, опечатки и мета-комментарии:
+
+```powershell
+python -m gemini_translator.cli consistency `
+  --epub "C:\books\book.epub" `
+  --project "C:\books\book_project" `
+  --provider gemini `
+  --model "Gemini 3.1 Flash-Lite" `
+  --consistency-mode fast `
+  --chapters translated
+```
+
+Глубокую проверку можно запустить через `--consistency-mode deep`; если нужно сразу получить правки, добавьте `--fix`, а запись в файлы включается отдельно через `--write`.
+
+Найти недопереводы без API-вызовов:
+
+```powershell
+python -m gemini_translator.cli untranslated-scan `
+  --epub "C:\books\book.epub" `
+  --project "C:\books\book_project" `
+  --chapters translated
+```
+
+Исправить найденные недопереводы через модель. Для проверки результата без записи используйте `--dry-run`:
+
+```powershell
+python -m gemini_translator.cli untranslated-fix `
+  --epub "C:\books\book.epub" `
+  --project "C:\books\book_project" `
+  --provider gemini `
+  --model "Gemini 3.1 Flash-Lite" `
+  --batch-size 50 `
+  --dry-run
+```
+
+Для команд проверки и исправления `--provider` выбирает API-провайдера модели. Если нужно выбрать конкретную версию перевода из `translation_map.json`, используйте `--suffix`, например `--suffix _validated.html`.

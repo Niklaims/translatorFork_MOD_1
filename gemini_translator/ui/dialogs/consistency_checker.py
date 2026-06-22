@@ -21,7 +21,11 @@ from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QBrush, QTextOption
 
-from ...core.consistency_engine import ConsistencyEngine
+from ...core.consistency_engine import (
+    DEEP_CONSISTENCY_MODE,
+    FAST_PROOFREAD_MODE,
+    ConsistencyEngine,
+)
 from ...api import config as api_config
 from ..widgets.key_management_widget import KeyManagementWidget
 from ..widgets.model_settings_widget import ModelSettingsWidget
@@ -298,6 +302,11 @@ class ConsistencyValidatorDialog(QDialog):
         self.glossary_first_checkbox.setToolTip(
             "Два прохода: сначала только сбор персонажей/терминов, затем поиск проблем")
         toolbar_layout.addWidget(self.glossary_first_checkbox)
+        self.consistency_mode_combo = QComboBox()
+        self.consistency_mode_combo.addItem("Глубокий", DEEP_CONSISTENCY_MODE)
+        self.consistency_mode_combo.addItem("Быстрый 3.1", FAST_PROOFREAD_MODE)
+        self.consistency_mode_combo.setToolTip("Глубокий = сюжет/согласованность. Быстрый 3.1 = род, опечатки и мета-комментарии.")
+        toolbar_layout.addWidget(self.consistency_mode_combo)
 
         self.select_chapters_btn = QPushButton("📚 Выбрать главы")
         self.select_chapters_btn.setToolTip("Выбрать, какие главы включать в AI-анализ согласованности.")
@@ -752,6 +761,8 @@ class ConsistencyValidatorDialog(QDialog):
         self.save_all_btn.clicked.connect(self.save_all_fixes)
         self.close_btn.clicked.connect(self.close)
         self.corrected_text.textChanged.connect(self._sync_corrected_preview_content)
+        self.consistency_mode_combo.currentIndexChanged.connect(self._on_consistency_mode_changed)
+        self._on_consistency_mode_changed()
 
         # Сигналы от engine
         self.engine.progress_updated.connect(self.update_progress)
@@ -769,6 +780,12 @@ class ConsistencyValidatorDialog(QDialog):
                 self._on_provider_changed)
             # Инициализируем модели
             self._on_provider_changed(self.key_management_widget.provider_combo.currentText())
+
+    def _on_consistency_mode_changed(self, *_args):
+        is_fast = self.consistency_mode_combo.currentData() == FAST_PROOFREAD_MODE
+        self.glossary_first_checkbox.setEnabled(not is_fast)
+        if is_fast:
+            self.glossary_first_checkbox.setChecked(False)
 
     def _on_provider_changed(self, provider_display_name):
         """Обновляет список моделей при смене провайдера."""
@@ -987,7 +1004,8 @@ class ConsistencyValidatorDialog(QDialog):
         # Добавляем специфичные для валидатора поля
         config.update({
             'provider': provider_id,
-            'chunk_size': self.chunk_size_spin.value()
+            'chunk_size': self.chunk_size_spin.value(),
+            'consistency_mode': self.consistency_mode_combo.currentData() or DEEP_CONSISTENCY_MODE,
         })
         
         return config
@@ -1058,7 +1076,12 @@ class ConsistencyValidatorDialog(QDialog):
         config = self._get_current_config()
         
         # Определяем режим анализа
-        mode = 'glossary_first' if self.glossary_first_checkbox.isChecked() else 'standard'
+        selected_consistency_mode = config.get('consistency_mode') or DEEP_CONSISTENCY_MODE
+        mode = (
+            FAST_PROOFREAD_MODE
+            if selected_consistency_mode == FAST_PROOFREAD_MODE
+            else ('glossary_first' if self.glossary_first_checkbox.isChecked() else 'standard')
+        )
         resume_state = self._build_session_payload()
         if not self._has_resumable_progress(mode, selected_chapters, config, resume_state):
             resume_state = None
@@ -1100,6 +1123,9 @@ class ConsistencyValidatorDialog(QDialog):
         self._log(f"  Активных ключей: {len(active_keys)}, глав в чанке: {config['chunk_size']}")
         if mode == 'glossary_first':
             self._log("  📚 Режим: сначала сбор глоссария (два прохода)")
+
+        if mode == FAST_PROOFREAD_MODE:
+            self._log("  Режим: быстрый 3.1 (род, опечатки, мета-комментарии)")
 
         self.analysis_thread = AnalysisWorker(
             self.engine, selected_chapters, config, active_keys, mode)
@@ -2246,6 +2272,7 @@ class ConsistencyValidatorDialog(QDialog):
 
         return {
             'timestamp': str(datetime.now()),
+            'consistency_mode': self.consistency_mode_combo.currentData() or DEEP_CONSISTENCY_MODE,
             'glossary': self.engine.glossary_session.to_dict(),
             'processed_chapters': self.engine.glossary_session.processed_chapters,
             'problems': problems_data,
@@ -2329,6 +2356,12 @@ class ConsistencyValidatorDialog(QDialog):
             )
 
             # 1. Восстанавливаем глоссарий
+            restored_mode = data.get('consistency_mode') or DEEP_CONSISTENCY_MODE
+            mode_index = self.consistency_mode_combo.findData(restored_mode)
+            if mode_index != -1:
+                self.consistency_mode_combo.setCurrentIndex(mode_index)
+                self._on_consistency_mode_changed()
+
             glossary_data = data.get('glossary', {})
             self.engine.glossary_session.clear()
             self._apply_shared_project_glossary()

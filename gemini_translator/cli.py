@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import contextlib
 import fnmatch
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -208,7 +210,7 @@ def _payload_chapters(payload: tuple) -> list[str]:
     task_type = payload[0] if payload else ""
     if task_type in {"epub", "epub_chunk"}:
         return [str(payload[2])]
-    if task_type == "epub_batch":
+    if task_type in {"epub_batch", "glossary_batch_task"}:
         return [str(item) for item in payload[2]]
     return []
 
@@ -485,6 +487,13 @@ def _safe_settings_for_output(settings: dict) -> dict:
     hidden = dict(settings)
     if hidden.get("api_keys"):
         hidden["api_keys"] = [f"...{str(key)[-4:]}" for key in hidden.get("api_keys", [])]
+    active_by_provider = hidden.get("active_keys_by_provider")
+    if isinstance(active_by_provider, dict):
+        hidden["active_keys_by_provider"] = {
+            str(provider): [f"...{str(key)[-4:]}" for key in (keys or [])]
+            for provider, keys in active_by_provider.items()
+            if isinstance(keys, (list, tuple, set))
+        }
     hidden.pop("project_manager", None)
     if hidden.get("custom_prompt"):
         hidden["custom_prompt_chars"] = len(str(hidden.pop("custom_prompt")))
@@ -506,7 +515,14 @@ def _queue_status_counts(task_manager) -> dict[str, int]:
 
 
 class CliSessionObserver:
-    def __init__(self, app, *, verbose: bool = False, timeout_sec: int | None = None):
+    def __init__(
+        self,
+        app,
+        *,
+        verbose: bool = False,
+        timeout_sec: int | None = None,
+        capture_results: bool = False,
+    ):
         from PyQt6 import QtCore
 
         self.app = app
@@ -519,8 +535,10 @@ class CliSessionObserver:
         self.timed_out = False
         self.reason = None
         self.task_events = []
+        self.task_results = []
         self.event_counts = Counter()
         self.logs = []
+        self.capture_results = bool(capture_results)
         app.event_bus.event_posted.connect(self.on_event)
         if timeout_sec:
             QtCore.QTimer.singleShot(int(timeout_sec * 1000), self.on_timeout)
@@ -547,6 +565,15 @@ class CliSessionObserver:
             task_payload = None
             if isinstance(task_info, (tuple, list)) and len(task_info) >= 2:
                 task_payload = task_info[1]
+            if self.capture_results:
+                self.task_results.append({
+                    "success": bool(data.get("success")),
+                    "task_info": task_info,
+                    "task_type": task_payload[0] if task_payload else None,
+                    "result_data": data.get("result_data"),
+                    "message": data.get("message"),
+                    "error_type": data.get("error_type"),
+                })
             self.task_events.append({
                 "success": bool(data.get("success")),
                 "error_type": data.get("error_type"),
@@ -673,6 +700,70 @@ def _project_manager(project_folder: str):
     return TranslationProjectManager(project_folder)
 
 
+def _run_task_session(
+    app,
+    runtime: HeadlessRuntime,
+    settings: dict,
+    payloads: list[tuple],
+    *,
+    verbose: bool = False,
+    timeout: int | None = None,
+    capture_results: bool = False,
+) -> tuple[dict, list[dict]]:
+    app.task_manager.clear_all_queues()
+    app.task_manager.set_pending_tasks(payloads)
+    observer = CliSessionObserver(
+        app,
+        verbose=verbose,
+        timeout_sec=timeout,
+        capture_results=capture_results,
+    )
+
+    def start_session():
+        app.event_bus.event_posted.emit({
+            "event": "start_session_requested",
+            "source": "cli",
+            "data": {"settings": settings},
+        })
+
+    app.event_bus.set_data("cli_session_active", True)
+    runtime.app_main.QtCore.QTimer.singleShot(0, start_session)
+    app.exec()
+    app.event_bus.pop_data("cli_session_active", None)
+    return observer.result_payload(app.task_manager), list(observer.task_results)
+
+
+def _session_completed_ok(result: dict) -> bool:
+    task_events = result.get("task_events") if isinstance(result, dict) else {}
+    failed = task_events.get("failed", 0) if isinstance(task_events, dict) else 0
+    return bool(result.get("finished") and not result.get("timed_out") and int(failed or 0) == 0)
+
+
+def _settings_with_single_task_mode(args):
+    if getattr(args, "mode", "saved") == "saved":
+        setattr(args, "mode", "single")
+    return args
+
+
+def _glossary_dict_to_list(glossary: dict[str, dict]) -> list[dict]:
+    result = []
+    for original, entry in (glossary or {}).items():
+        if not str(original).strip():
+            continue
+        data = entry if isinstance(entry, dict) else {}
+        result.append({
+            "original": str(original),
+            "rus": str(data.get("rus") or data.get("translation") or ""),
+            "note": str(data.get("note") or ""),
+        })
+    return result
+
+
+def _read_epub_member(epub_path: str, internal_path: str) -> str:
+    with zipfile.ZipFile(epub_path, "r") as archive:
+        return archive.read(internal_path).decode("utf-8", "ignore")
+
+
 def command_status(args) -> dict:
     runtime = HeadlessRuntime()
     app = runtime.bootstrap(include_engine=False)
@@ -718,6 +809,78 @@ def command_status(args) -> dict:
             "path": _abs_path(args.epub),
             "chapters": len(get_epub_chapters(args.epub)),
         }
+    runtime.shutdown()
+    return payload
+
+
+def command_providers(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=False)
+    api_config = _ensure_api_config_initialized()
+    key_statuses = app.settings_manager.load_key_statuses()
+    keys_by_provider = Counter(
+        item.get("provider")
+        for item in key_statuses
+        if isinstance(item, dict) and item.get("provider")
+    )
+    providers = []
+    for provider_id, provider in api_config.api_providers().items():
+        if not getattr(args, "all", False) and not provider.get("visible", True):
+            continue
+        api_config.ensure_dynamic_provider_models(provider_id)
+        models = provider.get("models", {})
+        providers.append({
+            "id": provider_id,
+            "display_name": provider.get("display_name") or provider_id,
+            "visible": bool(provider.get("visible", True)),
+            "requires_api_key": api_config.provider_requires_api_key(provider_id),
+            "configured_keys": int(keys_by_provider.get(provider_id, 0)),
+            "model_count": len(models) if isinstance(models, dict) else 0,
+            "file_suffix": provider.get("file_suffix"),
+            "browser_based": bool(provider.get("browser_based") or provider.get("use_browser")),
+        })
+    runtime.shutdown()
+    return {"ok": True, "providers": providers}
+
+
+def command_models(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=False)
+    api_config = _ensure_api_config_initialized()
+    saved_settings = app.settings_manager.load_full_session_settings() or {}
+    provider_id = _resolve_provider(api_config, saved_settings, getattr(args, "provider", None))
+    models = _provider_models(api_config, provider_id)
+    payload_models = []
+    for name, config in models.items():
+        config = config or {}
+        payload_models.append({
+            "name": name,
+            "id": config.get("id"),
+            "provider": config.get("provider") or provider_id,
+            "rpm": config.get("rpm"),
+            "rpd": config.get("rpd"),
+            "max_output_tokens": config.get("max_output_tokens"),
+            "context_window": config.get("context_window"),
+            "supports_thinking": config.get("supports_thinking"),
+        })
+    runtime.shutdown()
+    return {
+        "ok": True,
+        "provider": provider_id,
+        "saved_model": saved_settings.get("model"),
+        "models": payload_models,
+    }
+
+
+def command_settings(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=False)
+    settings = app.settings_manager.load_full_session_settings() or {}
+    payload = {
+        "ok": True,
+        "settings_file": app.settings_manager.config_file,
+        "settings": _safe_settings_for_output(settings),
+    }
     runtime.shutdown()
     return payload
 
@@ -826,6 +989,342 @@ def _choose_translation_rel_path(versions: dict, suffix: str | None = None) -> s
     return next(iter(versions.values()), None)
 
 
+def _load_translated_chapter_records(
+    epub_path: str,
+    project_folder: str,
+    project_manager,
+    chapters: list[str],
+    *,
+    suffix: str | None = None,
+) -> tuple[list[dict], list[str]]:
+    records = []
+    missing = []
+    for chapter in chapters:
+        versions = project_manager.get_versions_for_original(chapter)
+        rel_path = _choose_translation_rel_path(versions, suffix)
+        if not rel_path:
+            missing.append(chapter)
+            continue
+
+        full_path = os.path.join(project_folder, rel_path.replace("/", os.sep))
+        if not os.path.exists(full_path):
+            missing.append(chapter)
+            continue
+
+        with open(full_path, "r", encoding="utf-8", errors="ignore") as handle:
+            translated_html = handle.read()
+        try:
+            source_html = _read_epub_member(epub_path, chapter)
+        except Exception:
+            source_html = ""
+
+        records.append({
+            "chapter": chapter,
+            "name": os.path.basename(chapter),
+            "rel_path": rel_path,
+            "file": full_path,
+            "translated_html": translated_html,
+            "source_html": source_html,
+        })
+    return records, missing
+
+
+def _build_consistency_chapters(records: list[dict], *, include_source: bool = True) -> list[dict]:
+    chapters = []
+    for record in records:
+        payload = {
+            "name": record["chapter"],
+            "path": record["file"],
+            "content": record.get("translated_html") or "",
+        }
+        if include_source:
+            payload["source_path"] = record["chapter"]
+            payload["source_content"] = record.get("source_html") or ""
+        chapters.append(payload)
+    return chapters
+
+
+def _word_exceptions_from_project(settings_manager, project_folder: str, exceptions_path: str | None = None) -> set[str]:
+    api_config = _ensure_api_config_initialized()
+    if exceptions_path:
+        exceptions_text = _load_text_file(exceptions_path) or ""
+    else:
+        exceptions_text = ""
+        try:
+            exceptions_text = settings_manager.get_last_word_exceptions_text()
+        except Exception:
+            exceptions_text = ""
+        if not exceptions_text.strip():
+            exceptions_text = api_config.default_word_exceptions()
+
+    exceptions = {
+        line.strip().lower()
+        for line in str(exceptions_text or "").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    cyrillic_re = re.compile(r"[\u0400-\u04FF]+")
+    pure_word_re = re.compile(r"[\W\d_]+", re.UNICODE)
+    for entry in load_project_glossary(project_folder).values():
+        if not isinstance(entry, dict):
+            continue
+        for value in (entry.get("rus"), entry.get("translation"), entry.get("note")):
+            if not value:
+                continue
+            residue = pure_word_re.sub(" ", cyrillic_re.sub(" ", str(value)))
+            for word in residue.split():
+                if len(word) >= 2:
+                    exceptions.add(word.lower())
+    return exceptions
+
+
+def _scan_untranslated_records(
+    records: list[dict],
+    *,
+    word_exceptions: set[str] | None = None,
+    include_mixed_script: bool = True,
+) -> list[dict]:
+    from .ui.dialogs.validation_dialogs.untranslated_detector import UntranslatedWordDetector
+
+    detector = UntranslatedWordDetector(word_exceptions or set())
+    issues = []
+    for record in records:
+        html = record.get("translated_html") or ""
+        words = detector.detect(html)
+        mixed = detector.detect_mixed_script(html) if include_mixed_script else []
+        if words or mixed:
+            issues.append({
+                "chapter": record["chapter"],
+                "file": record["file"],
+                "untranslated_words": words,
+                "mixed_script": mixed,
+                "problem_count": len(words) + len(mixed),
+            })
+    return issues
+
+
+def _collect_untranslated_fix_items(
+    records: list[dict],
+    *,
+    word_exceptions: set[str] | None = None,
+    max_context_chars: int = 2000,
+) -> tuple[list[dict], dict, list[dict]]:
+    from bs4 import BeautifulSoup, Comment, Declaration, ProcessingInstruction
+    from .ui.dialogs.validation_dialogs.untranslated_detector import UntranslatedWordDetector
+
+    detector = UntranslatedWordDetector(word_exceptions or set())
+    inline_tags = {
+        "span", "a", "strong", "em", "b", "i", "u", "font",
+        "small", "big", "sub", "sup", "strike", "code", "var", "cite",
+    }
+    safe_blocks = {
+        "p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "dt", "dd",
+        "blockquote", "pre", "caption", "figcaption", "td", "th", "label",
+    }
+    dangerous_roots = {"body", "html", "main", "[document]"}
+
+    grouped: dict[tuple[str, str], dict] = {}
+    soup_cache = {}
+    scan_issues = []
+
+    for record_index, record in enumerate(records):
+        html = record.get("translated_html") or ""
+        words = detector.detect(html)
+        mixed = detector.detect_mixed_script(html)
+        if words or mixed:
+            scan_issues.append({
+                "chapter": record["chapter"],
+                "file": record["file"],
+                "untranslated_words": words,
+                "mixed_script": mixed,
+                "problem_count": len(words) + len(mixed),
+            })
+        if not words:
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        soup_cache[record["file"]] = {"soup": soup, "record": record}
+        processed_containers = set()
+
+        for term in words:
+            term_pattern = re.compile(re.escape(term), re.IGNORECASE)
+            for node in soup.find_all(string=term_pattern):
+                if not node.parent:
+                    continue
+                if isinstance(node, (ProcessingInstruction, Comment, Declaration)):
+                    continue
+                if node.find_parent(["head", "script", "style", "title"]):
+                    continue
+
+                effective_container = node.parent
+                while effective_container and effective_container.name in inline_tags:
+                    if effective_container.parent:
+                        effective_container = effective_container.parent
+                    else:
+                        break
+
+                container_name = getattr(effective_container, "name", None)
+                use_orphan_mode = False
+                if container_name in dangerous_roots:
+                    use_orphan_mode = True
+                elif container_name in safe_blocks:
+                    use_orphan_mode = False
+                else:
+                    block_children = safe_blocks.union({"div", "section", "article", "table", "ul", "ol"})
+                    use_orphan_mode = any(getattr(child, "name", None) in block_children for child in effective_container.children)
+
+                target_object = node if use_orphan_mode else effective_container
+                context_text = (
+                    str(node).strip()
+                    if use_orphan_mode
+                    else "".join(str(child) for child in effective_container.contents).strip()
+                )
+                if not context_text:
+                    continue
+                if max_context_chars > 0 and len(context_text) > max_context_chars:
+                    target_object = node
+                    context_text = str(node).strip()
+                    use_orphan_mode = True
+                    if len(context_text) > max_context_chars:
+                        context_text = context_text[:max(0, max_context_chars - 3)].rstrip() + "..."
+
+                unique_id = id(target_object)
+                if unique_id in processed_containers:
+                    continue
+                processed_containers.add(unique_id)
+
+                key = (record["file"], context_text)
+                if key not in grouped:
+                    grouped[key] = {
+                        "term": term,
+                        "context": context_text,
+                        "location_info": f"{record['chapter']} #{record_index + 1}",
+                        "source_type": "system",
+                        "internal_html_path": record["chapter"],
+                        "file": record["file"],
+                        "occurrences": [],
+                    }
+                grouped[key]["occurrences"].append({
+                    "target": target_object,
+                    "is_orphan": use_orphan_mode,
+                    "file": record["file"],
+                })
+
+    return list(grouped.values()), soup_cache, scan_issues
+
+
+def _build_untranslated_fix_payloads(data_items: list[dict], *, batch_size: int = 50) -> list[str]:
+    batch_size = max(1, int(batch_size or 50))
+    payloads = []
+    for start in range(0, len(data_items), batch_size):
+        html_parts = []
+        for idx, data_item in enumerate(data_items[start:start + batch_size], start=start):
+            text = data_item.get("new_context", data_item.get("context", ""))
+            html_parts.append(f'<p data-id="{idx}">{text}</p>')
+        payloads.append("<html><body>" + "\n".join(html_parts) + "</body></html>")
+    return payloads
+
+
+def _untranslated_fix_prompt(settings_manager, prompt_path: str | None = None) -> str:
+    api_config = _ensure_api_config_initialized()
+    prompt_text = _load_text_file(prompt_path)
+    if prompt_text is None:
+        try:
+            prompt_text = settings_manager.get_last_untranslated_prompt_text()
+        except Exception:
+            prompt_text = ""
+    if not str(prompt_text or "").strip():
+        prompt_text = api_config.default_untranslated_prompt()
+    try:
+        from .ui.dialogs.validation_dialogs.untranslated_fixer_dialog import build_effective_untranslated_prompt
+
+        return build_effective_untranslated_prompt(prompt_text)
+    except Exception:
+        return str(prompt_text or "").strip()
+
+
+def _parse_untranslated_fix_changes(results: list[dict], data_items: list[dict]) -> tuple[list[dict], int]:
+    from bs4 import BeautifulSoup
+
+    changes = []
+    translated_groups = 0
+    for result in results:
+        if not result.get("success"):
+            continue
+        html = result.get("result_data") or ""
+        if not html:
+            continue
+        soup = BeautifulSoup(str(html), "html.parser")
+        for paragraph in soup.find_all("p", attrs={"data-id": True}):
+            try:
+                idx = int(paragraph["data-id"])
+            except (TypeError, ValueError):
+                continue
+            if idx < 0 or idx >= len(data_items):
+                continue
+            translated_groups += 1
+            new_context = paragraph.decode_contents()
+            if new_context == data_items[idx].get("context"):
+                continue
+            updated = dict(data_items[idx])
+            updated["new_context"] = new_context
+            changes.append(updated)
+    return changes, translated_groups
+
+
+def _apply_untranslated_fix_changes(changes: list[dict], soup_cache: dict, *, dry_run: bool = False) -> dict:
+    from bs4 import BeautifulSoup
+
+    affected_files = set()
+    replacements = 0
+    for change in changes:
+        new_text = change.get("new_context") or ""
+        temp_soup = BeautifulSoup(new_text, "html.parser")
+        content_to_insert = temp_soup.body if temp_soup.body else temp_soup
+
+        for occurrence in change.get("occurrences", []):
+            target = occurrence.get("target")
+            file_path = occurrence.get("file")
+            if target is None or not file_path:
+                continue
+            nodes_to_inject = [copy.copy(node) for node in content_to_insert.contents]
+            if occurrence.get("is_orphan"):
+                try:
+                    target.replace_with(*nodes_to_inject)
+                except TypeError:
+                    if nodes_to_inject:
+                        first = nodes_to_inject[0]
+                        target.replace_with(first)
+                        current = first
+                        for extra_node in nodes_to_inject[1:]:
+                            current.insert_after(extra_node)
+                            current = extra_node
+            else:
+                target.clear()
+                for node in nodes_to_inject:
+                    target.append(node)
+            affected_files.add(file_path)
+            replacements += 1
+
+    saved_count = 0
+    if not dry_run:
+        for file_path in sorted(affected_files):
+            cached = soup_cache.get(file_path)
+            if not cached:
+                continue
+            with open(file_path, "w", encoding="utf-8") as handle:
+                handle.write(str(cached["soup"]))
+            saved_count += 1
+
+    return {
+        "groups_changed": len(changes),
+        "replacements": replacements,
+        "affected_files": sorted(affected_files),
+        "saved_count": saved_count,
+        "dry_run": bool(dry_run),
+    }
+
+
 def _resolve_build_suffix(args) -> str | None:
     if getattr(args, "suffix", None):
         return args.suffix
@@ -893,6 +1392,313 @@ def command_build_epub(args) -> dict:
     }
 
 
+def command_generate(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=True)
+    _settings_with_single_task_mode(args)
+
+    prompt_text = getattr(args, "prompt", None)
+    if prompt_text is None:
+        prompt_text = _load_text_file(getattr(args, "prompt_file", None))
+
+    input_text = getattr(args, "text", None)
+    if input_text is None:
+        input_text = _load_text_file(getattr(args, "input", None))
+    if input_text is None and not sys.stdin.isatty():
+        input_text = sys.stdin.read()
+    input_text = input_text if input_text is not None else ""
+
+    settings = build_session_settings(app.settings_manager, None, [], args)
+    payload = ("raw_text_translation", input_text, prompt_text, getattr(args, "label", None) or "CLI generation")
+    result, task_results = _run_task_session(
+        app,
+        runtime,
+        settings,
+        [payload],
+        verbose=bool(args.verbose),
+        timeout=args.timeout,
+        capture_results=True,
+    )
+    successful = [item for item in task_results if item.get("success")]
+    runtime.shutdown()
+    return {
+        "ok": bool(_session_completed_ok(result) and successful),
+        "status": "finished" if result["finished"] else "stopped",
+        "provider": settings.get("provider"),
+        "model": settings.get("model"),
+        "text": successful[0].get("result_data") if successful else "",
+        "result": result,
+    }
+
+
+def command_glossary_generate(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=True)
+    _settings_with_single_task_mode(args)
+
+    project_folder = _abs_path(args.project)
+    epub_path = _abs_path(args.epub)
+    pm = _project_manager(project_folder)
+    chapters = select_chapters(
+        epub_path,
+        pm,
+        mode=args.chapters,
+        patterns=args.chapter or [],
+        offset=args.offset,
+        limit=args.limit,
+    )
+    if not chapters:
+        runtime.shutdown()
+        return {"ok": True, "status": "no_chapters", "epub": epub_path, "project": project_folder}
+
+    settings = build_session_settings(app.settings_manager, pm, chapters, args)
+    glossary_prompt = _load_text_file(getattr(args, "glossary_prompt_file", None))
+    if glossary_prompt is not None:
+        settings["glossary_generation_prompt"] = glossary_prompt
+    else:
+        settings.setdefault("glossary_generation_prompt", _ensure_api_config_initialized().default_glossary_prompt())
+    settings["glossary_merge_mode"] = args.merge_mode
+    settings["initial_glossary_list"] = _glossary_dict_to_list(load_project_glossary(project_folder, getattr(args, "glossary", None)))
+    if getattr(args, "new_terms_limit", None) is not None:
+        settings["new_terms_limit"] = int(args.new_terms_limit)
+
+    batch_size = max(1, int(args.batch_size or 1))
+    payloads = [
+        ("glossary_batch_task", epub_path, tuple(chapters[index:index + batch_size]))
+        for index in range(0, len(chapters), batch_size)
+    ]
+    result, _ = _run_task_session(
+        app,
+        runtime,
+        settings,
+        payloads,
+        verbose=bool(args.verbose),
+        timeout=args.timeout,
+    )
+
+    glossary_rows = 0
+    unique_terms = 0
+    try:
+        with app.task_manager._get_read_only_conn() as conn:
+            glossary_rows = int(conn.execute("SELECT COUNT(*) FROM glossary_results").fetchone()[0] or 0)
+            unique_terms = int(conn.execute("SELECT COUNT(DISTINCT LOWER(TRIM(original))) FROM glossary_results").fetchone()[0] or 0)
+    except Exception:
+        pass
+
+    runtime.shutdown()
+    return {
+        "ok": _session_completed_ok(result),
+        "status": "finished" if result["finished"] else "stopped",
+        "epub": epub_path,
+        "project": project_folder,
+        "chapters": chapters,
+        "task_count": len(payloads),
+        "merge_mode": args.merge_mode,
+        "glossary_results": {
+            "rows": glossary_rows,
+            "unique_terms": unique_terms,
+        },
+        "result": result,
+    }
+
+
+def command_consistency(args) -> dict:
+    from .core.consistency_engine import (
+        DEEP_CONSISTENCY_MODE,
+        FAST_PROOFREAD_MODE,
+        ConsistencyEngine,
+        normalize_consistency_mode,
+    )
+
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=False)
+    _settings_with_single_task_mode(args)
+
+    project_folder = _abs_path(args.project)
+    epub_path = _abs_path(args.epub)
+    pm = _project_manager(project_folder)
+    suffix = getattr(args, "suffix", None)
+    chapters = select_chapters(
+        epub_path,
+        pm,
+        mode=args.chapters,
+        patterns=args.chapter or [],
+        offset=args.offset,
+        limit=args.limit,
+    )
+    records, missing = _load_translated_chapter_records(epub_path, project_folder, pm, chapters, suffix=suffix)
+    if not records:
+        runtime.shutdown()
+        raise CliError("No translated chapters found for consistency check.", payload={"missing": missing[:50]})
+
+    settings = build_session_settings(app.settings_manager, pm, chapters, args)
+    settings.update({
+        "chunk_size": int(args.chunk_size or 3),
+        "full_glossary_data": load_project_glossary(project_folder, getattr(args, "glossary", None)),
+        "consistency_mode": normalize_consistency_mode(args.consistency_mode),
+    })
+    if getattr(args, "confidences", None):
+        settings["consistency_fix_confidences"] = args.confidences
+
+    consistency_chapters = _build_consistency_chapters(records, include_source=not args.no_source)
+    engine = ConsistencyEngine(app.settings_manager)
+    logs = []
+    errors = []
+    engine.log_message.connect(lambda message: logs.append(str(message)))
+    engine.error_occurred.connect(lambda message: errors.append(str(message)))
+
+    mode = FAST_PROOFREAD_MODE if settings["consistency_mode"] == FAST_PROOFREAD_MODE else DEEP_CONSISTENCY_MODE
+    if getattr(args, "glossary_first", False) and mode != FAST_PROOFREAD_MODE:
+        mode = "glossary_first"
+
+    engine.analyze_chapters(consistency_chapters, settings, list(settings.get("api_keys") or []), mode=mode)
+    problems = list(getattr(engine, "all_problems", []) or [])
+
+    fix_payload = None
+    if getattr(args, "fix", False) and problems:
+        fixed = engine.fix_all_chapters(consistency_chapters, settings, list(settings.get("api_keys") or []))
+        written = []
+        if getattr(args, "write", False):
+            for file_path, content in fixed.items():
+                with open(file_path, "w", encoding="utf-8") as handle:
+                    handle.write(content)
+                written.append(file_path)
+        fix_payload = {
+            "changed_files": sorted(fixed.keys()),
+            "written_files": sorted(written),
+            "write": bool(args.write),
+        }
+
+    runtime.shutdown()
+    return {
+        "ok": not errors,
+        "epub": epub_path,
+        "project": project_folder,
+        "mode": settings["consistency_mode"],
+        "checked_chapters": [record["chapter"] for record in records],
+        "missing_translations": missing[:50],
+        "problem_count": len(problems),
+        "problems": problems,
+        "glossary_summary": engine.get_glossary_summary(),
+        "fix": fix_payload,
+        "errors": errors,
+        "logs": logs[-50:],
+    }
+
+
+def command_untranslated_scan(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=False)
+    project_folder = _abs_path(args.project)
+    epub_path = _abs_path(args.epub)
+    pm = _project_manager(project_folder)
+    suffix = getattr(args, "suffix", None)
+    chapters = select_chapters(
+        epub_path,
+        pm,
+        mode=args.chapters,
+        patterns=args.chapter or [],
+        offset=args.offset,
+        limit=args.limit,
+    )
+    records, missing = _load_translated_chapter_records(epub_path, project_folder, pm, chapters, suffix=suffix)
+    exceptions = _word_exceptions_from_project(app.settings_manager, project_folder, getattr(args, "exceptions", None))
+    issues = _scan_untranslated_records(
+        records,
+        word_exceptions=exceptions,
+        include_mixed_script=not args.no_mixed_script,
+    )
+    runtime.shutdown()
+    return {
+        "ok": True,
+        "epub": epub_path,
+        "project": project_folder,
+        "checked_chapters": len(records),
+        "missing_translations": missing[:50],
+        "problem_chapters": len(issues),
+        "problem_count": sum(item.get("problem_count", 0) for item in issues),
+        "issues": issues,
+    }
+
+
+def command_untranslated_fix(args) -> dict:
+    runtime = HeadlessRuntime()
+    app = runtime.bootstrap(include_engine=True)
+    _settings_with_single_task_mode(args)
+
+    project_folder = _abs_path(args.project)
+    epub_path = _abs_path(args.epub)
+    pm = _project_manager(project_folder)
+    suffix = getattr(args, "suffix", None)
+    chapters = select_chapters(
+        epub_path,
+        pm,
+        mode=args.chapters,
+        patterns=args.chapter or [],
+        offset=args.offset,
+        limit=args.limit,
+    )
+    records, missing = _load_translated_chapter_records(epub_path, project_folder, pm, chapters, suffix=suffix)
+    exceptions = _word_exceptions_from_project(app.settings_manager, project_folder, getattr(args, "exceptions", None))
+    data_items, soup_cache, scan_issues = _collect_untranslated_fix_items(
+        records,
+        word_exceptions=exceptions,
+        max_context_chars=int(args.max_context_chars or 2000),
+    )
+    if not data_items:
+        runtime.shutdown()
+        return {
+            "ok": True,
+            "status": "no_untranslated_contexts",
+            "epub": epub_path,
+            "project": project_folder,
+            "checked_chapters": len(records),
+            "missing_translations": missing[:50],
+            "issues": scan_issues,
+        }
+
+    settings = build_session_settings(app.settings_manager, pm, chapters, args)
+    prompt_text = _untranslated_fix_prompt(app.settings_manager, getattr(args, "fix_prompt_file", None))
+    request_payloads = _build_untranslated_fix_payloads(data_items, batch_size=args.batch_size)
+    task_payloads = [
+        ("raw_text_translation", payload, prompt_text, f"Untranslated fixer {index + 1}/{len(request_payloads)}")
+        for index, payload in enumerate(request_payloads)
+    ]
+    result, task_results = _run_task_session(
+        app,
+        runtime,
+        settings,
+        task_payloads,
+        verbose=bool(args.verbose),
+        timeout=args.timeout,
+        capture_results=True,
+    )
+
+    changes, translated_groups = _parse_untranslated_fix_changes(task_results, data_items)
+    apply_info = _apply_untranslated_fix_changes(changes, soup_cache, dry_run=bool(args.dry_run)) if changes else {
+        "groups_changed": 0,
+        "replacements": 0,
+        "affected_files": [],
+        "saved_count": 0,
+        "dry_run": bool(args.dry_run),
+    }
+
+    runtime.shutdown()
+    return {
+        "ok": _session_completed_ok(result),
+        "status": "finished" if result["finished"] else "stopped",
+        "epub": epub_path,
+        "project": project_folder,
+        "checked_chapters": len(records),
+        "missing_translations": missing[:50],
+        "groups_found": len(data_items),
+        "translated_groups": translated_groups,
+        "issues": scan_issues,
+        "apply": apply_info,
+        "result": result,
+    }
+
+
 def _add_common_project_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--epub", required=True, help="Source EPUB path.")
     parser.add_argument("--project", required=True, help="Translator project/output folder.")
@@ -935,6 +1741,17 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--epub")
     status.set_defaults(func=command_status)
 
+    providers = subparsers.add_parser("providers", help="List configured providers and key counts.")
+    providers.add_argument("--all", action="store_true", help="Include hidden providers.")
+    providers.set_defaults(func=command_providers)
+
+    models = subparsers.add_parser("models", help="List models for a provider.")
+    models.add_argument("--provider", help="Provider id or display name. Defaults to saved provider.")
+    models.set_defaults(func=command_models)
+
+    settings = subparsers.add_parser("settings", help="Dump saved session settings without API keys.")
+    settings.set_defaults(func=command_settings)
+
     plan = subparsers.add_parser("plan", help="Build a translation task plan without calling APIs.")
     _add_common_project_args(plan)
     _add_common_run_args(plan)
@@ -946,6 +1763,66 @@ def build_parser() -> argparse.ArgumentParser:
     translate.add_argument("--timeout", type=int, help="Stop the session after N seconds.")
     translate.add_argument("--verbose", action="store_true", help="Mirror app log messages to stderr.")
     translate.set_defaults(func=command_translate)
+
+    generate = subparsers.add_parser("generate", help="Run a single raw model request through the translator engine.")
+    generate.add_argument("--project", help="Optional project folder for glossary/settings context.")
+    generate.add_argument("--epub", help="Optional EPUB path for settings context.")
+    generate.add_argument("--text", help="Input text. If omitted, --input or stdin is used.")
+    generate.add_argument("--input", help="UTF-8 text file used as input.")
+    generate.add_argument("--prompt", help="Prompt template. {text} is replaced with input text.")
+    generate.add_argument("--label", help="Task label in logs.")
+    _add_common_run_args(generate)
+    generate.add_argument("--timeout", type=int, help="Stop the session after N seconds.")
+    generate.add_argument("--verbose", action="store_true", help="Mirror app log messages to stderr.")
+    generate.set_defaults(func=command_generate)
+
+    glossary = subparsers.add_parser("glossary-generate", aliases=["glossary"], help="Generate AI glossary batches for selected chapters.")
+    _add_common_project_args(glossary)
+    _add_common_run_args(glossary)
+    glossary.set_defaults(chapters="all")
+    glossary.add_argument("--batch-size", type=int, default=1, help="Chapters per glossary generation task.")
+    glossary.add_argument("--merge-mode", choices=["supplement", "update", "accumulate"], default="supplement")
+    glossary.add_argument("--new-terms-limit", type=int, help="Limit new terms per batch.")
+    glossary.add_argument("--glossary-prompt-file", help="Custom AI glossary prompt.")
+    glossary.add_argument("--timeout", type=int, help="Stop the session after N seconds.")
+    glossary.add_argument("--verbose", action="store_true", help="Mirror app log messages to stderr.")
+    glossary.set_defaults(func=command_glossary_generate)
+
+    consistency = subparsers.add_parser("consistency", aliases=["check-consistency"], help="Run consistency/proofread analysis on translated chapters.")
+    _add_common_project_args(consistency)
+    _add_common_run_args(consistency)
+    consistency.set_defaults(chapters="translated")
+    consistency.add_argument("--suffix", help="translation_map suffix to inspect, e.g. _validated.html.")
+    consistency.add_argument("--consistency-mode", choices=["deep", "deep_consistency", "fast", "fast_proofread_3_1"], default="fast")
+    consistency.add_argument("--glossary-first", action="store_true", help="Use deep two-pass glossary-first mode.")
+    consistency.add_argument("--chunk-size", type=int, default=3, help="Chapters per consistency API chunk.")
+    consistency.add_argument("--no-source", action="store_true", help="Do not include original EPUB source as reference.")
+    consistency.add_argument("--fix", action="store_true", help="Ask AI to fix detected problems.")
+    consistency.add_argument("--write", action="store_true", help="Write fixed consistency output back to translated files.")
+    consistency.add_argument("--confidences", action="append", help="Problem confidence to fix. Can be repeated.")
+    consistency.set_defaults(func=command_consistency)
+
+    untranslated_scan = subparsers.add_parser("untranslated-scan", help="Scan translated chapters for untranslated residue.")
+    _add_common_project_args(untranslated_scan)
+    untranslated_scan.set_defaults(chapters="translated")
+    untranslated_scan.add_argument("--suffix", help="translation_map suffix to inspect, e.g. _validated.html.")
+    untranslated_scan.add_argument("--exceptions", help="Custom word exceptions file.")
+    untranslated_scan.add_argument("--no-mixed-script", action="store_true", help="Skip mixed CJK/Cyrillic context reporting.")
+    untranslated_scan.set_defaults(func=command_untranslated_scan)
+
+    untranslated_fix = subparsers.add_parser("untranslated-fix", aliases=["fix-untranslated"], help="Use AI to fix untranslated residue in translated chapters.")
+    _add_common_project_args(untranslated_fix)
+    _add_common_run_args(untranslated_fix)
+    untranslated_fix.set_defaults(chapters="translated")
+    untranslated_fix.add_argument("--suffix", help="translation_map suffix to inspect, e.g. _validated.html.")
+    untranslated_fix.add_argument("--exceptions", help="Custom word exceptions file.")
+    untranslated_fix.add_argument("--fix-prompt-file", help="Custom untranslated-fixer prompt.")
+    untranslated_fix.add_argument("--batch-size", type=int, default=50, help="Contexts per raw fixer request.")
+    untranslated_fix.add_argument("--max-context-chars", type=int, default=2000)
+    untranslated_fix.add_argument("--dry-run", action="store_true", help="Run AI and report changes without writing files.")
+    untranslated_fix.add_argument("--timeout", type=int, help="Stop the session after N seconds.")
+    untranslated_fix.add_argument("--verbose", action="store_true", help="Mirror app log messages to stderr.")
+    untranslated_fix.set_defaults(func=command_untranslated_fix)
 
     build_epub = subparsers.add_parser("build-epub", help="Build an EPUB by replacing source chapters with translated files.")
     build_epub.add_argument("--epub", required=True)

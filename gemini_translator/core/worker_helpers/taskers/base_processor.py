@@ -1,4 +1,8 @@
 from gemini_translator.api.errors import ValidationFailedError
+from gemini_translator.core.worker_helpers.provider_orchestrator import (
+    execute_orchestrated_api_call,
+    should_orchestrate_api_call,
+)
 
 
 class BaseTaskProcessor:
@@ -58,6 +62,15 @@ class BaseTaskProcessor:
 
     async def _execute_api_call(self, prompt, log_prefix, *, task_info, operation_context: dict | None = None, **kwargs):
         context_payload = operation_context or self._build_operation_context(task_info)
+        if should_orchestrate_api_call(self.worker, context_payload):
+            return await execute_orchestrated_api_call(
+                self.worker,
+                prompt,
+                log_prefix,
+                task_info=task_info,
+                operation_context=context_payload,
+                call_kwargs=kwargs,
+            )
         with self.worker.debug_operation_context(context_payload):
             return await self.worker.api_handler_instance.execute_api_call(
                 prompt,

@@ -126,6 +126,29 @@ class TranslationOptionsWidgetTaskSizeTests(unittest.TestCase):
         self.assertTrue(settings["use_batching"])
         self.assertTrue(settings["chunking"])
 
+    def test_orchestration_settings_round_trip(self):
+        widget = self._create_widget()
+
+        widget.set_settings({
+            "parallel_providers_enabled": True,
+            "parallel_provider_list": "openrouter:Claude, local:DeepSeek",
+            "parallel_provider_strategy": "best_score",
+            "multi_pass_enabled": True,
+            "multi_pass_count": 4,
+            "multi_pass_strategy": "first_success",
+        })
+
+        settings = widget.get_settings()
+        self.assertTrue(settings["parallel_providers_enabled"])
+        self.assertEqual(settings["parallel_provider_list"], "openrouter:Claude, local:DeepSeek")
+        self.assertEqual(settings["parallel_provider_strategy"], "best_score")
+        self.assertTrue(settings["multi_pass_enabled"])
+        self.assertTrue(settings["multi_pass_chapter_translation"])
+        self.assertEqual(settings["multi_pass_count"], 4)
+        self.assertEqual(settings["multi_pass_strategy"], "first_success")
+        self.assertTrue(widget.parallel_providers_edit.isEnabled())
+        self.assertTrue(widget.multi_pass_count_spin.isEnabled())
+
 
 if __name__ == "__main__":
     unittest.main()

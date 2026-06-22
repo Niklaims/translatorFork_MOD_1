@@ -3,6 +3,8 @@
 
 import asyncio
 import traceback
+from pathlib import Path
+from .. import config as api_config
 from ..base import BaseApiHandler
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError, 
@@ -13,12 +15,12 @@ from ..errors import (
 PLAYWRIGHT_AVAILABLE = False
 class PlaywrightTimeoutError(Exception): pass
 
-# try:
-    # from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-    # PLAYWRIGHT_AVAILABLE = True
-# except ImportError:
-    # PLAYWRIGHT_AVAILABLE = False
-    # class PlaywrightTimeoutError(Exception): pass
+try:
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    class PlaywrightTimeoutError(Exception): pass
 
 class BrowserApiHandler(BaseApiHandler):
     def __init__(self, worker):
@@ -30,6 +32,9 @@ class BrowserApiHandler(BaseApiHandler):
         self.browser = None
         self.context = None
         self.page = None
+        self.profile_dir = None
+        self.browser_profile_index = 1
+        self.browser_profiles_count = 1
         self.is_logged_in = False
 
     def setup_client(self, client_override=None, proxy_settings=None):
@@ -45,7 +50,25 @@ class BrowserApiHandler(BaseApiHandler):
 
         # Загружаем селекторы
         self.selectors = self.worker.provider_config.get("selectors", {})
+        try:
+            self.browser_profiles_count = max(1, int(getattr(self.worker, "browser_profiles_count", 1) or 1))
+        except (TypeError, ValueError):
+            self.browser_profiles_count = 1
+        try:
+            profile_index = int(getattr(self.worker, "browser_profile_index", 1) or 1)
+        except (TypeError, ValueError):
+            profile_index = 1
+        self.browser_profile_index = max(1, min(profile_index, self.browser_profiles_count))
+        self.profile_dir = self._resolve_profile_dir()
         return True
+
+    def _resolve_profile_dir(self):
+        if self.browser_profiles_count <= 1:
+            return None
+        root = api_config.default_workascii_runtime_root()
+        provider_id = str(getattr(self.worker, "api_provider_name", "browser") or "browser")
+        safe_provider = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in provider_id).strip("_")
+        return Path(root) / "browser_profiles" / (safe_provider or "browser") / f"profile-{self.browser_profile_index:02d}"
 
     async def _ensure_browser_active(self):
         if self.page and not self.page.is_closed():
@@ -61,6 +84,20 @@ class BrowserApiHandler(BaseApiHandler):
             if self.proxy_settings.get('user'):
                 proxy_cfg["username"] = self.proxy_settings['user']
                 proxy_cfg["password"] = self.proxy_settings['pass']
+
+        if self.profile_dir:
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+            self.context = await self.playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self.profile_dir),
+                headless=False,
+                proxy=proxy_cfg,
+                args=["--disable-blink-features=AutomationControlled"],
+                user_agent=user_agent,
+            )
+            self.browser = self.context.browser
+            self.page = await self.context.new_page()
+            return
 
         self.browser = await self.playwright.chromium.launch(
             headless=False, # Смените на True для скрытого режима
@@ -242,5 +279,15 @@ class BrowserApiHandler(BaseApiHandler):
             raise NetworkError(f"Ошибка браузера: {e}")
 
     async def _close_thread_session_internal(self):
-        if self.browser:
+        if self.context:
+            await self.context.close()
+            self.context = None
+            self.browser = None
+            self.page = None
+        elif self.browser:
             await self.browser.close()
+            self.browser = None
+            self.page = None
+        if self.playwright:
+            await self.playwright.stop()
+            self.playwright = None

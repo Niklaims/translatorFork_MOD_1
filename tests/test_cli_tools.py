@@ -3,6 +3,11 @@ import zipfile
 
 from gemini_translator.cli import (
     _choose_translation_rel_path,
+    _collect_untranslated_fix_items,
+    _load_translated_chapter_records,
+    _safe_settings_for_output,
+    _scan_untranslated_records,
+    build_parser,
     build_task_plan,
     select_chapters,
 )
@@ -92,3 +97,114 @@ def test_choose_translation_rel_path_prefers_explicit_suffix():
 
     assert _choose_translation_rel_path(versions, "_translated.html") == "a.html"
     assert _choose_translation_rel_path(versions) == "b.html"
+
+
+def test_safe_settings_masks_active_keys_by_provider():
+    safe = _safe_settings_for_output({
+        "api_keys": ["abcd1234"],
+        "active_keys_by_provider": {
+            "gemini": ["full-secret-key"],
+            "local": [],
+        },
+        "custom_prompt": "prompt",
+    })
+
+    assert safe["api_keys"] == ["...1234"]
+    assert safe["active_keys_by_provider"]["gemini"] == ["...-key"]
+    assert "full-secret-key" not in str(safe)
+    assert safe["custom_prompt_chars"] == 6
+
+
+def test_new_cli_commands_parse_common_arguments():
+    parser = build_parser()
+
+    args = parser.parse_args(["providers"])
+    assert args.func.__name__ == "command_providers"
+
+    args = parser.parse_args(["models", "--provider", "gemini"])
+    assert args.func.__name__ == "command_models"
+    assert args.provider == "gemini"
+
+    args = parser.parse_args([
+        "consistency",
+        "--epub", "book.epub",
+        "--project", "project",
+        "--consistency-mode", "fast",
+        "--suffix", "_validated.html",
+    ])
+    assert args.func.__name__ == "command_consistency"
+    assert args.chapters == "translated"
+    assert args.suffix == "_validated.html"
+
+    args = parser.parse_args([
+        "untranslated-fix",
+        "--epub", "book.epub",
+        "--project", "project",
+        "--dry-run",
+    ])
+    assert args.func.__name__ == "command_untranslated_fix"
+    assert args.dry_run is True
+
+
+def test_untranslated_scan_reads_project_translations(tmp_path):
+    epub_path = tmp_path / "book.epub"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _build_epub(epub_path)
+
+    translated = project_dir / "OEBPS" / "ch1_validated.html"
+    translated.parent.mkdir()
+    translated.write_text("<html><body><p>Перевод Alpha остался.</p></body></html>", encoding="utf-8")
+
+    manager = TranslationProjectManager(str(project_dir))
+    manager.register_translation(
+        "OEBPS/ch1.xhtml",
+        "_validated.html",
+        os.path.relpath(translated, project_dir).replace("\\", "/"),
+    )
+
+    records, missing = _load_translated_chapter_records(
+        str(epub_path),
+        str(project_dir),
+        manager,
+        ["OEBPS/ch1.xhtml"],
+        suffix="_validated.html",
+    )
+    issues = _scan_untranslated_records(records, word_exceptions=set())
+
+    assert missing == []
+    assert records[0]["file"] == str(translated)
+    assert issues[0]["chapter"] == "OEBPS/ch1.xhtml"
+    assert "Alpha" in issues[0]["untranslated_words"]
+
+
+def test_untranslated_fix_collector_groups_html_context(tmp_path):
+    epub_path = tmp_path / "book.epub"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    _build_epub(epub_path)
+
+    translated = project_dir / "OEBPS" / "ch1_validated.html"
+    translated.parent.mkdir()
+    translated.write_text("<html><body><p>Перевод Alpha остался.</p></body></html>", encoding="utf-8")
+
+    manager = TranslationProjectManager(str(project_dir))
+    manager.register_translation(
+        "OEBPS/ch1.xhtml",
+        "_validated.html",
+        os.path.relpath(translated, project_dir).replace("\\", "/"),
+    )
+    records, _ = _load_translated_chapter_records(
+        str(epub_path),
+        str(project_dir),
+        manager,
+        ["OEBPS/ch1.xhtml"],
+        suffix="_validated.html",
+    )
+
+    data_items, soup_cache, scan_issues = _collect_untranslated_fix_items(records, word_exceptions=set())
+
+    assert scan_issues
+    assert str(translated) in soup_cache
+    assert data_items[0]["internal_html_path"] == "OEBPS/ch1.xhtml"
+    assert "Alpha" in data_items[0]["context"]

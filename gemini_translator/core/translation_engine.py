@@ -68,6 +68,47 @@ def normalize_sequential_parallel_settings(settings: dict, log_callback=None):
     settings['num_instances'] = requested_splits
     settings['max_concurrent_requests'] = 1
 
+
+def normalize_browser_profile_settings(settings: dict, log_callback=None):
+    provider_id = str(settings.get('provider') or (settings.get('model_config') or {}).get('provider') or "").strip()
+    if not provider_id:
+        return
+
+    provider_config = api_config.api_providers().get(provider_id, {})
+    if not api_config.uses_legacy_worker_thread(provider_config):
+        return
+
+    try:
+        profile_count = int(
+            settings.get('browser_profiles_count')
+            or settings.get('workascii_profile_count')
+            or 1
+        )
+    except (TypeError, ValueError):
+        profile_count = 1
+    profile_count = max(1, min(profile_count, 32))
+    settings['browser_profiles_count'] = profile_count
+    if profile_count <= 1:
+        return
+
+    try:
+        requested_workers = int(settings.get('num_instances', 1) or 1)
+    except (TypeError, ValueError):
+        requested_workers = 1
+    settings['num_instances'] = max(requested_workers, profile_count)
+
+    if not api_config.provider_requires_api_key(provider_id):
+        placeholder = api_config.provider_placeholder_api_key(provider_id)
+        settings['api_keys'] = [
+            f"{placeholder}::profile-{index}"
+            for index in range(1, profile_count + 1)
+        ]
+
+    if log_callback:
+        log_callback(
+            f"[BROWSER] Parallel browser profiles enabled: {profile_count} profile(s)."
+        )
+
 class TranslationEngine(QObject):
     LONG_PAUSE_THRESHOLD_SECONDS = 60
     MAX_REPEATED_WAITS = 5
@@ -648,6 +689,10 @@ class TranslationEngine(QObject):
             settings,
             lambda message: self._post_event('log_message', {'message': message})
         )
+        normalize_browser_profile_settings(
+            settings,
+            lambda message: self._post_event('log_message', {'message': message})
+        )
 
         if full_glossary_dict and self.context_manager.chinese_processor and (use_jieba_for_glossary or segment_cjk_text):
             self._post_event('log_message', {'message': "[JIEBA] Обучение Jieba на глоссарии сессии…"})
@@ -922,6 +967,19 @@ class TranslationEngine(QObject):
             'settings_manager': self.settings_manager,
             'project_manager': self.project_manager,
         })
+        try:
+            profile_count = int(self.session_settings.get('browser_profiles_count', 1) or 1)
+        except (TypeError, ValueError):
+            profile_count = 1
+        if profile_count > 1:
+            profile_match = re.search(r"::profile-(\d+)$", str(api_key))
+            if profile_match:
+                profile_index = int(profile_match.group(1))
+            else:
+                profile_index = (len(self.active_workers_map) % profile_count) + 1
+            worker_params['browser_profile_index'] = max(1, min(profile_index, profile_count))
+            worker_params['browser_profiles_count'] = profile_count
+            worker_params['workascii_workspace_index'] = worker_params['browser_profile_index']
         
         worker = UniversalWorker(**worker_params)
 

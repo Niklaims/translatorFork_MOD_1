@@ -283,6 +283,45 @@ class ConsistencyResponseNormalizationTests(unittest.TestCase):
         self.assertEqual(engine.glossary_session.important_events, ["Event 1"])
         self.assertEqual(engine.glossary_session.next_chunk_focus, ["Focus 1"])
 
+    def test_fast_proofread_filter_keeps_only_gender_typos_and_meta_comments(self):
+        engine = ConsistencyEngine(object())
+        result = engine._filter_fast_proofread_result(
+            {
+                "problems": [
+                    {"id": 10, "type": "gender_mismatch", "chapter": "1.xhtml"},
+                    {"id": 11, "type": "typo", "chapter": "1.xhtml"},
+                    {"id": 12, "type": "meta_comment", "chapter": "1.xhtml"},
+                    {"id": 13, "type": "grammar", "chapter": "1.xhtml"},
+                    {"id": 14, "type": "logic_error", "chapter": "1.xhtml"},
+                    {"id": 15, "type": "term_inconsistency", "chapter": "1.xhtml"},
+                ],
+                "glossary_update": {
+                    "characters": [{"name": "Alice"}],
+                    "terms": [{"term": "Mana"}],
+                },
+                "context_summary": {
+                    "processed_chapters": ["1.xhtml"],
+                    "important_events": ["Story event"],
+                    "next_chunk_focus": ["Focus"],
+                },
+            }
+        )
+
+        self.assertEqual(
+            [problem["type"] for problem in result["problems"]],
+            ["gender_mismatch", "typo", "meta_comment"],
+        )
+        self.assertEqual([problem["id"] for problem in result["problems"]], [1, 2, 3])
+        self.assertEqual(result["glossary_update"], {"characters": [], "terms": []})
+        self.assertEqual(
+            result["context_summary"],
+            {
+                "processed_chapters": ["1.xhtml"],
+                "important_events": [],
+                "next_chunk_focus": [],
+            },
+        )
+
 
 class ConsistencyKeyRetryTests(unittest.TestCase):
     def test_analyze_chapters_discards_bad_key_and_retries_same_chunk(self):

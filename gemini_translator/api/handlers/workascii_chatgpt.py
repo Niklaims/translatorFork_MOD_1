@@ -38,6 +38,8 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
         self.execution_cwd = None
         self.workspace_name = ""
         self.workspace_index = 1
+        self.browser_profile_index = 1
+        self.browser_profiles_count = 1
         self.headless = False
         self.timeout_sec = 1800
         # Matches work_ascii: one persistent browser profile with one page per worker,
@@ -79,6 +81,17 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
         except (TypeError, ValueError):
             workspace_index = 1
         self.workspace_index = max(1, workspace_index)
+        try:
+            browser_profile_index = int(getattr(self.worker, "browser_profile_index", self.workspace_index) or self.workspace_index)
+        except (TypeError, ValueError):
+            browser_profile_index = self.workspace_index
+        try:
+            browser_profiles_count = int(getattr(self.worker, "browser_profiles_count", 1) or 1)
+        except (TypeError, ValueError):
+            browser_profiles_count = 1
+        self.browser_profiles_count = max(1, browser_profiles_count)
+        self.browser_profile_index = max(1, min(browser_profile_index, self.browser_profiles_count))
+        self.profile_dir = self._resolve_profile_dir_for_slot(resolved_profile)
 
         try:
             timeout_sec = int(getattr(self.worker, "workascii_timeout_sec", 1800) or 1800)
@@ -106,6 +119,20 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
         self._successful_calls_since_refresh = 0
         self._bridge_restart_pending = False
         return True
+
+    @staticmethod
+    def _safe_profile_segment(value: str) -> str:
+        text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value or "").strip())
+        return text.strip("_")[:48] or "default"
+
+    def _resolve_profile_dir_for_slot(self, base_profile_dir):
+        if not base_profile_dir or self.browser_profiles_count <= 1:
+            return base_profile_dir
+
+        base_path = Path(base_profile_dir)
+        workspace_segment = self._safe_profile_segment(self.workspace_name)
+        profiles_root = base_path.parent / f"{base_path.name}-profiles" / workspace_segment
+        return profiles_root / f"profile-{self.browser_profile_index:02d}"
 
     async def call_api(
         self,

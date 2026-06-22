@@ -189,6 +189,7 @@ class ModelSettingsWidget(QGroupBox):
         self.skip_filter_retry_checkbox.stateChanged.connect(self._emit_settings_changed)
         self.workascii_workspace_name_edit.textChanged.connect(self._emit_settings_changed)
         self.workascii_workspace_index_spin.valueChanged.connect(self._emit_settings_changed)
+        self.browser_profiles_count_spin.valueChanged.connect(self._emit_settings_changed)
         self.workascii_timeout_spin.valueChanged.connect(self._emit_settings_changed)
         self.workascii_headless_checkbox.stateChanged.connect(self._emit_settings_changed)
         self.workascii_profile_template_edit.textChanged.connect(self._emit_settings_changed)
@@ -519,6 +520,11 @@ class ModelSettingsWidget(QGroupBox):
         self.workascii_workspace_index_spin.setRange(1, 99)
         self.workascii_workspace_index_spin.setValue(1)
 
+        self.browser_profiles_count_spin = NoScrollSpinBox()
+        self.browser_profiles_count_spin.setRange(1, 32)
+        self.browser_profiles_count_spin.setValue(1)
+        self.browser_profiles_count_spin.setToolTip("Количество отдельных браузерных профилей для параллельных web-сессий.")
+
         self.workascii_timeout_spin = NoScrollSpinBox()
         self.workascii_timeout_spin.setRange(60, 7200)
         self.workascii_timeout_spin.setValue(1800)
@@ -632,6 +638,8 @@ class ModelSettingsWidget(QGroupBox):
         workascii_layout.addWidget(auth_buttons_widget, 7, 0, 1, 3)
         workascii_layout.addWidget(QLabel("Таймаут:"), 8, 0)
         workascii_layout.addWidget(self.workascii_timeout_spin, 8, 1)
+        workascii_layout.addWidget(QLabel("Профилей браузера:"), 9, 0)
+        workascii_layout.addWidget(self.browser_profiles_count_spin, 9, 1)
 
         right_layout.addWidget(self.workascii_group)
 
@@ -875,6 +883,7 @@ class ModelSettingsWidget(QGroupBox):
             'use_warmup': not self.warmup_checkbox.isHidden() and self.warmup_checkbox.isChecked(),
             'workascii_workspace_name': self.workascii_workspace_name_edit.text().strip(),
             'workascii_workspace_index': self.workascii_workspace_index_spin.value(),
+            'browser_profiles_count': self.browser_profiles_count_spin.value(),
             'workascii_timeout_sec': self.workascii_timeout_spin.value(),
             'workascii_headless': self.workascii_headless_checkbox.isChecked(),
             'workascii_profile_template_dir': self.workascii_profile_template_edit.text().strip(),
@@ -957,6 +966,7 @@ class ModelSettingsWidget(QGroupBox):
 
             self.workascii_workspace_name_edit.setText(settings.get('workascii_workspace_name', ''))
             self.workascii_workspace_index_spin.setValue(int(settings.get('workascii_workspace_index', 1) or 1))
+            self.browser_profiles_count_spin.setValue(int(settings.get('browser_profiles_count', 1) or 1))
             self.workascii_timeout_spin.setValue(int(settings.get('workascii_timeout_sec', 1800) or 1800))
             self.workascii_headless_checkbox.setChecked(bool(settings.get('workascii_headless', False)))
             self.workascii_profile_template_edit.setText(settings.get('workascii_profile_template_dir', '') or '')

@@ -25,6 +25,21 @@ from ..utils.text import repair_json_string
 logger = logging.getLogger(__name__)
 
 CONSISTENCY_CONFIDENCE_LEVELS = ("high", "medium", "low")
+FAST_PROOFREAD_MODE = "fast_proofread_3_1"
+DEEP_CONSISTENCY_MODE = "deep_consistency"
+FAST_PROOFREAD_ALLOWED_TYPES = {
+    "typo",
+    "meta_comment",
+    "gender_mismatch",
+}
+FAST_PROOFREAD_BLOCKED_TYPES = {
+    "logic_error",
+    "continuity_error",
+    "plot_error",
+    "story_error",
+    "style_issue",
+    "factual_error",
+}
 
 DEFAULT_SOURCE_REFERENCE_PROMPT = {
     "intro": [
@@ -47,6 +62,15 @@ def normalize_consistency_confidence(value: Any, default: str = "medium") -> str
     normalized = str(value or "").strip().lower()
     if normalized in CONSISTENCY_CONFIDENCE_LEVELS:
         return normalized
+    return default
+
+
+def normalize_consistency_mode(value: Any, default: str = DEEP_CONSISTENCY_MODE) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {FAST_PROOFREAD_MODE, "fast", "proofread", "proofread_3_1"}:
+        return FAST_PROOFREAD_MODE
+    if normalized in {DEEP_CONSISTENCY_MODE, "standard", "glossary_first", "deep"}:
+        return DEEP_CONSISTENCY_MODE
     return default
 
 
@@ -728,6 +752,15 @@ class ConsistencyEngine(QObject):
         self.reset_session()
         self._restore_runtime_state(resume_state)
 
+        consistency_mode = normalize_consistency_mode(config.get("consistency_mode") or mode)
+        config["consistency_mode"] = consistency_mode
+        if consistency_mode == FAST_PROOFREAD_MODE:
+            mode = FAST_PROOFREAD_MODE
+        elif mode == FAST_PROOFREAD_MODE:
+            config["consistency_mode"] = FAST_PROOFREAD_MODE
+        elif mode == DEEP_CONSISTENCY_MODE:
+            mode = "standard"
+
         if not active_keys:
             self.error_occurred.emit("Нет активных ключей для анализа")
             self.finished.emit([])
@@ -842,11 +875,14 @@ class ConsistencyEngine(QObject):
                         'chunk_index': i + 1,
                         'total_chunks': total_chunks,
                         'mode': mode,
+                        'consistency_mode': config.get("consistency_mode"),
                     },
                 )
 
                 # 4. Валидация и парсинг JSON
                 analysis_result = self._parse_ai_response(response_text)
+                if analysis_result and config.get("consistency_mode") == FAST_PROOFREAD_MODE:
+                    analysis_result = self._filter_fast_proofread_result(analysis_result)
 
                 if analysis_result:
                     # Накапливаем проблемы
@@ -1321,8 +1357,13 @@ class ConsistencyEngine(QObject):
         system_prompt = ""
         
         prompts_data = self._load_consistency_prompts_data()
+        prompt_key = (
+            "fast_proofread_3_1_analysis"
+            if config.get("consistency_mode") == FAST_PROOFREAD_MODE
+            else "consistency_analysis"
+        )
         system_prompt = "\n".join(
-            prompts_data.get("consistency_analysis", []))
+            prompts_data.get(prompt_key, []))
 
         if not system_prompt:
             system_prompt = config.get(
@@ -2145,6 +2186,31 @@ class ConsistencyEngine(QObject):
         data['context_summary'] = _normalize_context_summary(data.get('context_summary'))
 
         return data
+
+    def _filter_fast_proofread_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        filtered = dict(data or {})
+        problems = []
+        for problem in filtered.get('problems', []) or []:
+            if not isinstance(problem, dict):
+                continue
+            problem_type = str(problem.get('type') or '').strip().lower()
+            if problem_type in FAST_PROOFREAD_BLOCKED_TYPES:
+                continue
+            if problem_type not in FAST_PROOFREAD_ALLOWED_TYPES:
+                continue
+            normalized_problem = dict(problem)
+            normalized_problem['type'] = problem_type
+            normalized_problem['id'] = len(problems) + 1
+            problems.append(normalized_problem)
+
+        filtered['problems'] = problems
+        filtered['glossary_update'] = {'characters': [], 'terms': []}
+        filtered['context_summary'] = {
+            'processed_chapters': filtered.get('context_summary', {}).get('processed_chapters', []),
+            'important_events': [],
+            'next_chunk_focus': [],
+        }
+        return filtered
 
     def get_problems_for_chapter(self, chapter_name: str) -> List[Dict[str, Any]]:
         """Возвращает список проблем для конкретной главы."""

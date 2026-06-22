@@ -6,7 +6,7 @@ import zipfile
 
 from PyQt6 import QtCore
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QCheckBox, QGridLayout, QGroupBox, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QCheckBox, QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit, QVBoxLayout
 
 from ...api import config as api_config
 from ...utils.epub_tools import (
@@ -132,14 +132,54 @@ class TranslationOptionsWidget(QGroupBox):
         settings_layout.addWidget(self.sequential_splits_spin, 1, 1)
         settings_layout.addWidget(self.info_label, 3, 0, 1, 2)
 
+        orchestration_group = QGroupBox("Оркестрация провайдеров")
+        orchestration_layout = QGridLayout(orchestration_group)
+
+        self.parallel_providers_checkbox = QCheckBox("Параллельные провайдеры")
+        self.parallel_providers_edit = QLineEdit("")
+        self.parallel_providers_edit.setPlaceholderText("provider[:model], provider[:model]")
+
+        self.parallel_provider_strategy_combo = QComboBox()
+        self.parallel_provider_strategy_combo.addItem("Свести в итог", "merge")
+        self.parallel_provider_strategy_combo.addItem("Лучший по оценке", "best_score")
+        self.parallel_provider_strategy_combo.addItem("Первый успешный", "first_success")
+
+        self.multi_pass_checkbox = QCheckBox("Несколько вариантов главы")
+        self.multi_pass_count_spin = NoScrollSpinBox()
+        self.multi_pass_count_spin.setRange(1, 8)
+        self.multi_pass_count_spin.setValue(3)
+
+        self.multi_pass_strategy_combo = QComboBox()
+        self.multi_pass_strategy_combo.addItem("Свести в итог", "merge")
+        self.multi_pass_strategy_combo.addItem("Лучший по оценке", "best_score")
+        self.multi_pass_strategy_combo.addItem("Первый успешный", "first_success")
+
+        orchestration_layout.addWidget(self.parallel_providers_checkbox, 0, 0, 1, 2)
+        orchestration_layout.addWidget(QLabel("Провайдеры:"), 1, 0)
+        orchestration_layout.addWidget(self.parallel_providers_edit, 1, 1)
+        orchestration_layout.addWidget(QLabel("Стратегия:"), 2, 0)
+        orchestration_layout.addWidget(self.parallel_provider_strategy_combo, 2, 1)
+        orchestration_layout.addWidget(self.multi_pass_checkbox, 3, 0, 1, 2)
+        orchestration_layout.addWidget(QLabel("Вариантов:"), 4, 0)
+        orchestration_layout.addWidget(self.multi_pass_count_spin, 4, 1)
+        orchestration_layout.addWidget(QLabel("Стратегия:"), 5, 0)
+        orchestration_layout.addWidget(self.multi_pass_strategy_combo, 5, 1)
+
         main_layout.addWidget(modes_group, 0, 0)
         main_layout.addWidget(settings_group, 0, 1)
+        main_layout.addWidget(orchestration_group, 1, 0, 1, 2)
 
         self.batch_checkbox.toggled.connect(self._on_mode_changed)
         self.chunking_checkbox.toggled.connect(self._on_mode_changed)
         self.chunk_on_error_checkbox.toggled.connect(self._on_mode_changed)
         self.sequential_checkbox.toggled.connect(self._on_mode_changed)
         self.sequential_splits_spin.valueChanged.connect(self._on_mode_changed)
+        self.parallel_providers_checkbox.toggled.connect(self._on_mode_changed)
+        self.parallel_providers_edit.textChanged.connect(self._on_mode_changed)
+        self.parallel_provider_strategy_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.multi_pass_checkbox.toggled.connect(self._on_mode_changed)
+        self.multi_pass_count_spin.valueChanged.connect(self._on_mode_changed)
+        self.multi_pass_strategy_combo.currentIndexChanged.connect(self._on_mode_changed)
         self.task_size_spin.valueChanged.connect(self._on_task_size_changed)
         line_edit = self.task_size_spin.lineEdit()
         if line_edit is not None:
@@ -154,6 +194,13 @@ class TranslationOptionsWidget(QGroupBox):
             "chunk_on_error": self.chunk_on_error_checkbox.isChecked(),
             "sequential_translation": self.sequential_checkbox.isChecked(),
             "sequential_translation_splits": self.sequential_splits_spin.value(),
+            "parallel_providers_enabled": self.parallel_providers_checkbox.isChecked(),
+            "parallel_provider_list": self.parallel_providers_edit.text().strip(),
+            "parallel_provider_strategy": self.parallel_provider_strategy_combo.currentData() or "merge",
+            "multi_pass_enabled": self.multi_pass_checkbox.isChecked(),
+            "multi_pass_chapter_translation": self.multi_pass_checkbox.isChecked(),
+            "multi_pass_count": self.multi_pass_count_spin.value(),
+            "multi_pass_strategy": self.multi_pass_strategy_combo.currentData() or "merge",
             "task_size_limit": self.task_size_spin.value(),
             "task_size_limit_user_defined": self._task_size_user_defined,
         }
@@ -187,6 +234,12 @@ class TranslationOptionsWidget(QGroupBox):
         current_chunk_on_error = self.chunk_on_error_checkbox.isChecked()
         current_sequential = self.sequential_checkbox.isChecked()
         current_sequential_splits = self.sequential_splits_spin.value()
+        current_parallel_enabled = self.parallel_providers_checkbox.isChecked()
+        current_parallel_list = self.parallel_providers_edit.text()
+        current_parallel_strategy = self.parallel_provider_strategy_combo.currentData() or "merge"
+        current_multi_pass_enabled = self.multi_pass_checkbox.isChecked()
+        current_multi_pass_count = self.multi_pass_count_spin.value()
+        current_multi_pass_strategy = self.multi_pass_strategy_combo.currentData() or "merge"
         current_task_size = self.task_size_spin.value()
         has_explicit_task_size = (
             "task_size_limit" in settings and settings.get("task_size_limit") is not None
@@ -210,6 +263,30 @@ class TranslationOptionsWidget(QGroupBox):
             self.sequential_splits_spin.setValue(
                 settings.get("sequential_translation_splits", current_sequential_splits)
             )
+            self.parallel_providers_checkbox.setChecked(
+                settings.get("parallel_providers_enabled", current_parallel_enabled)
+            )
+            parallel_list_value = settings.get("parallel_provider_list", current_parallel_list)
+            if isinstance(parallel_list_value, (list, tuple)):
+                parallel_list_value = ", ".join(str(item) for item in parallel_list_value)
+            self.parallel_providers_edit.setText(str(parallel_list_value or ""))
+            parallel_strategy = settings.get("parallel_provider_strategy", current_parallel_strategy)
+            parallel_index = self.parallel_provider_strategy_combo.findData(parallel_strategy)
+            if parallel_index != -1:
+                self.parallel_provider_strategy_combo.setCurrentIndex(parallel_index)
+            self.multi_pass_checkbox.setChecked(
+                settings.get(
+                    "multi_pass_enabled",
+                    settings.get("multi_pass_chapter_translation", current_multi_pass_enabled),
+                )
+            )
+            self.multi_pass_count_spin.setValue(
+                settings.get("multi_pass_count", current_multi_pass_count)
+            )
+            multi_pass_strategy = settings.get("multi_pass_strategy", current_multi_pass_strategy)
+            multi_pass_index = self.multi_pass_strategy_combo.findData(multi_pass_strategy)
+            if multi_pass_index != -1:
+                self.multi_pass_strategy_combo.setCurrentIndex(multi_pass_index)
             if has_explicit_task_size:
                 user_defined = bool(settings.get("task_size_limit_user_defined", True))
                 self._set_task_size_value(target_task_size, user_defined=user_defined)
@@ -549,6 +626,10 @@ class TranslationOptionsWidget(QGroupBox):
 
         self.batch_checkbox.setEnabled(len(self.html_files) > 1)
         self.sequential_splits_spin.setEnabled(self.sequential_checkbox.isChecked())
+        self.parallel_providers_edit.setEnabled(self.parallel_providers_checkbox.isChecked())
+        self.parallel_provider_strategy_combo.setEnabled(self.parallel_providers_checkbox.isChecked())
+        self.multi_pass_count_spin.setEnabled(self.multi_pass_checkbox.isChecked())
+        self.multi_pass_strategy_combo.setEnabled(self.multi_pass_checkbox.isChecked())
 
         self._update_info_text()
         if emit_signal:
