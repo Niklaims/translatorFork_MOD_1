@@ -586,24 +586,48 @@ def google_translate_title_to_english(title: str, timeout: int = 20) -> str:
     return _clean_text(translated)
 
 
-def parse_prepared_metadata(raw_response: str) -> PreparedRulateMetadata:
+def _parse_json_response(raw_response: str) -> dict:
     raw_response = (raw_response or "").strip()
     raw_response = re.sub(r"^```(?:json)?\s*", "", raw_response, flags=re.IGNORECASE)
     raw_response = re.sub(r"\s*```$", "", raw_response)
     match = re.search(r"\{.*\}", raw_response, re.DOTALL)
     payload_text = match.group(0) if match else raw_response
-    payload = json.loads(payload_text)
+    return json.loads(payload_text)
 
-    genres = _normalize_list(payload.get("genres"), allowed=RULATE_GENRES, fallback=FALLBACK_GENRES)
-    tags = normalize_rulate_tags(payload.get("tags"))
+
+def parse_translation_metadata(raw_response: str) -> PreparedRulateMetadata:
+    payload = _parse_json_response(raw_response)
 
     return PreparedRulateMetadata(
         english_title=_clean_text(payload.get("english_title")),
         translated_title=_clean_text(payload.get("translated_title")),
         translated_description=_clean_multiline(payload.get("translated_description")),
+    )
+
+
+def parse_catalog_metadata(raw_response: str) -> PreparedRulateMetadata:
+    payload = _parse_json_response(raw_response)
+
+    genres = _normalize_list(payload.get("genres"), allowed=RULATE_GENRES, fallback=FALLBACK_GENRES)
+    tags = normalize_rulate_tags(payload.get("tags"))
+
+    return PreparedRulateMetadata(
         genres=genres,
         tags=tags,
         cover_prompt=clean_cover_prompt_response(payload.get("cover_prompt")),
+    )
+
+
+def parse_prepared_metadata(raw_response: str) -> PreparedRulateMetadata:
+    payload = _parse_json_response(raw_response)
+    catalog = parse_catalog_metadata(json.dumps(payload, ensure_ascii=False))
+    return PreparedRulateMetadata(
+        english_title=_clean_text(payload.get("english_title")),
+        translated_title=_clean_text(payload.get("translated_title")),
+        translated_description=_clean_multiline(payload.get("translated_description")),
+        genres=catalog.genres,
+        tags=catalog.tags,
+        cover_prompt=catalog.cover_prompt,
     )
 
 
@@ -644,20 +668,39 @@ def _clean_multiline(value: str | None) -> str:
     return value.strip()
 
 
-def build_ai_prompt(metadata: QidianBookMetadata, english_title: str, chapters_text: str = "") -> str:
-    allowed_genres = ", ".join(RULATE_GENRES)
-    chapters_text = _truncate_cover_source_text(chapters_text)
-    return f"""Ты готовишь карточку китайской веб-новеллы для Rulate и промпт для генерации обложки.
+def build_ai_prompt(metadata: QidianBookMetadata, english_title: str) -> str:
+    return f"""Ты переводишь базовые данные китайской веб-новеллы для карточки Rulate.
 
 Верни только JSON без markdown.
 
 Поля JSON:
 - english_title: английское название. Используй это значение, если оно пригодно: {english_title!r}
 - translated_title: литературное название на русском.
-- translated_description: литературный русский перевод описания. Не вставляй название отдельной строкой.
+- translated_description: литературный русский перевод только исходного описания. Не добавляй сведения из глав, метаданные сайта, количество глав, автора, статус обновлений и не вставляй название отдельной строкой.
+
+Исходные данные:
+Китайское название: {metadata.title_original}
+Автор: {metadata.author_name}
+Описание:
+{metadata.description}
+"""
+
+
+def build_catalog_prompt(
+    metadata: QidianBookMetadata,
+    prepared: PreparedRulateMetadata,
+    chapters_text: str = "",
+) -> str:
+    allowed_genres = ", ".join(RULATE_GENRES)
+    chapters_text = _truncate_cover_source_text(chapters_text)
+    return f"""Ты подбираешь жанры, теги Rulate и промпт для генерации обложки китайской веб-новеллы.
+
+Верни только JSON без markdown.
+
+Поля JSON:
 - genres: от 3 до 5 жанров строго из списка допустимых жанров.
 - tags: от 3 до 8 существующих тегов Rulate по смыслу описания. Не придумывай новые теги и не используй заготовленный список.
-- cover_prompt: единый промпт на английском для генерации обложки в DALL-E 3 / Ideogram. Используй русское название из translated_title внутри блока Typography в кавычках. Формат значения строго такой: [Subject & Action], [Background & Atmosphere], [Typography: The text "[translated_title]" written in [Font Style Description], placed at the [bottom/top], professional book cover typography, legible, high contrast], [Visual Style: Manhwa style, Riot Games Splash Art, 8k, masterpiece], --ar 2:3
+- cover_prompt: единый промпт на английском для генерации обложки в DALL-E 3 / Ideogram. Используй русское название "{prepared.translated_title}" внутри блока Typography в кавычках. Формат значения строго такой: [Subject & Action], [Background & Atmosphere], [Typography: The text "{prepared.translated_title}" written in [Font Style Description], placed at the [bottom/top], professional book cover typography, legible, high contrast], [Visual Style: Manhwa style, Riot Games Splash Art, 8k, masterpiece], --ar 2:3
 
 Допустимые жанры Rulate:
 {allowed_genres}
@@ -665,8 +708,17 @@ def build_ai_prompt(metadata: QidianBookMetadata, english_title: str, chapters_t
 Исходные данные:
 Китайское название: {metadata.title_original}
 Автор: {metadata.author_name}
-Описание:
+Оригинальное описание Qidian:
 {metadata.description}
+
+Название EN:
+{prepared.english_title}
+
+Название RU:
+{prepared.translated_title}
+
+Описание RU:
+{prepared.translated_description}
 
 Текст первых глав для понимания визуала и жанра:
 {chapters_text or "[текст глав не найден]"}
@@ -1049,6 +1101,21 @@ class AiPrepareWorker(QThread):
             if not self.active_keys:
                 raise ValueError("Не выбран активный ключ или сессия для AI-сервиса.")
 
+            self.log("INFO", "AI: перевожу название и описание...")
+            translation_prompt = build_ai_prompt(self.metadata, english_title)
+            translation_response = self._run_ai_request(
+                translation_prompt,
+                log_prefix="Qidian -> Rulate translation",
+                max_output_tokens=2048,
+            )
+            prepared = parse_translation_metadata(translation_response)
+            if english_title and not prepared.english_title:
+                prepared.english_title = english_title
+            if not prepared.translated_title:
+                raise ValueError("AI не вернул название на русском.")
+            if not prepared.translated_description:
+                raise ValueError("AI не вернул описание на русском.")
+
             chapters_text = ""
             if validate_qidian_url(self.metadata.source_url):
                 try:
@@ -1065,15 +1132,17 @@ class AiPrepareWorker(QThread):
             else:
                 self.log("WARNING", "Qidian: ссылка на оригинал не задана, промпт обложки будет без текста глав.")
 
-            prompt = build_ai_prompt(self.metadata, english_title, chapters_text)
-            raw_response = self._run_ai_request(prompt)
-            prepared = parse_prepared_metadata(raw_response)
-            if english_title and not prepared.english_title:
-                prepared.english_title = english_title
-            if not prepared.translated_title:
-                raise ValueError("AI не вернул название на русском.")
-            if not prepared.translated_description:
-                raise ValueError("AI не вернул описание на русском.")
+            self.log("INFO", "AI: подбираю жанры, теги и промпт обложки...")
+            catalog_prompt = build_catalog_prompt(self.metadata, prepared, chapters_text)
+            catalog_response = self._run_ai_request(
+                catalog_prompt,
+                log_prefix="Qidian -> Rulate catalog",
+                max_output_tokens=4096,
+            )
+            catalog = parse_catalog_metadata(catalog_response)
+            prepared.genres = catalog.genres
+            prepared.tags = catalog.tags
+            prepared.cover_prompt = catalog.cover_prompt
             if not prepared.cover_prompt:
                 self.log("WARNING", "AI не вернул промпт для обложки, его можно сгенерировать отдельной кнопкой.")
 
@@ -1085,7 +1154,13 @@ class AiPrepareWorker(QThread):
         finally:
             self.finished_signal.emit()
 
-    def _run_ai_request(self, prompt: str) -> str:
+    def _run_ai_request(
+        self,
+        prompt: str,
+        *,
+        log_prefix: str = "Qidian -> Rulate",
+        max_output_tokens: int = 4096,
+    ) -> str:
         return _run_ai_request(
             provider_id=self.provider_id,
             model_settings=self.model_settings,
@@ -1093,8 +1168,8 @@ class AiPrepareWorker(QThread):
             settings_manager=self.settings_manager,
             prompt=prompt,
             log_callback=self.log,
-            log_prefix="Qidian -> Rulate",
-            max_output_tokens=4096,
+            log_prefix=log_prefix,
+            max_output_tokens=max_output_tokens,
         )
 
 

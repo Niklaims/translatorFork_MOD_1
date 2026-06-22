@@ -21,10 +21,13 @@ from qidian_rulate.workers import (
     RULATE_PROFILE_DIR,
     RulateFillWorker,
     build_ai_prompt,
+    build_catalog_prompt,
     build_cover_prompt_request,
     clean_cover_prompt_response,
     normalize_rulate_tags,
+    parse_catalog_metadata,
     parse_prepared_metadata,
+    parse_translation_metadata,
     validate_qidian_url,
 )
 
@@ -201,6 +204,42 @@ def test_parse_prepared_metadata_strips_json_fence_and_normalizes_lists(monkeypa
     )
 
 
+def test_parse_translation_metadata_ignores_catalog_fields():
+    payload = {
+        "english_title": "Otherworldly Inn",
+        "translated_title": "\u0418\u043d\u043e\u043c\u0438\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430",
+        "translated_description": "\u0422\u0435\u043a\u0441\u0442\n\n\n\u043e\u043f\u0438\u0441\u0430\u043d\u0438\u044f",
+        "genres": [FANTASY],
+        "tags": ["sci-fi"],
+    }
+
+    prepared = parse_translation_metadata(json.dumps(payload, ensure_ascii=False))
+
+    assert prepared.english_title == "Otherworldly Inn"
+    assert prepared.translated_title == "\u0418\u043d\u043e\u043c\u0438\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430"
+    assert prepared.translated_description == "\u0422\u0435\u043a\u0441\u0442\n\n\u043e\u043f\u0438\u0441\u0430\u043d\u0438\u044f"
+    assert prepared.genres == []
+    assert prepared.tags == []
+
+
+def test_parse_catalog_metadata_returns_only_catalog_fields(monkeypatch):
+    allowed_tags = ["sci-fi", "\u0442\u0430\u0439\u043d\u044b", "\u043c\u0438\u0441\u0442\u0438\u043a\u0430"]
+    monkeypatch.setattr(workers, "load_rulate_tags", lambda: allowed_tags)
+    payload = {
+        "genres": [FANTASY.upper(), MYSTIC],
+        "tags": ["SCI-FI"],
+        "cover_prompt": "A cover. Typography: The text \"\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435\" written in gold. --ar 2:3",
+        "translated_description": "\u041d\u0435 \u0434\u043e\u043b\u0436\u043d\u043e \u043f\u043e\u043f\u0430\u0441\u0442\u044c \u0432 \u043f\u0435\u0440\u0435\u0432\u043e\u0434",
+    }
+
+    prepared = parse_catalog_metadata(json.dumps(payload, ensure_ascii=False))
+
+    assert prepared.translated_description == ""
+    assert prepared.genres[:3] == [FANTASY, MYSTIC, ADVENTURE]
+    assert prepared.tags == ["sci-fi", "\u0442\u0430\u0439\u043d\u044b", "\u043c\u0438\u0441\u0442\u0438\u043a\u0430"]
+    assert prepared.cover_prompt.startswith("A cover.")
+
+
 def test_normalize_rulate_tags_requires_tags_from_allowed_file(monkeypatch):
     allowed_tags = ["sci-fi", "\u0442\u0430\u0439\u043d\u044b", "\u043c\u0438\u0441\u0442\u0438\u043a\u0430"]
     monkeypatch.setattr(workers, "load_rulate_tags", lambda: allowed_tags)
@@ -307,7 +346,7 @@ def test_select_qidian_description_uses_clean_partial_when_only_truncated_exists
     assert description == "罗南穿越而来，直到有一天，他登…"
 
 
-def test_build_ai_prompt_contains_source_context_and_description_rule():
+def test_build_ai_prompt_contains_only_translation_fields():
     metadata = QidianBookMetadata(
         source_url="https://www.qidian.com/book/1041604040/",
         title_original="\u5f02\u5ea6\u65c5\u793e",
@@ -315,15 +354,43 @@ def test_build_ai_prompt_contains_source_context_and_description_rule():
         description="\u63cf\u8ff0",
     )
 
-    prompt = build_ai_prompt(metadata, "Otherworldly Inn", "\u7b2c1\u7ae0 \u96e8\n\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0\u3002")
+    prompt = build_ai_prompt(metadata, "Otherworldly Inn")
 
     assert "\u5f02\u5ea6\u65c5\u793e" in prompt
     assert "\u8fdc\u77b3" in prompt
     assert "Otherworldly Inn" in prompt
-    assert "\u041d\u0435 \u0432\u0441\u0442\u0430\u0432\u043b\u044f\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435" in prompt
+    assert "\u043d\u0435 \u0432\u0441\u0442\u0430\u0432\u043b\u044f\u0439 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435" in prompt
+    assert "translated_description" in prompt
+    assert "cover_prompt" not in prompt
+    assert "\u0422\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0432\u044b\u0445 \u0433\u043b\u0430\u0432" not in prompt
+
+
+def test_build_catalog_prompt_contains_cover_context_and_no_translation_fields():
+    metadata = QidianBookMetadata(
+        source_url="https://www.qidian.com/book/1041604040/",
+        title_original="\u5f02\u5ea6\u65c5\u793e",
+        author_name="\u8fdc\u77b3",
+        description="\u63cf\u8ff0",
+    )
+    prepared = PreparedRulateMetadata(
+        english_title="Otherworldly Inn",
+        translated_title="\u0418\u043d\u043e\u043c\u0438\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430",
+        translated_description="\u0420\u0443\u0441\u0441\u043a\u043e\u0435 \u043e\u043f\u0438\u0441\u0430\u043d\u0438\u0435.",
+    )
+
+    prompt = build_catalog_prompt(
+        metadata,
+        prepared,
+        "\u7b2c1\u7ae0 \u96e8\n\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0\u3002",
+    )
+
     assert "cover_prompt" in prompt
+    assert "genres" in prompt
+    assert "tags" in prompt
+    assert "translated_description:" not in prompt
     assert "\u0422\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0432\u044b\u0445 \u0433\u043b\u0430\u0432" in prompt
     assert "\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0" in prompt
+    assert 'The text "\u0418\u043d\u043e\u043c\u0438\u0440\u043d\u0430\u044f \u0433\u043e\u0441\u0442\u0438\u043d\u0438\u0446\u0430"' in prompt
 
 
 def test_build_ai_prompt_does_not_include_hardcoded_tag_examples():
