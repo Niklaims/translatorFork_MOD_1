@@ -14,6 +14,8 @@ from gemini_translator.ui.widgets.model_settings_widget import (
     CHATGPT_LOGIN_URL,
     CHATGPT_SIGNUP_URL,
     CustomModelDialog,
+    FREE_DEEPSEEK_SETTINGS_KEY,
+    FreeDeepseekApiDialog,
     ModelSettingsWidget,
 )
 
@@ -52,6 +54,7 @@ class _WidgetSettingsStub:
         self._last_system_prompt_text = ""
         self._last_system_prompt_preset_name = ""
         self._last_settings = {}
+        self._full_session_settings = {}
         self.custom_provider_models = {}
 
     def load_system_prompts(self):
@@ -74,7 +77,11 @@ class _WidgetSettingsStub:
         return self.config_dir
 
     def load_full_session_settings(self):
-        return {}
+        return dict(self._full_session_settings)
+
+    def save_full_session_settings(self, settings):
+        self._full_session_settings = dict(settings or {})
+        return True
 
     def get_last_settings(self):
         return dict(self._last_settings)
@@ -205,6 +212,28 @@ class ModelSettingsWidgetTests(unittest.TestCase):
 
         widget.set_available_models("gemini")
         self.assertTrue(widget.refresh_models_btn.isHidden())
+
+    def test_free_deepseek_provider_shows_gui_tools_and_refresh_button(self):
+        widget = self._create_widget()
+
+        widget.set_available_models("free_deepseek")
+        self.assertFalse(widget.free_deepseek_tools_btn.isHidden())
+        self.assertFalse(widget.refresh_models_btn.isHidden())
+
+        widget.set_available_models("gemini")
+        self.assertTrue(widget.free_deepseek_tools_btn.isHidden())
+
+    def test_free_deepseek_dialog_persists_repo_path(self):
+        widget = self._create_widget()
+        dialog = FreeDeepseekApiDialog(widget.settings_manager, widget)
+        self.addCleanup(dialog.close)
+
+        dialog._save_repo_dir(r"C:\FreeDeepseekAPI")
+
+        self.assertEqual(
+            widget.settings_manager.load_full_session_settings()[FREE_DEEPSEEK_SETTINGS_KEY],
+            r"C:\FreeDeepseekAPI",
+        )
 
     def test_custom_model_dialog_builds_model_config(self):
         dialog = CustomModelDialog(

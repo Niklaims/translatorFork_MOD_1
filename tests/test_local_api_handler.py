@@ -97,6 +97,36 @@ class LocalApiHandlerTests(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertNotIn("temperature", captured_payloads[0])
 
+    def test_real_api_key_is_sent_as_bearer_header(self):
+        handler, _worker = self._make_handler()
+        captured_headers = []
+
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+            captured_headers.append(headers)
+            return _DummyResponse()
+
+        with patch("gemini_translator.api.handlers.local.requests.post", side_effect=fake_post):
+            result = handler.call_api("prompt", "log")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(captured_headers[0]["Authorization"], "Bearer local-key")
+
+    def test_placeholder_api_key_is_not_sent_as_bearer_header(self):
+        worker = _WorkerStub()
+        handler = LocalApiHandler(worker)
+        handler.setup_client(SimpleNamespace(api_key="__free_deepseek_session__"))
+        captured_headers = []
+
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+            captured_headers.append(headers)
+            return _DummyResponse()
+
+        with patch("gemini_translator.api.handlers.local.requests.post", side_effect=fake_post):
+            result = handler.call_api("prompt", "log")
+
+        self.assertEqual(result, "ok")
+        self.assertNotIn("Authorization", captured_headers[0])
+
     def test_length_finish_reason_raises_partial_with_limit_source(self):
         handler, worker = self._make_handler()
 

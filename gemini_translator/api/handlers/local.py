@@ -86,6 +86,9 @@ class LocalApiHandler(BaseApiHandler):
         Аргумент `session` (aiohttp) здесь всегда None и не используется.
         """
         headers = { "Content-Type": "application/json" }
+        api_key = str(getattr(self.worker, "api_key", "") or "").strip()
+        if api_key and not api_key.startswith("__"):
+            headers["Authorization"] = f"Bearer {api_key}"
         
         messages = (
             [{"role": "system", "content": self.worker.prompt_builder.system_instruction}]
@@ -115,11 +118,15 @@ class LocalApiHandler(BaseApiHandler):
         # ставим таймаут из конфига
         timeout_seconds = self.timeout_seconds
 
+        debug_headers = dict(headers)
+        if "Authorization" in debug_headers:
+            debug_headers["Authorization"] = "Bearer ..."
+
         self._debug_record_request(
             {
                 "method": "POST",
                 "url": self.base_url,
-                "headers": headers,
+                "headers": debug_headers,
                 "payload": payload,
                 "proxies": self.prepared_proxies,
             },

@@ -305,6 +305,108 @@
       }
     }
    },
+  "free_deepseek": {
+    "display_name": "DeepSeek Web (FreeDeepseekAPI)",
+    "provider": "free_deepseek",
+    "handler_class": "LocalApiHandler",
+    "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+    "base_timeout": 1800,
+    "is_async": false,
+    "needs_warmup": false,
+    "visible": true,
+    "requires_api_key": false,
+    "placeholder_api_key": "__free_deepseek_session__",
+    "dynamic_model_discovery": true,
+    "discovery_endpoints": [
+      {
+        "name": "FreeDeepseekAPI",
+        "base_url": "http://127.0.0.1:9655/v1"
+      }
+    ],
+    "file_suffix": "_translated_free_deepseek.html",
+    "shared_request_counter": false,
+    "reset_policy": {
+      "type": "rolling",
+      "duration_hours": 9999
+    },
+    "models": {
+      "DeepSeek Chat (FreeDeepseekAPI)": {
+        "id": "deepseek-chat",
+        "rpm": 60,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 8192,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "min_thinking_budget": false
+      },
+      "DeepSeek Reasoner (FreeDeepseekAPI)": {
+        "id": "deepseek-reasoner",
+        "rpm": 30,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 64000,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "thinkingLevel": [
+          "high",
+          "max"
+        ],
+        "min_thinking_budget": "high",
+        "default_reasoning_effort": "high"
+      },
+      "DeepSeek Chat Search (FreeDeepseekAPI)": {
+        "id": "deepseek-chat-search",
+        "rpm": 30,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 8192,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "min_thinking_budget": false
+      },
+      "DeepSeek Reasoner Search (FreeDeepseekAPI)": {
+        "id": "deepseek-reasoner-search",
+        "rpm": 20,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 64000,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "thinkingLevel": [
+          "high",
+          "max"
+        ],
+        "min_thinking_budget": "high",
+        "default_reasoning_effort": "high"
+      },
+      "DeepSeek Expert (FreeDeepseekAPI)": {
+        "id": "deepseek-expert",
+        "rpm": 20,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 8192,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "min_thinking_budget": false
+      },
+      "DeepSeek V4 Pro Expert (FreeDeepseekAPI)": {
+        "id": "deepseek-v4-pro",
+        "rpm": 20,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 64000,
+        "context_window": 128000,
+        "base_url": "http://127.0.0.1:9655/v1/chat/completions",
+        "thinkingLevel": [
+          "high",
+          "max"
+        ],
+        "min_thinking_budget": "high",
+        "default_reasoning_effort": "high"
+      }
+    }
+  },
   "openmodel": {
     "display_name": "OpenModel DeepSeek V4 Flash",
     "provider": "openmodel",

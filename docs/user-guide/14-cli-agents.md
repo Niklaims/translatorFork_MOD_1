@@ -98,6 +98,20 @@ python -m gemini_translator.cli generate `
   --input ".\chapter.txt"
 ```
 
+Использовать локальный FreeDeepseekAPI proxy:
+
+```powershell
+python -m gemini_translator.cli models --provider free_deepseek
+
+python -m gemini_translator.cli translate `
+  --epub "C:\books\book.epub" `
+  --project "C:\books\book_project" `
+  --provider free_deepseek `
+  --model "DeepSeek Chat (FreeDeepseekAPI)" `
+  --workers 1 `
+  --chapters pending
+```
+
 Сгенерировать AI-глоссарий по всем главам:
 
 ```powershell

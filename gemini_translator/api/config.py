@@ -1046,11 +1046,19 @@ def _discover_local_provider_models(
     return static_models
 
 
+def _provider_uses_dynamic_model_discovery(provider_id: str, provider_config: dict | None = None) -> bool:
+    if provider_id == "local":
+        return True
+    provider_config = provider_config or _API_PROVIDERS.get(provider_id, {})
+    return bool(provider_config.get("dynamic_model_discovery"))
+
+
 def _refresh_dynamic_provider_models(provider_id: str, force: bool = False) -> dict:
     global _ALL_MODELS
 
     normalized_provider = str(provider_id or "").strip()
-    if normalized_provider != "local":
+    provider_config = _API_PROVIDERS.get(normalized_provider, {})
+    if not normalized_provider or not _provider_uses_dynamic_model_discovery(normalized_provider, provider_config):
         return {}
 
     with _DYNAMIC_PROVIDER_MODELS_LOCK:
@@ -1061,7 +1069,6 @@ def _refresh_dynamic_provider_models(provider_id: str, force: bool = False) -> d
         if not force and cached_models is not None and (now - cached_ts) < _LOCAL_MODEL_DISCOVERY_TTL_SECONDS:
             return cached_models
 
-        provider_config = _API_PROVIDERS.get(normalized_provider, {})
         resolved_models = _discover_local_provider_models(
             provider_config,
             include_details=force,
@@ -1168,7 +1175,7 @@ def all_models():
 def ensure_dynamic_provider_models(provider_id: str | None, force: bool = False):
     _ensure_configs_initialized()
     normalized_provider = str(provider_id or "").strip()
-    if normalized_provider == "local":
+    if normalized_provider and _provider_uses_dynamic_model_discovery(normalized_provider):
         _refresh_dynamic_provider_models(normalized_provider, force=force)
     if normalized_provider:
         return api_providers().get(normalized_provider, {})

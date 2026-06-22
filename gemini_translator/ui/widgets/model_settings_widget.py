@@ -2,6 +2,8 @@
 
 import os
 import subprocess
+import urllib.error
+import urllib.request
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
@@ -19,6 +21,9 @@ from ...utils import markdown_viewer
 
 CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
 CHATGPT_SIGNUP_URL = "https://chatgpt.com/auth/login?mode=signup"
+FREE_DEEPSEEK_PROVIDER_ID = "free_deepseek"
+FREE_DEEPSEEK_PROXY_URL = "http://127.0.0.1:9655"
+FREE_DEEPSEEK_SETTINGS_KEY = "free_deepseek_api_dir"
 MODEL_COMBO_MIN_WIDTH = 280
 MODEL_COMBO_POPUP_MIN_WIDTH = 460
 MODEL_COMBO_POPUP_MAX_WIDTH = 760
@@ -122,6 +127,255 @@ class CustomModelDialog(QDialog):
             "user_defined": True,
         }
         return display_name, model_config
+
+
+class FreeDeepseekApiDialog(QDialog):
+    def __init__(self, settings_manager, parent=None):
+        super().__init__(parent)
+        self.settings_manager = settings_manager
+        self.auth_process = None
+        self.proxy_process = None
+
+        self.setWindowTitle("FreeDeepseekAPI")
+        self.setMinimumWidth(720)
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "Выберите папку клонированного ForgetMeAI/FreeDeepseekAPI. "
+            "Вход DeepSeek и запуск локального proxy выполняются из этого окна."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #888;")
+        layout.addWidget(hint)
+
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("Папка:"))
+        self.path_edit = QLineEdit(self._load_saved_repo_dir())
+        self.path_edit.setPlaceholderText(r"C:\path\to\FreeDeepseekAPI")
+        path_layout.addWidget(self.path_edit, 1)
+        browse_btn = QPushButton("...")
+        browse_btn.setFixedWidth(34)
+        browse_btn.clicked.connect(self._browse_repo_dir)
+        path_layout.addWidget(browse_btn)
+        layout.addLayout(path_layout)
+
+        actions_layout = QHBoxLayout()
+        self.auth_btn = QPushButton("Войти в DeepSeek")
+        self.auth_btn.clicked.connect(self._start_auth)
+        actions_layout.addWidget(self.auth_btn)
+
+        self.continue_auth_btn = QPushButton("Продолжить после входа")
+        self.continue_auth_btn.setEnabled(False)
+        self.continue_auth_btn.clicked.connect(self._continue_auth)
+        actions_layout.addWidget(self.continue_auth_btn)
+
+        self.start_proxy_btn = QPushButton("Запустить proxy")
+        self.start_proxy_btn.clicked.connect(self._start_proxy_background)
+        actions_layout.addWidget(self.start_proxy_btn)
+
+        self.check_proxy_btn = QPushButton("Проверить")
+        self.check_proxy_btn.clicked.connect(self._check_proxy)
+        actions_layout.addWidget(self.check_proxy_btn)
+
+        actions_layout.addStretch(1)
+        layout.addLayout(actions_layout)
+
+        self.log_edit = QtWidgets.QPlainTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setMinimumHeight(220)
+        self.log_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self.log_edit)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=self)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+        self._append_log(f"Proxy URL: {FREE_DEEPSEEK_PROXY_URL}")
+
+    @staticmethod
+    def _npm_command(*args):
+        if os.name == "nt":
+            return ["cmd", "/c", "npm", *args]
+        return ["npm", *args]
+
+    def _append_log(self, message: str):
+        self.log_edit.appendPlainText(str(message).rstrip())
+        scroll_bar = self.log_edit.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def _load_saved_repo_dir(self) -> str:
+        try:
+            settings = self.settings_manager.load_full_session_settings() or {}
+            if isinstance(settings, dict):
+                saved_path = settings.get(FREE_DEEPSEEK_SETTINGS_KEY)
+                if saved_path:
+                    return str(saved_path)
+        except Exception:
+            pass
+        return os.environ.get("FREE_DEEPSEEK_API_DIR", "")
+
+    def _save_repo_dir(self, repo_dir: str):
+        try:
+            loader = getattr(self.settings_manager, "load_full_session_settings", None)
+            saver = getattr(self.settings_manager, "save_full_session_settings", None)
+            if not callable(saver):
+                return
+            settings = loader() if callable(loader) else {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings[FREE_DEEPSEEK_SETTINGS_KEY] = repo_dir
+            saver(settings)
+        except Exception as error:
+            self._append_log(f"Не удалось сохранить путь: {error}")
+
+    def _selected_repo_dir(self) -> str:
+        raw_path = str(self.path_edit.text() or "").strip()
+        return os.path.normpath(raw_path) if raw_path else ""
+
+    def _validate_repo_dir(self) -> str | None:
+        repo_dir = self._selected_repo_dir()
+        if not repo_dir:
+            QtWidgets.QMessageBox.warning(self, "FreeDeepseekAPI", "Укажите папку FreeDeepseekAPI.")
+            return None
+        if not os.path.isdir(repo_dir):
+            QtWidgets.QMessageBox.warning(self, "FreeDeepseekAPI", "Папка FreeDeepseekAPI не найдена.")
+            return None
+        if not os.path.isfile(os.path.join(repo_dir, "package.json")):
+            QtWidgets.QMessageBox.warning(
+                self,
+                "FreeDeepseekAPI",
+                "В выбранной папке нет package.json. Выберите корень репозитория ForgetMeAI/FreeDeepseekAPI.",
+            )
+            return None
+        return repo_dir
+
+    def _browse_repo_dir(self):
+        current_path = self._selected_repo_dir()
+        initial_dir = current_path if current_path and os.path.isdir(current_path) else ""
+        if not initial_dir:
+            try:
+                initial_dir = self.settings_manager.get_last_project_folder() or ""
+            except Exception:
+                initial_dir = ""
+        if not initial_dir or not os.path.isdir(initial_dir):
+            initial_dir = os.path.expanduser("~")
+
+        selected_dir = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Папка FreeDeepseekAPI",
+            initial_dir,
+        )
+        if selected_dir:
+            self.path_edit.setText(os.path.normpath(selected_dir))
+
+    def _start_auth(self):
+        repo_dir = self._validate_repo_dir()
+        if not repo_dir:
+            return
+
+        if self.auth_process and self.auth_process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            QtWidgets.QMessageBox.information(self, "FreeDeepseekAPI", "Процесс входа уже запущен.")
+            return
+
+        self._save_repo_dir(repo_dir)
+        command = self._npm_command("run", "auth")
+        self._append_log("")
+        self._append_log(f"> {' '.join(command)}")
+
+        self.auth_process = QtCore.QProcess(self)
+        self.auth_process.setWorkingDirectory(repo_dir)
+        self.auth_process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
+        self.auth_process.readyReadStandardOutput.connect(self._read_auth_output)
+        self.auth_process.finished.connect(self._on_auth_finished)
+        self.auth_process.start(command[0], command[1:])
+
+        if not self.auth_process.waitForStarted(3000):
+            error_text = self.auth_process.errorString()
+            self.auth_process = None
+            QtWidgets.QMessageBox.warning(
+                self,
+                "FreeDeepseekAPI",
+                f"Не удалось запустить npm run auth: {error_text}",
+            )
+            return
+
+        self.auth_btn.setEnabled(False)
+        self.continue_auth_btn.setEnabled(True)
+
+    def _read_auth_output(self):
+        if not self.auth_process:
+            return
+        data = bytes(self.auth_process.readAllStandardOutput()).decode(errors="replace")
+        if data:
+            self._append_log(data.rstrip())
+
+    def _continue_auth(self):
+        if not self.auth_process or self.auth_process.state() == QtCore.QProcess.ProcessState.NotRunning:
+            return
+        self.auth_process.write(b"\n")
+        self.auth_process.waitForBytesWritten(1000)
+        self._append_log("> отправлен Enter")
+
+    def _on_auth_finished(self, exit_code: int, _exit_status):
+        self._append_log(f"Auth завершен, код: {exit_code}")
+        self.auth_btn.setEnabled(True)
+        self.continue_auth_btn.setEnabled(False)
+        self.auth_process = None
+
+    def _start_proxy_background(self):
+        repo_dir = self._validate_repo_dir()
+        if not repo_dir:
+            return
+
+        self._save_repo_dir(repo_dir)
+        command = self._npm_command("start")
+        kwargs = {
+            "cwd": repo_dir,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            self.proxy_process = subprocess.Popen(command, **kwargs)
+        except Exception as error:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "FreeDeepseekAPI",
+                f"Не удалось запустить proxy: {error}",
+            )
+            return
+
+        self._append_log(f"> {' '.join(command)}")
+        self._append_log(f"Proxy запущен в фоне, PID: {self.proxy_process.pid}")
+        self._append_log(f"Провайдер использует {FREE_DEEPSEEK_PROXY_URL}/v1/chat/completions")
+
+    def _check_proxy(self):
+        try:
+            with urllib.request.urlopen(f"{FREE_DEEPSEEK_PROXY_URL}/v1/models", timeout=2) as response:
+                body = response.read(500).decode(errors="replace")
+                self._append_log(f"Проверка proxy: HTTP {response.status}")
+                if body:
+                    self._append_log(body)
+                QtWidgets.QMessageBox.information(self, "FreeDeepseekAPI", "Proxy отвечает.")
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            self._append_log(f"Проверка proxy не прошла: {error}")
+            QtWidgets.QMessageBox.warning(
+                self,
+                "FreeDeepseekAPI",
+                "Proxy не отвечает. Запустите его или проверьте вывод в окне.",
+            )
+
+    def closeEvent(self, event):
+        if self.auth_process and self.auth_process.state() != QtCore.QProcess.ProcessState.NotRunning:
+            self.auth_process.kill()
+            self.auth_process.waitForFinished(1000)
+        super().closeEvent(event)
 
 
 class ModelSettingsWidget(QGroupBox):
@@ -241,6 +495,11 @@ class ModelSettingsWidget(QGroupBox):
         self.add_custom_model_btn.setToolTip("Добавить модель в текущий сервис.")
         self.add_custom_model_btn.clicked.connect(self._open_custom_model_dialog)
         left_layout.addWidget(self.add_custom_model_btn, 0, 3)
+        self.free_deepseek_tools_btn = QPushButton("DeepSeek")
+        self.free_deepseek_tools_btn.setToolTip("Вход в DeepSeek и запуск FreeDeepseekAPI без консоли.")
+        self.free_deepseek_tools_btn.clicked.connect(self._open_free_deepseek_dialog)
+        self.free_deepseek_tools_btn.setVisible(False)
+        left_layout.addWidget(self.free_deepseek_tools_btn, 0, 4)
         
         self.rpm_row_widget = QWidget()
         self.rpm_row_widget.setObjectName("rpm_row")
@@ -715,6 +974,10 @@ class ModelSettingsWidget(QGroupBox):
     def _open_chatgpt_signup(self):
         self._launch_chatgpt_profile_browser(CHATGPT_SIGNUP_URL, "регистрации")
 
+    def _open_free_deepseek_dialog(self):
+        dialog = FreeDeepseekApiDialog(self.settings_manager, self)
+        dialog.exec()
+
     def _launch_chatgpt_profile_browser(self, start_url: str, action_label: str):
         runtime_root = api_config.default_workascii_runtime_root()
         profile_dir = api_config.default_workascii_profile_dir(runtime_root)
@@ -800,11 +1063,15 @@ class ModelSettingsWidget(QGroupBox):
     def _update_provider_specific_controls(self, provider_id):
         self._current_provider_id = provider_id
         is_workascii = provider_id == "workascii_chatgpt"
-        is_local_provider = provider_id == "local"
+        provider_config = api_config.api_providers().get(provider_id, {}) if provider_id else {}
+        is_dynamic_provider = provider_id == "local" or bool(provider_config.get("dynamic_model_discovery"))
+        is_free_deepseek = provider_id == FREE_DEEPSEEK_PROVIDER_ID
         self.workascii_group.setVisible(is_workascii)
-        self.refresh_models_btn.setVisible(is_local_provider)
-        self.refresh_models_btn.setEnabled(is_local_provider)
-        can_add_custom_model = bool(provider_id and api_config.api_providers().get(provider_id))
+        self.refresh_models_btn.setVisible(is_dynamic_provider)
+        self.refresh_models_btn.setEnabled(is_dynamic_provider)
+        self.free_deepseek_tools_btn.setVisible(is_free_deepseek)
+        self.free_deepseek_tools_btn.setEnabled(is_free_deepseek)
+        can_add_custom_model = bool(provider_id and provider_config)
         self.add_custom_model_btn.setEnabled(can_add_custom_model)
 
     def _update_model_combo_popup_width(self):

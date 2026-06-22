@@ -12,6 +12,7 @@
 - `OpenRouter`;
 - `Hugging Face`;
 - локальные модели `Ollama/LM Studio`;
+- `DeepSeek Web (FreeDeepseekAPI)`;
 - `NeuroAPI`;
 - `ChatGPT Web (work_ascii)`.
 
@@ -129,6 +130,25 @@
 - программа может подтягивать список моделей с локального сервера;
 - скорость и качество зависят уже не только от программы, но и от вашей машины;
 - не ждите, что тяжёлая модель на слабом железе даст комфортную скорость.
+
+## DeepSeek Web через FreeDeepseekAPI
+
+Провайдер `DeepSeek Web (FreeDeepseekAPI)` подключается к локальному proxy [ForgetMeAI/FreeDeepseekAPI](https://github.com/ForgetMeAI/FreeDeepseekAPI). Он не требует API-ключа в переводчике: proxy использует ваш сохранённый login DeepSeek Web.
+
+Минимальный запуск proxy:
+
+```powershell
+git clone https://github.com/ForgetMeAI/FreeDeepseekAPI.git
+cd FreeDeepseekAPI
+npm run auth
+npm start
+```
+
+То же самое можно сделать из GUI без отдельной консоли: выберите провайдер `DeepSeek Web (FreeDeepseekAPI)`, нажмите кнопку `DeepSeek` рядом со списком моделей, укажите папку репозитория FreeDeepseekAPI, затем используйте `Войти в DeepSeek` и `Запустить proxy`. Путь к папке сохраняется в настройках сессии.
+
+По умолчанию переводчик ждёт proxy на `http://127.0.0.1:9655/v1/chat/completions`. Если proxy запущен, список моделей подтянется из `/v1/models`; если нет, останутся встроенные aliases: `deepseek-chat`, `deepseek-reasoner`, search-варианты и expert mode.
+
+Для первого теста лучше выбрать `DeepSeek Chat (FreeDeepseekAPI)`, поставить параллельность `1` и прогнать одну небольшую главу. Это web-proxy, поэтому стабильность зависит от текущей сессии DeepSeek Web; при `401/403/429` обновите login через кнопку `DeepSeek` или команду `npm run auth`.
 
 ## ChatGPT Web
 

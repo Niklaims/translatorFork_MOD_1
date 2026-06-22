@@ -154,6 +154,53 @@ class LocalModelDiscoveryTests(unittest.TestCase):
         self.assertNotIn("max_output_tokens", local_models["Qwen 3 8B (Ollama)"])
         self.assertNotIn("max_output_tokens", local_models["Gemma 3 12B IT (LM Studio)"])
 
+    def test_free_deepseek_provider_discovers_openai_compatible_models(self):
+        def fake_get(url, timeout=None):
+            if url == "http://127.0.0.1:9655/api/tags":
+                return _DummyResponse(404, {})
+            if url == "http://127.0.0.1:9655/v1/models":
+                return _DummyResponse(
+                    200,
+                    {
+                        "data": [
+                            {"id": "deepseek-chat"},
+                            {"id": "deepseek-reasoner", "max_context_length": 128000},
+                        ]
+                    },
+                )
+            if url == "http://127.0.0.1:9655/api/v0/models":
+                return _DummyResponse(404, {})
+            if "/v1/models/" in url or "/api/v0/models/" in url:
+                return _DummyResponse(404, {})
+            raise AssertionError(f"Unexpected discovery URL: {url}")
+
+        def fake_post(url, json=None, timeout=None):
+            return _DummyResponse(404, {})
+
+        with patch.dict(os.environ, {"GT_DISABLE_LOCAL_MODEL_DISCOVERY": "0"}), \
+             patch.object(api_config, "requests", SimpleNamespace(get=fake_get, post=fake_post)):
+            api_config.refresh_dynamic_models("free_deepseek")
+            models = api_config.api_providers()["free_deepseek"]["models"]
+
+        self.assertIn("DeepSeek Chat (FreeDeepseekAPI)", models)
+        self.assertIn("DeepSeek Reasoner (FreeDeepseekAPI)", models)
+        self.assertEqual(
+            models["DeepSeek Chat (FreeDeepseekAPI)"]["base_url"],
+            "http://127.0.0.1:9655/v1/chat/completions",
+        )
+        self.assertEqual(models["DeepSeek Reasoner (FreeDeepseekAPI)"]["context_length"], 128000)
+        self.assertTrue(api_config.api_providers()["free_deepseek"]["dynamic_model_discovery"])
+
+    def test_free_deepseek_provider_uses_virtual_session_key(self):
+        api_config.initialize_configs()
+
+        self.assertFalse(api_config.provider_requires_api_key("free_deepseek"))
+        self.assertEqual(
+            api_config.provider_placeholder_api_key("free_deepseek"),
+            "__free_deepseek_session__",
+        )
+        self.assertIn("DeepSeek Web (FreeDeepseekAPI)", api_config.provider_display_map())
+
 
 if __name__ == "__main__":
     unittest.main()
