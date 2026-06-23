@@ -48,6 +48,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 from ..widgets.preset_widget import PresetWidget
 from ..shell import ShellPage
 from ...api import config as api_config
+from gemini_translator.ui import theme_manager
 from .validation_dialogs import UntranslatedWordDetector
 from .validation_dialogs.untranslated_fixer_dialog import (
     AITranslationDialog,
@@ -253,7 +254,7 @@ class LargeTextInputDialog(QDialog):
             
             escaped_code = item_data["code"].replace('<', '&lt;').replace('>', '&gt;')
             code_label = QLabel(f"<code>{escaped_code}</code>")
-            code_label.setStyleSheet("background-color: #313643; padding: 4px; border-radius: 3px; font-family: Consolas, monospace;")
+            code_label.setStyleSheet(f"background-color: {theme_manager.color('input_bg')}; padding: 4px; border-radius: 3px; font-family: Consolas, monospace;")
             code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
             # --- НАЧАЛО КЛЮЧЕВОГО ИЗМЕНЕНИЯ ---
@@ -1916,7 +1917,9 @@ class TranslationValidatorPage(ShellPage):
         self.setMinimumSize(900, 620)
         
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(8, 8, 8, 8)
+        # Top margin 0 so the first card sits flush under the nav bar instead of
+        # exposing a gray window-background strip "под Назад".
+        main_layout.setContentsMargins(8, 0, 8, 8)
         main_layout.setSpacing(6)
 
         self.content_scroll_area = QScrollArea()
@@ -2874,7 +2877,7 @@ class TranslationValidatorPage(ShellPage):
         self.btn_consistency = QPushButton("🔍 Согласованность (AI)")
         self.btn_consistency.clicked.connect(self._on_consistency_check)
         self.btn_consistency.setStyleSheet(
-            "background-color: #673AB7; color: white; padding: 5px 10px;")
+            f"background-color: {theme_manager.color('info')}; color: {theme_manager.color('accent_text')}; padding: 5px 10px;")
         
         self.btn_apply_changes = QPushButton("✅ Применить действия"); self.btn_apply_changes.clicked.connect(self.apply_changes)
         self.btn_send_to_retry = QPushButton("▶️ Отправить на перевод и закрыть"); self.btn_send_to_retry.clicked.connect(self.request_retry_translation); self.btn_send_to_retry.setVisible(self.retry_is_available)
@@ -3946,12 +3949,12 @@ class TranslationValidatorPage(ShellPage):
 
         if files_to_scan_count > 0:
             # Оранжевый стиль - "Требуется обновление"
-            style = """
-                QPushButton {
+            style = f"""
+                QPushButton {{
                     background-color: rgba(255, 140, 0, 40);
-                    border: 1px solid #FF8C00;
+                    border: 1px solid {theme_manager.color('warning')};
                     font-weight: bold;
-                }
+                }}
             """
             self.btn_analyze.setStyleSheet(style)
             self.btn_analyze.setText(f"🚀 Проверить ({files_to_scan_count})")

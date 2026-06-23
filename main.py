@@ -36,6 +36,7 @@ from gemini_translator.ui.themes import (
     build_dark_stylesheet,
     extract_theme_colors,
 )
+from gemini_translator.ui import theme_manager
 
 # ---------------------------------------------------------------------------
 # Gemini EPUB Translator - Точка входа в приложение
@@ -446,20 +447,24 @@ def apply_saved_app_theme(app, settings_manager=None):
     if manager is None:
         app.setStyleSheet(DARK_STYLESHEET)
         return
-
-    theme_colors = {}
-    for loader_name in ("load_full_session_settings", "load_settings"):
-        loader = getattr(manager, loader_name, None)
-        if not callable(loader):
-            continue
-        try:
-            theme_colors = extract_theme_colors(loader())
-        except Exception:
-            theme_colors = {}
-        if theme_colors:
-            break
-
-    app.setStyleSheet(build_dark_stylesheet(theme_colors))
+    mode = theme_manager.load_mode(manager)
+    manual = theme_manager._manual_colors(manager)
+    theme_manager.apply(app, mode=mode, manual_colors=manual)
+    theme_manager.install(app, manager)
+    # Liquid Glass needs a shown window for the macOS vibrancy backdrop, so —
+    # if the user opted in — re-apply it once the UI is up, avoiding a
+    # frost-less transparent flash at startup.
+    if theme_manager.glass_enabled(manager):
+        QtCore.QTimer.singleShot(
+            900,
+            lambda: theme_manager.apply(
+                app,
+                mode=theme_manager.load_mode(manager),
+                manual_colors=theme_manager._manual_colors(manager),
+                glass=True,
+                glass_opacities=theme_manager.load_glass_opacities(manager),
+            ),
+        )
 
 
 def run_emergency_viewer():
@@ -841,6 +846,12 @@ class ApplicationWithContext(QtWidgets.QApplication):
             self._show_critical_error,
             QtCore.Qt.ConnectionType.QueuedConnection,
         )
+        self.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QtCore.QEvent.Type.Wheel and isinstance(obj, QtWidgets.QTabBar):
+            return True
+        return super().eventFilter(obj, event)
 
     @QtCore.pyqtSlot(str)
     def _show_critical_error(self, error_message: str):
@@ -1078,7 +1089,9 @@ if __name__ == "__main__":
 
     app = ApplicationWithContext(sys.argv)
     install_window_title_branding(app)
-    app.setStyleSheet(DARK_STYLESHEET)
+    # Тема (светлая/тёмная/авто) применяется в apply_saved_app_theme ниже,
+    # как только доступен settings_manager — без раннего тёмного дефолта,
+    # чтобы пользователи светлой/авто-темы не видели тёмной вспышки.
 
     # Инициализация ресурсов (один раз при старте процесса)
     if sys.platform == "win32":

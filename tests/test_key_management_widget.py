@@ -48,6 +48,27 @@ class _KeySettingsStub:
         return 0
 
 
+class _KeyStatusSettingsStub(_KeySettingsStub):
+    def __init__(self, provider_id):
+        self.provider_id = provider_id
+
+    def load_key_statuses(self):
+        return [
+            {"provider": self.provider_id, "key": "active-a"},
+            {"provider": self.provider_id, "key": "active-b"},
+            {"provider": self.provider_id, "key": "exhausted-c", "limited": True},
+        ]
+
+    def is_key_limit_active(self, key_info, model_id):
+        return bool(key_info.get("limited"))
+
+    def _get_status_for_model(self, key_info, model_id):
+        return {"exhausted_level": 2 if key_info.get("limited") else 0}
+
+    def get_key_reset_time_str(self, key_info, model_id):
+        return "Сброс позже"
+
+
 class _CountingButton(QtWidgets.QPushButton):
     def __init__(self, text=""):
         super().__init__(text)
@@ -149,6 +170,23 @@ class KeyManagementWidgetProviderModeTests(unittest.TestCase):
         self.assertEqual(widget.active_keys_list.count(), 1)
         self.assertIn("Локальная сессия", widget.active_keys_list.item(0).text())
         self.assertFalse(widget.available_keys_list.isEnabled())
+
+    def test_key_status_is_rendered_as_provider_card(self):
+        first_provider_id = next(
+            provider_id
+            for provider_id, provider in api_config.api_providers().items()
+            if provider.get("visible", True)
+            and api_config.provider_requires_api_key(provider_id)
+        )
+        widget = KeyManagementWidget(_KeyStatusSettingsStub(first_provider_id))
+        self.addCleanup(widget.close)
+
+        card = widget.findChild(QtWidgets.QFrame, "keyStatusCard")
+        self.assertIsNotNone(card)
+        self.assertEqual(widget.key_total_value_label.text(), "3")
+        self.assertEqual(widget.key_available_value_label.text(), "2")
+        self.assertEqual(widget.key_exhausted_value_label.text(), "1")
+        self.assertFalse(widget.findChildren(QtWidgets.QLabel, "keyStatusDetail"))
 
 
 if __name__ == "__main__":
