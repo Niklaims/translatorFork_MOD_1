@@ -635,6 +635,19 @@ QPushButton#contextToggleButton:checked {
     color: __TEXT_PRIMARY__;
 }
 
+QPushButton#reorderButton {
+    background-color: __INPUT_BG__;
+    color: __TEXT_PRIMARY__;
+    border: 1px solid __BORDER__;
+    border-radius: 4px;
+    font-size: 12px;
+    padding: 0px;
+}
+
+QPushButton#reorderButton:hover {
+    background-color: __HOVER_BG__;
+}
+
 /* Lists and tables */
 QTableWidget,
 QListWidget {

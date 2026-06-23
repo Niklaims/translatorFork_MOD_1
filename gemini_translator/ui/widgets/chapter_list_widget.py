@@ -165,8 +165,6 @@ class ChapterListWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._is_session_active = False
-        self._reorder_up_icon = None
-        self._reorder_down_icon = None
         self._init_ui()
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
@@ -272,12 +270,6 @@ class ChapterListWidget(QWidget):
 
         main_layout.addWidget(self.table, 1)
 
-    def _get_reorder_icons(self):
-        if self._reorder_up_icon is None or self._reorder_down_icon is None:
-            style = self.style()
-            self._reorder_up_icon = style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp)
-            self._reorder_down_icon = style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
-        return self._reorder_up_icon, self._reorder_down_icon
 
     def _create_reorder_cell_widget(self, row):
         """
@@ -289,27 +281,15 @@ class ChapterListWidget(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(4)
 
-        btn_style = """
-        QPushButton {
-            background: transparent;
-            border: none;
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background: rgba(128, 128, 128, 0.2);
-        }
-        """
-
-        up_icon, down_icon = self._get_reorder_icons()
-        btn_up = QPushButton(up_icon, "")
+        btn_up = QPushButton("▲")
+        btn_up.setObjectName("reorderButton")
         btn_up.setFixedSize(20, 20)
-        btn_up.setStyleSheet(btn_style)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_up.clicked.connect(lambda: self._emit_reorder_from_button('up', self.sender()))
 
-        btn_down = QPushButton(down_icon, "")
+        btn_down = QPushButton("▼")
+        btn_down.setObjectName("reorderButton")
         btn_down.setFixedSize(20, 20)
-        btn_down.setStyleSheet(btn_style)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_down.clicked.connect(lambda: self._emit_reorder_from_button('down', self.sender()))
 
@@ -937,9 +917,16 @@ class ChapterListWidget(QWidget):
         new_tooltip = f"Статус: {display_text}{error_tooltip}"
 
         # 3. Diff gate — skip if text+colour+tooltip all match current.
-        current_color = status_item.foreground().color().name().lower()
-        task_color = item_task.foreground().color().name().lower()
-        target_color = color_hex.lower()
+        def _get_color(item):
+            brush = item.foreground()
+            if brush.style() != QtCore.Qt.BrushStyle.NoBrush and brush.color().isValid():
+                return brush.color().name().lower()
+            return None
+
+        current_color = _get_color(status_item)
+        task_color = _get_color(item_task)
+        target_color = color_hex.lower() if status != 'pending' else None
+        
         if (
             status_item.text() == display_text
             and current_color == target_color
@@ -950,9 +937,14 @@ class ChapterListWidget(QWidget):
 
         status_item.setText(display_text)
         status_item.setToolTip(new_tooltip)
-        brush = QtGui.QBrush(QtGui.QColor(color_hex))
-        item_task.setForeground(brush)
-        status_item.setForeground(brush)
+        
+        if status == 'pending':
+            item_task.setData(QtCore.Qt.ItemDataRole.ForegroundRole, None)
+            status_item.setData(QtCore.Qt.ItemDataRole.ForegroundRole, None)
+        else:
+            brush = QtGui.QBrush(QtGui.QColor(color_hex))
+            item_task.setForeground(brush)
+            status_item.setForeground(brush)
 
     def set_retry_button_visible(self, visible):
         """Управляет видимостью кнопки 'Выбрать ошибочные'."""
