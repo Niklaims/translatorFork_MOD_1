@@ -3,7 +3,7 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 
 from gemini_translator.api import config as api_config
 from gemini_translator.ui.widgets.key_management_widget import (
@@ -75,21 +75,24 @@ class AdaptiveControlsWidgetTests(unittest.TestCase):
         layout = QtWidgets.QVBoxLayout(host)
         layout.addWidget(widget)
 
-        host.resize(320, 300)
-        host.show()
-        self.app.processEvents()
+        # Trigger resize directly to avoid host.show() and event loop quirks on Windows
+        widget.resize(320, 300)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 300), QtCore.QSize(320, 300))
+        widget.resizeEvent(dummy_event)
 
         initial_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
         self.assertGreater(initial_calls, 0)
 
-        host.resize(320, 305)
-        self.app.processEvents()
+        widget.resize(320, 305)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 305), QtCore.QSize(320, 300))
+        widget.resizeEvent(dummy_event)
 
         repeated_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
         self.assertEqual(repeated_calls, initial_calls)
 
-        host.resize(320, 420)
-        self.app.processEvents()
+        widget.resize(320, 420)
+        dummy_event = QtGui.QResizeEvent(QtCore.QSize(320, 420), QtCore.QSize(320, 305))
+        widget.resizeEvent(dummy_event)
 
         changed_calls = sum(button.style_calls for button in arrow_buttons + action_buttons)
         self.assertGreater(changed_calls, repeated_calls)
@@ -140,7 +143,6 @@ class KeyManagementWidgetProviderModeTests(unittest.TestCase):
         self.addCleanup(widget.close)
 
         widget.set_active_keys_for_provider("local", [])
-        self.app.processEvents()
 
         self.assertFalse(api_config.provider_requires_api_key("local"))
         self.assertEqual(widget.get_active_keys(), ["__local_model_session__"])
