@@ -120,7 +120,7 @@ cls
 echo --- Установка / обновление зависимостей программы ---
 echo.
 echo [+] Запуск установки из файла 'requirements.txt'...
-"%PYTHON_CMD%" -m pip install --upgrade -r "requirements.txt"
+"%PYTHON_CMD%" -m pip install --upgrade --no-cache-dir -r "requirements.txt"
 if %ERRORLEVEL% NEQ 0 (
     echo [!!!] Ошибка при установке. Проверьте подключение к интернету.
 ) else (
@@ -327,7 +327,7 @@ cls
 echo --- Полный цикл сборки (%~1 версия) ---
 echo.
 echo [+] Этап 1 из 3: Установка/обновление всех зависимостей и инструментов...
-"%PYTHON_CMD%" -m pip install --upgrade -r "requirements.txt" pyinstaller pyinstaller-hooks-contrib
+"%PYTHON_CMD%" -m pip install --upgrade --no-cache-dir -r "requirements.txt" pyinstaller pyinstaller-hooks-contrib
 if %ERRORLEVEL% NEQ 0 (
     echo [!!!] Ошибка при установке зависимостей. Проверьте подключение к интернету.
     pause

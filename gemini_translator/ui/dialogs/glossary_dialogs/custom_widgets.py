@@ -41,7 +41,6 @@ class ExpandingTextEdit(QtWidgets.QTextEdit):
         # И сообщаем об этом, чтобы таблица тоже обновилась
         self.geometryChangeRequested.emit()
 
-
 class ExpandingTextEditDelegate(QtWidgets.QStyledItemDelegate):
     """
     Финальная версия делегата v4.0 ("Синхронизатор").

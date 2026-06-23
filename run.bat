@@ -13,7 +13,7 @@ if not exist "%VENV_PYTHON%" (
     if %ERRORLEVEL% NEQ 0 exit /b 1
 
     echo [+] Upgrading pip...
-    "%VENV_PYTHON%" -m pip install --upgrade pip
+    "%VENV_PYTHON%" -m pip install --upgrade --no-cache-dir pip
     if %ERRORLEVEL% NEQ 0 exit /b 1
 )
 
@@ -38,7 +38,7 @@ if exist "%REQ_STAMP%" set /p CURRENT_HASH=<"%REQ_STAMP%"
 if /I "%CURRENT_HASH%"=="%REQ_HASH%" exit /b 0
 
 echo [+] Syncing project dependencies...
-"%VENV_PYTHON%" -m pip install --upgrade -r "%REQ_FILE%"
+"%VENV_PYTHON%" -m pip install --upgrade --no-cache-dir -r "%REQ_FILE%"
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
 >"%REQ_STAMP%" echo %REQ_HASH%
