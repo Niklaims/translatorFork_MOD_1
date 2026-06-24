@@ -158,19 +158,19 @@ call :build_app_base "ПОЛНОСТЬЮ ПОРТАТИВНАЯ"
 --add-data "gemini_translator\scripts\chatgpt_workascii_bridge.cjs;gemini_translator\scripts" ^
 --add-data "gemini_translator\scripts\chatgpt_profile_launcher.cjs;gemini_translator\scripts" ^
 --add-data "qidian_rulate\tags.txt;qidian_rulate" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\__init__.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\api_upload.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\constants.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dependencies.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dialogs.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main_window.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\models.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\parsers.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib-upload.mjs;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib_uploader_v12.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\utils.py;ranobelib" ^
---add-data "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\workers.py;ranobelib"
+--add-data "ranobelib\__init__.py;ranobelib" ^
+--add-data "ranobelib\api_upload.py;ranobelib" ^
+--add-data "ranobelib\constants.py;ranobelib" ^
+--add-data "ranobelib\dependencies.py;ranobelib" ^
+--add-data "ranobelib\dialogs.py;ranobelib" ^
+--add-data "ranobelib\main.py;ranobelib" ^
+--add-data "ranobelib\main_window.py;ranobelib" ^
+--add-data "ranobelib\models.py;ranobelib" ^
+--add-data "ranobelib\parsers.py;ranobelib" ^
+--add-data "ranobelib\ranobelib-upload.mjs;ranobelib" ^
+--add-data "ranobelib\ranobelib_uploader_v12.py;ranobelib" ^
+--add-data "ranobelib\utils.py;ranobelib" ^
+--add-data "ranobelib\workers.py;ranobelib"
 call :build_app_end
 goto :eof
 
@@ -209,31 +209,31 @@ if %ERRORLEVEL% EQU 0 (
     if not exist "dist\qidian_rulate" mkdir "dist\qidian_rulate"
     copy /Y "qidian_rulate\tags.txt" "dist\qidian_rulate\tags.txt" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\__init__.py" "dist\ranobelib\__init__.py" > nul
+    copy /Y "ranobelib\__init__.py" "dist\ranobelib\__init__.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\api_upload.py" "dist\ranobelib\api_upload.py" > nul
+    copy /Y "ranobelib\api_upload.py" "dist\ranobelib\api_upload.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\constants.py" "dist\ranobelib\constants.py" > nul
+    copy /Y "ranobelib\constants.py" "dist\ranobelib\constants.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dependencies.py" "dist\ranobelib\dependencies.py" > nul
+    copy /Y "ranobelib\dependencies.py" "dist\ranobelib\dependencies.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dialogs.py" "dist\ranobelib\dialogs.py" > nul
+    copy /Y "ranobelib\dialogs.py" "dist\ranobelib\dialogs.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main.py" "dist\ranobelib\main.py" > nul
+    copy /Y "ranobelib\main.py" "dist\ranobelib\main.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main_window.py" "dist\ranobelib\main_window.py" > nul
+    copy /Y "ranobelib\main_window.py" "dist\ranobelib\main_window.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\models.py" "dist\ranobelib\models.py" > nul
+    copy /Y "ranobelib\models.py" "dist\ranobelib\models.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\parsers.py" "dist\ranobelib\parsers.py" > nul
+    copy /Y "ranobelib\parsers.py" "dist\ranobelib\parsers.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib-upload.mjs" "dist\ranobelib\ranobelib-upload.mjs" > nul
+    copy /Y "ranobelib\ranobelib-upload.mjs" "dist\ranobelib\ranobelib-upload.mjs" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib_uploader_v12.py" "dist\ranobelib\ranobelib_uploader_v12.py" > nul
+    copy /Y "ranobelib\ranobelib_uploader_v12.py" "dist\ranobelib\ranobelib_uploader_v12.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\utils.py" "dist\ranobelib\utils.py" > nul
+    copy /Y "ranobelib\utils.py" "dist\ranobelib\utils.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\workers.py" "dist\ranobelib\workers.py" > nul
+    copy /Y "ranobelib\workers.py" "dist\ranobelib\workers.py" > nul
     echo [OK] Данные скопированы.
 )
 call :build_app_end
@@ -273,31 +273,31 @@ if %ERRORLEVEL% EQU 0 (
     if not exist "dist\%AppName%\qidian_rulate" mkdir "dist\%AppName%\qidian_rulate"
     copy /Y "qidian_rulate\tags.txt" "dist\%AppName%\qidian_rulate\tags.txt" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\__init__.py" "dist\%AppName%\ranobelib\__init__.py" > nul
+    copy /Y "ranobelib\__init__.py" "dist\%AppName%\ranobelib\__init__.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\api_upload.py" "dist\%AppName%\ranobelib\api_upload.py" > nul
+    copy /Y "ranobelib\api_upload.py" "dist\%AppName%\ranobelib\api_upload.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\constants.py" "dist\%AppName%\ranobelib\constants.py" > nul
+    copy /Y "ranobelib\constants.py" "dist\%AppName%\ranobelib\constants.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dependencies.py" "dist\%AppName%\ranobelib\dependencies.py" > nul
+    copy /Y "ranobelib\dependencies.py" "dist\%AppName%\ranobelib\dependencies.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\dialogs.py" "dist\%AppName%\ranobelib\dialogs.py" > nul
+    copy /Y "ranobelib\dialogs.py" "dist\%AppName%\ranobelib\dialogs.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main.py" "dist\%AppName%\ranobelib\main.py" > nul
+    copy /Y "ranobelib\main.py" "dist\%AppName%\ranobelib\main.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\main_window.py" "dist\%AppName%\ranobelib\main_window.py" > nul
+    copy /Y "ranobelib\main_window.py" "dist\%AppName%\ranobelib\main_window.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\models.py" "dist\%AppName%\ranobelib\models.py" > nul
+    copy /Y "ranobelib\models.py" "dist\%AppName%\ranobelib\models.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\parsers.py" "dist\%AppName%\ranobelib\parsers.py" > nul
+    copy /Y "ranobelib\parsers.py" "dist\%AppName%\ranobelib\parsers.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib-upload.mjs" "dist\%AppName%\ranobelib\ranobelib-upload.mjs" > nul
+    copy /Y "ranobelib\ranobelib-upload.mjs" "dist\%AppName%\ranobelib\ranobelib-upload.mjs" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\ranobelib_uploader_v12.py" "dist\%AppName%\ranobelib\ranobelib_uploader_v12.py" > nul
+    copy /Y "ranobelib\ranobelib_uploader_v12.py" "dist\%AppName%\ranobelib\ranobelib_uploader_v12.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\utils.py" "dist\%AppName%\ranobelib\utils.py" > nul
+    copy /Y "ranobelib\utils.py" "dist\%AppName%\ranobelib\utils.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
-    copy /Y "C:\Users\Admin\Desktop\Новая папка (4)\translatorFork_MOD\ranobelib\workers.py" "dist\%AppName%\ranobelib\workers.py" > nul
+    copy /Y "ranobelib\workers.py" "dist\%AppName%\ranobelib\workers.py" > nul
     echo [OK] Данные скопированы.
 )
 call :build_app_end

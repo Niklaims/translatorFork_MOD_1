@@ -338,9 +338,20 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
             print(f"     [WARN] Элемент не найден и будет пропущен: {path}")
             continue
 
+        is_directory = path.is_dir()
+        file_name = path.name
+
+        try:
+            path = path.relative_to(PROJECT_ROOT)
+        except ValueError:
+            localappdata = os.environ.get("LOCALAPPDATA")
+            if localappdata and str(path).startswith(localappdata):
+                path_str = str(path).replace(localappdata, "%LOCALAPPDATA%")
+                path = Path(path_str)
+
         destination_str = str(destination) if str(destination) else '.'
         display_source = str(path)
-        if path.is_dir():
+        if is_directory:
             print(f"     - Папка: {display_source} -> {destination_str}")
         else:
             print(f"     - Файл:  {display_source} -> {destination_str}")
@@ -350,18 +361,18 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
         src_win = str(path).replace('/', '\\')
         dest_win = destination_str.replace('/', '\\')
 
-        if path.is_dir():
+        if is_directory:
             copy_commands_hybrid.append(f'    xcopy "{src_win}" "dist\\{dest_win}\\" /E /I /Y /Q > nul')
             copy_commands_advanced.append(f'    xcopy "{src_win}" "dist\\%AppName%\\{dest_win}\\" /E /I /Y /Q > nul')
         else:
             if dest_win not in ("", "."):
                 copy_commands_hybrid.append(f'    if not exist "dist\\{dest_win}" mkdir "dist\\{dest_win}"')
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{dest_win}\\{path.name}" > nul')
+                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{dest_win}\\{file_name}" > nul')
                 copy_commands_advanced.append(f'    if not exist "dist\\%AppName%\\{dest_win}" mkdir "dist\\%AppName%\\{dest_win}"')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{dest_win}\\{path.name}" > nul')
+                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{dest_win}\\{file_name}" > nul')
             else:
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{path.name}" > nul')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{path.name}" > nul')
+                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{file_name}" > nul')
+                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{file_name}" > nul')
 
     # Команда для ПОЛНОСТЬЮ ПОРТАТИВНОЙ сборки (включает --add-data)
     full_portable_args = list(base_pyinstaller_args) + ["--onefile"] + add_data_args
