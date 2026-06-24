@@ -47,6 +47,7 @@ jobs:
       - name: Package macOS
         if: matrix.os == 'macos-latest'
         run: |
+          codesign --force --deep --sign - "dist/GeminiTranslator.app"
           npm install -g create-dmg
           create-dmg dist/GeminiTranslator.app || true
           mv *.dmg GeminiTranslator-macOS.dmg || true
