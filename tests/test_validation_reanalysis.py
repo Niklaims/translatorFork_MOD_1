@@ -33,6 +33,37 @@ class _SpinStub:
         return self._value
 
 
+class _ProblemCellItem:
+    def __init__(self):
+        self.text = None
+
+    def setText(self, text):
+        self.text = text
+
+
+class _ProblemCellTableStub:
+    def __init__(self):
+        self.items = {(0, 1): _ProblemCellItem()}
+        self.widgets = {(0, 1): object()}
+        self.removed_widgets = []
+
+    def removeCellWidget(self, row, column):
+        self.removed_widgets.append((row, column))
+        self.widgets.pop((row, column), None)
+
+    def cellWidget(self, row, column):
+        return self.widgets.get((row, column))
+
+    def item(self, row, column):
+        return self.items.get((row, column))
+
+    def setItem(self, row, column, item):
+        self.items[(row, column)] = item
+
+    def setCellWidget(self, row, column, widget):
+        self.widgets[(row, column)] = widget
+
+
 class _ValidationHarness:
     _read_text_file = TranslationValidatorDialog._read_text_file
     _invalidate_analysis_for_data = TranslationValidatorDialog._invalidate_analysis_for_data
@@ -44,6 +75,7 @@ class _ValidationHarness:
     _compute_analysis_targets = TranslationValidatorDialog._compute_analysis_targets
     _calculate_status_for_data = TranslationValidatorDialog._calculate_status_for_data
     _update_previous_problem_path_for_data = TranslationValidatorDialog._update_previous_problem_path_for_data
+    _set_problem_cell = TranslationValidatorDialog._set_problem_cell
 
     def __init__(self):
         self.validation_snapshot_entries = {}
@@ -65,6 +97,9 @@ class _ValidationHarness:
 
     def _get_current_ratio_bounds(self):
         return 0.70, 1.80
+
+    def show_structure_details(self, errors_dict):
+        return None
 
 
 class _ProjectManagerStub:
@@ -229,6 +264,35 @@ class ValidationReanalysisTests(unittest.TestCase):
         self.assertNotIn("untranslated_words", data)
         self.assertNotIn("ratio_value", data)
         self.assertNotIn("Text/chapter.xhtml", harness.previous_problem_paths)
+
+    def test_problem_cell_hides_structural_details_when_structure_check_is_off(self):
+        harness = _ValidationHarness()
+        harness.check_structure = _CheckStub(False)
+        harness.table_results = _ProblemCellTableStub()
+
+        harness._set_problem_cell(
+            0,
+            {"structural_errors": {"headings": {"h1": (1, 0)}}},
+            [],
+        )
+
+        self.assertIsNone(harness.table_results.cellWidget(0, 1))
+        self.assertEqual(harness.table_results.items[(0, 1)].text, "")
+        self.assertEqual(harness.table_results.removed_widgets, [(0, 1)])
+
+    def test_problem_cell_keeps_non_structural_reasons_when_structure_check_is_off(self):
+        harness = _ValidationHarness()
+        harness.check_structure = _CheckStub(False)
+        harness.table_results = _ProblemCellTableStub()
+
+        harness._set_problem_cell(
+            0,
+            {"structural_errors": {"headings": {"h1": (1, 0)}}},
+            ["Недоперевод"],
+        )
+
+        self.assertIsNone(harness.table_results.cellWidget(0, 1))
+        self.assertEqual(harness.table_results.items[(0, 1)].text, "Недоперевод")
 
     def test_previous_problem_paths_follow_fresh_analysis_result(self):
         harness = _ValidationHarness()

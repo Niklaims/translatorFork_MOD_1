@@ -2419,13 +2419,8 @@ class TranslationValidatorPage(ShellPage):
             self.table_results.setItem(row_pos, 0, display_path_item)
             
             # Колонка 1, 2, 3
-            if data_placeholder.get('structural_errors'):
-                details_button = QPushButton("См. детали…")
-                errors = data_placeholder['structural_errors']
-                details_button.clicked.connect(lambda checked=False, e=errors: self.show_structure_details(e))
-                self.table_results.setCellWidget(row_pos, 1, details_button)
-            else:
-                self.table_results.setItem(row_pos, 1, QTableWidgetItem(""))
+            current_reasons, _ = self._calculate_status_for_data(data_placeholder)
+            self._set_problem_cell(row_pos, data_placeholder, current_reasons)
             len_text = (
                 f"{data_placeholder.get('len_orig', 0)} | {data_placeholder.get('len_trans', 0)}"
                 if data_placeholder.get('has_cached_analysis')
@@ -2916,6 +2911,9 @@ class TranslationValidatorPage(ShellPage):
             return selected_rows, True
 
         target_rows = []
+        if not self.check_structure.isChecked():
+            return target_rows, False
+
         for row in range(self.table_results.rowCount()):
             if self.table_results.isRowHidden(row):
                 continue
@@ -3462,6 +3460,33 @@ class TranslationValidatorPage(ShellPage):
             visual_status = 'problem' if has_problems else 'neutral'
             
         return current_reasons, visual_status
+
+    def _set_problem_cell(self, row, data, current_reasons=None):
+        """Обновляет колонку проблем с учетом включенных проверок."""
+        current_reasons = current_reasons or []
+        show_structural_details = (
+            self.check_structure.isChecked()
+            and bool(data.get('structural_errors'))
+        )
+
+        self.table_results.removeCellWidget(row, 1)
+
+        if show_structural_details:
+            details_button = QPushButton("См. детали…")
+            errors = data['structural_errors']
+            details_button.clicked.connect(lambda checked=False, e=errors: self.show_structure_details(e))
+            self.table_results.setCellWidget(row, 1, details_button)
+
+            item_1 = self.table_results.item(row, 1)
+            if item_1:
+                item_1.setText("")
+            return
+
+        item_1 = self.table_results.item(row, 1)
+        if not item_1:
+            item_1 = QTableWidgetItem("")
+            self.table_results.setItem(row, 1, item_1)
+        item_1.setText(", ".join(current_reasons))
         
     def _sync_data_with_visual_order(self):
         """
@@ -3538,13 +3563,8 @@ class TranslationValidatorPage(ShellPage):
 
             # 3. Обновляем UI (С ЗАЩИТОЙ ОТ NoneType)
             
-            # Колонка 1: Причины / Ошибки. Если там кнопка (widget), текст не трогаем.
-            if not self.table_results.cellWidget(row, 1):
-                item_1 = self.table_results.item(row, 1)
-                if not item_1: # Если ячейка не создана, создаем её
-                    item_1 = QTableWidgetItem("")
-                    self.table_results.setItem(row, 1, item_1)
-                item_1.setText(", ".join(current_reasons))
+            # Колонка 1: Причины / Ошибки.
+            self._set_problem_cell(row, data, current_reasons)
 
             # Колонка 3: Статус. Должна быть всегда текстовой.
             item_3 = self.table_results.item(row, 3)
@@ -3830,13 +3850,8 @@ class TranslationValidatorPage(ShellPage):
             display_path_item.setData(Qt.ItemDataRole.UserRole, is_validated_present)
             self.table_results.setItem(row_pos, 0, display_path_item)
 
-            if data.get('structural_errors'):
-                details_button = QPushButton("См. детали…")
-                errors = data['structural_errors']
-                details_button.clicked.connect(lambda checked=False, e=errors: self.show_structure_details(e))
-                self.table_results.setCellWidget(row_pos, 1, details_button)
-            else:
-                self.table_results.setItem(row_pos, 1, QTableWidgetItem(""))
+            current_reasons, _ = self._calculate_status_for_data(data)
+            self._set_problem_cell(row_pos, data, current_reasons)
 
             len_text = (
                 f"{data.get('len_orig', 0)} | {data.get('len_trans', 0)}"
@@ -4341,36 +4356,24 @@ class TranslationValidatorPage(ShellPage):
             self.untranslated_found_count += 1
             
         # --- UI Обновление ТОЛЬКО ОДНОЙ строки ---
-        
-        # 1. Кнопка деталей
-        if 'structural_errors' in result:
-            details_button = QPushButton("См. детали…")
-            errors = result['structural_errors']
-            details_button.clicked.connect(lambda checked=False, e=errors: self.show_structure_details(e))
-            self.table_results.setCellWidget(row_pos, 1, details_button)
-        else:
-            self.table_results.removeCellWidget(row_pos, 1)
-            self.table_results.setItem(row_pos, 1, QTableWidgetItem(""))
 
-        # 2. Длина
+        # 1. Длина
         self.table_results.item(row_pos, 2).setText(f"{result['len_orig']} | {result['len_trans']}")
         
-        # 3. Расчет статуса (Локально!)
+        # 2. Расчет статуса (Локально!)
         current_reasons, visual_status = self._calculate_status_for_data(result)
         
         if result.get('status') not in ['ok', 'delete', 'retry', 'edited']:
             result['status'] = visual_status
 
         self._update_previous_problem_path_for_data(result)
-            
-        # 4. Применение текста и цвета
+
+        # 3. Причины / кнопка деталей
+        self._set_problem_cell(row_pos, result, current_reasons)
+
+        # 4. Применение статуса и цвета
         status_map = {'problem': "Проблема", 'neutral': "Проблем нет", 'ok': "Готов", 'delete': "На удаление", 'retry': "К переотправке", 'edited': "Редакт."}
-        
-        reason_item = self.table_results.item(row_pos, 1)
-        # Если там кнопка, текст не ставим, иначе ставим причины
-        if not self.table_results.cellWidget(row_pos, 1):
-             reason_item.setText(", ".join(current_reasons))
-             
+
         self.table_results.item(row_pos, 3).setText(status_map.get(visual_status, visual_status))
         self.update_row_color(row_pos, visual_status)
         
