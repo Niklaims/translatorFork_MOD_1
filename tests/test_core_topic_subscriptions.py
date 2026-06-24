@@ -11,6 +11,7 @@ from gemini_translator.core.translation_engine import TranslationEngine
 class _TopicOnlyBus:
     def __init__(self):
         self.subscriptions = {}
+        self.events = []
 
     def subscribe(self, event_name, callback):
         self.subscriptions.setdefault(event_name, []).append(callback)
@@ -19,6 +20,9 @@ class _TopicOnlyBus:
         callbacks = self.subscriptions.get(event_name, [])
         if callback in callbacks:
             callbacks.remove(callback)
+
+    def emit_event(self, event):
+        self.events.append(event)
 
 
 class _DummyContext:
@@ -39,6 +43,19 @@ class _FakeChunkAssembler:
 
     def cleanup(self):
         self.cleaned_up = True
+
+
+class _FakePowerInhibitor:
+    def __init__(self):
+        self.prevent_calls = 0
+        self.allow_calls = 0
+
+    def prevent_sleep(self):
+        self.prevent_calls += 1
+        return True
+
+    def allow_sleep(self):
+        self.allow_calls += 1
 
 
 class CoreTopicSubscriptionTests(unittest.TestCase):
@@ -80,3 +97,38 @@ class CoreTopicSubscriptionTests(unittest.TestCase):
 
         self.assertTrue(assembler.cleaned_up)
         self.assertIsNone(engine.chunk_assembler)
+
+    def test_translation_engine_controls_power_inhibitor_for_opted_in_session(self):
+        engine = TranslationEngine(
+            context_manager=_DummyContext(),
+            settings_manager=_DummySettings(),
+            task_manager=_DummyTaskManager(),
+            event_bus=_TopicOnlyBus(),
+        )
+        self.addCleanup(engine.cleanup)
+        inhibitor = _FakePowerInhibitor()
+        engine.power_inhibitor = inhibitor
+        engine.session_settings = {"prevent_sleep_during_translation": True}
+        engine.session_id = "session-1"
+
+        engine._activate_power_inhibitor_for_session()
+        engine._end_session_event("Сессия успешно завершена")
+
+        self.assertEqual(inhibitor.prevent_calls, 1)
+        self.assertEqual(inhibitor.allow_calls, 1)
+
+    def test_translation_engine_leaves_power_inhibitor_idle_when_setting_is_disabled(self):
+        engine = TranslationEngine(
+            context_manager=_DummyContext(),
+            settings_manager=_DummySettings(),
+            task_manager=_DummyTaskManager(),
+            event_bus=_TopicOnlyBus(),
+        )
+        self.addCleanup(engine.cleanup)
+        inhibitor = _FakePowerInhibitor()
+        engine.power_inhibitor = inhibitor
+        engine.session_settings = {"prevent_sleep_during_translation": False}
+
+        engine._activate_power_inhibitor_for_session()
+
+        self.assertEqual(inhibitor.prevent_calls, 0)

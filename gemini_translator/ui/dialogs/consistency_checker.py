@@ -91,6 +91,12 @@ from ...core.consistency_engine import (
     FAST_PROOFREAD_MODE,
     ConsistencyEngine,
 )
+from ...utils.power_inhibitor import (
+    PREVENT_SLEEP_SETTING_KEY,
+    PowerInhibitor,
+    load_prevent_sleep_setting,
+    save_prevent_sleep_setting,
+)
 from ...api import config as api_config
 from ..widgets.key_management_widget import KeyManagementWidget
 from ..widgets.model_settings_widget import ModelSettingsWidget
@@ -308,6 +314,7 @@ class ConsistencyValidatorPage(ShellPage):
         self.chapters = chapters
         self.selected_chapter_ids = set()
         self.settings_manager = settings_manager
+        self.power_inhibitor = PowerInhibitor()
         self.project_manager = project_manager
         self.engine = ConsistencyEngine(settings_manager)
         self.analysis_thread = None
@@ -658,6 +665,15 @@ class ConsistencyValidatorPage(ShellPage):
         chunk_layout.addWidget(self.chunk_size_spin)
         chunk_layout.addStretch()
         extra_layout.addLayout(chunk_layout)
+
+        self.prevent_sleep_checkbox = QCheckBox("Не блокировать и не усыплять компьютер во время AI-сессии")
+        self.prevent_sleep_checkbox.setToolTip(
+            "Использует ту же настройку, что и вкладка настроек EPUB-переводчика.\n"
+            "Экран может гаснуть, но система не должна уходить в сон во время проверки."
+        )
+        self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
+        self.prevent_sleep_checkbox.toggled.connect(self._save_shared_sleep_prevention_setting)
+        extra_layout.addWidget(self.prevent_sleep_checkbox)
         
         # Инфо о чанке (Токены)
         self.chunk_info_label = QLabel("~0 токенов")
@@ -1139,9 +1155,29 @@ class ConsistencyValidatorPage(ShellPage):
             'provider': provider_id,
             'chunk_size': self.chunk_size_spin.value(),
             'consistency_mode': ConsistencyValidatorDialog._current_consistency_mode(self),
+            PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
         })
         
         return config
+
+    def _restore_shared_sleep_prevention_setting(self):
+        if hasattr(self, 'prevent_sleep_checkbox'):
+            self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
+
+    def _save_shared_sleep_prevention_setting(self, enabled: bool):
+        save_prevent_sleep_setting(self.settings_manager, enabled)
+
+    def _activate_power_inhibitor_for_config(self, config: dict):
+        if not config.get(PREVENT_SLEEP_SETTING_KEY):
+            return
+        if self.power_inhibitor.prevent_sleep():
+            self._log("[POWER] Сон системы заблокирован на время AI-проверки.")
+        elif self.power_inhibitor.last_error:
+            self._log(f"[POWER-WARN] Не удалось включить защиту от сна: {self.power_inhibitor.last_error}")
+
+    def _release_power_inhibitor(self):
+        if getattr(self, 'power_inhibitor', None):
+            self.power_inhibitor.allow_sleep()
 
     def _get_active_keys(self) -> list:
         """Возвращает список активных ключей для сессии."""
@@ -1265,6 +1301,7 @@ class ConsistencyValidatorPage(ShellPage):
         if mode == FAST_PROOFREAD_MODE:
             self._log("  Режим: быстрый 3.1 (род, опечатки, мета-комментарии)")
 
+        self._activate_power_inhibitor_for_config(config)
         self.analysis_thread = AnalysisWorker(
             self.engine, selected_chapters, config, active_keys, mode)
         self.analysis_thread.error.connect(self.on_error)
@@ -1661,6 +1698,7 @@ class ConsistencyValidatorPage(ShellPage):
 
     @pyqtSlot(list)
     def on_analysis_finished(self, all_problems):
+        self._release_power_inhibitor()
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.select_chapters_btn.setEnabled(True)
@@ -1686,6 +1724,7 @@ class ConsistencyValidatorPage(ShellPage):
             self._is_thread_running('single_fix_thread') or
             self._single_fix_in_progress
         ):
+            self._release_power_inhibitor()
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.select_chapters_btn.setEnabled(True)
@@ -1697,6 +1736,7 @@ class ConsistencyValidatorPage(ShellPage):
         restore_batch_map = getattr(self, '_restore_batch_fix_problem_map', None)
         if callable(restore_batch_map):
             restore_batch_map()
+        self._release_power_inhibitor()
         self._log(f"❌ Ошибка: {error_msg}")
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -2654,6 +2694,7 @@ class ConsistencyValidatorPage(ShellPage):
         self._wait_for_thread('analysis_thread', 1000)
         self._wait_for_thread('fix_thread', 1000)
         self._wait_for_thread('single_fix_thread', 1000)
+        self._release_power_inhibitor()
 
 
 class _ConsistencyValidatorDialogMeta(type(QDialog)):

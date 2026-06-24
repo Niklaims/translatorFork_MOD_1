@@ -69,9 +69,13 @@ class _PromptWidgetStub:
 class _KeyManagementWidgetStub:
     def __init__(self, provider_id="gemini"):
         self._provider_id = provider_id
+        self.current_active_keys_by_provider = {provider_id: {"key-1"}}
 
     def get_selected_provider(self):
         return self._provider_id
+
+    def get_active_keys(self):
+        return ["key-1"]
 
 
 class _SpinBoxStub:
@@ -82,8 +86,18 @@ class _SpinBoxStub:
         return self._value
 
 
+class _CheckBoxStub:
+    def __init__(self, checked=False):
+        self._checked = checked
+
+    def isChecked(self):
+        return self._checked
+
+
 class _SetupSettingsHarness:
     _get_ui_state_for_saving = InitialSetupDialog._get_ui_state_for_saving
+    get_settings = InitialSetupDialog.get_settings
+    _get_full_ui_settings = InitialSetupDialog._get_full_ui_settings
     _collect_global_ui_settings_for_restore = InitialSetupDialog._collect_global_ui_settings_for_restore
     _restore_global_ui_settings = InitialSetupDialog._restore_global_ui_settings
     _save_global_ui_settings = InitialSetupDialog._save_global_ui_settings
@@ -120,7 +134,10 @@ class _SetupSettingsHarness:
         self.key_management_widget = _KeyManagementWidgetStub("workascii_chatgpt")
         self.instances_spin = _SpinBoxStub(3)
         self.glossary_widget = _DictWidgetStub([])
+        self.prevent_sleep_checkbox = _CheckBoxStub(True)
+        self.selected_file = None
         self.output_folder = None
+        self.html_files = []
         self.local_set = False
         self.initial_glossary_state = []
         self._returning_to_main_menu = False
@@ -141,25 +158,6 @@ class _SetupSettingsHarness:
         }
         self._window_title = "Настройка сессии*"
         self.applied_settings = None
-
-    def _get_full_ui_settings(self):
-        return {
-            "model": "Gemini 3.0 Flash Preview",
-            "use_warmup": True,
-            "provider": "workascii_chatgpt",
-            "num_instances": 3,
-            "use_batching": True,
-            "chunking": False,
-            "chunk_on_error": True,
-            "task_size_limit": 15000,
-            "auto_translation": {
-                "enabled": True,
-                "filter_redirect_enabled": True,
-                "filter_redirect_provider": "deepseek",
-                "filter_redirect_model": "deepseek-chat NonThink",
-            },
-            "ui_theme_colors": dict(self._ui_theme_colors),
-        }
 
     def _apply_full_ui_settings(self, settings):
         self.applied_settings = dict(settings)
@@ -186,6 +184,7 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(state["provider"], "workascii_chatgpt")
         self.assertEqual(state["num_instances"], 3)
         self.assertEqual(state["ui_theme_colors"]["accent"], "#ff8800")
+        self.assertTrue(state["prevent_sleep_during_translation"])
 
     def test_collect_global_ui_settings_merges_legacy_and_full_session(self):
         settings_manager = _SettingsManagerStub(
@@ -240,6 +239,7 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(settings_manager.saved_full_session["task_size_limit"], 15000)
         self.assertEqual(settings_manager.saved_full_session["provider"], "workascii_chatgpt")
         self.assertEqual(settings_manager.saved_full_session["ui_theme_colors"]["accent"], "#ff8800")
+        self.assertTrue(settings_manager.saved_full_session["prevent_sleep_during_translation"])
         self.assertTrue(settings_manager.saved_full_session["auto_translation"]["filter_redirect_enabled"])
         self.assertEqual(
             settings_manager.saved_full_session["auto_translation"]["filter_redirect_provider"],

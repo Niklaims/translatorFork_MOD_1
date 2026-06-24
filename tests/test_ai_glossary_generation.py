@@ -113,6 +113,9 @@ class _ModelSettingsWidgetStub:
     def set_settings(self, settings):
         self.received_settings = dict(settings)
 
+    def get_settings(self):
+        return {"model": "saved-model"}
+
 
 class _TranslationOptionsWidgetStub:
     def __init__(self):
@@ -121,6 +124,9 @@ class _TranslationOptionsWidgetStub:
     def set_settings(self, settings):
         self.received_settings = dict(settings)
 
+    def get_settings(self):
+        return {"use_batching": True}
+
 
 class _PromptWidgetStub:
     def __init__(self):
@@ -128,6 +134,9 @@ class _PromptWidgetStub:
 
     def set_prompt(self, prompt):
         self.prompt = prompt
+
+    def get_prompt(self):
+        return self.prompt or "prompt"
 
 
 class _CheckboxStub:
@@ -141,16 +150,31 @@ class _CheckboxStub:
         return self.checked
 
 
+class _GlossaryWidgetStub:
+    def get_glossary(self):
+        return []
+
+
 class _SettingsManagerStub:
     def __init__(self, saved=None):
         self.saved = dict(saved or {})
+        self.full_session = {}
         self.persisted = None
+        self.saved_full_session = None
 
     def get_last_glossary_generation_settings(self):
         return dict(self.saved)
 
     def save_last_glossary_generation_settings(self, settings):
         self.persisted = dict(settings)
+        return True
+
+    def load_full_session_settings(self):
+        return dict(self.full_session)
+
+    def save_full_session_settings(self, settings):
+        self.saved_full_session = dict(settings)
+        self.full_session = dict(settings)
         return True
 
 
@@ -163,10 +187,13 @@ class _GenerationSettingsHarness:
     _new_terms_limit_user_defined_from_settings = GenerationSessionDialog._new_terms_limit_user_defined_from_settings
     _merge_initial_ui_settings = GenerationSessionDialog._merge_initial_ui_settings
     _save_persistent_ui_settings = GenerationSessionDialog._save_persistent_ui_settings
+    _save_shared_sleep_prevention_setting = GenerationSessionDialog._save_shared_sleep_prevention_setting
     _get_available_session_capacity = GenerationSessionDialog._get_available_session_capacity
     _update_instances_spinbox_limit = GenerationSessionDialog._update_instances_spinbox_limit
     _update_new_terms_limit_from_current_size = GenerationSessionDialog._update_new_terms_limit_from_current_size
     round_up_to_tens = GenerationSessionDialog.round_up_to_tens
+    _get_common_settings = GenerationSessionDialog._get_common_settings
+    _get_full_ui_settings = GenerationSessionDialog._get_full_ui_settings
 
     def __init__(self):
         self.settings_manager = _SettingsManagerStub()
@@ -186,9 +213,13 @@ class _GenerationSettingsHarness:
         self.pipeline_enabled_checkbox = _CheckboxStub()
         self.sequential_mode_checkbox = _CheckboxStub()
         self.send_notes_checkbox = _CheckboxStub()
+        self.prevent_sleep_checkbox = _CheckboxStub()
         self.ai_mode_update_radio = _CheckboxStub()
         self.ai_mode_supplement_radio = _CheckboxStub()
         self.ai_mode_accumulate_radio = _CheckboxStub()
+        self.glossary_widget = _GlossaryWidgetStub()
+        self.epub_path = "/tmp/book.epub"
+        self.pipeline_steps = []
         self.pipeline_replaced_with = None
         self.dependent_widgets_updated = 0
         self.start_button_updates = 0
@@ -213,17 +244,6 @@ class _GenerationSettingsHarness:
 
     def _update_sequential_mode_widgets(self, is_sequential):
         self.sequential_widget_updates.append(bool(is_sequential))
-
-    def _get_full_ui_settings(self):
-        return {
-            "model": "saved-model",
-            "is_sequential": self.sequential_mode_checkbox.isChecked(),
-            "send_notes_in_sequence": self.send_notes_checkbox.isChecked(),
-            "merge_mode": self.get_merge_mode(),
-            "num_instances": self.instances_spin.value(),
-            "new_terms_limit": self.new_terms_limit_spin.value(),
-            "new_terms_limit_user_defined": self._new_terms_limit_user_defined,
-        }
 
     def get_merge_mode(self):
         if self.ai_mode_accumulate_radio.isChecked():
@@ -446,6 +466,13 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertEqual(harness.new_terms_limit_spin.value(), 123)
         self.assertEqual(harness._pending_new_terms_limit, 123)
 
+    def test_initial_settings_restore_shared_sleep_prevention_setting(self):
+        harness = _GenerationSettingsHarness()
+
+        harness._apply_initial_settings({"prevent_sleep_during_translation": True})
+
+        self.assertTrue(harness.prevent_sleep_checkbox.isChecked())
+
     def test_saved_glossary_generation_settings_override_parent_defaults(self):
         harness = _GenerationSettingsHarness()
         harness.settings_manager = _SettingsManagerStub(
@@ -470,6 +497,30 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertEqual(merged["new_terms_limit"], 77)
         self.assertEqual(merged["provider"], "gemini")
 
+    def test_shared_sleep_prevention_setting_overrides_stale_glossary_setting(self):
+        harness = _GenerationSettingsHarness()
+        harness.settings_manager = _SettingsManagerStub(
+            {"prevent_sleep_during_translation": False}
+        )
+        harness.settings_manager.full_session = {
+            "prevent_sleep_during_translation": True,
+        }
+
+        merged = harness._merge_initial_ui_settings({})
+
+        self.assertTrue(merged["prevent_sleep_during_translation"])
+
+    def test_ai_glossary_saves_sleep_prevention_to_shared_session_settings(self):
+        harness = _GenerationSettingsHarness()
+        harness.settings_manager.full_session = {"model": "kept-model"}
+
+        harness._save_shared_sleep_prevention_setting(True)
+
+        self.assertEqual(harness.settings_manager.saved_full_session["model"], "kept-model")
+        self.assertTrue(
+            harness.settings_manager.saved_full_session["prevent_sleep_during_translation"]
+        )
+
     def test_persistent_settings_save_current_glossary_generation_state(self):
         harness = _GenerationSettingsHarness()
         harness.sequential_mode_checkbox.setChecked(True)
@@ -488,6 +539,14 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertEqual(harness.settings_manager.persisted["num_instances"], 3)
         self.assertEqual(harness.settings_manager.persisted["new_terms_limit"], 88)
         self.assertTrue(harness.settings_manager.persisted["new_terms_limit_user_defined"])
+
+    def test_glossary_generation_common_settings_include_shared_sleep_prevention(self):
+        harness = _GenerationSettingsHarness()
+        harness.prevent_sleep_checkbox.setChecked(True)
+
+        settings = harness._get_common_settings()
+
+        self.assertTrue(settings["prevent_sleep_during_translation"])
 
     def test_auto_new_terms_limit_has_practical_floor(self):
         harness = _GenerationSettingsHarness()
