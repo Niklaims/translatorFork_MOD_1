@@ -13,14 +13,78 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QLabel, QHeaderView, QSplitter, QTextEdit,
     QProgressBar, QMessageBox, QWidget, QComboBox, QSpinBox,
     QGroupBox, QCheckBox, QApplication, QDialogButtonBox, QTabWidget,
-    QFrame
+    QFrame, QStyledItemDelegate, QStyle, QStyleOptionButton
 )
 import json
 import shutil
 from pathlib import Path
 from datetime import datetime
-from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QEvent
 from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QBrush, QTextOption
+
+class CenteredCheckboxDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        self.initStyleOption(option, index)
+        
+        from PyQt6.QtWidgets import QStyleOptionViewItem
+        opt = QStyleOptionViewItem(option)
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        from PyQt6.QtCore import Qt
+        opt.checkState = Qt.CheckState.Unchecked
+        
+        bg_color = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg_color:
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg_color)
+            rect = option.rect.adjusted(4, 2, -4, -2)
+            painter.drawRoundedRect(rect, 6, 6)
+            painter.restore()
+
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
+
+        checked = index.data(Qt.ItemDataRole.CheckStateRole)
+        if checked is not None:
+            check_box_style_option = QStyleOptionButton()
+            check_box_style_option.state |= QStyle.StateFlag.State_Enabled
+            if checked == Qt.CheckState.Checked.value or checked == Qt.CheckState.Checked:
+                check_box_style_option.state |= QStyle.StateFlag.State_On
+            else:
+                check_box_style_option.state |= QStyle.StateFlag.State_Off
+                
+            checkbox_rect = style.subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, check_box_style_option, option.widget)
+            
+            x = option.rect.x() + (option.rect.width() - checkbox_rect.width()) // 2
+            y = option.rect.y() + (option.rect.height() - checkbox_rect.height()) // 2
+            check_box_style_option.rect = QRect(x, y, checkbox_rect.width(), checkbox_rect.height())
+            
+            style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorCheckBox, check_box_style_option, painter, option.widget)
+
+    def editorEvent(self, event, model, option, index):
+        if event.type() in (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick):
+            if event.button() == Qt.MouseButton.LeftButton:
+                checked = index.data(Qt.ItemDataRole.CheckStateRole)
+                if checked is not None:
+                    is_checked = checked == Qt.CheckState.Checked.value or checked == Qt.CheckState.Checked
+                    new_state = Qt.CheckState.Unchecked if is_checked else Qt.CheckState.Checked
+                    model.setData(index, new_state, Qt.ItemDataRole.CheckStateRole)
+                    return True
+        return super().editorEvent(event, model, option, index)
+
+class ThemedTableDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        from PyQt6.QtCore import Qt
+        bg_color = index.data(Qt.ItemDataRole.BackgroundRole)
+        if bg_color:
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(bg_color)
+            rect = option.rect.adjusted(4, 2, -4, -2)
+            painter.drawRoundedRect(rect, 6, 6)
+            painter.restore()
+        super().paint(painter, option, index)
+
 
 from ...core.consistency_engine import (
     DEEP_CONSISTENCY_MODE,
@@ -411,6 +475,8 @@ class ConsistencyValidatorPage(ShellPage):
         self.problems_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.problems_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.problems_table.setAlternatingRowColors(True)
+        self.problems_table.setItemDelegate(ThemedTableDelegate(self.problems_table))
+        self.problems_table.setItemDelegateForColumn(0, CenteredCheckboxDelegate(self.problems_table))
         problems_layout.addWidget(self.problems_table)
         
         # Поле деталей (внизу списка проблем)
@@ -544,9 +610,9 @@ class ConsistencyValidatorPage(ShellPage):
         log_layout.addWidget(self.log_text)
         
         settings_splitter.addWidget(log_group)
-        settings_splitter.setSizes([500, 700])
-        settings_splitter.setStretchFactor(0, 0)
-        settings_splitter.setStretchFactor(1, 1)
+        settings_splitter.setSizes([750, 450])
+        settings_splitter.setStretchFactor(0, 3)
+        settings_splitter.setStretchFactor(1, 2)
         
         settings_layout.addWidget(settings_splitter)
         self.main_tabs.addTab(settings_tab, "⚙️ Настройки и Логи")
@@ -1114,8 +1180,13 @@ class ConsistencyValidatorPage(ShellPage):
                 ):
                     item = self.problems_table.item(row, 1)
                     if item:
-                        item.setBackground(QColor('#c8e6c9'))
-
+                        success = QColor(theme_manager.color('success'))
+                        bg = QColor(theme_manager.color('panel_bg'))
+                        r = int(success.red() * 0.20 + bg.red() * 0.80)
+                        g = int(success.green() * 0.20 + bg.green() * 0.80)
+                        b = int(success.blue() * 0.20 + bg.blue() * 0.80)
+                        resolved_bg = QColor(r, g, b)
+                        item.setBackground(resolved_bg)
         self.save_all_btn.setEnabled(bool(self.pending_fixes))
         self._update_size_info()
 
@@ -1232,6 +1303,7 @@ class ConsistencyValidatorPage(ShellPage):
             # Колонка 0: Чекбокс
             check_item = QTableWidgetItem()
             check_item.setCheckState(Qt.CheckState.Checked)
+            check_item.setFlags(check_item.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             signals_were_blocked = self.problems_table.blockSignals(True)
             try:
                 self.problems_table.setItem(row, 0, check_item)
@@ -1401,6 +1473,13 @@ class ConsistencyValidatorPage(ShellPage):
 
         self.resolved_problem_keys.add(key)
 
+        success = QColor(theme_manager.color('success'))
+        bg = QColor(theme_manager.color('panel_bg'))
+        r = int(success.red() * 0.20 + bg.red() * 0.80)
+        g = int(success.green() * 0.20 + bg.green() * 0.80)
+        b = int(success.blue() * 0.20 + bg.blue() * 0.80)
+        resolved_bg = QColor(r, g, b)
+
         rows = [row] if row is not None else range(self.problems_table.rowCount())
         for row_idx in rows:
             if row_idx is None or row_idx < 0 or row_idx >= self.problems_table.rowCount():
@@ -1414,7 +1493,7 @@ class ConsistencyValidatorPage(ShellPage):
             for col in range(self.problems_table.columnCount()):
                 item = self.problems_table.item(row_idx, col)
                 if item:
-                    item.setBackground(QColor('#c8e6c9'))
+                    item.setBackground(resolved_bg)
 
         self._update_batch_fix_button_state()
 
@@ -1521,6 +1600,31 @@ class ConsistencyValidatorPage(ShellPage):
         if old_content == self.current_chapter.get('content'):
             self.fix_previews[problem_key] = (old_content, new_content)
 
+    def _is_dark_theme(self) -> bool:
+        bg = QColor(theme_manager.color('panel_bg'))
+        luminance = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
+        return luminance < 128
+
+    def _blend_bg_color(self, hex_color: str) -> str:
+        if not self._is_dark_theme():
+            return hex_color
+        bg = QColor(theme_manager.color('panel_bg'))
+        c = QColor(hex_color)
+        r = int(c.red() * 0.15 + bg.red() * 0.85)
+        g = int(c.green() * 0.15 + bg.green() * 0.85)
+        b = int(c.blue() * 0.15 + bg.blue() * 0.85)
+        return QColor(r, g, b).name()
+
+    def _blend_text_color(self, hex_color: str) -> str:
+        if not self._is_dark_theme():
+            return hex_color
+        # In dark mode, brighten the dark text colors slightly by mixing with white
+        c = QColor(hex_color)
+        r = int(c.red() * 0.7 + 255 * 0.3)
+        g = int(c.green() * 0.7 + 255 * 0.3)
+        b = int(c.blue() * 0.7 + 255 * 0.3)
+        return QColor(r, g, b).name()
+
     def _get_type_colors(self, problem_type: str) -> tuple:
         """Возвращает (bg_color, text_color) для типа проблемы."""
         colors = {
@@ -1531,7 +1635,8 @@ class ConsistencyValidatorPage(ShellPage):
             'typo': ('#f3e5f5', '#7b1fa2'),               # светло-фиолетовый фон, тёмно-фиолетовый текст
             'meta_comment': ('#e3f2fd', '#1565c0'),       # светло-голубой фон, тёмно-голубой текст
         }
-        return colors.get(problem_type, ('#f5f5f5', '#424242'))
+        bg, text = colors.get(problem_type, ('#f5f5f5', '#424242'))
+        return self._blend_bg_color(bg), self._blend_text_color(text)
 
     def _get_type_color(self, problem_type: str) -> QColor:
         """Возвращает цвет фона для типа проблемы (обратная совместимость)."""
@@ -1545,7 +1650,8 @@ class ConsistencyValidatorPage(ShellPage):
             'medium': ('#fffde7', '#f57f17'),  # жёлтый
             'low': ('#ffebee', '#c62828'),     # красный
         }
-        return colors.get(confidence, ('#f5f5f5', '#424242'))
+        bg, text = colors.get(confidence, ('#f5f5f5', '#424242'))
+        return self._blend_bg_color(bg), self._blend_text_color(text)
 
     def _get_confidence_color(self, confidence: str) -> QColor:
         """Возвращает цвет фона для уровня уверенности (обратная совместимость)."""
