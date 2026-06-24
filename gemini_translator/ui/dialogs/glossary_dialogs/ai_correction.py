@@ -2398,6 +2398,11 @@ class CorrectionSessionPage(ShellPage):
             return
 
         main_window = self._get_glossary_owner()
+        
+        real_main = self.window().parent()
+        if hasattr(real_main, 'show_notification'):
+            real_main.show_notification("Глоссарий", "AI-корректор завершил работу.")
+            
         if not main_window or main_window.__class__.__name__ not in ('MainWindow', 'GlossaryManagerPage'):
             return
 

@@ -2007,6 +2007,13 @@ class GenerationSessionPage(ShellPage):
         self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
         main_settings_layout.addWidget(self.prevent_sleep_checkbox)
 
+        from PyQt6.QtCore import QSettings
+        self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
+        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        main_settings_layout.addWidget(self.cb_notifications)
+
         # Распорка
         main_settings_layout.addStretch(1)
 
@@ -2724,6 +2731,10 @@ class GenerationSessionPage(ShellPage):
             # при следующем запуске он увидит полностью готовый результат.
             # Удаление произойдет только в методе accept() (кнопка "Применить").
             self._perform_safe_recovery_save()
+            
+            main_window = self.window().parent()
+            if hasattr(main_window, 'show_notification'):
+                main_window.show_notification("Глоссарий", "Генерация глоссария завершена.")
             
             return
     
