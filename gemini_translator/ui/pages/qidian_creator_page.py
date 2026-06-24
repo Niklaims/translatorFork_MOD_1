@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -64,9 +65,16 @@ class QidianCreatorPage(ShellPage):
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
 
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setDocumentMode(False)
+        root.addWidget(self.main_tabs, 1)
+
+        main_tab = QWidget()
+        main_layout = QVBoxLayout(main_tab)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
-        root.addWidget(splitter, 1)
+        main_layout.addWidget(splitter, 1)
 
         top_widget = QWidget()
         top_layout = QVBoxLayout(top_widget)
@@ -79,13 +87,15 @@ class QidianCreatorPage(ShellPage):
         ai_layout.addWidget(self._build_ai_group())
         splitter.addWidget(ai_widget)
 
-        log_group = QGroupBox("Лог")
-        log_layout = QVBoxLayout(log_group)
+        self.main_tabs.addTab(main_tab, "Основное")
+
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumBlockCount(1000)
         log_layout.addWidget(self.log_edit)
-        root.addWidget(log_group)
+        self.main_tabs.addTab(log_tab, "Лог")
 
         splitter.setSizes([560, 320])
 
