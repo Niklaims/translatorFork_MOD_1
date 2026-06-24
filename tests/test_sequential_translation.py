@@ -137,6 +137,50 @@ class SequentialTranslationTests(unittest.TestCase):
             ("epub", "/tmp/does-not-need-to-exist.epub", "Text/ch2.xhtml"),
         ])
 
+    def test_task_preparer_does_not_create_single_chunk_in_individual_mode(self):
+        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as epub_file:
+            epub_path = epub_file.name
+        self.addCleanup(lambda: os.path.exists(epub_path) and os.remove(epub_path))
+        body = "<html><body><p>" + ("word " * 50) + "</p></body></html>"
+        with zipfile.ZipFile(epub_path, "w") as epub_zip:
+            epub_zip.writestr("Text/ch1.xhtml", body)
+
+        settings = {
+            "file_path": epub_path,
+            "use_batching": False,
+            "chunking": True,
+            "sequential_translation": False,
+            "task_size_limit": 10,
+        }
+        preparer = TaskPreparer(settings, {"Text/ch1.xhtml": 999})
+
+        with patch.object(TaskPreparer, "_chunk_target_chars_for_token_limit", return_value=len(body) * 2):
+            tasks = preparer.prepare_tasks(["Text/ch1.xhtml"])
+
+        self.assertEqual(tasks, [("epub", epub_path, "Text/ch1.xhtml")])
+
+    def test_task_preparer_does_not_create_single_chunk_in_batch_mode(self):
+        with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as epub_file:
+            epub_path = epub_file.name
+        self.addCleanup(lambda: os.path.exists(epub_path) and os.remove(epub_path))
+        body = "<html><body><p>" + ("word " * 50) + "</p></body></html>"
+        with zipfile.ZipFile(epub_path, "w") as epub_zip:
+            epub_zip.writestr("Text/ch1.xhtml", body)
+
+        settings = {
+            "file_path": epub_path,
+            "use_batching": True,
+            "chunking": True,
+            "sequential_translation": False,
+            "task_size_limit": 10,
+        }
+        preparer = TaskPreparer(settings, {"Text/ch1.xhtml": 999})
+
+        with patch.object(TaskPreparer, "_chunk_target_chars_for_token_limit", return_value=len(body) * 2):
+            tasks = preparer.prepare_tasks(["Text/ch1.xhtml"])
+
+        self.assertEqual(tasks, [("epub", epub_path, "Text/ch1.xhtml")])
+
     def test_task_preparer_batches_small_chapters_across_large_chapter(self):
         settings = {
             "file_path": "book.epub",

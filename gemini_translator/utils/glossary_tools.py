@@ -648,6 +648,15 @@ class TaskPreparer:
         final_items.sort(key=lambda item: (item[0], item[1]))
         return [payload for _, _, payload in final_items]
 
+    def _payloads_from_chunks(self, chapter_file, chunks, prefix, suffix):
+        chunks = list(chunks or [])
+        if len(chunks) <= 1:
+            return [('epub', self.epub_path, chapter_file)]
+        return [
+            ('epub_chunk', self.epub_path, chapter_file, chunk_content, i, len(chunks), prefix, suffix)
+            for i, chunk_content in enumerate(chunks)
+        ]
+
     def _prepare_chunk_payloads(self, chapter_file):
         from ..utils.text import split_text_into_chunks
         from ..api import config as api_config
@@ -669,10 +678,7 @@ class TaskPreparer:
             chunk_target_chars = self._chunk_target_chars_for_token_limit(body_content)
             chunks = split_text_into_chunks(body_content, chunk_target_chars,
                                             api_config.chunk_search_window(), api_config.min_chunk_size())
-            return [
-                ('epub_chunk', self.epub_path, chapter_file, chunk_content, i, len(chunks), prefix, suffix)
-                for i, chunk_content in enumerate(chunks)
-            ]
+            return self._payloads_from_chunks(chapter_file, chunks, prefix, suffix)
         except Exception as e:
             print(f"[ERROR] Critical error while chunking chapter {chapter_file}: {e}")
             return [('epub', self.epub_path, chapter_file)]
@@ -720,9 +726,9 @@ class TaskPreparer:
                     chunks = split_text_into_chunks(body_content, chunk_target_chars,
                                                     api_config.chunk_search_window(), api_config.min_chunk_size())
 
-                    for i, chunk_content in enumerate(chunks):
-                        final_payloads.append(('epub_chunk', self.epub_path, chapter_file,
-                                            chunk_content, i, len(chunks), prefix, suffix))
+                    final_payloads.extend(
+                        self._payloads_from_chunks(chapter_file, chunks, prefix, suffix)
+                    )
                 except Exception as e:
                     print(f"[ERROR] Критическая ошибка при чанкинге главы {chapter_file}: {e}")
                     final_payloads.append(('epub', self.epub_path, chapter_file))
