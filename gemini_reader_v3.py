@@ -30,9 +30,10 @@ from PyQt6.QtWidgets import (
     QProgressBar, QMessageBox, QInputDialog, QSplitter,
     QListWidget, QListWidgetItem, QToolBar, QSlider,
     QSizePolicy, QCheckBox, QMenu, QComboBox, QSpinBox, QDoubleSpinBox,
-    QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit
+    QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit,
+    QSystemTrayIcon
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings
 from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QTextBlockFormat, QDragEnterEvent, QDropEvent, QIcon
 
 # Libraries
@@ -5723,6 +5724,14 @@ class MainWindow(QMainWindow):
         self.resize(1150, 850)
         self.setAcceptDrops(True)
         self.settings_manager = settings_manager or _get_app_settings_manager()
+        
+        self._tray_icon = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = QSystemTrayIcon(self)
+            # Установим иконку позже после _init_ui или здесь, если она доступна
+            # self._tray_icon.setIcon(self.windowIcon())
+            self._tray_icon.show()
+            
         self.reader_books_dir = _reader_books_dir(self.settings_manager)
         self.daily_request_limiter = ProjectDailyRequestLimiter(self.settings_manager)
         self.preprocess_models_map = _build_preprocess_models_map()
@@ -5774,6 +5783,12 @@ class MainWindow(QMainWindow):
         self._reader_full_ui_ready = False
         self._reader_log_connected = False
         self._init_lazy_ui_skeleton()
+
+    def show_notification(self, title, message):
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        if settings.value("notifications_enabled", True, type=bool):
+            if hasattr(self, '_tray_icon') and self._tray_icon and self._tray_icon.isVisible():
+                self._tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def _init_lazy_ui_skeleton(self):
         central = QWidget()
