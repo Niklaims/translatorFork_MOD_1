@@ -188,7 +188,12 @@ def discover_ranobelib_source_data():
 
 
 def get_additional_data_entries():
-    entries = list(ADDITIONAL_DATA)
+    entries = []
+    for src, dst in ADDITIONAL_DATA:
+        if Path(src).exists() or (PROJECT_ROOT / src).exists():
+            entries.append((src, dst))
+        else:
+            print(f"     [WARN] Файл или папка '{src}' не найдены, пропуск.")
     entries.extend(discover_ranobelib_source_data())
     entries.extend(discover_playwright_runtime_data())
     return entries
@@ -217,24 +222,23 @@ def filter_third_party_imports(imports):
     print("\n--- Этап 2: Фильтрация модулей (улучшенная логика) ---")
     third_party_imports = set()
     
-    # 1. Получаем список стандартных библиотек. Это наш "черный список".
     try:
-        # Для Python 3.10+
         standard_libs = set(sys.stdlib_module_names)
         print(f"  -> Используется полный список стандартных библиотек Python {sys.version.split()[0]}.")
     except AttributeError:
-        # Для более старых версий Python (fallback)
         standard_libs = set(sys.builtin_module_names)
         print(f"  -> [WARN] Используется базовый список встроенных модулей. Точность может быть ниже.")
 
-    # 2. Итерируем по всем найденным импортам
     for module_name in sorted(list(imports)):
-        # 3. Применяем простое правило исключения
         if module_name in PROJECT_MODULES or module_name in standard_libs:
-            # Если модуль - часть нашего проекта или стандартный, пропускаем его.
             continue
-        
-        # 4. ВСЁ ОСТАЛЬНОЕ - считаем сторонней зависимостью!
+            
+        if (PROJECT_ROOT / f"{module_name}.py").exists() or (PROJECT_ROOT / module_name).is_dir():
+            continue
+            
+        if os.name == 'nt' and module_name in ('AppKit', 'objc'):
+            continue
+            
         third_party_imports.add(module_name)
 
     print("[OK] Идентифицированы сторонние зависимости по принципу исключения.")
@@ -414,7 +418,7 @@ if /I "%PYTHON_CMD%"=="python" (
         goto :eof
     )
 ) else if not exist "%PYTHON_CMD%" (
-    echo [!!!] Не найден интерпретатор Python: %PYTHON_CMD%
+    echo [!!!] Не найден интерпретатор Python: "%PYTHON_CMD%"
     pause
     goto :eof
 )
