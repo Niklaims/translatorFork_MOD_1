@@ -3900,10 +3900,6 @@ class InitialSetupPage(ShellPage):
         # Эти виджеты блокируются полностью
         widgets_to_toggle = [
             self.paths_widget,
-            self.key_management_widget,
-            self.glossary_widget,
-            self.preset_widget,
-            self.auto_translate_widget,
             self.translation_options_widget,
             self.model_settings_widget,
             self.project_actions_widget,
@@ -3912,8 +3908,12 @@ class InitialSetupPage(ShellPage):
         for widget in widgets_to_toggle:
             widget.setEnabled(not is_session_active)
 
-        # А этот виджет переводится в специальный режим
+        # А эти виджеты переводится в специальный режим
         self.task_management_widget.set_session_mode(is_session_active)
+        self.key_management_widget.set_session_mode(is_session_active)
+        self.glossary_widget.set_session_mode(is_session_active)
+        self.preset_widget.set_session_mode(is_session_active)
+        self.auto_translate_widget.set_session_mode(is_session_active)
 
         if not enabled:
             # Сессия НАЧАЛАСЬ
