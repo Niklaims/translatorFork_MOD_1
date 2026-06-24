@@ -72,20 +72,35 @@ class QidianCreatorPage(ShellPage):
         main_tab = QWidget()
         main_layout = QVBoxLayout(main_tab)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        main_layout.addWidget(splitter, 1)
+        main_layout.addWidget(self._build_source_group())
 
-        top_widget = QWidget()
-        top_layout = QVBoxLayout(top_widget)
-        top_layout.addWidget(self._build_source_group())
-        top_layout.addWidget(self._build_preview_group(), 1)
-        splitter.addWidget(top_widget)
+        unified_scroll = QScrollArea()
+        unified_scroll.setWidgetResizable(True)
 
-        ai_widget = QWidget()
-        ai_layout = QVBoxLayout(ai_widget)
-        ai_layout.addWidget(self._build_ai_group())
-        splitter.addWidget(ai_widget)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
+        scroll_layout.addWidget(self._build_preview_group(), 1)
+
+        self.key_widget = KeyManagementWidget(
+            self.settings_manager,
+            self,
+            server_manager=self.server_manager,
+        )
+        self.model_settings_widget = ModelSettingsWidget(
+            self,
+            settings_manager=self.settings_manager,
+            server_manager=self.server_manager,
+        )
+        self.model_settings_widget.set_cjk_options_visible(False)
+        self.model_settings_widget.set_glossary_options_visible(False)
+        self.model_settings_widget.set_misc_options_visible(False)
+
+        scroll_layout.addWidget(self.key_widget)
+        scroll_layout.addWidget(self.model_settings_widget)
+
+        unified_scroll.setWidget(scroll_content)
+        main_layout.addWidget(unified_scroll, 1)
 
         self.main_tabs.addTab(main_tab, "Основное")
 
@@ -96,8 +111,6 @@ class QidianCreatorPage(ShellPage):
         self.log_edit.setMaximumBlockCount(1000)
         log_layout.addWidget(self.log_edit)
         self.main_tabs.addTab(log_tab, "Лог")
-
-        splitter.setSizes([560, 320])
 
     def _build_source_group(self) -> QGroupBox:
         group = QGroupBox("Источник и действия")
@@ -213,37 +226,6 @@ class QidianCreatorPage(ShellPage):
         layout.addRow("Промпт обложки:", self.cover_prompt_edit)
 
         return group
-
-    def _build_ai_group(self) -> QWidget:
-        wrapper = QWidget()
-        layout = QVBoxLayout(wrapper)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-
-        self.key_widget = KeyManagementWidget(
-            self.settings_manager,
-            self,
-            server_manager=self.server_manager,
-        )
-        self.model_settings_widget = ModelSettingsWidget(
-            self,
-            settings_manager=self.settings_manager,
-            server_manager=self.server_manager,
-        )
-        self.model_settings_widget.set_cjk_options_visible(False)
-        self.model_settings_widget.set_glossary_options_visible(False)
-        self.model_settings_widget.set_misc_options_visible(False)
-
-        content_layout.addWidget(self.key_widget)
-        content_layout.addWidget(self.model_settings_widget)
-        scroll.setWidget(content)
-        layout.addWidget(scroll)
-
-        return wrapper
 
     def _connect_ai_widgets(self) -> None:
         provider_id = self.key_widget.get_selected_provider()
