@@ -5728,8 +5728,11 @@ class MainWindow(QMainWindow):
         self._tray_icon = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray_icon = QSystemTrayIcon(self)
-            # Установим иконку позже после _init_ui или здесь, если она доступна
-            # self._tray_icon.setIcon(self.windowIcon())
+            from PyQt6.QtWidgets import QStyle
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self._tray_icon.setIcon(icon)
             self._tray_icon.show()
             
         self.reader_books_dir = _reader_books_dir(self.settings_manager)
