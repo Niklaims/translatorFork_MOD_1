@@ -8256,6 +8256,8 @@ class MainWindow(QMainWindow):
             self._project_quota_message = ""
             self._stop_requested = False
             self.statusBar().showMessage(final_message)
+            if hasattr(self, 'show_notification'):
+                self.show_notification("Сессия завершена", final_message)
 
     def _on_invalid_worker_key(self, worker_id, api_key, error_text, chapter_index):
         self.disabled_api_keys.add(api_key)
