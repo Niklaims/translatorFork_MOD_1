@@ -8,6 +8,7 @@
 # ---------------------------------------------------------------------------
 
 import os
+import sys
 import re
 import json
 import sqlite3
@@ -966,6 +967,8 @@ class InitialSetupPage(ShellPage):
         self.theme_mode_combo.currentIndexChanged.connect(
             lambda _i: self._on_theme_mode_changed(self.theme_mode_combo.currentData())
         )
+        if sys.platform == 'win32':
+            self.theme_mode_combo.wheelEvent = lambda event: event.ignore()
         mode_row.addWidget(self.theme_mode_combo, 1)
         layout.addLayout(mode_row)
 
