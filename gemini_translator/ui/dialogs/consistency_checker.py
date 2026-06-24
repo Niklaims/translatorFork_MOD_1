@@ -674,6 +674,13 @@ class ConsistencyValidatorPage(ShellPage):
         self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
         self.prevent_sleep_checkbox.toggled.connect(self._save_shared_sleep_prevention_setting)
         extra_layout.addWidget(self.prevent_sleep_checkbox)
+
+        from PyQt6.QtCore import QSettings
+        self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
+        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        extra_layout.addWidget(self.cb_notifications)
         
         # Инфо о чанке (Токены)
         self.chunk_info_label = QLabel("~0 токенов")
@@ -1166,6 +1173,11 @@ class ConsistencyValidatorPage(ShellPage):
 
     def _save_shared_sleep_prevention_setting(self, enabled: bool):
         save_prevent_sleep_setting(self.settings_manager, enabled)
+
+    def _on_notifications_toggled(self, checked):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        settings.setValue("notifications_enabled", checked)
 
     def _activate_power_inhibitor_for_config(self, config: dict):
         if not config.get(PREVENT_SLEEP_SETTING_KEY):
@@ -1714,6 +1726,10 @@ class ConsistencyValidatorPage(ShellPage):
         token_count = self.engine.get_glossary_token_count()
         self._log(f"   Токенов в глоссарии: ~{token_count}")
         self._save_session()
+        
+        main_window = self.window().parent()
+        if hasattr(main_window, 'show_notification'):
+            main_window.show_notification("Согласованность", f"Анализ завершен. Найдено проблем: {len(all_problems)}")
 
     @pyqtSlot(str)
     def on_engine_error(self, error_msg):
