@@ -5790,8 +5790,38 @@ class MainWindow(QMainWindow):
     def show_notification(self, title, message):
         settings = QSettings("SiberianTeam", "TranslatorFork")
         if settings.value("notifications_enabled", True, type=bool):
-            if hasattr(self, '_tray_icon') and self._tray_icon and self._tray_icon.isVisible():
-                self._tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 3000)
+            import sys
+            import subprocess
+            if sys.platform == 'darwin':
+                safe_msg = str(message).replace('"', '\\"')
+                safe_title = str(title).replace('"', '\\"')
+                script = f'display notification "{safe_msg}" with title "{safe_title}" sound name "default"'
+                try:
+                    subprocess.Popen(['osascript', '-e', script])
+                except Exception as e:
+                    from loguru import logger
+                    logger.error(f"Failed to send macOS notification: {e}")
+            elif sys.platform == 'win32':
+                safe_msg = str(message).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
+                safe_title = str(title).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
+                ps_script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = "<toast><visual><binding template='ToastText02'><text id='1'>{safe_title}</text><text id='2'>{safe_msg}</text></binding></visual></toast>"
+$doc = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$doc.LoadXml($xml)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($doc)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("Gemini Translator")
+$notifier.Show($toast)
+"""
+                try:
+                    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script], creationflags=0x08000000)
+                except Exception as e:
+                    from loguru import logger
+                    logger.error(f"Failed to send Windows notification: {e}")
+            else:
+                if hasattr(self, '_tray_icon') and self._tray_icon and self._tray_icon.isVisible():
+                    self._tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def _init_lazy_ui_skeleton(self):
         central = QWidget()
