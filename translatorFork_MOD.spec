@@ -55,4 +55,11 @@ if sys.platform == 'darwin':
         name='GeminiTranslator.app',
         icon=None,
         bundle_identifier='com.siberianteam.translatorfork',
+        info_plist={
+            'NSPrincipalClass': 'NSApplication',
+            'NSHighResolutionCapable': 'True',
+            'NSUserNotificationAlertStyle': 'alert',
+            'CFBundleName': 'GeminiTranslator',
+            'CFBundleDisplayName': 'GeminiTranslator',
+        }
     )

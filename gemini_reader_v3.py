@@ -5791,16 +5791,15 @@ class MainWindow(QMainWindow):
         settings = QSettings("SiberianTeam", "TranslatorFork")
         if settings.value("notifications_enabled", True, type=bool):
             import sys
-            import subprocess
             if sys.platform == 'darwin':
-                safe_msg = str(message).replace('"', '\\"')
-                safe_title = str(title).replace('"', '\\"')
-                script = f'display notification "{safe_msg}" with title "{safe_title}" sound name "default"'
-                try:
+                if hasattr(self, 'tray_icon') and self.tray_icon:
+                    self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 5000)
+                else:
+                    import subprocess
+                    safe_msg = str(message).replace('"', '\\"')
+                    safe_title = str(title).replace('"', '\\"')
+                    script = f'display notification "{safe_msg}" with title "{safe_title}" sound name "default"'
                     subprocess.Popen(['osascript', '-e', script])
-                except Exception as e:
-                    from loguru import logger
-                    logger.error(f"Failed to send macOS notification: {e}")
             elif sys.platform == 'win32':
                 safe_msg = str(message).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
                 safe_title = str(title).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
