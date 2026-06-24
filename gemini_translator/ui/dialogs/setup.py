@@ -1059,7 +1059,19 @@ class InitialSetupPage(ShellPage):
         self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
         layout.addWidget(self.prevent_sleep_checkbox)
 
+        from PyQt6.QtCore import QSettings
+        self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
+        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        layout.addWidget(self.cb_notifications)
+
         return group
+
+    def _on_notifications_toggled(self, checked):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        settings.setValue("notifications_enabled", checked)
 
     def _refresh_ui_theme_controls(self):
         theme_color_buttons = _instance_attr(self, "theme_color_buttons")
