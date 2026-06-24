@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
+from gemini_translator.ui.themes import LIGHT_DEFAULT_THEME_COLORS, build_stylesheet
 from gemini_translator.ui.widgets.chapter_list_widget import ChapterListWidget
 
 
@@ -148,6 +149,52 @@ class DiffGateTests(unittest.TestCase):
         # But UserRole (the task tuple) must be skipped:
         userrole_calls = [c for c in data_calls if c[0] == QtCore.Qt.ItemDataRole.UserRole]
         self.assertEqual(userrole_calls, [], "UserRole setData should be skipped when value unchanged")
+
+    def test_reorder_column_and_rows_fit_arrow_buttons(self):
+        widget = self._make_widget()
+        header = widget.table.horizontalHeader()
+
+        self.assertGreaterEqual(widget.table.verticalHeader().defaultSectionSize(), 36)
+        self.assertGreaterEqual(widget.table.verticalHeader().minimumSectionSize(), 36)
+        self.assertEqual(header.sectionResizeMode(1), QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.assertLessEqual(widget.table.columnWidth(1), 150)
+        self.assertEqual(header.sectionResizeMode(2), QtWidgets.QHeaderView.ResizeMode.Fixed)
+        self.assertGreaterEqual(widget.table.columnWidth(2), 96)
+
+        reorder_widget = widget._create_reorder_cell_widget(0)
+        self.addCleanup(reorder_widget.deleteLater)
+        buttons = reorder_widget.findChildren(QtWidgets.QPushButton)
+
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(all(button.size() == QtCore.QSize(24, 24) for button in buttons))
+        self.assertLessEqual(reorder_widget.sizeHint().height(), widget.table.verticalHeader().defaultSectionSize())
+        self.assertLessEqual(reorder_widget.sizeHint().width(), widget.table.columnWidth(2))
+
+    def test_populated_reorder_cell_has_vertical_room_under_light_theme(self):
+        app = QtWidgets.QApplication.instance()
+        previous_stylesheet = app.styleSheet()
+        app.setStyleSheet(build_stylesheet(LIGHT_DEFAULT_THEME_COLORS))
+        self.addCleanup(lambda: app.setStyleSheet(previous_stylesheet))
+
+        previous_engine = getattr(app, "engine", "__missing__")
+        app.engine = None
+        if previous_engine == "__missing__":
+            self.addCleanup(lambda: delattr(app, "engine"))
+        else:
+            self.addCleanup(lambda: setattr(app, "engine", previous_engine))
+
+        widget = self._make_widget()
+        widget.resize(1200, 600)
+        widget._full_redraw([
+            ((QtCore.QUuid.createUuid(), ("epub", "/tmp/book.epub", "/tmp/chapter.xhtml")), "pending", {})
+        ])
+        widget.show()
+        app.processEvents()
+
+        reorder_widget = widget.table.cellWidget(0, 2)
+
+        self.assertIsNotNone(reorder_widget)
+        self.assertGreaterEqual(reorder_widget.height(), reorder_widget.sizeHint().height())
 
 
 

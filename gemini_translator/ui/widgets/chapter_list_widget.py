@@ -17,6 +17,13 @@ except ImportError:
     LEVENSHTEIN_AVAILABLE = False
 
 
+TASK_TABLE_ROW_HEIGHT = 40
+REORDER_BUTTON_SIZE = 24
+STATUS_COLUMN_WIDTH = 136
+REORDER_COLUMN_WIDTH = 112
+REORDER_CELL_MIN_WIDTH = REORDER_BUTTON_SIZE * 2 + 14
+
+
 class BatchChapterOrderDialog(QDialog):
     """Небольшой редактор порядка глав внутри одного пакета."""
 
@@ -257,9 +264,13 @@ class ChapterListWidget(QWidget):
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(1, STATUS_COLUMN_WIDTH)
+        self.table.setColumnWidth(2, REORDER_COLUMN_WIDTH)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(TASK_TABLE_ROW_HEIGHT)
+        self.table.verticalHeader().setMinimumSectionSize(TASK_TABLE_ROW_HEIGHT)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -278,18 +289,20 @@ class ChapterListWidget(QWidget):
         """
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setContentsMargins(3, 2, 3, 2)
         layout.setSpacing(4)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        widget.setMinimumWidth(REORDER_CELL_MIN_WIDTH)
 
         btn_up = QPushButton("▲")
         btn_up.setObjectName("reorderButton")
-        btn_up.setFixedSize(20, 20)
+        btn_up.setFixedSize(REORDER_BUTTON_SIZE, REORDER_BUTTON_SIZE)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_up.clicked.connect(lambda: self._emit_reorder_from_button('up', self.sender()))
 
         btn_down = QPushButton("▼")
         btn_down.setObjectName("reorderButton")
-        btn_down.setFixedSize(20, 20)
+        btn_down.setFixedSize(REORDER_BUTTON_SIZE, REORDER_BUTTON_SIZE)
         # --- ИЗМЕНЕНИЕ: Используем 'self' для поиска строки ---
         btn_down.clicked.connect(lambda: self._emit_reorder_from_button('down', self.sender()))
 
