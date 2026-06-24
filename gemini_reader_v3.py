@@ -30,9 +30,10 @@ from PyQt6.QtWidgets import (
     QProgressBar, QMessageBox, QInputDialog, QSplitter,
     QListWidget, QListWidgetItem, QToolBar, QSlider,
     QSizePolicy, QCheckBox, QMenu, QComboBox, QSpinBox, QDoubleSpinBox,
-    QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit
+    QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit,
+    QSystemTrayIcon
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings
 from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QTextBlockFormat, QDragEnterEvent, QDropEvent, QIcon
 
 # Libraries
@@ -5723,6 +5724,17 @@ class MainWindow(QMainWindow):
         self.resize(1150, 850)
         self.setAcceptDrops(True)
         self.settings_manager = settings_manager or _get_app_settings_manager()
+        
+        self._tray_icon = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray_icon = QSystemTrayIcon(self)
+            from PyQt6.QtWidgets import QStyle
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+            self._tray_icon.setIcon(icon)
+            self._tray_icon.show()
+            
         self.reader_books_dir = _reader_books_dir(self.settings_manager)
         self.daily_request_limiter = ProjectDailyRequestLimiter(self.settings_manager)
         self.preprocess_models_map = _build_preprocess_models_map()
@@ -5774,6 +5786,41 @@ class MainWindow(QMainWindow):
         self._reader_full_ui_ready = False
         self._reader_log_connected = False
         self._init_lazy_ui_skeleton()
+
+    def show_notification(self, title, message):
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        if settings.value("notifications_enabled", True, type=bool):
+            import sys
+            if sys.platform == 'darwin':
+                if hasattr(self, 'tray_icon') and self.tray_icon:
+                    self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 5000)
+                else:
+                    import subprocess
+                    safe_msg = str(message).replace('"', '\\"')
+                    safe_title = str(title).replace('"', '\\"')
+                    script = f'display notification "{safe_msg}" with title "{safe_title}" sound name "default"'
+                    subprocess.Popen(['osascript', '-e', script])
+            elif sys.platform == 'win32':
+                safe_msg = str(message).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
+                safe_title = str(title).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
+                ps_script = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+$xml = "<toast><visual><binding template='ToastText02'><text id='1'>{safe_title}</text><text id='2'>{safe_msg}</text></binding></visual></toast>"
+$doc = [Windows.Data.Xml.Dom.XmlDocument]::new()
+$doc.LoadXml($xml)
+$toast = [Windows.UI.Notifications.ToastNotification]::new($doc)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("SiberianTeam.GeminiTranslator")
+$notifier.Show($toast)
+"""
+                try:
+                    subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script], creationflags=0x08000000)
+                except Exception as e:
+                    from loguru import logger
+                    logger.error(f"Failed to send Windows notification: {e}")
+            else:
+                if hasattr(self, '_tray_icon') and self._tray_icon and self._tray_icon.isVisible():
+                    self._tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 3000)
 
     def _init_lazy_ui_skeleton(self):
         central = QWidget()
@@ -8241,6 +8288,8 @@ class MainWindow(QMainWindow):
             self._project_quota_message = ""
             self._stop_requested = False
             self.statusBar().showMessage(final_message)
+            if hasattr(self, 'show_notification'):
+                self.show_notification("Сессия завершена", final_message)
 
     def _on_invalid_worker_key(self, worker_id, api_key, error_text, chapter_index):
         self.disabled_api_keys.add(api_key)
@@ -9264,6 +9313,14 @@ class MainWindow(QMainWindow):
         if p: self.load_book(p)
 
 if __name__ == "__main__":
+    if sys.platform == 'win32':
+        import ctypes
+        myappid = 'SiberianTeam.GeminiTranslator'
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

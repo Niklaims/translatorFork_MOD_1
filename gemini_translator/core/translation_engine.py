@@ -21,6 +21,7 @@ from ..utils.project_manager import TranslationProjectManager
 from ..utils.helpers import check_value 
 from ..api.managers import ApiKeyManager
 from ..core.chunk_assembler import ChunkAssembler
+from ..utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor
 
 def normalize_sequential_parallel_settings(settings: dict, log_callback=None):
     if not settings.get('sequential_translation'):
@@ -169,6 +170,7 @@ class TranslationEngine(QObject):
         self.is_session_finishing = False
         self.is_soft_stopping = False
         self.session_settings = {}
+        self.power_inhibitor = PowerInhibitor()
         self.is_starting = False 
         # Менеджеры, создаваемые для каждой сессии
         self.api_key_manager = None
@@ -791,6 +793,7 @@ class TranslationEngine(QObject):
         total_tasks_for_session = len(self.task_manager.get_all_pending_tasks())
         model_id = settings.get('model_id')
         self._register_active_session()
+        self._activate_power_inhibitor_for_session()
         self._post_event('session_started', {
             'session_id': self.session_id,
             'model_id': model_id,
@@ -869,6 +872,7 @@ class TranslationEngine(QObject):
         self.is_starting = False # <-- Сбрасываем и этот флаг тоже
         
     def _end_session_event(self, reason: str, session_id_event=None):
+        self._release_power_inhibitor()
         self._post_event('session_finished', {
             'reason': reason,
             "session_id_log": self.session_id,
@@ -876,6 +880,23 @@ class TranslationEngine(QObject):
             'background_role': self.session_settings.get('background_role'),
             'background_run_id': self.session_settings.get('background_run_id'),
         })
+
+    def _activate_power_inhibitor_for_session(self):
+        if not self.session_settings.get(PREVENT_SLEEP_SETTING_KEY):
+            return
+        if self.power_inhibitor.prevent_sleep():
+            self._post_event('log_message', {
+                'message': "[POWER] Сон системы заблокирован на время активной сессии."
+            })
+        else:
+            detail = f" ({self.power_inhibitor.last_error})" if self.power_inhibitor.last_error else ""
+            self._post_event('log_message', {
+                'message': f"[POWER-WARN] Не удалось включить защиту от сна{detail}."
+            })
+
+    def _release_power_inhibitor(self):
+        if self.power_inhibitor:
+            self.power_inhibitor.allow_sleep()
     
     def _launch_next_from_ramp_up(self):
         if self.is_soft_stopping:
@@ -1279,6 +1300,7 @@ class TranslationEngine(QObject):
         self._stop_timers()
         self._disconnect_from_bus()
         self._cleanup_chunk_assembler()
+        self._release_power_inhibitor()
 
         self.is_cancelled = True # Финальный флаг для всех
         self._terminate_all_workers()

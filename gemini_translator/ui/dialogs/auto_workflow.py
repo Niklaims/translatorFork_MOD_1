@@ -12,6 +12,7 @@ from ...core.consistency_engine import (
     normalize_consistency_confidence,
     normalize_consistency_confidences,
 )
+from ...utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor
 
 
 def choose_preferred_translation_rel_path(versions: dict) -> str | None:
@@ -121,7 +122,15 @@ class AutoConsistencyWorker(QtCore.QThread):
 
     def run(self):
         engine = None
+        power_inhibitor = PowerInhibitor()
         try:
+            if self.config.get(PREVENT_SLEEP_SETTING_KEY):
+                if power_inhibitor.prevent_sleep():
+                    self.progress_message.emit("[POWER] Сон системы заблокирован на время AI-проверки.")
+                elif power_inhibitor.last_error:
+                    self.progress_message.emit(
+                        f"[POWER-WARN] Не удалось включить защиту от сна: {power_inhibitor.last_error}"
+                    )
             engine = ConsistencyEngine(self.settings_manager)
             engine_errors: list[str] = []
             engine.error_occurred.connect(lambda message: engine_errors.append(str(message)))
@@ -197,5 +206,6 @@ class AutoConsistencyWorker(QtCore.QThread):
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
+            power_inhibitor.allow_sleep()
             if engine is not None:
                 engine.close_session_resources()

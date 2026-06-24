@@ -25,6 +25,7 @@ pymorphy3
 pypdf
 PyQt6
 PySocks
+pytest
 python-docx
 python-Levenshtein
 pytz

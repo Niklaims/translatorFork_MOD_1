@@ -8,6 +8,7 @@
 # ---------------------------------------------------------------------------
 
 import os
+import sys
 import re
 import json
 import sqlite3
@@ -57,6 +58,11 @@ from ...utils.helpers import TokenCounter
 from ...utils.language_tools import SmartGlossaryFilter, GlossaryReplacer
 from ...utils.project_migrator import ProjectMigrator
 from ...utils.project_manager import TranslationProjectManager
+from ...utils.power_inhibitor import (
+    PREVENT_SLEEP_SETTING_KEY,
+    load_prevent_sleep_setting,
+    save_prevent_sleep_setting,
+)
 from ...utils.translated_paths import build_translated_output_path
 
 from ..themes import (
@@ -523,6 +529,8 @@ class InitialSetupPage(ShellPage):
         # model_settings_widget уже является QGroupBox, просто добавляем его
         # stretch=0, чтобы она занимала только необходимый минимум высоты
         settings_layout.addWidget(self.model_settings_widget, 0)
+        self.session_behavior_group = self._create_session_behavior_group()
+        settings_layout.addWidget(self.session_behavior_group, 0)
         self.appearance_group = self._create_appearance_group()
         settings_layout.addWidget(self.appearance_group, 0)
         self.model_settings_widget.prettify_checkbox.setVisible(True)
@@ -673,6 +681,10 @@ class InitialSetupPage(ShellPage):
         self.preset_widget.text_changed.connect(self._mark_promt_as_dirty)
         self.glossary_widget.glossary_changed.connect(self._on_glossary_changed)
         self.auto_translate_widget.settings_changed.connect(self._mark_settings_as_dirty)
+        self.prevent_sleep_checkbox.toggled.connect(self._mark_settings_as_dirty)
+        self.prevent_sleep_checkbox.toggled.connect(
+            lambda checked: save_prevent_sleep_setting(self.settings_manager, checked)
+        )
         self.auto_translate_widget.open_glossary_requested.connect(self.open_ai_glossary_generation)
         self.auto_translate_widget.open_validator_requested.connect(self.open_translation_validator)
         self.auto_translate_widget.open_consistency_requested.connect(self.open_ai_consistency_checker)
@@ -955,6 +967,8 @@ class InitialSetupPage(ShellPage):
         self.theme_mode_combo.currentIndexChanged.connect(
             lambda _i: self._on_theme_mode_changed(self.theme_mode_combo.currentData())
         )
+        if sys.platform == 'win32':
+            self.theme_mode_combo.wheelEvent = lambda event: event.ignore()
         mode_row.addWidget(self.theme_mode_combo, 1)
         layout.addLayout(mode_row)
 
@@ -1034,6 +1048,33 @@ class InitialSetupPage(ShellPage):
 
         self._refresh_ui_theme_controls()
         return group
+
+    def _create_session_behavior_group(self) -> QGroupBox:
+        group = QGroupBox("Поведение сессии")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(8)
+
+        self.prevent_sleep_checkbox = QCheckBox("Не блокировать и не усыплять компьютер во время перевода")
+        self.prevent_sleep_checkbox.setToolTip(
+            "При активной сессии приложение попросит систему не уходить в сон и не блокироваться.\n"
+            "Экран при этом может гаснуть или переходить в энергосберегающий режим по настройкам ОС."
+        )
+        self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
+        layout.addWidget(self.prevent_sleep_checkbox)
+
+        from PyQt6.QtCore import QSettings
+        self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
+        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        layout.addWidget(self.cb_notifications)
+
+        return group
+
+    def _on_notifications_toggled(self, checked):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        settings.setValue("notifications_enabled", checked)
 
     def _refresh_ui_theme_controls(self):
         theme_color_buttons = _instance_attr(self, "theme_color_buttons")
@@ -1626,6 +1667,7 @@ class InitialSetupPage(ShellPage):
             'custom_prompt': self.preset_widget.get_prompt(),
             'last_prompt_preset': self.preset_widget.get_current_preset_name(),
             'auto_translation': self.auto_translate_widget.get_settings(),
+            PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
             THEME_SETTINGS_KEY: editable_theme_colors(getattr(self, '_ui_theme_colors', None)),
         })
         # Добавьте сюда другие настройки, если они должны сохраняться
@@ -3142,6 +3184,8 @@ class InitialSetupPage(ShellPage):
         self.key_management_widget.blockSignals(True)
         self.instances_spin.blockSignals(True)
         self.auto_translate_widget.blockSignals(True)
+        if hasattr(self, 'prevent_sleep_checkbox'):
+            self.prevent_sleep_checkbox.blockSignals(True)
 
         try:
             if THEME_SETTINGS_KEY in settings:
@@ -3164,6 +3208,9 @@ class InitialSetupPage(ShellPage):
 
             if 'custom_prompt' in settings:
                 self.preset_widget.set_prompt(settings['custom_prompt'])
+
+            if hasattr(self, 'prevent_sleep_checkbox'):
+                self.prevent_sleep_checkbox.setChecked(bool(settings.get(PREVENT_SLEEP_SETTING_KEY, False)))
 
             model_name = settings.get('model')
             model_id = api_config.all_models().get(model_name, {}).get('id')
@@ -3207,6 +3254,8 @@ class InitialSetupPage(ShellPage):
             self.key_management_widget.blockSignals(False)
             self.instances_spin.blockSignals(False)
             self.auto_translate_widget.blockSignals(False)
+            if hasattr(self, 'prevent_sleep_checkbox'):
+                self.prevent_sleep_checkbox.blockSignals(False)
 
         self._refresh_auto_translate_runtime_context()
         self._update_distribution_info_from_widget()
@@ -5902,6 +5951,7 @@ class InitialSetupPage(ShellPage):
             'consistency_fix_confidences': list(selected_confidences),
             'consistency_include_original': include_original,
             'consistency_original_chapter_limit': original_chapter_limit,
+            PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
         })
 
         self._auto_followup_running = True
@@ -6048,6 +6098,7 @@ class InitialSetupPage(ShellPage):
             'full_glossary_data': full_glossary_data,
             'custom_prompt': self.preset_widget.get_prompt() or api_config.default_prompt(),
             'auto_translation': self.auto_translate_widget.get_settings(),
+            PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
             'auto_start': True,
             'num_instances': self.instances_spin.value(),
             'active_keys_by_provider': {

@@ -30,6 +30,11 @@ from gemini_translator.utils.language_tools import LanguageDetector
 from gemini_translator.api import config as api_config
 from gemini_translator.utils.epub_tools import estimate_epub_chapter_input_tokens
 from gemini_translator.utils.glossary_tools import GlossaryAggregator, ContextManager
+from gemini_translator.utils.power_inhibitor import (
+    PREVENT_SLEEP_SETTING_KEY,
+    load_prevent_sleep_setting,
+    save_prevent_sleep_setting,
+)
 from gemini_translator.utils.settings import SettingsManager
 from gemini_translator.core.task_manager import TaskDBWorker
 from gemini_translator.core.glossary_pipeline import (
@@ -410,15 +415,28 @@ class GenerationSessionPage(ShellPage):
 
     def _merge_initial_ui_settings(self, initial_ui_settings):
         merged = dict(initial_ui_settings or {})
+        initial_has_sleep_setting = PREVENT_SLEEP_SETTING_KEY in merged
+
+        def shared_sleep_setting():
+            if initial_has_sleep_setting:
+                return bool(merged.get(PREVENT_SLEEP_SETTING_KEY))
+            return load_prevent_sleep_setting(
+                self.settings_manager,
+                merged.get(PREVENT_SLEEP_SETTING_KEY, False),
+            )
+
         if not self._restore_saved_ui_settings:
+            merged[PREVENT_SLEEP_SETTING_KEY] = shared_sleep_setting()
             return merged
         if not hasattr(self.settings_manager, 'get_last_glossary_generation_settings'):
+            merged[PREVENT_SLEEP_SETTING_KEY] = shared_sleep_setting()
             return merged
 
         try:
             saved_settings = self.settings_manager.get_last_glossary_generation_settings() or {}
         except Exception as e:
             print(f"[WARN] Failed to load glossary generation settings: {e}")
+            merged[PREVENT_SLEEP_SETTING_KEY] = shared_sleep_setting()
             return merged
 
         if isinstance(saved_settings, dict):
@@ -426,6 +444,7 @@ class GenerationSessionPage(ShellPage):
             if any(key in saved_settings for key in ('task_size_limit', 'task_size_limit_user_defined')):
                 saved_settings['_glossary_generation_saved_task_size'] = True
             merged.update(saved_settings)
+        merged[PREVENT_SLEEP_SETTING_KEY] = shared_sleep_setting()
         return merged
 
     def _save_persistent_ui_settings(self):
@@ -442,6 +461,9 @@ class GenerationSessionPage(ShellPage):
             )
         except Exception as e:
             print(f"[WARN] Failed to save glossary generation settings: {e}")
+
+    def _save_shared_sleep_prevention_setting(self, enabled: bool):
+        save_prevent_sleep_setting(self.settings_manager, enabled)
     
     
     
@@ -1271,6 +1293,8 @@ class GenerationSessionPage(ShellPage):
             self.sequential_mode_checkbox.setChecked(bool(initial_settings.get('is_sequential')))
         if 'send_notes_in_sequence' in initial_settings:
             self.send_notes_checkbox.setChecked(bool(initial_settings.get('send_notes_in_sequence', True)))
+        if hasattr(self, 'prevent_sleep_checkbox'):
+            self.prevent_sleep_checkbox.setChecked(bool(initial_settings.get(PREVENT_SLEEP_SETTING_KEY, False)))
 
         merge_mode = initial_settings.get('merge_mode') or initial_settings.get('glossary_merge_mode')
         if merge_mode == 'update':
@@ -1673,6 +1697,8 @@ class GenerationSessionPage(ShellPage):
         self.sequential_mode_checkbox.setChecked(is_sequential)
 
         self.send_notes_checkbox.setChecked(settings.get('send_notes_in_sequence', True))
+        if hasattr(self, 'prevent_sleep_checkbox'):
+            self.prevent_sleep_checkbox.setChecked(bool(settings.get(PREVENT_SLEEP_SETTING_KEY, False)))
 
         merge_mode = settings.get('merge_mode', 'supplement')
         if merge_mode == 'update': self.ai_mode_update_radio.setChecked(True)
@@ -1973,6 +1999,21 @@ class GenerationSessionPage(ShellPage):
         self.send_notes_checkbox.setChecked(True)
         main_settings_layout.addWidget(self.send_notes_checkbox)
 
+        self.prevent_sleep_checkbox = QCheckBox("Не блокировать и не усыплять компьютер во время AI-сессии")
+        self.prevent_sleep_checkbox.setToolTip(
+            "Использует ту же настройку, что и вкладка настроек EPUB-переводчика.\n"
+            "Экран может гаснуть, но система не должна уходить в сон во время AI-сессии."
+        )
+        self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
+        main_settings_layout.addWidget(self.prevent_sleep_checkbox)
+
+        from PyQt6.QtCore import QSettings
+        self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
+        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        main_settings_layout.addWidget(self.cb_notifications)
+
         # Распорка
         main_settings_layout.addStretch(1)
 
@@ -2051,12 +2092,18 @@ class GenerationSessionPage(ShellPage):
             lambda checked: self.model_settings_widget.set_concurrent_requests_visible(not checked)
         )
         self.sequential_mode_checkbox.toggled.connect(self._on_mode_changed)
+        self.prevent_sleep_checkbox.toggled.connect(self._save_shared_sleep_prevention_setting)
 
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll_area.setWidget(settings_container)
         return scroll_area
+
+    def _on_notifications_toggled(self, checked):
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        settings.setValue("notifications_enabled", checked)
 
 
     def _create_results_tab(self):
@@ -2612,6 +2659,7 @@ class GenerationSessionPage(ShellPage):
         settings['custom_prompt'] = api_config.default_prompt()
         settings['glossary_merge_mode'] = self.get_merge_mode()
         settings['send_notes_in_sequence'] = self.send_notes_checkbox.isChecked()
+        settings[PREVENT_SLEEP_SETTING_KEY] = self.prevent_sleep_checkbox.isChecked()
         
         # Передаем лимит новых терминов
         if hasattr(self, 'new_terms_limit_spin'):
@@ -2688,6 +2736,12 @@ class GenerationSessionPage(ShellPage):
             # при следующем запуске он увидит полностью готовый результат.
             # Удаление произойдет только в методе accept() (кнопка "Применить").
             self._perform_safe_recovery_save()
+            
+            from PyQt6.QtWidgets import QApplication
+            for w in QApplication.topLevelWidgets():
+                if hasattr(w, 'show_notification'):
+                    w.show_notification("Глоссарий", "Генерация глоссария завершена.")
+                    break
             
             return
     

@@ -2398,6 +2398,13 @@ class CorrectionSessionPage(ShellPage):
             return
 
         main_window = self._get_glossary_owner()
+        
+        from PyQt6.QtWidgets import QApplication
+        for w in QApplication.topLevelWidgets():
+            if hasattr(w, 'show_notification'):
+                w.show_notification("Глоссарий", "AI-корректор завершил работу.")
+                break
+            
         if not main_window or main_window.__class__.__name__ not in ('MainWindow', 'GlossaryManagerPage'):
             return
 

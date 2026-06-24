@@ -188,7 +188,12 @@ def discover_ranobelib_source_data():
 
 
 def get_additional_data_entries():
-    entries = list(ADDITIONAL_DATA)
+    entries = []
+    for src, dst in ADDITIONAL_DATA:
+        if Path(src).exists() or (PROJECT_ROOT / src).exists():
+            entries.append((src, dst))
+        else:
+            print(f"     [WARN] Файл или папка '{src}' не найдены, пропуск.")
     entries.extend(discover_ranobelib_source_data())
     entries.extend(discover_playwright_runtime_data())
     return entries
@@ -217,24 +222,23 @@ def filter_third_party_imports(imports):
     print("\n--- Этап 2: Фильтрация модулей (улучшенная логика) ---")
     third_party_imports = set()
     
-    # 1. Получаем список стандартных библиотек. Это наш "черный список".
     try:
-        # Для Python 3.10+
         standard_libs = set(sys.stdlib_module_names)
         print(f"  -> Используется полный список стандартных библиотек Python {sys.version.split()[0]}.")
     except AttributeError:
-        # Для более старых версий Python (fallback)
         standard_libs = set(sys.builtin_module_names)
         print(f"  -> [WARN] Используется базовый список встроенных модулей. Точность может быть ниже.")
 
-    # 2. Итерируем по всем найденным импортам
     for module_name in sorted(list(imports)):
-        # 3. Применяем простое правило исключения
         if module_name in PROJECT_MODULES or module_name in standard_libs:
-            # Если модуль - часть нашего проекта или стандартный, пропускаем его.
             continue
-        
-        # 4. ВСЁ ОСТАЛЬНОЕ - считаем сторонней зависимостью!
+            
+        if (PROJECT_ROOT / f"{module_name}.py").exists() or (PROJECT_ROOT / module_name).is_dir():
+            continue
+            
+        if os.name == 'nt' and module_name in ('AppKit', 'objc'):
+            continue
+            
         third_party_imports.add(module_name)
 
     print("[OK] Идентифицированы сторонние зависимости по принципу исключения.")
@@ -334,9 +338,20 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
             print(f"     [WARN] Элемент не найден и будет пропущен: {path}")
             continue
 
+        is_directory = path.is_dir()
+        file_name = path.name
+
+        try:
+            path = path.relative_to(PROJECT_ROOT)
+        except ValueError:
+            localappdata = os.environ.get("LOCALAPPDATA")
+            if localappdata and str(path).startswith(localappdata):
+                path_str = str(path).replace(localappdata, "%LOCALAPPDATA%")
+                path = Path(path_str)
+
         destination_str = str(destination) if str(destination) else '.'
         display_source = str(path)
-        if path.is_dir():
+        if is_directory:
             print(f"     - Папка: {display_source} -> {destination_str}")
         else:
             print(f"     - Файл:  {display_source} -> {destination_str}")
@@ -346,18 +361,18 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
         src_win = str(path).replace('/', '\\')
         dest_win = destination_str.replace('/', '\\')
 
-        if path.is_dir():
+        if is_directory:
             copy_commands_hybrid.append(f'    xcopy "{src_win}" "dist\\{dest_win}\\" /E /I /Y /Q > nul')
             copy_commands_advanced.append(f'    xcopy "{src_win}" "dist\\%AppName%\\{dest_win}\\" /E /I /Y /Q > nul')
         else:
             if dest_win not in ("", "."):
                 copy_commands_hybrid.append(f'    if not exist "dist\\{dest_win}" mkdir "dist\\{dest_win}"')
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{dest_win}\\{path.name}" > nul')
+                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{dest_win}\\{file_name}" > nul')
                 copy_commands_advanced.append(f'    if not exist "dist\\%AppName%\\{dest_win}" mkdir "dist\\%AppName%\\{dest_win}"')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{dest_win}\\{path.name}" > nul')
+                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{dest_win}\\{file_name}" > nul')
             else:
-                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{path.name}" > nul')
-                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{path.name}" > nul')
+                copy_commands_hybrid.append(f'    copy /Y "{src_win}" "dist\\{file_name}" > nul')
+                copy_commands_advanced.append(f'    copy /Y "{src_win}" "dist\\%AppName%\\{file_name}" > nul')
 
     # Команда для ПОЛНОСТЬЮ ПОРТАТИВНОЙ сборки (включает --add-data)
     full_portable_args = list(base_pyinstaller_args) + ["--onefile"] + add_data_args
@@ -414,7 +429,7 @@ if /I "%PYTHON_CMD%"=="python" (
         goto :eof
     )
 ) else if not exist "%PYTHON_CMD%" (
-    echo [!!!] Не найден интерпретатор Python: %PYTHON_CMD%
+    echo [!!!] Не найден интерпретатор Python: "%PYTHON_CMD%"
     pause
     goto :eof
 )
