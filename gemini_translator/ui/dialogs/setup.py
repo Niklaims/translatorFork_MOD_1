@@ -362,6 +362,7 @@ class InitialSetupPage(ShellPage):
         self.current_project_folder_loaded = None # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
         self.is_settings_dirty = False
         self.is_glossary_dirty = False
+        self._task_queue_needs_rebuild = False
         self.local_set = False
         self.cpu_performance_index = None
         self.is_fuzzy_disabled_by_system = False
@@ -696,6 +697,14 @@ class InitialSetupPage(ShellPage):
     def _on_translation_options_changed(self):
         self._refresh_auto_translate_runtime_context()
         self._mark_settings_as_dirty()
+        self._task_queue_needs_rebuild = True
+        if getattr(self, 'is_session_active', False):
+            return
+        if not (getattr(self, 'selected_file', None) and getattr(self, 'html_files', None)):
+            return
+        if not getattr(self, 'task_manager', None):
+            return
+        self._prepare_and_display_tasks(clean_rebuild=True)
 
     def _on_main_tab_changed(self, index: int):
         if index == getattr(self, 'glossary_tab_index', -1):
@@ -3520,7 +3529,11 @@ class InitialSetupPage(ShellPage):
         """
         engine = getattr(self, 'engine', None)
         task_manager = getattr(engine, 'task_manager', None) or getattr(self, 'task_manager', None)
-        if task_manager and task_manager.has_pending_tasks():
+        if (
+            task_manager
+            and task_manager.has_pending_tasks()
+            and not getattr(self, '_task_queue_needs_rebuild', False)
+        ):
             return True
 
         if not (self.selected_file and self.output_folder and self.html_files):
@@ -4773,6 +4786,7 @@ class InitialSetupPage(ShellPage):
                 self.task_manager.set_pending_tasks(plain_payloads)
 
         QtCore.QTimer.singleShot(15, lambda: self.translation_options_widget._update_info_text())
+        self._task_queue_needs_rebuild = False
 
 
         if self.cpu_performance_index is None and self.html_files and self.glossary_widget.get_glossary():
