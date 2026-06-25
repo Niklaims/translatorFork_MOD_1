@@ -174,6 +174,10 @@ class MainShell(QtWidgets.QMainWindow):
         self._back_button.setVisible(self.navigation.depth > 1)
 
     def closeEvent(self, event) -> None:
+        if self.property("is_updating"):
+            event.accept()
+            return
+
         if not self.isVisible():
             event.accept()
             return

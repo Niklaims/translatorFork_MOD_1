@@ -256,7 +256,11 @@ class HomePage(ShellPage):
         try:
             repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
             QtWidgets.QApplication.processEvents()
-            result = subprocess.run(["git", "pull"], capture_output=True, text=True, cwd=repo_root)
+            # Используем временные данные пользователя, чтобы git мог сделать авто-мердж (или stash/rebase) при наличии локальных изменений
+            result = subprocess.run(
+                ["git", "-c", "user.name=Updater", "-c", "user.email=updater@localhost", "pull", "--no-edit"], 
+                capture_output=True, text=True, cwd=repo_root
+            )
             progress.close()
             
             if result.returncode == 0:
@@ -272,6 +276,7 @@ class HomePage(ShellPage):
         from PyQt6.QtCore import QProcess
         from PyQt6.QtWidgets import QApplication
         try:
+            self.window().setProperty("is_updating", True)
             QProcess.startDetached(sys.executable, sys.argv)
             QApplication.quit()
         except Exception as e:
