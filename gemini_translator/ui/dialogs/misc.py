@@ -764,10 +764,13 @@ class EnhancedProjectHistoryDialog(QDialog):
         self._update_delete_button_state()
 
     def choose_projects_root_folder(self):
+        start_folder = self.projects_root_folder
+        if not start_folder and hasattr(self.settings_manager, "get_project_start_folder"):
+            start_folder = self.settings_manager.get_project_start_folder()
         folder = QFileDialog.getExistingDirectory(
             self,
             "Выберите папку с проектами",
-            self.projects_root_folder or os.path.expanduser("~")
+            start_folder or os.path.expanduser("~")
         )
         if not folder:
             return

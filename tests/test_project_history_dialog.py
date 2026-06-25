@@ -62,6 +62,46 @@ class ProjectHistoryTests(unittest.TestCase):
             self.assertEqual(history[0]["output_folder"], os.path.normpath(output_folder))
             self.assertEqual(history[0]["epub_path"], os.path.normpath(epub_path))
 
+    def test_projects_root_folder_is_empty_until_user_sets_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = os.path.join(temp_dir, "settings.json")
+            root_folder = os.path.join(temp_dir, "books")
+            os.makedirs(root_folder)
+            manager = SettingsManager(config_file=config_file)
+
+            self.assertEqual(manager.get_last_projects_root_folder(), "")
+
+            manager.save_last_projects_root_folder(root_folder)
+
+            self.assertEqual(
+                manager.get_last_projects_root_folder(),
+                os.path.normpath(root_folder),
+            )
+            self.assertEqual(
+                manager.get_project_start_folder(),
+                os.path.normpath(root_folder),
+            )
+
+            manager.save_last_projects_root_folder("")
+
+            self.assertEqual(manager.get_last_projects_root_folder(), "")
+
+    def test_project_start_folder_prefers_explicit_candidate_over_root(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = os.path.join(temp_dir, "settings.json")
+            root_folder = os.path.join(temp_dir, "books")
+            candidate_folder = os.path.join(temp_dir, "selected")
+            os.makedirs(root_folder)
+            os.makedirs(candidate_folder)
+
+            manager = SettingsManager(config_file=config_file)
+            manager.save_last_projects_root_folder(root_folder)
+
+            self.assertEqual(
+                manager.get_project_start_folder(candidate_folder),
+                os.path.normpath(candidate_folder),
+            )
+
     def test_remove_history_project_hides_scanned_entry_in_current_dialog(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             project_folder = os.path.join(temp_dir, "Project Two")

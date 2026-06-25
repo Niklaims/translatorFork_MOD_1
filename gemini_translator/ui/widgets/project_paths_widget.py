@@ -28,13 +28,23 @@ class ProjectPathsWidget(QWidget):
     chapters_reselection_requested = pyqtSignal()
     swap_file_requested = pyqtSignal()
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, settings_manager=None):
         super().__init__(parent)
+        self.settings_manager = settings_manager
         self._file_path = None
         self._folder_path = None
         self._chapters_count = 0
         self._collapsed = False
         self._init_ui()
+
+    def _dialog_start_folder(self, *candidates):
+        if self.settings_manager and hasattr(self.settings_manager, "get_project_start_folder"):
+            return self.settings_manager.get_project_start_folder(*candidates)
+
+        for candidate in candidates:
+            if candidate and os.path.isdir(candidate):
+                return os.path.normpath(candidate)
+        return os.path.expanduser("~")
 
     def _init_ui(self):
         root_layout = QVBoxLayout(self)
@@ -220,10 +230,12 @@ class ProjectPathsWidget(QWidget):
         return card, value_label, detail_label, button
 
     def _on_select_file(self):
+        current_file_dir = os.path.dirname(self._file_path) if self._file_path else ""
+        start_folder = self._dialog_start_folder(current_file_dir, self._folder_path)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Выберите книгу или документ",
-            "",
+            start_folder,
             DOCUMENT_INPUT_FILTER,
         )
         if file_path:
@@ -235,7 +247,12 @@ class ProjectPathsWidget(QWidget):
             self.file_selected.emit(file_path)
 
     def _on_select_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Выберите папку для проекта перевода")
+        start_folder = self._dialog_start_folder(self._folder_path)
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Выберите папку для проекта перевода",
+            start_folder,
+        )
         if folder:
             self.folder_selected.emit(folder)
 
