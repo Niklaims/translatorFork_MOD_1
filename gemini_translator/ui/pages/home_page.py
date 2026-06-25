@@ -11,8 +11,13 @@ stays a real button (``.click()`` works).
 from __future__ import annotations
 
 from PyQt6 import QtCore, QtWidgets
-
+import os
+import sys
+import subprocess
+import requests
+import tempfile
 from gemini_translator.ui.shell import ShellPage
+from gemini_translator.utils.updater import UpdateChecker
 
 # (icon, title, description, tool_id, is_large)
 _TOOLS = [
@@ -119,11 +124,27 @@ class HomePage(ShellPage):
         super().__init__(parent)
         self.tool_buttons: dict[str, QtWidgets.QPushButton] = {}
         self._build_ui()
+        import os
+        if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
+            QtCore.QTimer.singleShot(1000, lambda: self.check_for_updates(silent=True))
 
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(26, 22, 26, 22)
         outer.setSpacing(16)
+
+        top_row = QtWidgets.QHBoxLayout()
+        self.btn_check_update = QtWidgets.QPushButton("Проверить обновления")
+        self.btn_check_update.setFixedSize(160, 30)
+        self.btn_check_update.clicked.connect(lambda: self.check_for_updates(silent=False))
+        top_row.addWidget(self.btn_check_update)
+        
+        from gemini_translator.version import APP_VERSION
+        self.lbl_version = QtWidgets.QLabel(f"Текущая версия: {APP_VERSION.lstrip('V ')}")
+        top_row.addWidget(self.lbl_version)
+        
+        top_row.addStretch()
+        outer.addLayout(top_row)
 
         heading = QtWidgets.QLabel("Выберите основной инструмент для запуска")
         heading.setObjectName("homeHeading")
@@ -149,3 +170,312 @@ class HomePage(ShellPage):
                 grid.addWidget(card, row, col)
         outer.addLayout(grid)
         outer.addStretch(1)
+
+    def check_for_updates(self, silent=False):
+        self.btn_check_update.setEnabled(False)
+        self.btn_check_update.setText("Проверка...")
+        self._update_silent = silent
+        
+        self.updater_thread = UpdateChecker(self)
+        self.updater_thread.update_available.connect(self.on_update_available)
+        self.updater_thread.no_update.connect(self.on_no_update)
+        self.updater_thread.error_occurred.connect(self.on_update_error)
+        self.updater_thread.start()
+        
+    def on_no_update(self):
+        self.btn_check_update.setEnabled(True)
+        self.btn_check_update.setText("Проверить обновления")
+        if getattr(self, '_update_silent', False): return
+        QtWidgets.QMessageBox.information(self, "Обновление", "У вас установлена последняя версия программы.")
+        
+    def on_update_error(self, err):
+        self.btn_check_update.setEnabled(True)
+        self.btn_check_update.setText("Проверить обновления")
+        if getattr(self, '_update_silent', False): return
+        QtWidgets.QMessageBox.warning(self, "Ошибка", f"Не удалось проверить обновления: {err}")
+        
+    def on_update_available(self, version, description, download_url):
+        settings = QtCore.QSettings("SiberianTeam", "TranslatorFork")
+        ignored = settings.value("updater/ignored_version", "")
+        installed = settings.value("updater/installed_version", "")
+        
+        if getattr(self, '_update_silent', False):
+            if version == ignored or version == installed:
+                self.btn_check_update.setEnabled(True)
+                self.btn_check_update.setText("Проверить обновления")
+                return
+
+        self.btn_check_update.setEnabled(True)
+        self.btn_check_update.setText("Проверить обновления")
+        
+        msg = QtWidgets.QMessageBox(self)
+        msg.setWindowTitle("Доступно обновление")
+        msg.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse)
+        
+        import re
+        html_desc = description.replace('\n', '<br>')
+        html_desc = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', html_desc)
+        html_desc = re.sub(r'(https?://[^\s<]+)', r'<a href="\1">\1</a>', html_desc)
+        
+        msg.setTextFormat(QtCore.Qt.TextFormat.RichText)
+        msg.setText(f"Доступна новая версия: <b>{version}</b><br><br>{html_desc}")
+        
+        btn_install_now = msg.addButton("Скачать и установить", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        btn_remind_later = msg.addButton("Напомнить позже", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        btn_ignore = msg.addButton("Игнорировать", QtWidgets.QMessageBox.ButtonRole.ActionRole)
+        
+        msg.exec()
+        
+        if msg.clickedButton() == btn_ignore:
+            settings.setValue("updater/ignored_version", version)
+            return
+            
+        if msg.clickedButton() == btn_remind_later:
+            return
+        
+        install_now = (msg.clickedButton() == btn_install_now)
+        
+        # Запускаем загрузку
+        if version == "source":
+            self.download_source_update(install_now)
+        else:
+            self.download_update(download_url, install_now, version)
+
+    def download_source_update(self, install_now):
+        if not install_now:
+            QtWidgets.QMessageBox.information(self, "Обновление", "Обновление будет установлено вручную (командой git pull).")
+            return
+            
+        progress = QtWidgets.QProgressDialog("Получение обновлений (git pull)...", "Отмена", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.setRange(0, 0) # Indeterminate progress
+        progress.show()
+        
+        import subprocess
+        import os
+        try:
+            repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+            QtWidgets.QApplication.processEvents()
+            result = subprocess.run(["git", "pull"], capture_output=True, text=True, cwd=repo_root)
+            progress.close()
+            
+            if result.returncode == 0:
+                self.launch_source_updater()
+            else:
+                QtWidgets.QMessageBox.critical(self, "Ошибка обновления", f"Не удалось обновить исходный код. Возможно, есть локальные изменения или конфликты (блокировки):\n{result.stderr}")
+        except Exception as e:
+            progress.close()
+            QtWidgets.QMessageBox.critical(self, "Ошибка обновления", f"Ошибка: {e}")
+            
+    def launch_source_updater(self):
+        import sys
+        from PyQt6.QtCore import QProcess
+        from PyQt6.QtWidgets import QApplication
+        try:
+            QProcess.startDetached(sys.executable, sys.argv)
+            QApplication.quit()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка перезапуска", f"Не удалось перезапустить программу: {e}")
+            
+    def download_update(self, url, install_now, version):
+        import requests
+        import uuid
+        import os
+        import tempfile
+        
+        if not url:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Ссылка на скачивание не найдена.")
+            return
+            
+        progress = QtWidgets.QProgressDialog("Загрузка обновления...", "Отмена", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        try:
+            r = requests.get(url, stream=True, timeout=10)
+            total_size = int(r.headers.get('content-length', 0))
+            
+            unique_id = uuid.uuid4().hex[:8]
+            filename = f"{unique_id}_{url.split('/')[-1]}"
+            filepath = os.path.join(tempfile.gettempdir(), filename)
+            
+            with open(filepath, 'wb') as f:
+                downloaded = 0
+                for data in r.iter_content(chunk_size=4096):
+                    if progress.wasCanceled():
+                        return
+                    downloaded += len(data)
+                    f.write(data)
+                    if total_size:
+                        progress.setValue(int(100 * downloaded / total_size))
+                        
+            progress.setValue(100)
+            
+            settings = QtCore.QSettings("SiberianTeam", "TranslatorFork")
+            settings.setValue("updater/installed_version", version)
+            settings.sync()
+            
+            if install_now:
+                self.launch_updater(filepath)
+            else:
+                QtWidgets.QMessageBox.information(self, "Успех", "Обновление скачано и будет установлено при следующем запуске (или вручную).")
+                
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось скачать обновление: {e}")
+
+    @staticmethod
+    def _get_real_executable():
+        """Get the real on-disk path to the application executable.
+
+        In PyInstaller ``--onefile`` builds ``sys.executable`` points to the
+        bootstrap binary inside a temporary ``_MEI*`` directory.  That folder
+        is removed when the process exits, so using it for a *restart* command
+        causes "Failed to load Python DLL" on Windows.
+
+        This helper resolves the original launch path instead.
+        """
+        import re
+        if getattr(sys, 'frozen', False):
+            exe = os.path.abspath(sys.executable)
+            # On Windows onefile builds sys.executable may resolve inside
+            # the _MEI* temp dir.  Fall back to sys.argv[0] which always
+            # holds the real exe the user double-clicked.
+            if sys.platform == 'win32' and re.search(r'_MEI\d+', exe):
+                exe = os.path.abspath(sys.argv[0])
+            return exe
+        return os.path.abspath(sys.executable)
+
+    def launch_updater(self, filepath):
+        import subprocess
+        import tempfile
+        import os
+        import sys
+        import copy
+        
+        # Prepare a clean environment for PyInstaller restart
+        env = copy.deepcopy(os.environ)
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+        for k in list(env.keys()):
+            if k.startswith('_PYI_'):
+                del env[k]
+
+        if sys.platform == "win32":
+            log_path = os.path.join(tempfile.gettempdir(), "translator_updater.log")
+            real_exe = self._get_real_executable()
+            if "setup" in filepath.lower() or "install" in filepath.lower():
+                # Inno Setup with skipifsilent flag does not restart the app
+                # automatically, so we must start it explicitly here.
+                bat_content = f"""@echo off
+chcp 65001 >nul
+set PYINSTALLER_RESET_ENVIRONMENT=1
+echo [%date% %time%] Waiting for application to close... >> "{log_path}"
+timeout /t 3 /nobreak >nul
+echo [%date% %time%] Running installer... >> "{log_path}"
+start /wait "" "{filepath}" /VERYSILENT /SUPPRESSMSGBOXES /FORCECLOSEAPPLICATIONS >> "{log_path}" 2>&1
+echo [%date% %time%] Restarting application... >> "{log_path}"
+start "" "{real_exe}"
+echo [%date% %time%] Installer finished. >> "{log_path}"
+del "%~f0"
+"""
+            else:
+                bat_content = f"""@echo off
+chcp 65001 >nul
+set PYINSTALLER_RESET_ENVIRONMENT=1
+echo [%date% %time%] Waiting for application to close... >> "{log_path}"
+timeout /t 3 /nobreak >nul
+echo [%date% %time%] Replacing portable executable... >> "{log_path}"
+copy /Y "{filepath}" "{real_exe}" >> "{log_path}" 2>&1
+if errorlevel 1 (
+    echo [%date% %time%] Retry copy... >> "{log_path}"
+    timeout /t 2 /nobreak >nul
+    copy /Y "{filepath}" "{real_exe}" >> "{log_path}" 2>&1
+)
+echo [%date% %time%] Restarting application... >> "{log_path}"
+start "" "{real_exe}"
+del "%~f0"
+"""
+            bat_path = os.path.join(tempfile.gettempdir(), "translator_updater.bat")
+            with open(bat_path, "w", encoding="utf-8") as f:
+                f.write(bat_content)
+                
+            try:
+                subprocess.call(['powershell', '-Command', f"Unblock-File -LiteralPath '{filepath}'"])
+            except Exception:
+                pass
+            subprocess.Popen(["cmd.exe", "/c", bat_path], creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0, env=env)
+            
+        elif sys.platform == "darwin" and (filepath.endswith('.dmg') or filepath.endswith('.zip')):
+            app_bundle_path = sys.executable
+            while app_bundle_path != '/' and not app_bundle_path.endswith('.app'):
+                app_bundle_path = os.path.dirname(app_bundle_path)
+                
+            if app_bundle_path.endswith('.app'):
+                sh_content = f"""#!/bin/bash
+# Clear PyInstaller environment variables to prevent crashes in the new app
+unset DYLD_LIBRARY_PATH
+unset LD_LIBRARY_PATH
+export PYINSTALLER_RESET_ENVIRONMENT=1
+
+# Relaxed error handling — individual commands may return non-zero
+# legitimately (e.g. hdiutil, xattr).
+exec >> /tmp/updater.log 2>&1
+echo "[$(date)] Starting update..."
+sleep 5
+
+if [[ "{filepath}" == *.dmg ]]; then
+    MNT_OUTPUT=$(hdiutil attach -nobrowse "{filepath}" 2>&1 | grep '/Volumes/' || true)
+    MNT=$(echo "$MNT_OUTPUT" | awk -F '/Volumes/' '{{print "/Volumes/"$2}}' | xargs)
+    if [ -n "$MNT" ]; then
+        NEW_APP=$(find "$MNT" -name "*.app" -maxdepth 1 | head -n 1)
+        if [ -n "$NEW_APP" ]; then
+            echo "[$(date)] Found new app in DMG: $NEW_APP"
+            if [ -d "{app_bundle_path}.old" ]; then
+                rm -rf "{app_bundle_path}.old"
+            fi
+            mv "{app_bundle_path}" "{app_bundle_path}.old"
+            ditto "$NEW_APP" "{app_bundle_path}"
+            xattr -cr "{app_bundle_path}" || true
+            echo "[$(date)] Update successful"
+        fi
+        hdiutil detach "$MNT" -force || true
+    fi
+elif [[ "{filepath}" == *.zip ]]; then
+    EXTRACT_DIR=$(mktemp -d)
+    unzip -q -o "{filepath}" -d "$EXTRACT_DIR"
+    NEW_APP=$(find "$EXTRACT_DIR" -name "*.app" -maxdepth 2 | head -n 1)
+    if [ -n "$NEW_APP" ]; then
+        echo "[$(date)] Found new app in ZIP: $NEW_APP"
+        if [ -d "{app_bundle_path}.old" ]; then
+            rm -rf "{app_bundle_path}.old"
+        fi
+        mv "{app_bundle_path}" "{app_bundle_path}.old"
+        ditto "$NEW_APP" "{app_bundle_path}"
+        xattr -cr "{app_bundle_path}" || true
+        echo "[$(date)] Update successful"
+    fi
+    rm -rf "$EXTRACT_DIR"
+fi
+
+sleep 1
+open "{app_bundle_path}"
+rm -f "$0"
+"""
+                sh_path = os.path.join(tempfile.gettempdir(), "translator_updater.sh")
+                with open(sh_path, "w", encoding="utf-8") as f:
+                    f.write(sh_content)
+                os.chmod(sh_path, 0o755)
+                subprocess.Popen(
+                    ["/bin/bash", sh_path],
+                    start_new_session=True,
+                    env=env
+                )
+            else:
+                subprocess.Popen(['open', filepath], env=env)
+        else:
+            if sys.platform == "darwin":
+                subprocess.Popen(['open', filepath], env=env)
+            else:
+                subprocess.Popen([filepath], env=env)
+                
+        # Force quit to avoid "Are you sure you want to quit?" dialogs
+        os._exit(0)

@@ -1727,11 +1727,8 @@ class ConsistencyValidatorPage(ShellPage):
         self._log(f"   Токенов в глоссарии: ~{token_count}")
         self._save_session()
         
-        from PyQt6.QtWidgets import QApplication
-        for w in QApplication.topLevelWidgets():
-            if hasattr(w, 'show_notification'):
-                w.show_notification("Согласованность", f"Анализ завершен. Найдено проблем: {len(all_problems)}")
-                break
+        from gemini_translator.ui.notifications import NotificationManager
+        NotificationManager.show("Согласованность", f"Анализ завершен. Найдено проблем: {len(all_problems)}")
 
     @pyqtSlot(str)
     def on_engine_error(self, error_msg):

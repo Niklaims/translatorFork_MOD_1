@@ -29,8 +29,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; Основной исполняемый файл
-Source: "dist\translatorFork_MOD.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Содержимое собранной папки
+Source: "dist\translatorFork_MOD\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 ; Ярлык в меню "Пуск". ВАЖНО: AppUserModelID позволяет уведомлениям показывать имя программы

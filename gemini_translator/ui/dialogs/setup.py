@@ -3774,6 +3774,14 @@ class InitialSetupPage(ShellPage):
                 )
 
             self._schedule_auto_workflow_followup(reason)
+            
+            # Отправка системного уведомления о завершении
+            try:
+                from gemini_translator.ui.notifications import NotificationManager
+                msg = "Работа завершена!" if not reason else f"Остановлено: {reason}"
+                NotificationManager.show("Перевод EPUB", msg)
+            except Exception as e:
+                print(f"Notification error: {e}")
 
         except Exception as e:
             error_text = f"[FINALIZE SESSION UI ERROR] {type(e).__name__}: {e}"

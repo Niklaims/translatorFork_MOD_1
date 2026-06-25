@@ -14,6 +14,8 @@ RELEASE_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
+    if value.strip().lower() == "dev":
+        return (999, 999, 999)
     base_version = str(value).strip().removeprefix("v").split("-", 1)[0]
     parts = base_version.split(".")
     if len(parts) != 3:

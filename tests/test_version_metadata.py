@@ -3,6 +3,8 @@ import importlib.util
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
+    if value.strip().lower() == "dev":
+        return (999, 999, 999)
     base = value.strip().removeprefix("v").split("-", 1)[0]
     return tuple(int(part) for part in base.split("."))
 

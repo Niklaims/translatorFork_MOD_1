@@ -26,19 +26,19 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+import sys
+exe_name = 'GeminiTranslator' if sys.platform == 'darwin' else 'translatorFork_MOD'
+
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='translatorFork_MOD',
+    exclude_binaries=True,
+    name=exe_name,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -48,12 +48,22 @@ exe = EXE(
     icon=['gemini_translator/GT.ico'],
 )
 
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name=exe_name,
+)
+
 import sys
 if sys.platform == 'darwin':
     app = BUNDLE(
-        exe,
+        coll,
         name='GeminiTranslator.app',
-        icon=None,
+        icon='gemini_translator/GT_mac.icns',
         bundle_identifier='com.siberianteam.translatorfork',
         info_plist={
             'NSPrincipalClass': 'NSApplication',
@@ -61,5 +71,6 @@ if sys.platform == 'darwin':
             'NSUserNotificationAlertStyle': 'alert',
             'CFBundleName': 'GeminiTranslator',
             'CFBundleDisplayName': 'GeminiTranslator',
+            'LSUIElement': False,
         }
     )

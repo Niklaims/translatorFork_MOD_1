@@ -2393,18 +2393,14 @@ class CorrectionSessionPage(ShellPage):
 
     def _handle_correction_patch(self, patch_dict: dict):
         """Принимает ГОТОВЫЙ словарь-патч и запускает диалог предпросмотра."""
+        from gemini_translator.ui.notifications import NotificationManager
+        NotificationManager.show("Глоссарий", "AI-корректор завершил работу.")
+
         if not patch_dict:
             QMessageBox.information(self, "Результат", "AI-корректор не нашел терминов, требующих исправления.")
             return
 
         main_window = self._get_glossary_owner()
-        
-        from PyQt6.QtWidgets import QApplication
-        for w in QApplication.topLevelWidgets():
-            if hasattr(w, 'show_notification'):
-                w.show_notification("Глоссарий", "AI-корректор завершил работу.")
-                break
-            
         if not main_window or main_window.__class__.__name__ not in ('MainWindow', 'GlossaryManagerPage'):
             return
 

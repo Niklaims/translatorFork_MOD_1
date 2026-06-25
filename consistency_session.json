@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-06-24 13:15:11.638488",
+  "consistency_mode": "deep_consistency",
+  "session_signature": "",
+  "glossary": {
+    "characters": [],
+    "terms": [],
+    "processed_chapters": [],
+    "important_events": [],
+    "next_chunk_focus": []
+  },
+  "processed_chapters": [],
+  "problems": [],
+  "selected_chapter_ids": [
+    "chapter.xhtml"
+  ],
+  "completed_chunks": {},
+  "request_response_trace": []
+}

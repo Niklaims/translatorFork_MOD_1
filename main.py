@@ -1088,6 +1088,26 @@ if __name__ == "__main__":
     os_patch.PatientLock.register_vip_thread(main_id)
 
     app = ApplicationWithContext(sys.argv)
+    
+    # --- ЛОКАЛИЗАЦИЯ СТАНДАРТНЫХ ЭЛЕМЕНТОВ QT ---
+    # Загружаем русскую локализацию для контекстных меню (ПКМ) и диалогов Qt (QMessageBox, QInputDialog и т.д.)
+    from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale
+    
+    # Локализация базовых компонентов (кнопки, меню)
+    qtbase_translator = QTranslator(app)
+    qt_translations_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+    if qtbase_translator.load("qtbase_ru", qt_translations_path):
+        app.installTranslator(qtbase_translator)
+        
+    # Локализация остальных компонентов
+    qt_translator = QTranslator(app)
+    if qt_translator.load("qt_ru", qt_translations_path):
+        app.installTranslator(qt_translator)
+    
+    # Фикс дублирования иконки в Dock на macOS
+    if sys.platform == "darwin":
+        app.setDesktopFileName("com.siberianteam.translatorfork")
+        
     install_window_title_branding(app)
     # Тема (светлая/тёмная/авто) применяется в apply_saved_app_theme ниже,
     # как только доступен settings_manager — без раннего тёмного дефолта,
@@ -1165,6 +1185,13 @@ if __name__ == "__main__":
 
         shell.show()
         exit_code = app.exec()
+        
+        # Гарантируем, что старое окно будет скрыто и уничтожено перед созданием нового
+        # в случае перезагрузки (EXIT_CODE_REBOOT)
+        if shell:
+            shell.hide()
+            shell.deleteLater()
+
         if exit_code != EXIT_CODE_REBOOT:
             break
 

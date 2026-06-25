@@ -60,3 +60,4 @@ _tmp_*
 *.swp
 .DS_Store
 Thumbs.db
+.worktrees/
