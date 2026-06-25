@@ -104,52 +104,47 @@ def test_save_mode_preserves_custom_mode():
     assert s.data["ui_theme_mode"] == "custom"
 
 
-class QtGlueTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+def test_system_is_dark_reads_color_scheme(qapp):
+    hints = MagicMock()
+    hints.colorScheme.return_value = QtCore.Qt.ColorScheme.Dark
+    fake_app = MagicMock()
+    fake_app.styleHints.return_value = hints
+    assert tm.system_is_dark(fake_app) is True
+    hints.colorScheme.return_value = QtCore.Qt.ColorScheme.Light
+    assert tm.system_is_dark(fake_app) is False
 
-    def test_system_is_dark_reads_color_scheme(self):
-        hints = MagicMock()
-        hints.colorScheme.return_value = QtCore.Qt.ColorScheme.Dark
-        fake_app = MagicMock()
-        fake_app.styleHints.return_value = hints
-        self.assertTrue(tm.system_is_dark(fake_app))
-        hints.colorScheme.return_value = QtCore.Qt.ColorScheme.Light
-        self.assertFalse(tm.system_is_dark(fake_app))
+def test_system_accent_returns_hex(qapp):
+    accent = tm.system_accent(qapp)
+    assert accent is None or accent.startswith("#")
 
-    def test_system_accent_returns_hex(self):
-        accent = tm.system_accent(self.app)
-        self.assertTrue(accent is None or accent.startswith("#"))
+def test_apply_light_sets_light_stylesheet(qapp):
+    tm.apply(qapp, mode="light", manual_colors={})
+    sheet = qapp.styleSheet()
+    assert themes.LIGHT_DEFAULT_THEME_COLORS["window_bg"] in sheet
 
-    def test_apply_light_sets_light_stylesheet(self):
-        tm.apply(self.app, mode="light", manual_colors={})
-        sheet = self.app.styleSheet()
-        self.assertIn(themes.LIGHT_DEFAULT_THEME_COLORS["window_bg"], sheet)
+def test_apply_dark_sets_dark_stylesheet(qapp):
+    tm.apply(qapp, mode="dark", manual_colors={})
+    sheet = qapp.styleSheet()
+    assert themes.DARK_DEFAULT_THEME_COLORS["window_bg"] in sheet
 
-    def test_apply_dark_sets_dark_stylesheet(self):
-        tm.apply(self.app, mode="dark", manual_colors={})
-        sheet = self.app.styleSheet()
-        self.assertIn(themes.DARK_DEFAULT_THEME_COLORS["window_bg"], sheet)
+def test_install_reapplies_on_real_color_scheme_signal(qapp):
+    # Connects via install() to the REAL QStyleHints.colorSchemeChanged and
+    # emits it, so the actual wiring is exercised (a wrong signal name would
+    # never reach the handler). Auto re-applies; a fixed mode does not.
+    calls = []
+    orig_apply = tm.apply
+    try:
+        tm.apply = lambda *a, **k: calls.append(k.get("mode"))
+        tm.install(qapp, FakeSettings({"ui_theme_mode": "auto"}))
 
-    def test_install_reapplies_on_real_color_scheme_signal(self):
-        # Connects via install() to the REAL QStyleHints.colorSchemeChanged and
-        # emits it, so the actual wiring is exercised (a wrong signal name would
-        # never reach the handler). Auto re-applies; a fixed mode does not.
-        calls = []
-        orig_apply = tm.apply
-        try:
-            tm.apply = lambda *a, **k: calls.append(k.get("mode"))
-            tm.install(self.app, FakeSettings({"ui_theme_mode": "auto"}))
+        setattr(qapp, "_active_theme_mode", "auto")
+        qapp.styleHints().colorSchemeChanged.emit(QtCore.Qt.ColorScheme.Dark)
+        assert "auto" in calls
 
-            setattr(self.app, "_active_theme_mode", "auto")
-            self.app.styleHints().colorSchemeChanged.emit(QtCore.Qt.ColorScheme.Dark)
-            self.assertIn("auto", calls)
-
-            calls.clear()
-            setattr(self.app, "_active_theme_mode", "dark")
-            self.app.styleHints().colorSchemeChanged.emit(QtCore.Qt.ColorScheme.Light)
-            self.assertEqual(calls, [])
-        finally:
-            tm.apply = orig_apply
-            setattr(self.app, "_active_theme_mode", "auto")
+        calls.clear()
+        setattr(qapp, "_active_theme_mode", "dark")
+        qapp.styleHints().colorSchemeChanged.emit(QtCore.Qt.ColorScheme.Light)
+        assert calls == []
+    finally:
+        tm.apply = orig_apply
+        setattr(qapp, "_active_theme_mode", "auto")

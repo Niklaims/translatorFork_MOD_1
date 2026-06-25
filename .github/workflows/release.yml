@@ -54,7 +54,7 @@ jobs:
           # Fallback to ZIP if create-dmg fails (which can happen on some CI environments)
           if [ ! -f GeminiTranslator-macOS.dmg ]; then
             cd dist
-            zip -r ../GeminiTranslator-macOS.zip GeminiTranslator.app
+            zip -y -r ../GeminiTranslator-macOS.zip GeminiTranslator.app
             cd ..
           fi
 
