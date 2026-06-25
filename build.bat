@@ -98,16 +98,21 @@ echo      - Создает папку с .exe и всеми зависимост
 echo      - Позволяет вручную редактировать конфиги и данные.
 echo      - Для разработчиков и отладки.
 echo.
-echo   4. Назад в главное меню
+echo   4. ИНСТАЛЛЯТОР (Inno Setup)
+echo      - Собирает Продвинутую версию, затем создает установщик Setup.exe.
+echo      - Требует установленного Inno Setup.
+echo.
+echo   5. Назад в главное меню
 echo.
 echo ======================================================
-set /p build_choice="Выберите действие (1, 2, 3 или 4): "
+set /p build_choice="Выберите действие (1, 2, 3, 4 или 5): "
 
 if not defined build_choice ( goto build_menu )
 if "%build_choice%"=="1" ( goto build_full_portable )
 if "%build_choice%"=="2" ( goto build_hybrid )
 if "%build_choice%"=="3" ( goto build_advanced )
-if "%build_choice%"=="4" ( goto menu )
+if "%build_choice%"=="4" ( goto build_installer )
+if "%build_choice%"=="5" ( goto menu )
 
 echo Неверный выбор.
 pause
@@ -140,13 +145,8 @@ call :build_app_base "ПОЛНОСТЬЮ ПОРТАТИВНАЯ"
 --clean ^
 --icon="gemini_translator\GT.ico" ^
 --noconfirm ^
---collect-data="PyQt6" ^
 --collect-data="certifi" ^
 --collect-data="docx" ^
---collect-data="emoji" ^
---collect-data="jieba" ^
---collect-data="lxml" ^
---collect-data="werkzeug" ^
 --hidden-import="PyQt6.sip" ^
 --hidden-import="docx" ^
 --hidden-import="playwright.sync_api" ^
@@ -155,22 +155,19 @@ call :build_app_base "ПОЛНОСТЬЮ ПОРТАТИВНАЯ"
 --onefile ^
 --add-data "config;config" ^
 --add-data "README.md;." ^
---add-data "gemini_translator\scripts\chatgpt_workascii_bridge.cjs;gemini_translator\scripts" ^
---add-data "gemini_translator\scripts\chatgpt_profile_launcher.cjs;gemini_translator\scripts" ^
---add-data "qidian_rulate\tags.txt;qidian_rulate" ^
---add-data "ranobelib\__init__.py;ranobelib" ^
---add-data "ranobelib\api_upload.py;ranobelib" ^
---add-data "ranobelib\constants.py;ranobelib" ^
---add-data "ranobelib\dependencies.py;ranobelib" ^
---add-data "ranobelib\dialogs.py;ranobelib" ^
---add-data "ranobelib\main.py;ranobelib" ^
---add-data "ranobelib\main_window.py;ranobelib" ^
---add-data "ranobelib\models.py;ranobelib" ^
---add-data "ranobelib\parsers.py;ranobelib" ^
---add-data "ranobelib\ranobelib-upload.mjs;ranobelib" ^
---add-data "ranobelib\ranobelib_uploader_v12.py;ranobelib" ^
---add-data "ranobelib\utils.py;ranobelib" ^
---add-data "ranobelib\workers.py;ranobelib"
+--add-data "ranobelib/__init__.py;ranobelib" ^
+--add-data "ranobelib/api_upload.py;ranobelib" ^
+--add-data "ranobelib/constants.py;ranobelib" ^
+--add-data "ranobelib/dependencies.py;ranobelib" ^
+--add-data "ranobelib/dialogs.py;ranobelib" ^
+--add-data "ranobelib/main.py;ranobelib" ^
+--add-data "ranobelib/main_window.py;ranobelib" ^
+--add-data "ranobelib/models.py;ranobelib" ^
+--add-data "ranobelib/parsers.py;ranobelib" ^
+--add-data "ranobelib/ranobelib-upload.mjs;ranobelib" ^
+--add-data "ranobelib/ranobelib_uploader_v12.py;ranobelib" ^
+--add-data "ranobelib/utils.py;ranobelib" ^
+--add-data "ranobelib/workers.py;ranobelib"
 call :build_app_end
 goto :eof
 
@@ -184,13 +181,8 @@ call :build_app_base "ГИБРИДНАЯ"
 --clean ^
 --icon="gemini_translator\GT.ico" ^
 --noconfirm ^
---collect-data="PyQt6" ^
 --collect-data="certifi" ^
 --collect-data="docx" ^
---collect-data="emoji" ^
---collect-data="jieba" ^
---collect-data="lxml" ^
---collect-data="werkzeug" ^
 --hidden-import="PyQt6.sip" ^
 --hidden-import="docx" ^
 --hidden-import="playwright.sync_api" ^
@@ -202,12 +194,6 @@ if %ERRORLEVEL% EQU 0 (
     echo [+] Этап 3 из 3: Копирование внешних данных...
     xcopy "config" "dist\config\" /E /I /Y /Q > nul
     copy /Y "README.md" "dist\README.md" > nul
-    if not exist "dist\gemini_translator\scripts" mkdir "dist\gemini_translator\scripts"
-    copy /Y "gemini_translator\scripts\chatgpt_workascii_bridge.cjs" "dist\gemini_translator\scripts\chatgpt_workascii_bridge.cjs" > nul
-    if not exist "dist\gemini_translator\scripts" mkdir "dist\gemini_translator\scripts"
-    copy /Y "gemini_translator\scripts\chatgpt_profile_launcher.cjs" "dist\gemini_translator\scripts\chatgpt_profile_launcher.cjs" > nul
-    if not exist "dist\qidian_rulate" mkdir "dist\qidian_rulate"
-    copy /Y "qidian_rulate\tags.txt" "dist\qidian_rulate\tags.txt" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
     copy /Y "ranobelib\__init__.py" "dist\ranobelib\__init__.py" > nul
     if not exist "dist\ranobelib" mkdir "dist\ranobelib"
@@ -249,13 +235,8 @@ call :build_app_base "ПРОДВИНУТАЯ"
 --clean ^
 --icon="gemini_translator\GT.ico" ^
 --noconfirm ^
---collect-data="PyQt6" ^
 --collect-data="certifi" ^
 --collect-data="docx" ^
---collect-data="emoji" ^
---collect-data="jieba" ^
---collect-data="lxml" ^
---collect-data="werkzeug" ^
 --hidden-import="PyQt6.sip" ^
 --hidden-import="docx" ^
 --hidden-import="playwright.sync_api" ^
@@ -266,12 +247,6 @@ if %ERRORLEVEL% EQU 0 (
     echo [+] Этап 3 из 3: Копирование внешних данных...
     xcopy "config" "dist\%AppName%\config\" /E /I /Y /Q > nul
     copy /Y "README.md" "dist\%AppName%\README.md" > nul
-    if not exist "dist\%AppName%\gemini_translator\scripts" mkdir "dist\%AppName%\gemini_translator\scripts"
-    copy /Y "gemini_translator\scripts\chatgpt_workascii_bridge.cjs" "dist\%AppName%\gemini_translator\scripts\chatgpt_workascii_bridge.cjs" > nul
-    if not exist "dist\%AppName%\gemini_translator\scripts" mkdir "dist\%AppName%\gemini_translator\scripts"
-    copy /Y "gemini_translator\scripts\chatgpt_profile_launcher.cjs" "dist\%AppName%\gemini_translator\scripts\chatgpt_profile_launcher.cjs" > nul
-    if not exist "dist\%AppName%\qidian_rulate" mkdir "dist\%AppName%\qidian_rulate"
-    copy /Y "qidian_rulate\tags.txt" "dist\%AppName%\qidian_rulate\tags.txt" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
     copy /Y "ranobelib\__init__.py" "dist\%AppName%\ranobelib\__init__.py" > nul
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
@@ -299,6 +274,136 @@ if %ERRORLEVEL% EQU 0 (
     if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
     copy /Y "ranobelib\workers.py" "dist\%AppName%\ranobelib\workers.py" > nul
     echo [OK] Данные скопированы.
+)
+call :build_app_end
+goto :eof
+
+
+:: --- Блок сборки: ИНСТАЛЛЯТОР ---
+:build_installer
+echo [+] Проверка наличия Inno Setup...
+set "ISCC_CMD="
+for /f "delims=" %%I in ('where iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+if not defined ISCC_CMD (
+    for /f "delims=" %%I in ('where /R "%PROGRAMFILES(X86)%" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+)
+if not defined ISCC_CMD (
+    for /f "delims=" %%I in ('where /R "%PROGRAMFILES%" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+)
+if not defined ISCC_CMD (
+    if exist "%LOCALAPPDATA%\Programs" (
+        for /f "delims=" %%I in ('where /R "%LOCALAPPDATA%\Programs" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+    )
+)
+if not defined ISCC_CMD (
+    for %%D in ("C:\Program Files (x86)\Inno Setup 8" "C:\Program Files (x86)\Inno Setup 7" "C:\Program Files (x86)\Inno Setup 6" "C:\Program Files\Inno Setup 6" "C:\Program Files (x86)\Inno Setup 5" "C:\Program Files\Inno Setup 5" "C:\Program Files (x86)\Inno Setup" "C:\Program Files\Inno Setup" "%LOCALAPPDATA%\Programs\Inno Setup 8" "%LOCALAPPDATA%\Programs\Inno Setup 7" "%LOCALAPPDATA%\Programs\Inno Setup 6" "%LOCALAPPDATA%\Programs\Inno Setup 5" "%LOCALAPPDATA%\Programs\Inno Setup") do (
+        if exist "%%~D\ISCC.exe" set "ISCC_CMD=%%~D\ISCC.exe"
+    )
+)
+
+if not defined ISCC_CMD (
+    echo [+] Inno Setup не найден. Попытка автоматической установки через winget...
+    where winget >nul 2^>^&1
+    if errorlevel 1 (
+        echo [!!!] winget не найден. Установите Inno Setup вручную: https://jrsoftware.org/isdl.php
+        pause
+        goto :eof
+    )
+    winget install --id JRSoftware.InnoSetup -e --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+    if errorlevel 1 (
+        echo [!!!] winget не смог установить Inno Setup.
+        echo     Проверьте сеть, winget/App Installer или установите вручную.
+        pause
+        goto :eof
+    )
+    
+    timeout /t 3 /nobreak >nul
+    
+    for /f "delims=" %%I in ('where iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+    if not defined ISCC_CMD (
+        for /f "delims=" %%I in ('where /R "%PROGRAMFILES(X86)%" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+    )
+    if not defined ISCC_CMD (
+        for /f "delims=" %%I in ('where /R "%PROGRAMFILES%" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+    )
+    if not defined ISCC_CMD (
+        if exist "%LOCALAPPDATA%\Programs" (
+            for /f "delims=" %%I in ('where /R "%LOCALAPPDATA%\Programs" iscc.exe 2^>nul') do set "ISCC_CMD=%%I"
+        )
+    )
+    if not defined ISCC_CMD (
+        for %%D in ("C:\Program Files (x86)\Inno Setup 8" "C:\Program Files (x86)\Inno Setup 7" "C:\Program Files (x86)\Inno Setup 6" "C:\Program Files\Inno Setup 6" "C:\Program Files (x86)\Inno Setup 5" "C:\Program Files\Inno Setup 5" "C:\Program Files (x86)\Inno Setup" "C:\Program Files\Inno Setup" "%LOCALAPPDATA%\Programs\Inno Setup 8" "%LOCALAPPDATA%\Programs\Inno Setup 7" "%LOCALAPPDATA%\Programs\Inno Setup 6" "%LOCALAPPDATA%\Programs\Inno Setup 5" "%LOCALAPPDATA%\Programs\Inno Setup") do (
+            if exist "%%~D\ISCC.exe" set "ISCC_CMD=%%~D\ISCC.exe"
+        )
+    )
+)
+
+if not defined ISCC_CMD (
+    echo [!!!] Не удалось автоматически установить Inno Setup. Установите его вручную: https://jrsoftware.org/isdl.php
+    pause
+    goto :eof
+)
+
+call :build_app_base "ИНСТАЛЛЯТОР"
+"%PYTHON_CMD%" -m PyInstaller main.py ^
+--windowed ^
+--name="%AppName%" ^
+--clean ^
+--icon="gemini_translator\GT.ico" ^
+--noconfirm ^
+--collect-data="certifi" ^
+--collect-data="docx" ^
+--hidden-import="PyQt6.sip" ^
+--hidden-import="docx" ^
+--hidden-import="playwright.sync_api" ^
+--hidden-import="google.genai" ^
+--hidden-import="google.genai.types"
+if %ERRORLEVEL% NEQ 0 (
+    call :build_app_end
+    goto :eof
+)
+
+echo.
+echo [+] Этап 3 из 4: Копирование внешних данных...
+    xcopy "config" "dist\%AppName%\config\" /E /I /Y /Q > nul
+    copy /Y "README.md" "dist\%AppName%\README.md" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\__init__.py" "dist\%AppName%\ranobelib\__init__.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\api_upload.py" "dist\%AppName%\ranobelib\api_upload.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\constants.py" "dist\%AppName%\ranobelib\constants.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\dependencies.py" "dist\%AppName%\ranobelib\dependencies.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\dialogs.py" "dist\%AppName%\ranobelib\dialogs.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\main.py" "dist\%AppName%\ranobelib\main.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\main_window.py" "dist\%AppName%\ranobelib\main_window.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\models.py" "dist\%AppName%\ranobelib\models.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\parsers.py" "dist\%AppName%\ranobelib\parsers.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\ranobelib-upload.mjs" "dist\%AppName%\ranobelib\ranobelib-upload.mjs" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\ranobelib_uploader_v12.py" "dist\%AppName%\ranobelib\ranobelib_uploader_v12.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\utils.py" "dist\%AppName%\ranobelib\utils.py" > nul
+    if not exist "dist\%AppName%\ranobelib" mkdir "dist\%AppName%\ranobelib"
+    copy /Y "ranobelib\workers.py" "dist\%AppName%\ranobelib\workers.py" > nul
+echo [OK] Данные скопированы.
+echo.
+echo [+] Этап 4 из 4: Создание инсталлятора через Inno Setup...
+"%ISCC_CMD%" "/DAppBuildName=%AppName%" windows_installer.iss
+if errorlevel 1 (
+    echo [!!!] Ошибка при создании инсталлятора.
+) else (
+    echo [OK] Инсталлятор успешно создан в папке installer_output.
+    echo [+] Очистка временных файлов сборки...
+    if exist "dist\%AppName%" rmdir /S /Q "dist\%AppName%"
+    set "BUILD_INSTALLER_SUCCESS=1"
 )
 call :build_app_end
 goto :eof
@@ -334,7 +439,11 @@ if %ERRORLEVEL% NEQ 0 (
 ) else (
     echo.
     echo [OK] СБОРКА УСПЕШНО ЗАВЕРШЕНА!
-    echo     Готовое приложение находится в папке 'dist'.
+    if defined BUILD_INSTALLER_SUCCESS (
+        echo     Готовый установщик находится в папке 'installer_output'.
+    ) else (
+        echo     Готовое приложение находится в папке 'dist'.
+    )
 )
 echo.
 echo [+] Процесс завершен.
