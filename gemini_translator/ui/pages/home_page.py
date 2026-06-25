@@ -220,7 +220,11 @@ class HomePage(ShellPage):
         msg.setTextFormat(QtCore.Qt.TextFormat.RichText)
         msg.setText(f"Доступна новая версия: <b>{version}</b><br><br>{html_desc}")
         
-        btn_install_now = msg.addButton("Скачать и установить", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        if download_url == "manual":
+            btn_install_now = msg.addButton("Скачать вручную", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        else:
+            btn_install_now = msg.addButton("Скачать и установить", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+
         btn_remind_later = msg.addButton("Напомнить позже", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         btn_ignore = msg.addButton("Игнорировать", QtWidgets.QMessageBox.ButtonRole.ActionRole)
         
@@ -238,6 +242,9 @@ class HomePage(ShellPage):
         # Запускаем загрузку
         if version == "source":
             self.download_source_update(install_now)
+        elif download_url.startswith("source_zip:"):
+            real_url = download_url.split(":", 1)[1]
+            self.download_source_zip_update(real_url, install_now, version)
         else:
             self.download_update(download_url, install_now, version)
 
@@ -282,7 +289,127 @@ class HomePage(ShellPage):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка перезапуска", f"Не удалось перезапустить программу: {e}")
             
+    def download_source_zip_update(self, url, install_now, version):
+        if not install_now:
+            QtWidgets.QMessageBox.information(self, "Обновление", "Обновление будет установлено вручную.")
+            return
+
+        import requests
+        import uuid
+        import os
+        import tempfile
+
+        progress = QtWidgets.QProgressDialog("Загрузка исходного кода...", "Отмена", 0, 100, self)
+        progress.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        progress.show()
+
+        try:
+            # GitHub zipballs might redirect, requests handles it
+            r = requests.get(url, stream=True, timeout=15)
+            # content-length may not be present for GitHub generated zip archives
+            total_size = int(r.headers.get('content-length', 0))
+
+            unique_id = uuid.uuid4().hex[:8]
+            filename = f"source_update_{unique_id}.zip"
+            filepath = os.path.join(tempfile.gettempdir(), filename)
+
+            with open(filepath, 'wb') as f:
+                downloaded = 0
+                for data in r.iter_content(chunk_size=4096):
+                    if progress.wasCanceled():
+                        return
+                    downloaded += len(data)
+                    f.write(data)
+                    if total_size:
+                        progress.setValue(int(100 * downloaded / total_size))
+
+            progress.setValue(100)
+
+            settings = QtCore.QSettings("SiberianTeam", "TranslatorFork")
+            settings.setValue("updater/installed_version", version)
+            settings.sync()
+
+            self.launch_source_zip_updater(filepath)
+
+        except Exception as e:
+            progress.close()
+            QtWidgets.QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось скачать обновление: {e}")
+
+    def launch_source_zip_updater(self, filepath):
+        import subprocess
+        import tempfile
+        import os
+        import sys
+        from PyQt6.QtWidgets import QApplication
+        
+        script_path = os.path.join(tempfile.gettempdir(), "translator_source_updater.py")
+        repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+        
+        script_content = f'''import sys
+import time
+import zipfile
+import os
+import shutil
+import subprocess
+
+time.sleep(3) # Wait for the app to close
+zip_path = {repr(filepath)}
+repo_root = {repr(repo_root)}
+main_script = "main.py"
+
+try:
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        for member in z.namelist():
+            parts = member.split('/', 1)
+            if len(parts) > 1 and parts[1]:
+                target_path = os.path.join(repo_root, parts[1])
+                if member.endswith('/'):
+                    os.makedirs(target_path, exist_ok=True)
+                else:
+                    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                    with z.open(member) as source, open(target_path, 'wb') as target:
+                        shutil.copyfileobj(source, target)
+except Exception as e:
+    with open(os.path.join(repo_root, "updater_error.log"), "w") as err_log:
+        err_log.write("Extraction failed: " + str(e))
+
+kwargs = {{}}
+if sys.platform == "win32":
+    kwargs["creationflags"] = 0x08000000 # subprocess.CREATE_NO_WINDOW
+
+req_path = os.path.join(repo_root, "requirements.txt")
+if os.path.exists(req_path):
+    subprocess.call([sys.executable, "-m", "pip", "install", "-r", req_path], **kwargs)
+
+subprocess.Popen([sys.executable, main_script], cwd=repo_root, **kwargs)
+'''
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(script_content)
+
+        self.window().setProperty("is_updating", True)
+        
+        env = dict(os.environ)
+        for k in list(env.keys()):
+            if k.startswith('_PYI_'):
+                del env[k]
+
+        kwargs = {{}}
+        if sys.platform == "win32":
+            kwargs["creationflags"] = 0x08000000 # subprocess.CREATE_NO_WINDOW
+
+        subprocess.Popen([sys.executable, script_path], cwd=tempfile.gettempdir(), env=env, **kwargs)
+        QApplication.quit()
+
     def download_update(self, url, install_now, version):
+        if url == "manual":
+            if install_now:
+                import webbrowser
+                from gemini_translator.api.config import GITHUB_REPO
+                webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
+            else:
+                QtWidgets.QMessageBox.information(self, "Обновление", "Пожалуйста, скачайте новую версию исходного кода вручную с GitHub.")
+            return
+
         import requests
         import uuid
         import os

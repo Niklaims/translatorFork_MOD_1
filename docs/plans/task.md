@@ -1,6 +1,7 @@
-- [x] Task 1: Обертка для уведомлений и QSystemTrayIcon в MainWindow (с тестами)
-- [x] Task 2: Интеграция в события MainWindow (Трансляция и т.д.)
-- [x] Task 3: Галочка в EpubSetupDialog (с тестами)
-- [x] Task 4: Уведомления и Галочка в AIGenerationDialog (Глоссарий)
-- [x] Task 5: Уведомления и Галочка в ConsistencyDialog
-- [x] Task 6: Финальная проверка тестов и spec compliance
+| Статус | Задача |
+|--------|--------|
+| [x] | Root Cause Investigation: почему при запуске из Python updater скачивает бинарники |
+| [x] | Pattern Analysis & Hypothesis: Отсутствие папки .git приводит к fallback на релизную проверку для скомпилированной версии |
+| [x] | Implementation: Добавление режима source_no_git в Updater |
+| [x] | Implementation: Поддержка manual скачивания в home_page.py |
+| [x] | Verification: Запуск и исправление тестов (test_updater.py) |

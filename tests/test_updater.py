@@ -22,9 +22,10 @@ def test_update_checker_finds_update(qtbot):
         
         with patch('gemini_translator.utils.updater.APP_VERSION', '1.0.0'):
             with patch.object(UpdateChecker, 'is_source_mode', return_value=False):
-                checker = UpdateChecker()
-                with qtbot.waitSignal(checker.update_available, timeout=1000) as blocker:
-                    checker.run()
+                with patch('sys.frozen', True, create=True):
+                    checker = UpdateChecker()
+                    with qtbot.waitSignal(checker.update_available, timeout=1000) as blocker:
+                        checker.run()
                 
             assert blocker.args[0] == "99.99.99"
             assert blocker.args[1] == "New release!"
@@ -32,6 +33,29 @@ def test_update_checker_finds_update(qtbot):
                 assert blocker.args[2] == "http://example.com/setup.exe"
             elif sys.platform == "darwin":
                 assert blocker.args[2] == "http://example.com/mac.dmg"
+
+def test_update_checker_source_no_git_finds_zip(qtbot):
+    with patch('requests.get') as mock_get:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "tag_name": "v99.99.99",
+            "body": "New release!",
+            "zipball_url": "https://api.github.com/repos/test/test/zipball/v99.99.99",
+            "assets": []
+        }
+        mock_get.return_value = mock_response
+        
+        with patch('gemini_translator.utils.updater.APP_VERSION', '1.0.0'):
+            with patch('gemini_translator.utils.updater.UpdateChecker.is_source_mode', return_value=False):
+                with patch('sys.frozen', False, create=True):
+                    checker = UpdateChecker()
+                    with qtbot.waitSignal(checker.update_available, timeout=1000) as blocker:
+                        checker.run()
+                
+            assert blocker.args[0] == "99.99.99"
+            assert blocker.args[1] == "New release!"
+            assert blocker.args[2] == "source_zip:https://api.github.com/repos/test/test/zipball/v99.99.99"
 
 def test_update_checker_no_update(qtbot):
     with patch('requests.get') as mock_get:

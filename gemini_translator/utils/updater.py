@@ -20,10 +20,14 @@ class UpdateChecker(QThread):
         return not is_frozen and (os.path.exists('.git') or os.path.exists(git_dir))
 
     def run(self):
-        if self.is_source_mode():
+        import sys
+        if getattr(sys, 'frozen', False):
+            self._check_release_update()
+        elif self.is_source_mode():
             self._check_source_update()
         else:
-            self._check_release_update()
+            # Source mode but without git (e.g. downloaded zip)
+            self._check_release_update(source_no_git=True)
 
     def _check_source_update(self):
         try:
@@ -45,7 +49,7 @@ class UpdateChecker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
             
-    def _check_release_update(self):
+    def _check_release_update(self, source_no_git=False):
         try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
             # Disable verify=False if possible, but keep simple timeout
@@ -65,6 +69,15 @@ class UpdateChecker(QThread):
                 
                 if latest_parsed > current_parsed:
                     body = data.get("body", "Доступно новое обновление.")
+                    
+                    if source_no_git:
+                        zip_url = data.get("zipball_url")
+                        if zip_url:
+                            self.update_available.emit(latest_version, body, f"source_zip:{zip_url}")
+                        else:
+                            self.update_available.emit(latest_version, body + "\n\n(Требуется ручное скачивание исходного кода)", "manual")
+                        return
+
                     assets = data.get("assets", [])
                     download_url = ""
                     
