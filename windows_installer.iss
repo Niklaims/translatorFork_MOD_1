@@ -1,3 +1,7 @@
+#ifndef AppBuildName
+#define AppBuildName "translatorFork_MOD"
+#endif
+
 [Setup]
 ; Уникальный идентификатор приложения
 AppId={{5E1C3C0B-8D52-4C67-B9B2-3A6D3A0A7A1B}
@@ -30,13 +34,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Содержимое собранной папки
-Source: "dist\translatorFork_MOD\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\{#AppBuildName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 ; Ярлык в меню "Пуск". ВАЖНО: AppUserModelID позволяет уведомлениям показывать имя программы
-Name: "{autoprograms}\Gemini Translator"; Filename: "{app}\translatorFork_MOD.exe"; AppUserModelID: "SiberianTeam.GeminiTranslator"
+Name: "{autoprograms}\Gemini Translator"; Filename: "{app}\{#AppBuildName}.exe"; AppUserModelID: "SiberianTeam.GeminiTranslator"
 ; Ярлык на рабочем столе
-Name: "{autodesktop}\Gemini Translator"; Filename: "{app}\translatorFork_MOD.exe"; Tasks: desktopicon; AppUserModelID: "SiberianTeam.GeminiTranslator"
+Name: "{autodesktop}\Gemini Translator"; Filename: "{app}\{#AppBuildName}.exe"; Tasks: desktopicon; AppUserModelID: "SiberianTeam.GeminiTranslator"
 
 [Run]
-Filename: "{app}\translatorFork_MOD.exe"; Description: "{cm:LaunchProgram,Gemini Translator}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppBuildName}.exe"; Description: "{cm:LaunchProgram,Gemini Translator}"; Flags: nowait postinstall skipifsilent
