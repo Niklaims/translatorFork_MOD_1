@@ -27,7 +27,7 @@ class UpdateChecker(QThread):
             self._check_source_update()
         else:
             # Source mode but without git (e.g. downloaded zip)
-            self._check_release_update(source_no_git=True)
+            self._check_commit_update()
 
     def _check_source_update(self):
         try:
@@ -49,7 +49,41 @@ class UpdateChecker(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
             
-    def _check_release_update(self, source_no_git=False):
+    def _check_commit_update(self):
+        try:
+            from PyQt6.QtCore import QSettings
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/main"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                latest_sha = data.get("sha")
+                if not latest_sha:
+                    self.no_update.emit()
+                    return
+                
+                settings = QSettings("SiberianTeam", "TranslatorFork")
+                installed_commit = settings.value("updater/installed_commit", "")
+                
+                if not installed_commit:
+                    # First run from source ZIP, silently save the commit to track future updates
+                    settings.setValue("updater/installed_commit", latest_sha)
+                    settings.sync()
+                    self.no_update.emit()
+                    return
+                
+                if installed_commit != latest_sha:
+                    commit_msg = data.get("commit", {}).get("message", "Доступно обновление исходного кода.")
+                    body = f"Найден новый коммит:\n{commit_msg}"
+                    zip_url = f"https://api.github.com/repos/{GITHUB_REPO}/zipball/main"
+                    self.update_available.emit(latest_sha, body, f"source_zip:{zip_url}")
+                else:
+                    self.no_update.emit()
+            else:
+                self.error_occurred.emit(f"Ошибка API GitHub: {response.status_code}")
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+    def _check_release_update(self):
         try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
             # Disable verify=False if possible, but keep simple timeout
@@ -67,29 +101,8 @@ class UpdateChecker(QThread):
                 latest_parsed = parse_version(latest_version)
                 current_parsed = parse_version(current_version)
                 
-                if not current_parsed:
-                    # If version has no numbers (e.g. "dev")
-                    settings = QtCore.QSettings("SiberianTeam", "TranslatorFork")
-                    installed_v = settings.value("updater/installed_version", "")
-                    installed_parsed = parse_version(installed_v)
-                    
-                    if installed_parsed:
-                        current_parsed = installed_parsed
-                    elif not getattr(sys, 'frozen', False):
-                        # Running from source (e.g. downloaded zip of main branch).
-                        # Assume they are on bleeding edge to prevent downgrading to a release.
-                        current_parsed = [float('inf')]
-                
                 if latest_parsed > current_parsed:
                     body = data.get("body", "Доступно новое обновление.")
-                    
-                    if source_no_git:
-                        zip_url = data.get("zipball_url")
-                        if zip_url:
-                            self.update_available.emit(latest_version, body, f"source_zip:{zip_url}")
-                        else:
-                            self.update_available.emit(latest_version, body + "\n\n(Требуется ручное скачивание исходного кода)", "manual")
-                        return
 
                     assets = data.get("assets", [])
                     download_url = ""

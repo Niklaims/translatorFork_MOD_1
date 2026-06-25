@@ -323,19 +323,14 @@ class HomePage(ShellPage):
                     if total_size:
                         progress.setValue(int(100 * downloaded / total_size))
 
-            progress.setValue(100)
-
-            settings = QtCore.QSettings("SiberianTeam", "TranslatorFork")
-            settings.setValue("updater/installed_version", version)
-            settings.sync()
-
-            self.launch_source_zip_updater(filepath)
+            # We'll save the version/commit inside the script AFTER successful extraction
+            self.launch_source_zip_updater(filepath, version)
 
         except Exception as e:
             progress.close()
             QtWidgets.QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось скачать обновление: {e}")
 
-    def launch_source_zip_updater(self, filepath):
+    def launch_source_zip_updater(self, filepath, version):
         import subprocess
         import tempfile
         import os
@@ -356,6 +351,7 @@ time.sleep(3) # Wait for the app to close
 zip_path = {repr(filepath)}
 repo_root = {repr(repo_root)}
 main_script = "main.py"
+version = {repr(version)}
 
 try:
     with zipfile.ZipFile(zip_path, 'r') as z:
@@ -369,6 +365,19 @@ try:
                     os.makedirs(os.path.dirname(target_path), exist_ok=True)
                     with z.open(member) as source, open(target_path, 'wb') as target:
                         shutil.copyfileobj(source, target)
+    
+    # Save the installed version/commit on success
+    try:
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("SiberianTeam", "TranslatorFork")
+        if len(version) == 40 and all(c in "0123456789abcdefABCDEF" for c in version):
+            settings.setValue("updater/installed_commit", version)
+        else:
+            settings.setValue("updater/installed_version", version)
+        settings.sync()
+    except ImportError:
+        pass
+        
 except Exception as e:
     with open(os.path.join(repo_root, "updater_error.log"), "w") as err_log:
         err_log.write("Extraction failed: " + str(e))
