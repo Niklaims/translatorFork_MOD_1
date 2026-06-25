@@ -126,9 +126,6 @@ class GlossaryStartupDialog(QDialog):
 
     def load_from_history(self):
         history = self.settings_manager.load_project_history()
-        if not history:
-            QMessageBox.information(self, "История пуста", "Нет сохраненных проектов.")
-            return
             
         from gemini_translator.ui.dialogs.misc import ProjectHistoryDialog
         dialog = ProjectHistoryDialog(history, self.settings_manager, self)

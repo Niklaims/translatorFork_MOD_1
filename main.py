@@ -603,10 +603,6 @@ class ValidatorStartupDialog(QtWidgets.QDialog):
 
     def load_from_history(self):
         history = self.settings_manager.load_project_history()
-        if not history:
-            QtWidgets.QMessageBox.information(
-                self, "История пуста", "Вы еще не запускали ни одного перевода.")
-            return
         from gemini_translator.ui.dialogs.setup import ProjectHistoryDialog
         dialog = ProjectHistoryDialog(history, self.settings_manager, self)
         if dialog.exec():
@@ -640,9 +636,7 @@ class ValidatorStartupDialog(QtWidgets.QDialog):
                         self, "Ошибка", "Пути в выбранном проекте недействительны.")
 
     def select_manually(self):
-        start_folder = self.settings_manager.get_last_project_folder()
-        if not start_folder or not os.path.isdir(start_folder):
-            start_folder = os.path.expanduser("~")
+        start_folder = self.settings_manager.get_project_start_folder()
         folder_dialog = QtWidgets.QFileDialog(self)
         folder_dialog.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
         folder_dialog.setOption(QtWidgets.QFileDialog.Option.ShowDirsOnly, True)

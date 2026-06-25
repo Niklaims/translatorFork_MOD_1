@@ -256,7 +256,10 @@ class FreeDeepseekApiDialog(QDialog):
         initial_dir = current_path if current_path and os.path.isdir(current_path) else ""
         if not initial_dir:
             try:
-                initial_dir = self.settings_manager.get_last_project_folder() or ""
+                if hasattr(self.settings_manager, "get_project_start_folder"):
+                    initial_dir = self.settings_manager.get_project_start_folder() or ""
+                else:
+                    initial_dir = self.settings_manager.get_last_project_folder() or ""
             except Exception:
                 initial_dir = ""
         if not initial_dir or not os.path.isdir(initial_dir):
@@ -1047,7 +1050,10 @@ class ModelSettingsWidget(QGroupBox):
 
         if not initial_dir:
             try:
-                initial_dir = self.settings_manager.get_last_project_folder() or ""
+                if hasattr(self.settings_manager, "get_project_start_folder"):
+                    initial_dir = self.settings_manager.get_project_start_folder() or ""
+                else:
+                    initial_dir = self.settings_manager.get_last_project_folder() or ""
             except Exception:
                 initial_dir = ""
 

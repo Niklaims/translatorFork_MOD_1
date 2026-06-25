@@ -598,6 +598,33 @@ class SettingsManager(QObject):
     def _normalize_project_path(self, path):
         return os.path.normpath(path) if path else ''
 
+    def _directory_if_exists(self, path):
+        normalized_path = self._normalize_project_path(path)
+        return normalized_path if normalized_path and os.path.isdir(normalized_path) else ''
+
+    def get_project_start_folder(self, *candidates, fallback_to_last_project=True):
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if os.path.isfile(candidate):
+                candidate = os.path.dirname(candidate)
+            valid_candidate = self._directory_if_exists(candidate)
+            if valid_candidate:
+                return valid_candidate
+
+        root_folder = self.get_last_projects_root_folder()
+        valid_root = self._directory_if_exists(root_folder)
+        if valid_root:
+            return valid_root
+
+        if fallback_to_last_project:
+            last_project_folder = self.get_last_project_folder()
+            valid_last_project = self._directory_if_exists(last_project_folder)
+            if valid_last_project:
+                return valid_last_project
+
+        return os.path.expanduser("~")
+
     def _project_history_key(self, output_folder='', epub_path=''):
         path = output_folder or epub_path
         return os.path.normcase(self._normalize_project_path(path))
@@ -642,7 +669,9 @@ class SettingsManager(QObject):
         return self._generic_saver('project_history', self._prepare_project_history(history_list))
     def get_last_project_folder(self): return self._generic_loader('last_project_folder', '')
     def save_last_project_folder(self, folder_path): return self._generic_saver('last_project_folder', folder_path or '')
-    def get_last_projects_root_folder(self): return self._generic_loader('last_projects_root_folder', '')
+    def get_last_projects_root_folder(self):
+        with self.file_lock:
+            return self._normalize_project_path(self._cache.get('last_projects_root_folder', ''))
     def save_last_projects_root_folder(self, folder_path): return self._generic_saver('last_projects_root_folder', folder_path or '')
 
     def add_to_project_history(self, epub_path, output_folder):

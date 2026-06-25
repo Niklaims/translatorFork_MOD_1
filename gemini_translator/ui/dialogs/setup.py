@@ -449,7 +449,7 @@ class InitialSetupPage(ShellPage):
         content_layout.setSpacing(0)
 
         # --- ШАГ 1: СОЗДАЕМ ВСЕ КАСТОМНЫЕ ВИДЖЕТЫ-КОМПОНЕНТЫ ---
-        self.paths_widget = ProjectPathsWidget(self)
+        self.paths_widget = ProjectPathsWidget(self, settings_manager=self.settings_manager)
         self.task_management_widget = TaskManagementWidget(self)
         self.log_widget = LogWidget(self)
         self.glossary_widget = GlossaryWidget(self, settings_manager=self.settings_manager)
@@ -4175,9 +4175,6 @@ class InitialSetupPage(ShellPage):
     def _open_project_history(self):
         """Открывает диалог с историей проектов."""
         history = self.settings_manager.load_project_history()
-        if not history:
-            QMessageBox.information(self, "История пуста", "Вы еще не запускали ни одного перевода.")
-            return
 
         # Передаем settings_manager в диалог
         dialog = ProjectHistoryDialog(history, self.settings_manager, self)
