@@ -48,8 +48,8 @@ class NotifyApiTests(unittest.TestCase):
 
     def test_notify_task_dirty_adds_id_and_emits_signal(self):
         tm = self._make_stub()
-        tm.notify_task_dirty("abc-123")
-        self.assertEqual(tm._dirty_task_ids, {"abc-123"})
+        tm.notify_task_dirty("00000000-0000-0000-0000-000000000004")
+        self.assertEqual(tm._dirty_task_ids, {"00000000-0000-0000-0000-000000000004"})
         self.assertFalse(tm._structural_dirty)
         self.assertEqual(tm._ui_update_requested.emit_calls, 1)
 

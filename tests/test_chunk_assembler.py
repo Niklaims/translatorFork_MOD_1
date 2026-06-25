@@ -104,17 +104,17 @@ class ChunkAssemblerTests(unittest.TestCase):
             suffix = "</body></html>"
 
             self._insert_completed_chunk(
-                "chunk-1",
+                "00000000-0000-0000-0000-000000000001",
                 ("epub_chunk", "mem://missing.epub", chapter_path, "<p>source 1</p>", 0, 2, prefix, suffix),
                 "<body><p>translated 1</p></body>",
             )
             self._insert_completed_chunk(
-                "chunk-2",
+                "00000000-0000-0000-0000-000000000002",
                 ("epub_chunk", "mem://missing.epub", chapter_path, "<p>source 2</p>", 1, 2, prefix, suffix),
                 "<body><p>translated 2</p></body>",
             )
 
-            assembler._assemble_chapter_from_db(["chunk-1", "chunk-2"], chapter_path)
+            assembler._assemble_chapter_from_db(["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"], chapter_path)
 
             output_path = os.path.join(output_folder, "Text", "ch_translated.html")
             self.assertTrue(os.path.exists(output_path))
@@ -151,17 +151,17 @@ class ChunkAssemblerTests(unittest.TestCase):
             virtual_epub_path = self._virtual_path_for_real_file(epub_path)
 
             self._insert_completed_chunk(
-                "chunk-1",
+                "00000000-0000-0000-0000-000000000001",
                 ("epub_chunk", virtual_epub_path, chapter_path, "<p>source 1</p>", 0, 2),
                 "<body><p>translated 1</p></body>",
             )
             self._insert_completed_chunk(
-                "chunk-2",
+                "00000000-0000-0000-0000-000000000002",
                 ("epub_chunk", virtual_epub_path, chapter_path, "<p>source 2</p>", 1, 2),
                 "<body><p>translated 2</p></body>",
             )
 
-            assembler._assemble_chapter_from_db(["chunk-1", "chunk-2"], chapter_path)
+            assembler._assemble_chapter_from_db(["00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"], chapter_path)
 
             output_path = os.path.join(output_folder, "Text", "ch_translated.html")
             self.assertTrue(os.path.exists(output_path))
@@ -182,12 +182,12 @@ class ChunkAssemblerTests(unittest.TestCase):
             )
             chapter_path = "Text/ch.xhtml"
             self._insert_completed_chunk(
-                "chunk-1",
+                "00000000-0000-0000-0000-000000000001",
                 ("epub_chunk", "mem://missing.epub", chapter_path, "<p>source</p>", 0, 1),
                 "<body><p>translated</p></body>",
             )
 
-            assembler._assemble_chapter_from_db(["chunk-1"], chapter_path)
+            assembler._assemble_chapter_from_db(["00000000-0000-0000-0000-000000000001"], chapter_path)
 
             self.assertEqual(self._chunk_result_count(), 1)
             output_path = os.path.join(output_folder, "Text", "ch_translated.html")
@@ -205,12 +205,12 @@ class ChunkAssemblerTests(unittest.TestCase):
             with self.task_manager._get_write_conn() as conn:
                 conn.execute(
                     "INSERT INTO tasks (task_id, payload, status, sequence) VALUES (?, ?, 'completed', 0)",
-                    ("chunk-1", json.dumps(payload, default=tuple_serializer)),
+                    ("00000000-0000-0000-0000-000000000001", json.dumps(payload, default=tuple_serializer)),
                 )
 
-            assembler._assemble_chapter_from_db(["chunk-1"], chapter_path)
+            assembler._assemble_chapter_from_db(["00000000-0000-0000-0000-000000000001"], chapter_path)
 
-            self.assertEqual(self._task_status("chunk-1"), "pending")
+            self.assertEqual(self._task_status("00000000-0000-0000-0000-000000000001"), "pending")
 
     def test_repeated_scans_do_not_queue_duplicate_assemblies(self):
         with tempfile.TemporaryDirectory() as output_folder:
@@ -223,12 +223,12 @@ class ChunkAssemblerTests(unittest.TestCase):
             prefix = '<html><body class="chapter">'
             suffix = "</body></html>"
             self._insert_completed_chunk(
-                "chunk-1",
+                "00000000-0000-0000-0000-000000000001",
                 ("epub_chunk", "mem://missing.epub", chapter_path, "<p>source 1</p>", 0, 2, prefix, suffix),
                 "<body><p>translated 1</p></body>",
             )
             self._insert_completed_chunk(
-                "chunk-2",
+                "00000000-0000-0000-0000-000000000002",
                 ("epub_chunk", "mem://missing.epub", chapter_path, "<p>source 2</p>", 1, 2, prefix, suffix),
                 "<body><p>translated 2</p></body>",
             )
@@ -244,7 +244,7 @@ class ChunkAssemblerTests(unittest.TestCase):
 
             self.assertEqual(
                 queued_assemblies,
-                [(("chunk-1", "chunk-2"), chapter_path)],
+                [(("00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002"), chapter_path)],
             )
 
     def test_cleanup_unsubscribes_topic_bus_callbacks(self):
