@@ -54,6 +54,28 @@ class OpenRouterApiHandler(BaseApiHandler):
         if effort:
             payload["reasoning_effort"] = effort
 
+    @staticmethod
+    def _is_model_access_denied_error(status, response_text):
+        if status != 403:
+            return False
+
+        text = str(response_text or "").lower()
+        if "model" not in text:
+            return False
+
+        access_markers = (
+            "not allowed",
+            "not permitted",
+            "not available",
+            "no access",
+            "access denied",
+            "forbidden",
+        )
+        key_markers = ("api key", "key")
+        return any(marker in text for marker in access_markers) and any(
+            marker in text for marker in key_markers
+        )
+
     def setup_client(self, client_override=None, proxy_settings=None):
         super().setup_client(client_override, proxy_settings)
         if not client_override: return False
@@ -131,6 +153,10 @@ class OpenRouterApiHandler(BaseApiHandler):
                     )
                     txt_low = response_text.lower()
                     
+                    if self._is_model_access_denied_error(response.status, response_text):
+                        raise ModelNotFoundError(
+                            f"Model {self.worker.model_id} is not allowed for this API key: {response_text[:150]}"
+                        )
                     if response.status in [401, 403]: raise RateLimitExceededError(f"Ошибка доступа ({response.status}): {response_text[:150]}")
                     if response.status == 402 or "quota" in txt_low: raise RateLimitExceededError("Недостаточно средств/Квота (402).")
                     if response.status == 429: raise TemporaryRateLimitError("Лимит запросов (429).", delay_seconds=20)

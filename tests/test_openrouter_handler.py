@@ -40,6 +40,23 @@ class OpenRouterHandlerTests(unittest.TestCase):
 
         self.assertEqual(payload["reasoning_effort"], "high")
 
+    def test_model_access_denied_error_is_detected(self):
+        response_text = (
+            '{"error":{"message":"model gemini-3.5-flash-extra-low is not allowed '
+            'for this API key","type":"qroute_error"}}'
+        )
+
+        self.assertTrue(
+            OpenRouterApiHandler._is_model_access_denied_error(403, response_text)
+        )
+
+    def test_generic_key_error_is_not_model_access_denied(self):
+        response_text = '{"error":{"message":"invalid api key","type":"auth_error"}}'
+
+        self.assertFalse(
+            OpenRouterApiHandler._is_model_access_denied_error(403, response_text)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
