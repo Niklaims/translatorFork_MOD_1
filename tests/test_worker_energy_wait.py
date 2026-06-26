@@ -4,6 +4,7 @@ import types
 import unittest
 
 from gemini_translator.core.worker import (
+    DEFAULT_TASK_STREAM_MODE,
     UniversalWorker,
     WORKER_IDLE_WAKE_TIMEOUT_SECONDS,
 )
@@ -36,6 +37,9 @@ class WorkerIdleTimeoutTests(unittest.TestCase):
             UniversalWorker._compute_idle_timeout(worker, True),
             WORKER_IDLE_WAKE_TIMEOUT_SECONDS,
         )
+
+    def test_hello_task_uses_non_streaming_warmup(self):
+        self.assertFalse(DEFAULT_TASK_STREAM_MODE["hello_task"])
 
 
 class WorkerEnergyWaitTests(unittest.IsolatedAsyncioTestCase):

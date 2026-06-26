@@ -27,7 +27,7 @@ class HelloTaskProcessor(BaseTaskProcessor):
             task_info=task_info,
             operation_context=operation_context,
             use_stream=use_stream,
-            allow_incomplete=True,
+            allow_incomplete=False,
         )
         
         if response and "ok" in response.lower():

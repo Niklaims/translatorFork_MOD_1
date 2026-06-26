@@ -60,6 +60,14 @@ from .worker_helpers.task_factory import get_task_processor_class
 
 _DEBUG_OPERATION_CONTEXT = contextvars.ContextVar("worker_debug_operation_context", default={})
 WORKER_IDLE_WAKE_TIMEOUT_SECONDS = 2.0
+DEFAULT_TASK_STREAM_MODE = {
+    'epub_batch': False,
+    'epub': True,
+    'epub_chunk': False,
+    'glossary_batch_task': True,
+    'hello_task': False,
+    'raw_text_translation': True,
+}
 
 # ============================================================================
 #  ЕДИНЫЙ УНИВЕРСАЛЬНЫЙ КЛАСС-ВОРКЕР
@@ -771,10 +779,7 @@ class UniversalWorker:
         task_name = self.task_manager._get_task_display_name(task_payload)
 
         # --- ИЗМЕНЕНИЕ 2: Упрощенная логика смены стратегии ---
-        default_stream_mode = {
-            'epub_batch': False, 'epub': True, 'epub_chunk': False,
-            'glossary_batch_task': True, 'raw_text_translation': True
-        }.get(task_type, True)
+        default_stream_mode = DEFAULT_TASK_STREAM_MODE.get(task_type, True)
 
         use_stream = default_stream_mode
         should_log_strategy = False

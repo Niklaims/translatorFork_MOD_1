@@ -57,6 +57,37 @@ class OpenRouterHandlerTests(unittest.TestCase):
             OpenRouterApiHandler._is_model_access_denied_error(403, response_text)
         )
 
+    def test_model_access_denied_stream_error_retries_once_without_stream(self):
+        response_text = (
+            '{"error":{"message":"model gemini-3.5-flash-extra-low is not allowed '
+            'for this API key","type":"qroute_error"}}'
+        )
+
+        self.assertTrue(
+            OpenRouterApiHandler._should_retry_without_stream_for_model_access(
+                403,
+                response_text,
+                use_stream=True,
+                already_retried=False,
+            )
+        )
+        self.assertFalse(
+            OpenRouterApiHandler._should_retry_without_stream_for_model_access(
+                403,
+                response_text,
+                use_stream=True,
+                already_retried=True,
+            )
+        )
+        self.assertFalse(
+            OpenRouterApiHandler._should_retry_without_stream_for_model_access(
+                403,
+                response_text,
+                use_stream=False,
+                already_retried=False,
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
