@@ -11,6 +11,7 @@ PREVENT_SLEEP_SETTING_KEY = "prevent_sleep_during_translation"
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
 
 
 def load_prevent_sleep_setting(settings_manager, default: bool = False) -> bool:
@@ -77,9 +78,10 @@ class PowerInhibitor:
         self.last_error = None
         if self.platform_name == "darwin":
             try:
-                # -i prevents idle sleep, -m prevents disk sleep, -s prevents system sleep.
-                # We intentionally do not use -d so the display may still dim or turn off.
-                self._process = self._popen_factory(["caffeinate", "-ims"])
+                # -i prevents idle sleep, -m prevents disk sleep, -s prevents system sleep,
+                # -d prevents display sleep. We intentionally block display sleep so that 
+                # macOS doesn't go to the lock screen, which stops our background processing.
+                self._process = self._popen_factory(["caffeinate", "-dims"])
                 return self.active
             except Exception as exc:
                 self.last_error = str(exc)
@@ -91,7 +93,7 @@ class PowerInhibitor:
                 ctypes_module = self._ctypes_module
                 if ctypes_module is None:
                     import ctypes as ctypes_module
-                flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+                flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
                 result = ctypes_module.windll.kernel32.SetThreadExecutionState(flags)
                 self._windows_active = bool(result)
                 return self._windows_active

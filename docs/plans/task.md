@@ -1,6 +1,0 @@
-- [x] Task 1: Обертка для уведомлений и QSystemTrayIcon в MainWindow (с тестами)
-- [x] Task 2: Интеграция в события MainWindow (Трансляция и т.д.)
-- [x] Task 3: Галочка в EpubSetupDialog (с тестами)
-- [x] Task 4: Уведомления и Галочка в AIGenerationDialog (Глоссарий)
-- [x] Task 5: Уведомления и Галочка в ConsistencyDialog
-- [x] Task 6: Финальная проверка тестов и spec compliance

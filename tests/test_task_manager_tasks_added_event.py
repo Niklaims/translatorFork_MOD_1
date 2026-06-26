@@ -38,7 +38,7 @@ class TaskManagerTasksAddedEventTests(unittest.TestCase):
         self.manager.session_id = "session-1"
 
     def test_set_pending_tasks_emits_tasks_added_for_worker_wakeup(self):
-        self.manager.set_pending_tasks([("hello_task",)])
+        self.manager.set_pending_tasks([("00000000-0000-0000-0000-000000000003",)])
 
         matching_events = [
             event for event in self.bus.events

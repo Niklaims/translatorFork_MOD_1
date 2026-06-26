@@ -2,6 +2,7 @@ import unittest
 
 from gemini_translator.utils.power_inhibitor import (
     ES_CONTINUOUS,
+    ES_DISPLAY_REQUIRED,
     ES_SYSTEM_REQUIRED,
     PowerInhibitor,
 )
@@ -42,7 +43,7 @@ class _FakeCtypes:
 
 
 class PowerInhibitorTests(unittest.TestCase):
-    def test_macos_starts_caffeinate_without_blocking_display_energy_saving(self):
+    def test_macos_starts_caffeinate_blocking_display_sleep_to_prevent_lock(self):
         calls = []
         process = _FakeProcess()
 
@@ -53,7 +54,7 @@ class PowerInhibitorTests(unittest.TestCase):
 
         self.assertTrue(inhibitor.prevent_sleep())
 
-        self.assertEqual(calls, [["caffeinate", "-ims"]])
+        self.assertEqual(calls, [["caffeinate", "-dims"]])
         self.assertTrue(inhibitor.active)
 
         inhibitor.allow_sleep()
@@ -62,7 +63,7 @@ class PowerInhibitorTests(unittest.TestCase):
         self.assertTrue(process.waited)
         self.assertFalse(inhibitor.active)
 
-    def test_windows_uses_system_required_without_display_required(self):
+    def test_windows_uses_system_required_and_display_required_to_prevent_lock(self):
         fake_ctypes = _FakeCtypes()
         inhibitor = PowerInhibitor(platform_name="win32", ctypes_module=fake_ctypes)
 
@@ -71,7 +72,7 @@ class PowerInhibitorTests(unittest.TestCase):
 
         self.assertEqual(
             fake_ctypes.windll.kernel32.calls,
-            [ES_CONTINUOUS | ES_SYSTEM_REQUIRED, ES_CONTINUOUS],
+            [ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED, ES_CONTINUOUS],
         )
         self.assertFalse(inhibitor.active)
 
