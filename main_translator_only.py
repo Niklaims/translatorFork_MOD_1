@@ -29,6 +29,7 @@ import main as app_main  # noqa: E402
 
 def _bootstrap_application():
     app_main.prepare_console_streams()
+    app_main.configure_settings_scope_from_argv(sys.argv)
     sys.excepthook = app_main.global_excepthook
 
     import threading

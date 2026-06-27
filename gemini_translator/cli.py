@@ -848,6 +848,9 @@ def command_status(args) -> dict:
     payload = {
         "ok": True,
         "settings_file": app.settings_manager.config_file,
+        "settings_dir": app.settings_manager.config_dir,
+        "settings_scope": getattr(app.settings_manager, "settings_scope", "default"),
+        "settings_profile": getattr(app.settings_manager, "settings_profile", ""),
         "saved_provider": settings.get("provider"),
         "saved_model": settings.get("model"),
         "providers": providers,
@@ -1029,6 +1032,9 @@ def command_settings(args) -> dict:
     payload = {
         "ok": True,
         "settings_file": app.settings_manager.config_file,
+        "settings_dir": app.settings_manager.config_dir,
+        "settings_scope": getattr(app.settings_manager, "settings_scope", "default"),
+        "settings_profile": getattr(app.settings_manager, "settings_profile", ""),
         "settings": _safe_settings_for_output(settings),
     }
     runtime.shutdown()
@@ -1887,6 +1893,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--compact", action="store_true", help="Print compact JSON.")
     parser.add_argument("--debug", action="store_true", help="Include traceback in JSON errors.")
+    settings_scope = parser.add_mutually_exclusive_group()
+    settings_scope.add_argument("--settings-profile", help="Use an isolated settings/key profile.")
+    settings_scope.add_argument("--settings-dir", help="Use an explicit settings directory.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     status = subparsers.add_parser("status", help="Show providers, keys, saved settings, and optional project status.")
@@ -2011,6 +2020,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "settings_dir", None):
+        from .utils.settings import configure_settings_scope
+
+        configure_settings_scope(config_dir=args.settings_dir)
+    elif getattr(args, "settings_profile", None) is not None:
+        from .utils.settings import configure_settings_scope
+
+        configure_settings_scope(profile=args.settings_profile)
     try:
         with _redirect_internal_stdout_to_stderr():
             payload = args.func(args)

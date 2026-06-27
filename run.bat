@@ -20,7 +20,7 @@ if not exist "%VENV_PYTHON%" (
 call :sync_requirements
 if %ERRORLEVEL% NEQ 0 exit /b 1
 
-"%VENV_PYTHON%" "main.py"
+"%VENV_PYTHON%" "main.py" %*
 exit /b %ERRORLEVEL%
 
 :sync_requirements

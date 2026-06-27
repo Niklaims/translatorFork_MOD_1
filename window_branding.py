@@ -1,15 +1,32 @@
 """Centralized window-title branding for translatorFork_MOD."""
 
+import os
+
 APP_WINDOW_BRAND = "translatorFork_MOD"
+_DEFAULT_PROFILE_ALIASES = {"", "default", "global", "main"}
+
+
+def _profile_brand_suffix():
+    profile = str(os.environ.get("GT_SETTINGS_PROFILE", "") or "").strip()
+    if profile.lower() not in _DEFAULT_PROFILE_ALIASES:
+        return f" [{profile}]"
+    if str(os.environ.get("GT_SETTINGS_DIR", "") or "").strip():
+        return " [isolated]"
+    return ""
+
+
+def app_window_brand():
+    return f"{APP_WINDOW_BRAND}{_profile_brand_suffix()}"
 
 
 def rebrand_window_title(title):
+    brand = app_window_brand()
     text = "" if title is None else str(title).strip()
     if not text:
-        return APP_WINDOW_BRAND
-    if text == APP_WINDOW_BRAND or text.startswith(APP_WINDOW_BRAND):
+        return brand
+    if text == brand or text.startswith(brand):
         return text
-    return f"{APP_WINDOW_BRAND} - {text}"
+    return f"{brand} - {text}"
 
 
 def install_window_title_branding(app=None):
@@ -27,8 +44,9 @@ def install_window_title_branding(app=None):
 
     application = app or QtWidgets.QApplication.instance()
     if application is not None:
-        application.setApplicationName(APP_WINDOW_BRAND)
+        brand = app_window_brand()
+        application.setApplicationName(brand)
         if hasattr(application, "setApplicationDisplayName"):
-            application.setApplicationDisplayName(APP_WINDOW_BRAND)
+            application.setApplicationDisplayName(brand)
         for widget in application.topLevelWidgets():
             widget.setWindowTitle(widget.windowTitle())

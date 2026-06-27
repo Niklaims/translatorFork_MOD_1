@@ -21,7 +21,7 @@ from gemini_translator.ui.dialogs.setup import InitialSetupDialog
 from gemini_translator.ui.dialogs.misc import StartupToolDialog
 from gemini_translator.ui.dialogs.glossary import MainWindow as GlossaryToolWindow
 from gemini_translator.ui.dialogs.validation import TranslationValidatorDialog
-from gemini_translator.utils.settings import SettingsManager
+from gemini_translator.utils.settings import SettingsManager, configure_settings_scope
 from gemini_translator.utils.project_manager import TranslationProjectManager
 from gemini_translator.core.translation_engine import TranslationEngine
 from gemini_translator.api import config as api_config
@@ -442,6 +442,21 @@ def prepare_console_streams():
             pass
 
 
+def configure_settings_scope_from_argv(argv) -> None:
+    parser = argparse.ArgumentParser(add_help=False)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--settings-profile")
+    group.add_argument("--settings-dir")
+    parsed, remaining = parser.parse_known_args(list(argv[1:]))
+
+    if parsed.settings_dir:
+        configure_settings_scope(config_dir=parsed.settings_dir)
+    elif parsed.settings_profile is not None:
+        configure_settings_scope(profile=parsed.settings_profile)
+
+    argv[:] = [argv[0], *remaining]
+
+
 def apply_saved_app_theme(app, settings_manager=None):
     manager = settings_manager or getattr(app, "settings_manager", None)
     if manager is None:
@@ -859,7 +874,6 @@ class ApplicationWithContext(QtWidgets.QApplication):
 
     def initialize_managers(self):
         """Инициализирует менеджеры после создания основного объекта."""
-        # Этот менеджер - константа. Он всегда работает с файлом ~/.epub_translator/settings.json
         self._true_global_settings_manager = SettingsManager(
             event_bus=self.event_bus)
         # По умолчанию активный менеджер - это глобальный
@@ -1074,6 +1088,7 @@ EXIT_CODE_REBOOT = 2000
 if __name__ == "__main__":
     import threading
     prepare_console_streams()
+    configure_settings_scope_from_argv(sys.argv)
     sys.excepthook = global_excepthook
     # --- РЕГИСТРАЦИЯ ГЛАВНОГО ПОТОКА ---
     main_id = threading.get_ident()

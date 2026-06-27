@@ -15,6 +15,69 @@ except ImportError:
 
 from ..api import config as api_config
 
+SETTINGS_PROFILE_ENV = "GT_SETTINGS_PROFILE"
+SETTINGS_DIR_ENV = "GT_SETTINGS_DIR"
+DEFAULT_SETTINGS_DIRNAME = ".epub_translator"
+PROFILE_SETTINGS_DIRNAME = "profiles"
+_DEFAULT_PROFILE_ALIASES = {"", "default", "global", "main"}
+
+
+def normalize_settings_profile(profile) -> str:
+    raw_value = "" if profile is None else str(profile).strip()
+    if raw_value.lower() in _DEFAULT_PROFILE_ALIASES:
+        return ""
+    return raw_value
+
+
+def _safe_profile_segment(profile: str) -> str:
+    normalized = normalize_settings_profile(profile)
+    if not normalized:
+        return ""
+    safe = "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in normalized
+    ).strip("._-")
+    return safe or "profile"
+
+
+def default_settings_dir(home_dir=None) -> str:
+    root = os.path.expanduser("~") if home_dir is None else os.path.expanduser(str(home_dir))
+    return os.path.abspath(os.path.join(root, DEFAULT_SETTINGS_DIRNAME))
+
+
+def resolve_settings_location(config_file=None, config_dir=None, profile=None, home_dir=None):
+    if config_file:
+        resolved_file = os.path.abspath(os.path.expanduser(str(config_file)))
+        return os.path.dirname(resolved_file), resolved_file, "", "explicit_file"
+
+    env_config_dir = os.environ.get(SETTINGS_DIR_ENV)
+    env_profile = os.environ.get(SETTINGS_PROFILE_ENV)
+    profile_name = normalize_settings_profile(profile if profile is not None else env_profile)
+
+    dir_override = config_dir if config_dir is not None else env_config_dir
+    if dir_override:
+        resolved_dir = os.path.abspath(os.path.expanduser(str(dir_override)))
+        return resolved_dir, os.path.join(resolved_dir, "settings.json"), profile_name, "custom_dir"
+
+    root_dir = default_settings_dir(home_dir=home_dir)
+    if profile_name:
+        resolved_dir = os.path.join(root_dir, PROFILE_SETTINGS_DIRNAME, _safe_profile_segment(profile_name))
+        return resolved_dir, os.path.join(resolved_dir, "settings.json"), profile_name, "profile"
+
+    return root_dir, os.path.join(root_dir, "settings.json"), "", "default"
+
+
+def configure_settings_scope(*, profile=None, config_dir=None):
+    if config_dir:
+        os.environ[SETTINGS_DIR_ENV] = os.path.abspath(os.path.expanduser(str(config_dir)))
+        os.environ.pop(SETTINGS_PROFILE_ENV, None)
+        return
+
+    if profile is not None:
+        os.environ.pop(SETTINGS_DIR_ENV, None)
+        os.environ[SETTINGS_PROFILE_ENV] = str(profile).strip()
+
+
 # --- ПРЕДПОЛАГАЕМЫЙ ИМПОРТ, МОЖЕТ ПОТРЕБОВАТЬ КОРРЕКТИРОВКИ ---
 try:
     # Попытка абсолютного импорта от корня (предпочтительно)
@@ -29,7 +92,7 @@ except (ImportError, AttributeError):
 class SettingsManager(QObject):
     _save_requested = pyqtSignal()
     _request_count_changed = pyqtSignal(str, str, int)
-    def __init__(self, event_bus=None, config_file=None):
+    def __init__(self, event_bus=None, config_file=None, config_dir=None, profile=None):
         super().__init__()
         
         # --- Гибридный подход к получению зависимостей ---
@@ -41,12 +104,16 @@ class SettingsManager(QObject):
             print("[WARN] SettingsManager не получил event_bus и не нашел его в QApplication.")
 
         # --- Гибкая логика для пути к файлу ---
-        if config_file:
-            self.config_file = config_file
-            self.config_dir = os.path.dirname(config_file)
-        else:
-            self.config_dir = os.path.expanduser("~/.epub_translator")
-            self.config_file = os.path.join(self.config_dir, "settings.json")
+        (
+            self.config_dir,
+            self.config_file,
+            self.settings_profile,
+            self.settings_scope,
+        ) = resolve_settings_location(
+            config_file=config_file,
+            config_dir=config_dir,
+            profile=profile,
+        )
         
         self.ensure_config_dir()
         
