@@ -54,6 +54,9 @@ class ProviderAttempt:
     label: str
     temperature: float | None = None
     temperature_override_enabled: bool | None = None
+    thinking_enabled: bool | None = None
+    thinking_budget: int | None = None
+    thinking_level: str | None = None
     prompt_prefix: str = ""
     prompt_suffix: str = ""
     pass_index: int = 1
@@ -96,6 +99,21 @@ class _ProviderWorkerProxy:
             attempt.temperature_override_enabled
             if attempt.temperature_override_enabled is not None
             else getattr(base_worker, "temperature_override_enabled", True)
+        )
+        self.thinking_enabled = (
+            attempt.thinking_enabled
+            if attempt.thinking_enabled is not None
+            else getattr(base_worker, "thinking_enabled", False)
+        )
+        self.thinking_budget = (
+            attempt.thinking_budget
+            if attempt.thinking_budget is not None
+            else getattr(base_worker, "thinking_budget", 0)
+        )
+        self.thinking_level = (
+            attempt.thinking_level
+            if attempt.thinking_level is not None
+            else getattr(base_worker, "thinking_level", None)
         )
 
     def __getattr__(self, name):
