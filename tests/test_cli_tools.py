@@ -17,6 +17,7 @@ from gemini_translator.cli import (
     build_session_settings,
     build_task_plan,
     command_plan,
+    command_build_epub,
     command_providers,
     command_translate,
     select_chapters,
@@ -234,6 +235,53 @@ def test_choose_translation_rel_path_prefers_explicit_suffix():
 
     assert _choose_translation_rel_path(versions, "_translated.html") == "a.html"
     assert _choose_translation_rel_path(versions) == "b.html"
+
+
+def test_build_epub_uses_newest_translation_when_retry_is_newer(tmp_path):
+    epub_path = tmp_path / "book.epub"
+    project_dir = tmp_path / "project"
+    output_path = tmp_path / "book_out.epub"
+    project_dir.mkdir()
+    _build_epub(epub_path)
+
+    old_path = project_dir / "OEBPS" / "ch1_validated.html"
+    retry_path = project_dir / "OEBPS" / "ch1_translated_retry.html"
+    old_path.parent.mkdir()
+    old_path.write_text("<html><body><p>old accepted</p></body></html>", encoding="utf-8")
+    retry_path.write_text("<html><body><p>fresh retry</p></body></html>", encoding="utf-8")
+    os.utime(old_path, (1000, 1000))
+    os.utime(retry_path, (2000, 2000))
+
+    manager = TranslationProjectManager(str(project_dir))
+    manager.register_translation(
+        "OEBPS/ch1.xhtml",
+        "_validated.html",
+        os.path.relpath(old_path, project_dir).replace("\\", "/"),
+    )
+    manager.register_translation(
+        "OEBPS/ch1.xhtml",
+        "_translated_retry.html",
+        os.path.relpath(retry_path, project_dir).replace("\\", "/"),
+    )
+
+    payload = command_build_epub(
+        Namespace(
+            epub=str(epub_path),
+            project=str(project_dir),
+            output=str(output_path),
+            provider=None,
+            suffix=None,
+            chapter=["OEBPS/ch1.xhtml"],
+            offset=0,
+            limit=None,
+            strict=True,
+        )
+    )
+
+    assert payload["replaced_count"] == 1
+    with zipfile.ZipFile(output_path, "r") as epub:
+        assert "OEBPS/ch1_translated_retry.html" in epub.namelist()
+        assert "fresh retry" in epub.read("OEBPS/ch1_translated_retry.html").decode("utf-8")
 
 
 def test_safe_settings_masks_active_keys_by_provider():

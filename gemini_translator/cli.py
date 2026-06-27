@@ -1498,6 +1498,7 @@ def _resolve_build_suffix(args) -> str | None:
 
 def command_build_epub(args) -> dict:
     from .utils.epub_tools import EpubUpdater
+    from .utils.translation_versions import select_epub_build_translation_version
 
     project_folder = _abs_path(args.project)
     epub_path = _abs_path(args.epub)
@@ -1518,7 +1519,10 @@ def command_build_epub(args) -> dict:
     missing = []
     for chapter in chapters:
         versions = pm.get_versions_for_original(chapter)
-        rel_path = _choose_translation_rel_path(versions, suffix)
+        if suffix is None:
+            rel_path = select_epub_build_translation_version(versions, project_folder)
+        else:
+            rel_path = _choose_translation_rel_path(versions, suffix)
         if not rel_path:
             missing.append(chapter)
             continue

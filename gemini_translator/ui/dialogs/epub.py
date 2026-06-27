@@ -61,6 +61,7 @@ from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path
 from ...utils.text import unify_paragraphs_for_ai
 from ...utils.project_manager import TranslationProjectManager
 from ...utils.project_migrator import ProjectMigrator, SyncThread
+from ...utils.translation_versions import sort_translation_versions_for_epub_build
 from ..widgets.common_widgets import NoScrollComboBox
 from .chapter_editor import ChapterEditorDialog
 from ...core.epub_deep_cleanup_helpers import (
@@ -1948,24 +1949,19 @@ class TranslatedChaptersManagerDialog(QDialog):
         item_path.setData(QtCore.Qt.ItemDataRole.UserRole, internal_path)
         item_path.setFlags(item_path.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
 
-        # Колонка 2: ComboBox с версиями
-        # ВАЖНО: Создание QComboBox - дорогая операция. Делаем это только если виджета нет.
-        if not self.table.cellWidget(row, self.COL_FILE):
-            combo = NoScrollComboBox()
-            
-            versions = self.project_manager.get_versions_for_original(internal_path)
-            # Формируем список версий
-            version_list = [{"suffix": suffix, "filepath": os.path.join(self.translated_folder, rel_path.replace('/', os.sep))} 
-                            for suffix, rel_path in versions.items()]
-            sorted_versions = sorted(version_list, key=lambda v: v['suffix'] != '_validated.html')
-            
-            for version_info in sorted_versions:
-                icon = "✅" if version_info['suffix'] == '_validated.html' else "📄"
-                display_text = f"{icon} {os.path.basename(version_info['filepath'])}"
-                combo.addItem(display_text, userData=version_info['filepath'])
-            
-            combo.currentIndexChanged.connect(self._update_preview_button_state)
-            self.table.setCellWidget(row, self.COL_FILE, combo)
+        combo = NoScrollComboBox()
+
+        versions = self.project_manager.get_versions_for_original(internal_path)
+        sorted_versions = sort_translation_versions_for_epub_build(versions, self.translated_folder)
+
+        for version_info in sorted_versions:
+            icon = "✅" if version_info['suffix'] == '_validated.html' else "📄"
+            display_text = f"{icon} {os.path.basename(version_info['filepath'])}"
+            combo.addItem(display_text, userData=version_info['filepath'])
+
+        combo.setCurrentIndex(0 if combo.count() else -1)
+        combo.currentIndexChanged.connect(self._update_preview_button_state)
+        self.table.setCellWidget(row, self.COL_FILE, combo)
             
     def _renumber_rows(self):
         for i in range(self.table.rowCount()):

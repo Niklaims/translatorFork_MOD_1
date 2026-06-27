@@ -3,7 +3,10 @@ import shutil
 from pathlib import Path
 
 from gemini_translator.utils.batch_markers import find_boundary_markers
-from gemini_translator.utils.translation_versions import select_target_translation_version
+from gemini_translator.utils.translation_versions import (
+    select_epub_build_translation_version,
+    select_target_translation_version,
+)
 
 
 def _fresh_tmp_dir(name):
@@ -62,6 +65,31 @@ def test_validation_keeps_validated_translation_preferred():
 
         assert rel_path == "Text/ch1_validated.html"
         assert is_validated is True
+    finally:
+        shutil.rmtree(tmp_path.parent, ignore_errors=True)
+
+
+def test_epub_build_selects_newer_retry_over_older_validated():
+    tmp_path = _fresh_tmp_dir("epub_build_newest")
+    retry_path = tmp_path / "Text" / "ch1_translated_retry.html"
+    validated_path = tmp_path / "Text" / "ch1_validated.html"
+    retry_path.parent.mkdir()
+    try:
+        validated_path.write_text("<html><body><p>accepted old</p></body></html>", encoding="utf-8")
+        retry_path.write_text("<html><body><p>retry fresh</p></body></html>", encoding="utf-8")
+
+        os.utime(validated_path, (1000, 1000))
+        os.utime(retry_path, (2000, 2000))
+
+        rel_path = select_epub_build_translation_version(
+            {
+                "_validated.html": "Text/ch1_validated.html",
+                "_translated_retry.html": "Text/ch1_translated_retry.html",
+            },
+            str(tmp_path),
+        )
+
+        assert rel_path == "Text/ch1_translated_retry.html"
     finally:
         shutil.rmtree(tmp_path.parent, ignore_errors=True)
 

@@ -2,6 +2,16 @@ import os
 
 
 VALIDATED_SUFFIX = "_validated.html"
+IGNORED_VERSION_SUFFIXES = {"filtered"}
+
+
+def _version_file_score(translated_folder, suffix, rel_path):
+    full_path = os.path.join(translated_folder, str(rel_path).replace("/", os.sep))
+    try:
+        stat_result = os.stat(full_path)
+        return (1, stat_result.st_mtime, stat_result.st_size, str(suffix), str(rel_path))
+    except OSError:
+        return (0, -1.0, -1, str(suffix), str(rel_path))
 
 
 def select_target_translation_version(versions, translated_folder):
@@ -15,18 +25,39 @@ def select_target_translation_version(versions, translated_folder):
     candidates = [
         (suffix, rel_path)
         for suffix, rel_path in versions.items()
-        if suffix != VALIDATED_SUFFIX and rel_path
+        if suffix != VALIDATED_SUFFIX and suffix not in IGNORED_VERSION_SUFFIXES and rel_path
     ]
     if not candidates:
         return None, False
 
-    def candidate_score(item):
-        suffix, rel_path = item
-        full_path = os.path.join(translated_folder, str(rel_path).replace("/", os.sep))
-        try:
-            stat_result = os.stat(full_path)
-            return (1, stat_result.st_mtime, stat_result.st_size, suffix)
-        except OSError:
-            return (0, -1.0, -1, suffix)
+    return max(candidates, key=lambda item: _version_file_score(translated_folder, item[0], item[1]))[1], False
 
-    return max(candidates, key=candidate_score)[1], False
+
+def sort_translation_versions_for_epub_build(versions, translated_folder):
+    if not versions:
+        return []
+
+    candidates = []
+    for suffix, rel_path in versions.items():
+        if suffix in IGNORED_VERSION_SUFFIXES or not rel_path:
+            continue
+        full_path = os.path.join(translated_folder, str(rel_path).replace("/", os.sep))
+        candidates.append({
+            "suffix": suffix,
+            "rel_path": rel_path,
+            "filepath": full_path,
+            "is_validated": suffix == VALIDATED_SUFFIX,
+        })
+
+    return sorted(
+        candidates,
+        key=lambda item: _version_file_score(translated_folder, item["suffix"], item["rel_path"]),
+        reverse=True,
+    )
+
+
+def select_epub_build_translation_version(versions, translated_folder):
+    sorted_versions = sort_translation_versions_for_epub_build(versions, translated_folder)
+    if not sorted_versions:
+        return None
+    return sorted_versions[0]["rel_path"]
