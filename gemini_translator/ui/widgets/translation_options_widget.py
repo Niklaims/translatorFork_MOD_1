@@ -196,6 +196,10 @@ class TranslationOptionsWidget(QGroupBox):
         main_layout.addWidget(modes_group, 0, 0)
         main_layout.addWidget(settings_group, 0, 1)
         main_layout.addWidget(orchestration_group, 1, 0, 1, 2)
+        # Keep the group boxes at their natural height: any extra vertical space
+        # given to this widget (e.g. by the tasks-tab splitter) is absorbed by an
+        # empty trailing row instead of stretching the boxes above.
+        main_layout.setRowStretch(2, 1)
 
         self.batch_checkbox.toggled.connect(self._on_mode_changed)
         self.chunking_checkbox.toggled.connect(self._on_mode_changed)

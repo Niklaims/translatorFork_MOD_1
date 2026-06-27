@@ -104,7 +104,7 @@ BENCHMARK_TEXT_SIZE = 10000     # Увеличиваем размер текст
 BASE_GLOSSARY_PROMPT_STATE_FILE = "base_glossary_prompt_state.json"
 QUEUE_AUTOSAVE_SETTING_KEY = "queue_autosave_enabled"
 TASK_LIST_MIN_HEIGHT = 420
-TASK_OPTIONS_MIN_HEIGHT = 650
+TASK_OPTIONS_MIN_HEIGHT = 400
 TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
 # --- КОНЕЦ НОВЫХ КОНСТАНТ ---
 
@@ -153,7 +153,7 @@ def _create_tasks_tab_scroll_area(task_management_widget, translation_options_wi
     tasks_splitter.addWidget(task_management_widget)
     tasks_splitter.addWidget(translation_options_widget)
     tasks_splitter.setStretchFactor(0, 5)
-    tasks_splitter.setStretchFactor(1, 1)
+    tasks_splitter.setStretchFactor(1, 0)
     tasks_splitter.setCollapsible(0, False)
     tasks_splitter.setCollapsible(1, True)
     tasks_splitter.setSizes([max(560, t_min), o_min])
@@ -161,7 +161,12 @@ def _create_tasks_tab_scroll_area(task_management_widget, translation_options_wi
     tasks_splitter.setMinimumHeight(tasks_min_height)
 
     tasks_tab_layout.addWidget(tasks_splitter, 1)
-    tasks_tab_container.setMinimumHeight(tasks_min_height)
+    # Don't pin the container's minimumHeight here. OverlayTabWidget.addTab() later
+    # adds a top margin (to clear the floating tab bar), so the container's real
+    # minimum is its layout's minimumSizeHint (splitter min + margins). An explicit
+    # setMinimumHeight() overrides that hint with a value computed *before* the margin
+    # exists, leaving the scroll area ~45px short and clipping the bottom control.
+    # Letting the layout drive the minimum keeps the whole tab scrollable.
 
     tasks_scroll = QScrollArea()
     tasks_scroll.setWidgetResizable(True)
