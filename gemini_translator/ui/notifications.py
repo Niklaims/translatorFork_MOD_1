@@ -1,9 +1,14 @@
 import sys
 import subprocess
+import logging
 from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QStyle
 from PyQt6.QtGui import QIcon
-from loguru import logger
+
+try:
+    from loguru import logger
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 class NotificationManager:
     _tray_icon = None
