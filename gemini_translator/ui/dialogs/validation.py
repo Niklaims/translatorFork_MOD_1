@@ -1860,6 +1860,15 @@ class TranslationValidatorPage(ShellPage):
         "Медиана ±25%": (-1.0, 0.25, "Отклонение от медианного значения по всем главам"),
         "Медиана ±30%": (-1.0, 0.30, "Отклонение от медианного значения по всем главам")
     }
+
+    VALIDATION_FILTER_DEFAULTS = {
+        "check_structure": True,
+        "check_untranslated": True,
+        "check_length_ratio": True,
+        "check_simplification": True,
+        "check_repeating_chars": False,
+        "check_paragraph_size": False,
+    }
     
 
     def __init__(self, translated_folder, original_epub_path, parent=None, retry_enabled=True, project_manager=None):
@@ -1969,6 +1978,7 @@ class TranslationValidatorPage(ShellPage):
         
         # 4. Комбобокс
         self.ratio_presets_combo.currentIndexChanged.connect(self.reapply_filters)
+        self._sync_validation_filter_controls()
 
         self._set_tooltips()
         
@@ -1997,6 +2007,51 @@ class TranslationValidatorPage(ShellPage):
             return True
         table = getattr(self, "table_results", None)
         return table is not None and sip.isdeleted(table)
+
+    def _iter_validation_filter_checkboxes(self):
+        for attr_name in self.VALIDATION_FILTER_DEFAULTS:
+            checkbox = getattr(self, attr_name, None)
+            if checkbox is not None:
+                yield attr_name, checkbox
+
+    def _sync_validation_filter_controls(self):
+        if hasattr(self, "ratio_presets_combo") and hasattr(self, "check_length_ratio"):
+            self.ratio_presets_combo.setEnabled(self.check_length_ratio.isChecked())
+        if hasattr(self, "simplification_threshold_spinbox") and hasattr(self, "check_simplification"):
+            self.simplification_threshold_spinbox.setEnabled(self.check_simplification.isChecked())
+        if hasattr(self, "repeating_chars_spinbox") and hasattr(self, "check_repeating_chars"):
+            self.repeating_chars_spinbox.setEnabled(self.check_repeating_chars.isChecked())
+        if hasattr(self, "max_paragraph_spinbox") and hasattr(self, "check_paragraph_size"):
+            self.max_paragraph_spinbox.setEnabled(self.check_paragraph_size.isChecked())
+
+    def _load_validation_filter_settings(self):
+        if not self.settings_manager:
+            self._sync_validation_filter_controls()
+            return
+
+        loader = getattr(self.settings_manager, "get_last_validation_filter_settings", None)
+        saved_settings = loader() if callable(loader) else {}
+        if not isinstance(saved_settings, dict):
+            self._sync_validation_filter_controls()
+            return
+
+        for attr_name, checkbox in self._iter_validation_filter_checkboxes():
+            if attr_name in saved_settings:
+                checkbox.setChecked(bool(saved_settings[attr_name]))
+
+        self._sync_validation_filter_controls()
+
+    def _save_validation_filter_settings(self):
+        if not self.settings_manager:
+            return
+
+        settings = {
+            attr_name: checkbox.isChecked()
+            for attr_name, checkbox in self._iter_validation_filter_checkboxes()
+        }
+        saver = getattr(self.settings_manager, "save_last_validation_filter_settings", None)
+        if callable(saver):
+            saver(settings)
 
     def _read_text_file(self, file_path):
         try:
@@ -2468,7 +2523,7 @@ class TranslationValidatorPage(ShellPage):
         self.check_revalidate_ok.setEnabled(True)
         self.check_show_all.setEnabled(True)
         self.analysis_mode_combo.setEnabled(True)
-        self.ratio_presets_combo.setEnabled(True)
+        self._sync_validation_filter_controls()
         self.btn_sync_project.setEnabled(True)
         self.btn_apply_changes.setEnabled(True)
         
@@ -2540,18 +2595,16 @@ class TranslationValidatorPage(ShellPage):
         grid.addWidget(self.check_paragraph_size, 2, 1)
         grid.addWidget(self.max_paragraph_spinbox, 2, 2)
     
-        self.check_structure.setChecked(True)
-        self.check_untranslated.setChecked(True)
-        self.check_length_ratio.setChecked(True)
-        self.check_simplification.setChecked(True)
-        self.check_repeating_chars.setChecked(False); self.repeating_chars_spinbox.setEnabled(False)
-        self.check_paragraph_size.setChecked(False); self.max_paragraph_spinbox.setEnabled(False)
-        
-        # --- НОВОЕ: ПОДКЛЮЧЕНИЕ ЖИВОЙ ФИЛЬТРАЦИИ ---
-        # При клике по чекбоксу мы не запускаем анализ заново, а просто пересчитываем видимость
+        for attr_name, default_value in self.VALIDATION_FILTER_DEFAULTS.items():
+            checkbox = getattr(self, attr_name)
+            checkbox.setChecked(default_value)
+        self._load_validation_filter_settings()
+
+        # Сохраняем состояние фильтров сразу при переключении.
+        # Живая фильтрация подключается ниже, после создания всей таблицы.
         for checkbox in [self.check_structure, self.check_untranslated, self.check_length_ratio, 
                          self.check_simplification, self.check_repeating_chars, self.check_paragraph_size]:
-            checkbox.clicked.connect(self.reapply_filters)
+            checkbox.toggled.connect(self._save_validation_filter_settings)
             
         return container
     

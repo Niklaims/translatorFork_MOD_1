@@ -17,6 +17,26 @@ class TranslationValidatorPageContractTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         cls.app.global_version = ""
 
+    def _install_fake_settings_manager(self, fake):
+        marker = object()
+        previous_settings = getattr(self.app, "settings_manager", marker)
+        previous_getter = getattr(self.app, "get_settings_manager", marker)
+        self.app.settings_manager = fake
+        self.app.get_settings_manager = lambda: fake
+
+        def restore():
+            if previous_settings is marker:
+                delattr(self.app, "settings_manager")
+            else:
+                self.app.settings_manager = previous_settings
+
+            if previous_getter is marker:
+                delattr(self.app, "get_settings_manager")
+            else:
+                self.app.get_settings_manager = previous_getter
+
+        self.addCleanup(restore)
+
     def test_is_shell_page_subclass(self):
         self.assertTrue(issubclass(TranslationValidatorPage, ShellPage))
 
@@ -84,6 +104,70 @@ class TranslationValidatorPageContractTests(unittest.TestCase):
         self.app.processEvents()
 
         self.assertGreater(page.content_scroll_area.verticalScrollBar().maximum(), 0)
+
+    def test_validation_filter_checkboxes_restore_saved_state(self):
+        class _Settings:
+            def get_last_validation_filter_settings(self):
+                return {
+                    "check_structure": False,
+                    "check_untranslated": False,
+                    "check_length_ratio": False,
+                    "check_simplification": False,
+                    "check_repeating_chars": True,
+                    "check_paragraph_size": True,
+                }
+
+            def save_last_validation_filter_settings(self, settings):
+                self.saved = settings
+
+        self._install_fake_settings_manager(_Settings())
+        with patch.object(TranslationValidatorPage, "_perform_initial_cjk_scan"):
+            page = TranslationValidatorPage(
+                "/tmp/nonexistent-translations",
+                "/tmp/nonexistent-book.epub",
+                project_manager=None,
+            )
+        self.addCleanup(page.deleteLater)
+        page._populate_initial_table_timer.stop()
+
+        self.assertFalse(page.check_structure.isChecked())
+        self.assertFalse(page.check_untranslated.isChecked())
+        self.assertFalse(page.check_length_ratio.isChecked())
+        self.assertFalse(page.check_simplification.isChecked())
+        self.assertTrue(page.check_repeating_chars.isChecked())
+        self.assertTrue(page.check_paragraph_size.isChecked())
+        self.assertFalse(page.ratio_presets_combo.isEnabled())
+        self.assertTrue(page.repeating_chars_spinbox.isEnabled())
+        self.assertTrue(page.max_paragraph_spinbox.isEnabled())
+
+    def test_validation_filter_checkboxes_save_when_toggled(self):
+        class _Settings:
+            def __init__(self):
+                self.saved = None
+
+            def get_last_validation_filter_settings(self):
+                return {}
+
+            def save_last_validation_filter_settings(self, settings):
+                self.saved = settings.copy()
+
+        fake_settings = _Settings()
+        self._install_fake_settings_manager(fake_settings)
+        with patch.object(TranslationValidatorPage, "_perform_initial_cjk_scan"):
+            page = TranslationValidatorPage(
+                "/tmp/nonexistent-translations",
+                "/tmp/nonexistent-book.epub",
+                project_manager=None,
+            )
+        self.addCleanup(page.deleteLater)
+        page._populate_initial_table_timer.stop()
+
+        page.check_repeating_chars.click()
+
+        self.assertIsNotNone(fake_settings.saved)
+        self.assertTrue(fake_settings.saved["check_repeating_chars"])
+        self.assertFalse(fake_settings.saved["check_paragraph_size"])
+        self.assertTrue(fake_settings.saved["check_structure"])
 
     def test_close_button_requests_shell_back_navigation(self):
         with patch.object(TranslationValidatorPage, "_perform_initial_cjk_scan"):

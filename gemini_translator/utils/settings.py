@@ -897,6 +897,11 @@ class SettingsManager(QObject):
     def save_last_glossary_generation_settings(self, settings_dict): return self._generic_saver('last_glossary_generation_settings', settings_dict or {})
     def get_ai_correction_review_settings(self): return self._generic_loader('ai_correction_review_settings', {})
     def save_ai_correction_review_settings(self, settings_dict): return self._generic_saver('ai_correction_review_settings', settings_dict or {})
+    def get_last_validation_filter_settings(self):
+        settings = self._generic_loader('last_validation_filter_settings', {})
+        return settings.copy() if isinstance(settings, dict) else {}
+    def save_last_validation_filter_settings(self, settings_dict):
+        return self._generic_saver('last_validation_filter_settings', settings_dict or {})
     
     def save_proxy_settings(self, proxy_settings_dict):
         with self.file_lock:
