@@ -70,6 +70,7 @@ from workers import (
     RulateToRanobeMetadataWorker,
     RulateToRanobeCreateWorker,
     UploadWorker,
+    publisher_from_source_url,
 )
 
 try:
@@ -587,6 +588,10 @@ class RanobeUploaderApp(QMainWindow):
         self.media_title_en_edit = QLineEdit()
         self.media_alt_names_edit = QLineEdit()
         self.media_author_edit = QLineEdit()
+        self.media_publisher_edit = QLineEdit()
+        self.media_publisher_edit.setPlaceholderText("Qidian / Fanqie Manhua")
+        self.media_translator_team_edit = QLineEdit()
+        self.media_translator_team_edit.setPlaceholderText("Название команды переводчиков")
         author_widget = QWidget()
         author_layout = QHBoxLayout(author_widget)
         author_layout.setContentsMargins(0, 0, 0, 0)
@@ -677,6 +682,8 @@ class RanobeUploaderApp(QMainWindow):
         form.addRow("Название EN:", self.media_title_en_edit)
         form.addRow("Альтернативные:", self.media_alt_names_edit)
         form.addRow("Автор:", author_widget)
+        form.addRow("Издатель:", self.media_publisher_edit)
+        form.addRow("Команда переводчиков:", self.media_translator_team_edit)
         form.addRow("Обложка URL:", cover_url_widget)
         form.addRow("Превью обложки:", self.media_cover_preview_label)
         form.addRow("Год релиза:", self.media_year_edit)
@@ -852,6 +859,8 @@ class RanobeUploaderApp(QMainWindow):
         self.settings.setValue("media_alt_names", self.media_alt_names_edit.text())
         self.settings.setValue("media_alt_hieroglyph", self.media_alt_hieroglyph_edit.text())
         self.settings.setValue("media_author", self.media_author_edit.text())
+        self.settings.setValue("media_publisher", self.media_publisher_edit.text())
+        self.settings.setValue("media_translator_team", self.media_translator_team_edit.text())
         self.settings.setValue("media_cover_url", self.media_cover_url_edit.text())
         self.settings.setValue("media_year", self.media_year_edit.text())
         self.settings.setValue("media_description", self.media_description_edit.toPlainText())
@@ -947,6 +956,15 @@ class RanobeUploaderApp(QMainWindow):
             self._settings_text("media_alt_hieroglyph", cached_media.get("alt_hieroglyph_title", ""))
         )
         self.media_author_edit.setText(self._settings_text("media_author", cached_media.get("author", "")))
+        self.media_publisher_edit.setText(
+            self._settings_text(
+                "media_publisher",
+                cached_media.get("publisher") or publisher_from_source_url(cached_media.get("source_url", "")),
+            )
+        )
+        self.media_translator_team_edit.setText(
+            self._settings_text("media_translator_team", cached_media.get("translator_team", ""))
+        )
         self.media_cover_url_edit.setText(self._settings_text("media_cover_url", cached_media.get("cover_url", "")))
         self.media_year_edit.setText(str(self.settings.value("media_year", cached_media.get("year") or "2026") or "2026"))
         self.media_description_edit.setPlainText(
@@ -1097,6 +1115,15 @@ class RanobeUploaderApp(QMainWindow):
             self._settings_text("media_alt_hieroglyph", cached_media.get("alt_hieroglyph_title", ""))
         )
         self.media_author_edit.setText(self._settings_text("media_author", cached_media.get("author", "")))
+        self.media_publisher_edit.setText(
+            self._settings_text(
+                "media_publisher",
+                cached_media.get("publisher") or publisher_from_source_url(cached_media.get("source_url", "")),
+            )
+        )
+        self.media_translator_team_edit.setText(
+            self._settings_text("media_translator_team", cached_media.get("translator_team", ""))
+        )
         self.media_cover_url_edit.setText(self._settings_text("media_cover_url", cached_media.get("cover_url", "")))
         self.media_year_edit.setText(str(self.settings.value("media_year", cached_media.get("year") or "2026") or "2026"))
         self.media_description_edit.setPlainText(
@@ -1155,6 +1182,8 @@ class RanobeUploaderApp(QMainWindow):
         self.settings.setValue("media_alt_names", self.media_alt_names_edit.text())
         self.settings.setValue("media_alt_hieroglyph", self.media_alt_hieroglyph_edit.text())
         self.settings.setValue("media_author", self.media_author_edit.text())
+        self.settings.setValue("media_publisher", self.media_publisher_edit.text())
+        self.settings.setValue("media_translator_team", self.media_translator_team_edit.text())
         self.settings.setValue("media_cover_url", self.media_cover_url_edit.text())
         self.settings.setValue("media_year", self.media_year_edit.text())
         self.settings.setValue("media_description", self.media_description_edit.toPlainText())
@@ -1323,6 +1352,15 @@ class RanobeUploaderApp(QMainWindow):
         value = self.settings.value(key, fallback)
         return str(value or "")
 
+    def _media_translator_team_text(self, metadata: dict | None = None) -> str:
+        metadata_team = str((metadata or {}).get("translator_team") or "").strip()
+        if metadata_team:
+            return metadata_team
+        current_team = self.media_translator_team_edit.text().strip()
+        if current_team:
+            return current_team
+        return self._settings_text("media_translator_team", "").strip()
+
     def _load_rulate_media_state(self) -> dict:
         raw = self.settings.value("media_last_metadata_json", "")
         if not raw:
@@ -1446,6 +1484,14 @@ class RanobeUploaderApp(QMainWindow):
         self.media_title_en_edit.setText(metadata.get("title_en", ""))
         self.media_alt_names_edit.setText(metadata.get("alt_names", ""))
         self.media_author_edit.setText(metadata.get("author", ""))
+        self.media_publisher_edit.setText(
+            metadata.get("publisher") or publisher_from_source_url(metadata.get("source_url", ""))
+        )
+        translator_team = self._media_translator_team_text(metadata)
+        self.media_translator_team_edit.setText(translator_team)
+        if translator_team:
+            self._rulate_media_metadata["translator_team"] = translator_team
+            self.settings.setValue("media_translator_team", translator_team)
         self.media_cover_url_edit.setText(metadata.get("cover_url", ""))
         self._refresh_media_cover_preview()
         self.media_year_edit.setText(metadata.get("year") or "2026")
@@ -1474,6 +1520,8 @@ class RanobeUploaderApp(QMainWindow):
                 "title_en": self.media_title_en_edit.text().strip(),
                 "alt_names": " / ".join(alt_values),
                 "author": self.media_author_edit.text().strip(),
+                "publisher": self.media_publisher_edit.text().strip(),
+                "translator_team": self.media_translator_team_edit.text().strip(),
                 "cover_url": self.media_cover_url_edit.text().strip(),
                 "year": self.media_year_edit.text().strip(),
                 "description": self.media_description_edit.toPlainText().strip(),

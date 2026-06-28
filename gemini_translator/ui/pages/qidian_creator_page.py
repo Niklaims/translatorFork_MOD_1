@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -42,6 +43,9 @@ from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
 
 
+QIDIAN_CREATOR_UI_STATE_KEY = "qidian_creator_ui"
+
+
 class QidianCreatorPage(ShellPage):
     page_title = "Qidian/Fanqie → Rulate"
 
@@ -59,6 +63,7 @@ class QidianCreatorPage(ShellPage):
         self._workers = []
 
         self._build_ui()
+        self._load_ui_state()
         self._connect_ai_widgets()
         self._update_action_state()
 
@@ -211,6 +216,12 @@ class QidianCreatorPage(ShellPage):
         self.translated_description_edit = QTextEdit()
         self.translated_description_edit.setAcceptRichText(False)
         self.translated_description_edit.setMinimumHeight(170)
+        self.translator_team_combo = QComboBox()
+        self.translator_team_combo.addItem("Первая подсказка", "first_suggestion")
+        self.translator_team_combo.addItem("Не выбирать", "")
+        self.translator_team_combo.setToolTip(
+            "Автоматически выбирает первую команду из подсказок Rulate, без ручного ввода ID или названия."
+        )
         self.genres_edit = QLineEdit()
         self.genres_edit.setPlaceholderText("фэнтези, мистика, приключения")
         self.tags_edit = QLineEdit()
@@ -223,6 +234,7 @@ class QidianCreatorPage(ShellPage):
         layout.addRow("Название EN:", self.english_title_edit)
         layout.addRow("Название RU:", self.translated_title_edit)
         layout.addRow("Описание RU:", self.translated_description_edit)
+        layout.addRow("Команда переводчиков:", self.translator_team_combo)
         layout.addRow("Жанры:", self.genres_edit)
         layout.addRow("Теги:", self.tags_edit)
         layout.addRow("Промпт обложки:", self.cover_prompt_edit)
@@ -234,6 +246,7 @@ class QidianCreatorPage(ShellPage):
         self.model_settings_widget.set_available_models(provider_id)
         self.key_widget.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.model_settings_widget.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.translator_team_combo.currentIndexChanged.connect(self._on_translator_team_mode_changed)
         self._on_model_changed(self.model_settings_widget.model_combo.currentIndex())
 
     def _on_provider_changed(self, _index: int) -> None:
@@ -335,6 +348,7 @@ class QidianCreatorPage(ShellPage):
         worker.start()
 
     def _fill_rulate(self) -> None:
+        self._save_ui_state()
         qidian = self._collect_qidian_metadata()
         prepared = self._collect_prepared_metadata()
         try:
@@ -391,6 +405,11 @@ class QidianCreatorPage(ShellPage):
         self.translated_description_edit.setPlainText(prepared.translated_description)
         self.genres_edit.setText(", ".join(prepared.genres))
         self.tags_edit.setText(", ".join(prepared.tags))
+        translator_team_mode = getattr(prepared, "translator_team_mode", "")
+        if translator_team_mode:
+            index = self.translator_team_combo.findData(translator_team_mode)
+            if index >= 0:
+                self.translator_team_combo.setCurrentIndex(index)
         if prepared.cover_prompt:
             self.cover_prompt_edit.setPlainText(prepared.cover_prompt)
         self._update_action_state()
@@ -398,6 +417,38 @@ class QidianCreatorPage(ShellPage):
     def _apply_cover_prompt(self, prompt: str) -> None:
         self.cover_prompt_edit.setPlainText(prompt)
         self._update_action_state()
+
+    def _load_ui_state(self) -> None:
+        saved = {}
+        try:
+            saved = self.settings_manager.load_settings().get(QIDIAN_CREATOR_UI_STATE_KEY, {}) or {}
+        except Exception:
+            saved = {}
+
+        if not isinstance(saved, dict) or "translator_team_mode" not in saved:
+            return
+
+        index = self.translator_team_combo.findData(saved.get("translator_team_mode") or "")
+        if index >= 0:
+            self.translator_team_combo.setCurrentIndex(index)
+
+    def _save_ui_state(self) -> None:
+        try:
+            self.settings_manager.save_ui_state(
+                {
+                    QIDIAN_CREATOR_UI_STATE_KEY: {
+                        "translator_team_mode": self.translator_team_combo.currentData() or "",
+                    }
+                }
+            )
+        except Exception:
+            pass
+
+    def _on_translator_team_mode_changed(self, _index: int) -> None:
+        self._save_ui_state()
+
+    def on_leave(self) -> None:
+        self._save_ui_state()
 
     def _collect_qidian_metadata(self) -> QidianBookMetadata:
         return QidianBookMetadata(
@@ -413,6 +464,7 @@ class QidianCreatorPage(ShellPage):
             english_title=self.english_title_edit.text().strip(),
             translated_title=self.translated_title_edit.text().strip(),
             translated_description=self.translated_description_edit.toPlainText().strip(),
+            translator_team_mode=self.translator_team_combo.currentData() or "",
             genres=_split_csv(self.genres_edit.text()),
             tags=_split_csv(self.tags_edit.text()),
             cover_prompt=self.cover_prompt_edit.toPlainText().strip(),

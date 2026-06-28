@@ -280,7 +280,7 @@ class BaseApiHandler:
                 stack.append(cause)
 
     def _is_transient_disconnect_error(self, error: Exception) -> bool:
-        transient_aiohttp_types = [aiohttp.ServerDisconnectedError]
+        transient_aiohttp_types = [aiohttp.ServerDisconnectedError, aiohttp.ClientPayloadError]
         for type_name in ("ClientConnectionResetError",):
             transient_type = getattr(aiohttp, type_name, None)
             if transient_type is not None:

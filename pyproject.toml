@@ -2,6 +2,7 @@
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]
+qt_api = "pyqt6"
 filterwarnings = [
     "default",
 ]

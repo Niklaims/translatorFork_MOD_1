@@ -9,6 +9,9 @@ if not "%~1"=="" set "NON_INTERACTIVE=1"
 call :resolve_python
 if %ERRORLEVEL% NEQ 0 goto :eof
 
+call :resolve_release_version
+if %ERRORLEVEL% NEQ 0 goto :eof
+
 if /I "%~1"=="translator" goto build_translator
 if /I "%~1"=="full" goto build_full
 if /I "%~1"=="all" goto build_all
@@ -62,6 +65,17 @@ if /I "%PYTHON_CMD%"=="python" (
 echo [INFO] Python: %PYTHON_CMD%
 exit /b 0
 
+:resolve_release_version
+for /f "delims=" %%V in ('"%PYTHON_CMD%" -c "from gemini_translator.version import __version__; print(__version__)"') do set "RELEASE_VERSION=%%V"
+if not defined RELEASE_VERSION (
+    echo [ERROR] Failed to resolve release version.
+    if not defined NON_INTERACTIVE pause
+    exit /b 1
+)
+set "RELEASE_DIR=dist\release-v%RELEASE_VERSION%-upload"
+echo [INFO] Release version: %RELEASE_VERSION%
+exit /b 0
+
 :prepare_build
 echo.
 echo [STEP] Installing build dependencies...
@@ -76,6 +90,9 @@ if exist "dist\chatgpt-profile-run" rmdir /S /Q "dist\chatgpt-profile-run"
 if exist "dist\logs" rmdir /S /Q "dist\logs"
 if exist "dist\translatorFork-translator.exe" del /Q "dist\translatorFork-translator.exe"
 if exist "dist\translatorFork-full.exe" del /Q "dist\translatorFork-full.exe"
+if exist "dist\translatorFork-translator" rmdir /S /Q "dist\translatorFork-translator"
+if exist "dist\translatorFork-full" rmdir /S /Q "dist\translatorFork-full"
+if exist "%RELEASE_DIR%" rmdir /S /Q "%RELEASE_DIR%"
 if exist "build\translatorFork-translator" rmdir /S /Q "build\translatorFork-translator"
 if exist "build\translatorFork-full" rmdir /S /Q "build\translatorFork-full"
 exit /b 0
@@ -86,7 +103,7 @@ if %ERRORLEVEL% NEQ 0 goto :eof
 echo.
 echo [STEP] Building small translator-only release...
 "%PYTHON_CMD%" -m PyInstaller --clean --noconfirm "translatorFork-translator-only.spec"
-call :finish_build "dist\translatorFork-translator.exe"
+call :finish_build "dist\translatorFork-translator"
 goto :eof
 
 :build_full
@@ -95,7 +112,7 @@ if %ERRORLEVEL% NEQ 0 goto :eof
 echo.
 echo [STEP] Building full release...
 "%PYTHON_CMD%" -m PyInstaller --clean --noconfirm "translatorFork-full.spec"
-call :finish_build "dist\translatorFork-full.exe"
+call :finish_build "dist\translatorFork-full"
 goto :eof
 
 :build_all
@@ -111,7 +128,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo.
 echo [STEP] Building full release...
 "%PYTHON_CMD%" -m PyInstaller --clean --noconfirm "translatorFork-full.spec"
-call :finish_build "dist\translatorFork-translator.exe" "dist\translatorFork-full.exe"
+call :finish_build "dist\translatorFork-translator" "dist\translatorFork-full"
 goto :eof
 
 :finish_build
@@ -122,9 +139,82 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 
+if not "%~1"=="" if not exist "%~1\" (
+    echo.
+    echo [ERROR] Expected output folder was not found: %~1
+    if not defined NON_INTERACTIVE pause
+    exit /b 1
+)
+if not "%~2"=="" if not exist "%~2\" (
+    echo.
+    echo [ERROR] Expected output folder was not found: %~2
+    if not defined NON_INTERACTIVE pause
+    exit /b 1
+)
+
+call :package_release "%~1" "%~2"
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERROR] Release packaging failed.
+    if not defined NON_INTERACTIVE pause
+    exit /b 1
+)
+
 echo.
 echo [OK] Build finished.
 if not "%~1"=="" echo     %~1
 if not "%~2"=="" echo     %~2
+echo.
+echo [OK] Release assets:
+echo     %RELEASE_DIR%
 if not defined NON_INTERACTIVE pause
+exit /b 0
+
+:package_release
+echo.
+echo [STEP] Packaging release assets...
+if not exist "dist" mkdir "dist"
+if not exist "%RELEASE_DIR%" mkdir "%RELEASE_DIR%"
+
+if not "%~1"=="" call :package_output "%~1"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+if not "%~2"=="" call :package_output "%~2"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+call :create_source_archive
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+call :write_sha256sums
+if %ERRORLEVEL% NEQ 0 exit /b 1
+
+exit /b 0
+
+:package_output
+set "OUTPUT_DIR=%~1"
+set "OUTPUT_NAME=%~nx1"
+if /I "%OUTPUT_NAME%"=="translatorFork-translator" (
+    set "ZIP_NAME=translatorFork-translator-v%RELEASE_VERSION%-windows.zip"
+) else if /I "%OUTPUT_NAME%"=="translatorFork-full" (
+    set "ZIP_NAME=translatorFork-full-v%RELEASE_VERSION%-windows.zip"
+) else (
+    echo [ERROR] Unknown output folder: %OUTPUT_DIR%
+    exit /b 1
+)
+
+echo [INFO] Creating %ZIP_NAME%...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $zip = Join-Path (Resolve-Path -LiteralPath '%RELEASE_DIR%') '%ZIP_NAME%'; if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }; Compress-Archive -LiteralPath '%OUTPUT_DIR%' -DestinationPath $zip -Force"
+if %ERRORLEVEL% NEQ 0 exit /b 1
+exit /b 0
+
+:create_source_archive
+set "SOURCE_ZIP=%RELEASE_DIR%\translatorFork_MOD-source-v%RELEASE_VERSION%.zip"
+echo [INFO] Creating translatorFork_MOD-source-v%RELEASE_VERSION%.zip...
+git archive --format=zip --output="%SOURCE_ZIP%" HEAD
+if %ERRORLEVEL% NEQ 0 exit /b 1
+exit /b 0
+
+:write_sha256sums
+echo [INFO] Writing SHA256SUMS.txt...
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $dir = Resolve-Path -LiteralPath '%RELEASE_DIR%'; Get-ChildItem -LiteralPath $dir -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | Sort-Object Name | ForEach-Object { '{0}  {1}' -f (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant(), $_.Name } | Set-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') -Encoding ASCII"
+if %ERRORLEVEL% NEQ 0 exit /b 1
 exit /b 0

@@ -56,6 +56,14 @@ class _AlwaysDisconnectHandler(_DisconnectOnceHandler):
         )
 
 
+class _PayloadErrorOnceHandler(_DisconnectOnceHandler):
+    async def call_api(self, *args, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            raise aiohttp.ClientPayloadError("Response payload is not completed")
+        return "ok"
+
+
 class TransientDisconnectRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_disconnected_is_retried_inside_api_call(self):
         worker = _WorkerStub()
@@ -78,6 +86,17 @@ class TransientDisconnectRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handler.calls, 2)
         self.assertEqual(worker.settings_manager.increment_calls, 1)
         self.assertEqual(worker.settings_manager.decrement_calls, 1)
+
+    async def test_client_payload_error_is_retried_inside_api_call(self):
+        worker = _WorkerStub()
+        handler = _PayloadErrorOnceHandler(worker)
+
+        result = await handler.execute_api_call("prompt", "[test]")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(handler.calls, 2)
+        self.assertEqual(worker.settings_manager.increment_calls, 1)
+        self.assertEqual(worker.settings_manager.decrement_calls, 0)
 
 
 if __name__ == "__main__":

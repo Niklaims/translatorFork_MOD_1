@@ -48,6 +48,14 @@ class FilterRepackSafetyTests(unittest.TestCase):
         )
         cls.app.main_db_connection.row_factory = sqlite3.Row
 
+    @classmethod
+    def tearDownClass(cls):
+        connection = getattr(cls.app, "main_db_connection", None)
+        if connection is not None:
+            connection.close()
+            cls.app.main_db_connection = None
+        cls.app.event_bus = None
+
     def test_dilute_payload_marks_green_chapters_as_context_only(self):
         dialog = FilterPackagingDialog(
             filtered_chapters=["Text/ch2.xhtml"],
@@ -59,6 +67,7 @@ class FilterRepackSafetyTests(unittest.TestCase):
                 "Text/ch2.xhtml": 100,
             },
         )
+        self.addCleanup(dialog.close)
         dialog.chapters_per_batch_spin.setValue(2)
 
         result = dialog._calculate_new_chapter_list()
@@ -81,6 +90,7 @@ class FilterRepackSafetyTests(unittest.TestCase):
                 "Text/ch3.xhtml": 100,
             },
         )
+        self.addCleanup(dialog.close)
         dialog.dilute_checkbox.setChecked(False)
 
         result = dialog._calculate_new_chapter_list()

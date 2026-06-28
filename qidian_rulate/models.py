@@ -20,6 +20,7 @@ class PreparedRulateMetadata:
     english_title: str = ""
     translated_title: str = ""
     translated_description: str = ""
+    translator_team_mode: str = ""
     genres: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     cover_prompt: str = ""

@@ -30,6 +30,11 @@ from parsers import FileParser
 from utils import format_num, format_timedelta, parse_vol_and_chapter
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+SOURCE_PUBLISHER_CANDIDATES = {
+    "qidian.com": ("Qidian",),
+    "fanqienovel.com": ("Fanqie Manhua",),
+}
+LEGACY_FANQIE_PUBLISHERS = {"fanqnovel", "fanqie novel", "fanqienovel"}
 QIDIAN_RULATE_PROFILE_DIR = Path(
     os.environ.get(
         "QIDIAN_RULATE_PROFILE_DIR",
@@ -222,6 +227,29 @@ def _has_saved_ranobelib_auth(profile_dir) -> tuple[bool, str | None]:
 
 def _collapse_rulate_spaces(value: str | None) -> str:
     return re.sub(r"[ \t\r\f\v]+", " ", str(value or "")).strip()
+
+
+def publisher_candidates_from_source_url(url: str | None) -> list[str]:
+    parsed = urllib.parse.urlparse(str(url or "").strip())
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    for domain, names in SOURCE_PUBLISHER_CANDIDATES.items():
+        if host == domain or host.endswith("." + domain):
+            return list(names)
+    return []
+
+
+def publisher_from_source_url(url: str | None) -> str:
+    candidates = publisher_candidates_from_source_url(url)
+    return candidates[0] if candidates else ""
+
+
+def _normalize_publisher_for_source(publisher: str | None, source_url: str | None) -> str:
+    value = _collapse_rulate_spaces(publisher)
+    if value.casefold() in LEGACY_FANQIE_PUBLISHERS and publisher_from_source_url(source_url) == "Fanqie Manhua":
+        return "Fanqie Manhua"
+    return value
 
 
 def _clean_rulate_media_title(value: str | None) -> str:
@@ -603,11 +631,12 @@ def _normalize_rulate_media_payload(raw: dict | None, source_url: str) -> dict:
     )
     year = _extract_release_year(raw.get("year") or status_text)
     original_source_url = _normalize_rulate_cover_url(raw.get("original_source_url"), source_url)
+    resolved_source_url = original_source_url or _rulate_public_book_url(source_url)
 
     genres = _normalize_rulate_catalog_items(raw.get("genres"), _load_rulate_allowed_genres())
     tags = _normalize_rulate_catalog_items(raw.get("tags"), _load_rulate_allowed_tags())
     return {
-        "source_url": original_source_url or _rulate_public_book_url(source_url),
+        "source_url": resolved_source_url,
         "rulate_url": _rulate_public_book_url(source_url),
         "rulate_edit_url": _rulate_edit_info_url(source_url),
         "title_ru": title_ru or "Без названия",
@@ -618,6 +647,7 @@ def _normalize_rulate_media_payload(raw: dict | None, source_url: str) -> dict:
         "description": _clean_rulate_description(raw.get("description")),
         "cover_url": _normalize_rulate_cover_url(raw.get("cover_url"), source_url),
         "author": _collapse_rulate_spaces(raw.get("author")),
+        "publisher": publisher_from_source_url(resolved_source_url),
         "genres": genres,
         "tags": tags,
         "rulate_genres": genres,
@@ -1720,6 +1750,8 @@ class RulateToRanobeCreateWorker(QThread):
             "alt_names": "alt_names",
             "description": "description",
             "author": "author",
+            "publisher": "publisher",
+            "translator_team": "translator_team",
             "year": "year",
             "cover_url": "cover_url",
         }
@@ -1769,6 +1801,10 @@ class RulateToRanobeCreateWorker(QThread):
 
         data["create_author"] = bool(self.options.get("create_author"))
         data["source_url"] = data.get("source_url") or self.rulate_url
+        data["publisher"] = (
+            _normalize_publisher_for_source(data.get("publisher"), data.get("source_url"))
+            or publisher_from_source_url(data.get("source_url"))
+        )
         data.setdefault("type_value", "12")
         data.setdefault("status_value", "1")
         data.setdefault("age_value", "3")
@@ -2265,12 +2301,18 @@ class RulateToRanobeCreateWorker(QThread):
         label = str(group_label or "").casefold()
         return "жанр" in label or "тег" in label
 
-    def _add_autocomplete_item(self, page, group_label: str, value: str) -> bool:
+    def _add_autocomplete_item(self, page, group_label: str, value: str, *, fast_missing: bool = False) -> bool:
         value = _collapse_rulate_spaces(value)
         if not value:
             return False
         if self._group_contains_value(page, group_label, value):
             return True
+        suggestion_wait_ms = 900 if fast_missing else 2400
+        click_wait_ms = 1200 if fast_missing else 2600
+        miss_retry_wait_ms = 500 if fast_missing else 1800
+        click_attempts = 1 if fast_missing else 2
+        final_wait_ms = 300 if fast_missing else 900
+        error_wait_ms = 400 if fast_missing else 1200
         try:
             if not self._ensure_group_autocomplete_open(page, group_label):
                 return False
@@ -2295,21 +2337,21 @@ class RulateToRanobeCreateWorker(QThread):
             if not self._clear_active_autocomplete_input(page):
                 return False
             page.keyboard.type(value, delay=60)
-            page.wait_for_timeout(2400)
+            page.wait_for_timeout(suggestion_wait_ms)
             success = False
-            for _ in range(2):
+            for _ in range(click_attempts):
                 if self._click_autocomplete_suggestion(page, value):
-                    page.wait_for_timeout(2600)
+                    page.wait_for_timeout(click_wait_ms)
                     if self._group_contains_value(page, group_label, value):
                         success = True
                         break
-                page.wait_for_timeout(1800)
+                page.wait_for_timeout(miss_retry_wait_ms)
             if not success:
                 try:
                     page.keyboard.press("ArrowDown")
-                    page.wait_for_timeout(400)
+                    page.wait_for_timeout(250 if fast_missing else 400)
                     page.keyboard.press("Enter")
-                    page.wait_for_timeout(2600)
+                    page.wait_for_timeout(click_wait_ms)
                     success = self._group_contains_value(page, group_label, value)
                 except Exception:
                     success = False
@@ -2317,14 +2359,14 @@ class RulateToRanobeCreateWorker(QThread):
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            page.wait_for_timeout(900)
+            page.wait_for_timeout(final_wait_ms)
             return success
         except Exception:
             try:
                 page.keyboard.press("Escape")
             except Exception:
                 pass
-            page.wait_for_timeout(1200)
+            page.wait_for_timeout(error_wait_ms)
             return False
 
     def _clear_active_autocomplete_input(self, page) -> bool:
@@ -2389,6 +2431,36 @@ class RulateToRanobeCreateWorker(QThread):
                         return text.toLowerCase().includes(norm(value).toLowerCase());
                     }""",
                     [group_label, value],
+                )
+            )
+        except Exception:
+            return False
+
+    def _group_has_any_value(self, page, group_label: str) -> bool:
+        try:
+            return bool(
+                page.evaluate(
+                    r"""(groupLabel) => {
+                        const norm = (raw) => (raw || "").replace(/\s+/g, " ").trim();
+                        const group = Array.from(document.querySelectorAll(".form-group")).find((item) => {
+                            const label = norm(item.querySelector(".form-label")?.innerText || "");
+                            return label.toLowerCase().includes(groupLabel.toLowerCase());
+                        });
+                        if (!group) return false;
+                        const clone = group.cloneNode(true);
+                        for (const item of Array.from(clone.querySelectorAll(
+                            ".form-label, .autocomplete-suggestion, .autocomplete-suggestion__list, input, textarea"
+                        ))) {
+                            item.remove();
+                        }
+                        for (const button of Array.from(clone.querySelectorAll("button"))) {
+                            const text = norm(button.innerText || "").toLowerCase();
+                            if (!text || text.includes("добавить")) button.remove();
+                        }
+                        const text = norm(clone.innerText || "");
+                        return Boolean(text);
+                    }""",
+                    group_label,
                 )
             )
         except Exception:
@@ -2502,22 +2574,56 @@ class RulateToRanobeCreateWorker(QThread):
         author = _collapse_rulate_spaces(metadata.get("author"))
         if not author:
             return []
-        payload = _prepare_ranobelib_author_payload(author)
-        primary = _collapse_rulate_spaces(payload.get("name_en")) or _collapse_rulate_spaces(payload.get("original"))
-        return [primary] if primary else []
+        return [author]
 
     def _ensure_author(self, page, metadata: dict, create_if_missing: bool):
         author = _collapse_rulate_spaces(metadata.get("author"))
         if not author:
             return
         for candidate in self._author_autocomplete_candidates(metadata):
-            if self._add_autocomplete_item(page, "Автор", candidate):
+            if self._add_autocomplete_item(page, "Автор", candidate, fast_missing=True):
                 self.log("SUCCESS", f"RanobeLib: автор добавлен: {candidate}")
                 return
         if create_if_missing and self._try_create_author(page, metadata):
             self.log("WARNING", "RanobeLib: после ручного создания автора его нужно добавить в карточку.")
             return
         self.log("WARNING", f"RanobeLib: автора нужно проверить вручную: {author}")
+
+    def _publisher_autocomplete_candidates(self, metadata: dict) -> list[str]:
+        candidates = []
+        publisher = _normalize_publisher_for_source(metadata.get("publisher"), metadata.get("source_url"))
+        if publisher:
+            candidates.append(publisher)
+        for candidate in publisher_candidates_from_source_url(metadata.get("source_url")):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def _ensure_publisher(self, page, metadata: dict):
+        candidates = self._publisher_autocomplete_candidates(metadata)
+        if not candidates:
+            return
+        if self._group_has_any_value(page, "Издатель"):
+            self.log("INFO", "RanobeLib: издатель уже выбран, повторный поиск пропущен.")
+            return
+        for candidate in candidates:
+            if self._add_autocomplete_item(page, "Издатель", candidate):
+                self.log("SUCCESS", f"RanobeLib: издатель добавлен: {candidate}")
+                return
+        self.log("WARNING", f"RanobeLib: издателя нужно проверить вручную: {candidates[0]}")
+
+    def _ensure_translator_team(self, page, metadata: dict):
+        team = _collapse_rulate_spaces(metadata.get("translator_team"))
+        if not team:
+            self.log("INFO", "RanobeLib: команда переводчиков не указана, поиск пропущен.")
+            return
+        self.log("INFO", f"RanobeLib: ищу команду переводчиков: {team}")
+        group_labels = ("Команды", "Команда переводчиков", "Команд", "Переводчики")
+        for group_label in group_labels:
+            if self._add_autocomplete_item(page, group_label, team):
+                self.log("SUCCESS", f"RanobeLib: команда переводчиков добавлена: {team}")
+                return
+        self.log("WARNING", f"RanobeLib: команду переводчиков нужно проверить вручную: {team}")
 
     def _fill_ranobelib_form(self, page, metadata: dict, cover_path: str | None):
         self._upload_cover(page, cover_path)
@@ -2544,6 +2650,8 @@ class RulateToRanobeCreateWorker(QThread):
             metadata,
             create_if_missing=bool(metadata.get("create_author")),
         )
+        self._ensure_publisher(page, metadata)
+        self._ensure_translator_team(page, metadata)
         self._add_autocomplete_items(page, "Жанры", metadata.get("genres"), 5)
         self._add_autocomplete_items(page, "Теги", metadata.get("tags"), 8)
         self._try_fill_source_link(page, metadata.get("source_url", ""))

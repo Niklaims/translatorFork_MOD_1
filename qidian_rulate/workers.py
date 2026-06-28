@@ -2027,6 +2027,49 @@ class RulateFillWorker(QThread):
         _fill(page, "#Book_author", qidian.author_name)
         _fill(page, "#Book_source_url", qidian.source_url)
         _fill(page, "#Book_a_title_1", qidian.title_original)
+        translator_team_mode = getattr(prepared, "translator_team_mode", "")
+        if translator_team_mode == "first_suggestion" and not _select_first_rulate_choice_field(
+            page,
+            selectors=(
+                "#Book_teams",
+                "#Book_team",
+                "#Book_team_id",
+                "#Book_team_ids",
+                "#Book_translate_team",
+                "#Book_translation_team",
+                "#Book_translation_team_id",
+                "#Book_translator_team",
+                "#Book_translator_team_id",
+                "#Book_translate_group",
+                "#Book_group",
+                "#Book_group_id",
+                '[name="Book[teams][]"]',
+                '[name="Book[teams]"]',
+                '[name="Book[team]"]',
+                '[name="Book[team_id]"]',
+                '[name="Book[team_ids][]"]',
+                '[name="Book[translator_team]"]',
+                '[name="Book[translator_team_id]"]',
+                '[name="Book[translation_team]"]',
+                '[name="Book[translation_team_id]"]',
+                '[name="Book[translate_group]"]',
+                '[name="Book[group]"]',
+                '[name="Book[group_id]"]',
+            ),
+            labels=(
+                "Команда переводчиков",
+                "Команда перевода",
+                "Группа переводчиков",
+                "Группа перевода",
+                "Команда",
+                "Переводчики",
+                "Translator team",
+                "Translation team",
+            ),
+        ):
+            self.log("WARNING", "Rulate: первую подсказку команды переводчиков нужно выбрать вручную.")
+        elif translator_team_mode == "first_suggestion":
+            self.log("SUCCESS", "Rulate: выбрана первая подсказка команды переводчиков.")
 
     def _fill_description(self, page) -> None:
         prepared = self.draft.prepared
@@ -2121,6 +2164,165 @@ def _fill(page, selector: str, value: str) -> None:
     )
 
 
+def _selector_exists(page, selector: str) -> bool:
+    try:
+        return page.locator(selector).count() > 0
+    except Exception:
+        return False
+
+
+def _select_first_plain_choice(page, selector: str) -> bool:
+    try:
+        return bool(
+            page.evaluate(
+                """(selector) => {
+                    const element = document.querySelector(selector);
+                    if (!element) return false;
+                    const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+                    const marker = (node) => normalize([
+                        node.id,
+                        node.getAttribute?.("name"),
+                        node.getAttribute?.("class"),
+                    ].filter(Boolean).join(" "));
+                    const likelyTeamField = (node) => /team|translat|group|команд|групп|перевод/.test(marker(node));
+                    const setNativeValue = (el, nextValue) => {
+                        const prototype = Object.getPrototypeOf(el);
+                        const descriptor = Object.getOwnPropertyDescriptor(prototype, "value")
+                            || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")
+                            || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")
+                            || Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+                        if (descriptor && descriptor.set) descriptor.set.call(el, nextValue);
+                        else el.value = nextValue;
+                        el.dispatchEvent(new Event("input", {bubbles: true}));
+                        el.dispatchEvent(new Event("change", {bubbles: true}));
+                    };
+                    const selectFirstOption = (select) => {
+                        if (!select || select.tagName !== "SELECT") return false;
+                        const options = Array.from(select.options || []).filter((item) => !item.disabled);
+                        const option = options.find((item) => String(item.value || "").trim())
+                            || options.find((item) => {
+                                const text = String(item.textContent || "").trim().toLowerCase();
+                                return text && !text.includes("выбер") && !text.includes("select");
+                            });
+                        if (!option) return false;
+                        setNativeValue(select, option.value);
+                        if (window.jQuery) {
+                            window.jQuery(select).val(option.value).trigger("change");
+                        }
+                        return true;
+                    };
+
+                    if (selectFirstOption(element)) return true;
+
+                    const roots = [element, element.parentElement, element.previousElementSibling, element.nextElementSibling]
+                        .filter(Boolean);
+                    const closestGroup = element.closest?.(".form-group, .control-group, .form-row, .row, tr");
+                    if (closestGroup) roots.push(closestGroup);
+                    for (const root of roots) {
+                        const select = root.querySelector?.("select");
+                        if (selectFirstOption(select)) return true;
+                    }
+
+                    if (window.jQuery) {
+                        for (const root of roots) {
+                            const data = window.jQuery(root).data?.() || {};
+                            if (data.select2 || data.chosen || data.selectize) {
+                                const select = root.matches?.("select") ? root : root.querySelector?.("select");
+                                if (selectFirstOption(select)) return true;
+                                try {
+                                    window.jQuery(root).trigger("mousedown").trigger("click");
+                                } catch (_error) {}
+                            }
+                        }
+                    }
+
+                    const selectedInput = roots
+                        .flatMap((root) => Array.from(root.querySelectorAll?.("input[type='hidden'], input[type='text']") || []))
+                        .find((input) => likelyTeamField(input) && normalize(input.value));
+                    if (selectedInput) return true;
+
+                    return false;
+                }""",
+                selector,
+            )
+        )
+    except Exception:
+        return False
+
+
+def _find_rulate_choice_selector_by_label(page, labels: tuple[str, ...]) -> str:
+    try:
+        return str(
+            page.evaluate(
+                """(labels) => {
+                    const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim();
+                    const marker = (node) => normalize(
+                        [
+                            node.id,
+                            node.getAttribute?.("name"),
+                            node.getAttribute?.("class"),
+                            node.getAttribute?.("data-select2-id"),
+                            node.getAttribute?.("aria-labelledby"),
+                        ].filter(Boolean).join(" ")
+                    ).toLowerCase();
+                    const likelyTeamField = (node) => /team|translat|group|команд|групп|перевод/.test(marker(node));
+                    const needles = labels.map((label) => normalize(label).toLowerCase()).filter(Boolean);
+                    if (!needles.length) return "";
+                    const groups = Array.from(document.querySelectorAll(".form-group, .control-group, .form-row, .row, tr"));
+                    for (const group of groups) {
+                        const labelText = normalize(
+                            group.querySelector("label, .control-label, .form-label, th, td:first-child")?.textContent
+                            || group.textContent
+                            || ""
+                        ).toLowerCase();
+                        if (!needles.some((needle) => labelText.includes(needle))) continue;
+                        const candidates = [
+                            ...Array.from(group.querySelectorAll(
+                                ".ms-ctn, .ms-parent, .magic-suggest, .select2-container, .selectize-control, .chosen-container"
+                            )),
+                            ...Array.from(group.querySelectorAll("select, textarea, input")),
+                            ...Array.from(group.querySelectorAll("[data-select2-id], [aria-controls], [id]")),
+                        ];
+                        for (const candidate of candidates) {
+                            if (candidate.disabled) continue;
+                            if (candidate.matches?.("input[type='hidden']") && !likelyTeamField(candidate)) continue;
+                            if (candidate.id) return `#${CSS.escape(candidate.id)}`;
+                            candidate.setAttribute("data-codex-rulate-choice", "1");
+                            return '[data-codex-rulate-choice="1"]';
+                        }
+                    }
+                    return "";
+                }""",
+                list(labels),
+            )
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _select_first_rulate_choice_field(
+    page,
+    *,
+    selectors: tuple[str, ...],
+    labels: tuple[str, ...] = (),
+) -> bool:
+    label_selector = _find_rulate_choice_selector_by_label(page, labels)
+    candidates = []
+    if label_selector:
+        candidates.append(label_selector)
+    candidates.extend(selector for selector in selectors if selector not in candidates)
+
+    for selector in candidates:
+        if not _selector_exists(page, selector):
+            continue
+        if _select_first_magic_value(page, selector):
+            return True
+        if _select_first_plain_choice(page, selector):
+            return True
+    return False
+
+
 def _show_rulate_tab(page, tab_id: str) -> None:
     page.evaluate(
         """(tabId) => {
@@ -2190,6 +2392,24 @@ def _select_magic_value(page, selector: str, value: str, *, allow_free: bool) ->
     return bool(selected)
 
 
+def _select_first_magic_value(page, selector: str) -> bool:
+    page.locator(selector).wait_for(state="attached", timeout=15000)
+    for _ in range(20):
+        selected = page.evaluate(_MAGIC_SELECT_FIRST_SCRIPT, selector)
+        if selected:
+            return True
+        page.wait_for_timeout(250)
+
+    activated = page.evaluate(_MAGIC_OPEN_SCRIPT, selector)
+    if not activated:
+        return False
+    for _ in range(12):
+        page.wait_for_timeout(250)
+        if page.evaluate(_MAGIC_CLICK_FIRST_SCRIPT, selector):
+            return True
+    return False
+
+
 _MAGIC_SELECT_SCRIPT = """([selector, value, allowFree]) => {
     const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim().toLowerCase();
     const root = document.querySelector(selector);
@@ -2197,8 +2417,15 @@ _MAGIC_SELECT_SCRIPT = """([selector, value, allowFree]) => {
 
     const candidates = [root, root.parentElement, root.previousElementSibling, root.nextElementSibling]
         .filter(Boolean);
+    const closestGroup = root.closest?.(".form-group, .control-group, .form-row, .row, tr");
+    if (closestGroup) candidates.push(closestGroup);
     for (const child of Array.from(root.querySelectorAll("*"))) {
         candidates.push(child);
+    }
+    if (closestGroup) {
+        for (const child of Array.from(closestGroup.querySelectorAll("*"))) {
+            candidates.push(child);
+        }
     }
 
     let api = null;
@@ -2260,6 +2487,189 @@ _MAGIC_SELECT_SCRIPT = """([selector, value, allowFree]) => {
         next.push(selectedValue);
     }
     api.setValue(next);
+    return true;
+}"""
+
+
+_MAGIC_SELECT_FIRST_SCRIPT = """(selector) => {
+    const normalize = (text) => String(text || "").replace(/\\s+/g, " ").trim().toLowerCase();
+    const root = document.querySelector(selector);
+    if (!root || !window.jQuery) return false;
+    const notifyRootChanged = () => {
+        root.dispatchEvent(new Event("input", {bubbles: true}));
+        root.dispatchEvent(new Event("change", {bubbles: true}));
+        window.jQuery(root).trigger("change");
+    };
+
+    const candidates = [root, root.parentElement, root.previousElementSibling, root.nextElementSibling]
+        .filter(Boolean);
+    const closestGroup = root.closest?.(".form-group, .control-group, .form-row, .row, tr");
+    if (closestGroup) candidates.push(closestGroup);
+    for (const child of Array.from(root.querySelectorAll("*"))) {
+        candidates.push(child);
+    }
+    if (closestGroup) {
+        for (const child of Array.from(closestGroup.querySelectorAll("*"))) {
+            candidates.push(child);
+        }
+    }
+
+    let api = null;
+    for (const node of candidates) {
+        const data = window.jQuery(node).data() || {};
+        api = data.magicSuggest || data.magicsuggest || data.ms || data.magic_suggest || null;
+        if (!api) {
+            api = Object.values(data).find(candidate => (
+                candidate && (
+                    typeof candidate.setValue === "function" ||
+                    typeof candidate.setSelection === "function"
+                )
+            )) || null;
+        }
+        if (api && (typeof api.setValue === "function" || typeof api.setSelection === "function")) break;
+    }
+    if (!api) return false;
+
+    const currentSelection = typeof api.getSelection === "function" ? api.getSelection() : [];
+    if (Array.isArray(currentSelection) && currentSelection.length > 0) return true;
+    const currentValue = typeof api.getValue === "function" ? api.getValue() : [];
+    if (Array.isArray(currentValue) && currentValue.length > 0) return true;
+
+    const displayField = (api.settings && api.settings.displayField) || "name";
+    const valueField = (api.settings && api.settings.valueField) || displayField;
+    const rawData = typeof api.getData === "function"
+        ? api.getData()
+        : ((api.settings && api.settings.data) || []);
+    const items = Array.isArray(rawData) ? rawData : Object.values(rawData || {});
+    const first = items.find(item => {
+        if (!item) return false;
+        const display = item[displayField] != null ? String(item[displayField]) : "";
+        const name = item.name != null ? String(item.name) : "";
+        const title = item.title != null ? String(item.title) : "";
+        const id = item.id != null ? String(item.id) : "";
+        return [display, name, title, id].some(candidate => normalize(candidate));
+    });
+    if (!first) return false;
+
+    if (typeof api.setSelection === "function") {
+        api.setSelection([first]);
+        notifyRootChanged();
+        return true;
+    }
+
+    if (typeof api.setValue !== "function") return false;
+    const selectedValue = first[valueField] != null
+        ? first[valueField]
+        : (first.id != null ? first.id : first[displayField]);
+    if (selectedValue == null || !normalize(selectedValue)) return false;
+    api.setValue([selectedValue]);
+    notifyRootChanged();
+    return true;
+}"""
+
+
+_MAGIC_OPEN_SCRIPT = """(selector) => {
+    const root = document.querySelector(selector);
+    if (!root) return false;
+    const nodes = [root, root.parentElement, root.previousElementSibling, root.nextElementSibling]
+        .filter(Boolean);
+    const closestGroup = root.closest?.(".form-group, .control-group, .form-row, .row, tr");
+    if (closestGroup) nodes.push(closestGroup);
+    for (const child of Array.from(root.querySelectorAll("*"))) {
+        nodes.push(child);
+    }
+    if (closestGroup) {
+        for (const child of Array.from(closestGroup.querySelectorAll("*"))) {
+            nodes.push(child);
+        }
+    }
+    const container = nodes.find(node => (
+        node.matches?.(".ms-ctn, .ms-parent, .magic-suggest, .select2-container, .selectize-control, .chosen-container")
+        || node.querySelector?.(
+            ".ms-sel-ctn input, .ms-trigger, .select2-selection, .selectize-input, .chosen-single, .chosen-choices"
+        )
+    ));
+    if (!container) return false;
+    container.scrollIntoView({block: "center", inline: "nearest"});
+    const clickTarget = container.querySelector?.(
+        ".ms-trigger, .ms-sel-ctn input, .select2-selection, .selectize-input, .chosen-single, .chosen-choices, input[type='text']"
+    ) || container;
+    clickTarget.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
+    clickTarget.click();
+    clickTarget.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, cancelable: true, view: window}));
+
+    if (window.jQuery) {
+        try {
+            const candidate = root.matches?.("select, input") ? root : root.querySelector?.("select, input");
+            if (candidate && window.jQuery(candidate).data("select2")) {
+                window.jQuery(candidate).select2("open");
+            }
+        } catch (_error) {}
+    }
+
+    const input = container.querySelector(
+        ".ms-sel-ctn input, .select2-search__field, .selectize-input input, .chosen-search input, input[type='text']"
+    ) || document.querySelector(".select2-search__field, .chosen-search input");
+    if (input) {
+        input.focus();
+        input.dispatchEvent(new Event("input", {bubbles: true}));
+        input.dispatchEvent(new Event("change", {bubbles: true}));
+    }
+    return true;
+}"""
+
+
+_MAGIC_CLICK_FIRST_SCRIPT = """(selector) => {
+    const root = document.querySelector(selector);
+    if (!root) return false;
+    const nodes = [root, root.parentElement, root.previousElementSibling, root.nextElementSibling]
+        .filter(Boolean);
+    const closestGroup = root.closest?.(".form-group, .control-group, .form-row, .row, tr");
+    if (closestGroup) nodes.push(closestGroup);
+    for (const child of Array.from(root.querySelectorAll("*"))) {
+        nodes.push(child);
+    }
+    if (closestGroup) {
+        for (const child of Array.from(closestGroup.querySelectorAll("*"))) {
+            nodes.push(child);
+        }
+    }
+    const container = nodes.find(node => (
+        node.matches?.(".ms-ctn, .ms-parent, .magic-suggest, .select2-container, .selectize-control, .chosen-container")
+        || node.querySelector?.(
+            ".ms-sel-ctn input, .ms-trigger, .select2-selection, .selectize-input, .chosen-single, .chosen-choices"
+        )
+    ));
+    const visible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.display !== "none" && style.visibility !== "hidden"
+            && rect.width > 0 && rect.height > 0;
+    };
+    const optionSelector = [
+        ".ms-res-item",
+        ".ms-res-item-active",
+        ".select2-results__option",
+        ".selectize-dropdown-content .option",
+        ".chosen-results li",
+        ".ui-menu-item",
+        ".tt-suggestion",
+        "[role='option']",
+    ].join(", ");
+    const localItems = container ? Array.from(container.querySelectorAll(optionSelector)) : [];
+    const globalItems = Array.from(document.querySelectorAll(optionSelector));
+    const item = localItems.concat(globalItems).find(candidate => (
+        visible(candidate) && String(candidate.textContent || "").trim()
+        && candidate.getAttribute("aria-disabled") !== "true"
+        && !candidate.classList.contains("disabled")
+        && !candidate.classList.contains("select2-results__message")
+        && !candidate.classList.contains("loading-results")
+    ));
+    if (!item) return false;
+    item.dispatchEvent(new MouseEvent("mousedown", {bubbles: true, cancelable: true, view: window}));
+    item.click();
+    item.dispatchEvent(new MouseEvent("mouseup", {bubbles: true, cancelable: true, view: window}));
     return true;
 }"""
 

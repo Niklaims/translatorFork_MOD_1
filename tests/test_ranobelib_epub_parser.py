@@ -26,11 +26,14 @@ from workers import (
     _normalize_allowed_catalog_items,
     _normalize_rulate_cover_url,
     _normalize_rulate_media_payload,
+    _normalize_publisher_for_source,
     _parse_ranobelib_catalog_response,
     _prepare_ranobelib_author_payload,
     _ranobelib_title_status_value,
     _rulate_edit_info_url,
     _rulate_public_book_url,
+    publisher_candidates_from_source_url,
+    publisher_from_source_url,
 )
 
 
@@ -182,6 +185,7 @@ def test_normalize_rulate_media_payload_for_ranobelib_create():
     assert payload["description"] == "первая строка\n\nвторая строка"
     assert payload["cover_url"] == "https://tl.rulate.ru/uploads/cover.webp"
     assert payload["source_url"] == "https://www.qidian.com/book/1041604040/"
+    assert payload["publisher"] == "Qidian"
     assert payload["rulate_url"] == "https://tl.rulate.ru/book/123"
     assert payload["rulate_edit_url"] == "https://tl.rulate.ru/book/123/edit/info"
     assert payload["author"] == "Автор"
@@ -189,6 +193,23 @@ def test_normalize_rulate_media_payload_for_ranobelib_create():
     assert payload["year"] == "2021"
     assert payload["rulate_genres"] == []
     assert payload["rulate_tags"] == []
+
+
+def test_source_url_sets_known_publisher_candidates():
+    assert publisher_from_source_url("https://www.qidian.com/book/1041604040/") == "Qidian"
+    assert publisher_from_source_url("https://fanqienovel.com/page/7229603492648717324") == "Fanqie Manhua"
+    assert publisher_candidates_from_source_url(
+        "https://www.fanqienovel.com/page/7229603492648717324?enter_from=search"
+    ) == ["Fanqie Manhua"]
+    assert publisher_from_source_url("https://example.com/book/1") == ""
+
+
+def test_legacy_fanqie_publisher_is_normalized_to_current_name():
+    assert (
+        _normalize_publisher_for_source("FanqNovel", "https://fanqienovel.com/page/7229603492648717324")
+        == "Fanqie Manhua"
+    )
+    assert _normalize_publisher_for_source("FanqNovel", "https://www.qidian.com/book/1041604040/") == "FanqNovel"
 
 
 def test_normalize_rulate_media_payload_filters_noise_and_logo_cover():
@@ -241,6 +262,7 @@ def test_rulate_and_ranobelib_catalog_fields_are_kept_separate():
         options={
             "rulate_genres": ["Фэнтези"],
             "rulate_tags": ["Магия"],
+            "translator_team": "Test Team",
         },
     )
     data = worker._apply_options({"genres": ["Фэнтези"], "tags": ["Магия"]})
@@ -249,6 +271,7 @@ def test_rulate_and_ranobelib_catalog_fields_are_kept_separate():
     assert data["rulate_tags"] == ["Магия"]
     assert data["genres"] == []
     assert data["tags"] == []
+    assert data["translator_team"] == "Test Team"
 
     worker = RulateToRanobeCreateWorker(
         "https://tl.rulate.ru/book/123",
@@ -309,6 +332,31 @@ def test_prepare_ranobelib_author_payload_uses_romanized_name(monkeypatch):
     assert payload["name_ru"] == "Далёкий зрачок"
     assert "远瞳" in payload["aliases"]
     assert "Far Pupil" in payload["aliases"]
+
+
+def test_ranobelib_author_autocomplete_searches_original_name_once():
+    worker = RulateToRanobeCreateWorker("https://tl.rulate.ru/book/123")
+
+    candidates = worker._author_autocomplete_candidates({"author": "远瞳"})
+
+    assert candidates == ["远瞳"]
+
+
+def test_ranobelib_translator_team_search_uses_teams_group_even_when_other_team_exists(monkeypatch):
+    worker = RulateToRanobeCreateWorker("https://tl.rulate.ru/book/123")
+    calls = []
+
+    monkeypatch.setattr(worker, "_group_has_any_value", lambda page, group_label: True)
+
+    def fake_add(page, group_label, value, **kwargs):
+        calls.append((group_label, value))
+        return group_label == "Команды"
+
+    monkeypatch.setattr(worker, "_add_autocomplete_item", fake_add)
+
+    worker._ensure_translator_team(object(), {"translator_team": "Required Team"})
+
+    assert calls == [("Команды", "Required Team")]
 
 
 def test_ranobelib_title_status_value_defaults_to_ongoing():
