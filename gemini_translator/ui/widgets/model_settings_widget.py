@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, pyqtSlot
 from .common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from .content_filter_fallback_panel import ContentFilterFallbackPanel
 from ..widgets.preset_widget import PresetWidget
 # --- Импорты из нашего проекта ---
 # Мы импортируем config напрямую, чтобы виджет был самодостаточным
@@ -455,6 +456,7 @@ class ModelSettingsWidget(QGroupBox):
         self.debug_logging_checkbox.stateChanged.connect(self._emit_settings_changed)
         self.debug_operation_filters_edit.textChanged.connect(self._emit_settings_changed)
         self.debug_max_log_mb_spin.valueChanged.connect(self._emit_settings_changed)
+        self.fallback_panel.config_changed.connect(self._emit_settings_changed)
     
         # 2. Основной обработчик смены модели остается
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
@@ -773,6 +775,9 @@ class ModelSettingsWidget(QGroupBox):
         misc_layout.addStretch(1)
         
         right_layout.addWidget(misc_group)
+
+        self.fallback_panel = ContentFilterFallbackPanel(settings_manager=self.settings_manager)
+        right_layout.addWidget(self.fallback_panel)
 
         self.workascii_group = QGroupBox("Настройки ChatGPT Web")
         self.workascii_group.setObjectName("workascii_group_box")
@@ -1135,7 +1140,7 @@ class ModelSettingsWidget(QGroupBox):
                 # Иначе берем бюджет
                 thinking_budget = self.thinking_budget_spin.value()
 
-        return {
+        settings = {
             'model': current_display_name,
             'dynamic_glossary': self.dynamic_glossary_checkbox.isChecked(),
             'use_jieba': self.use_jieba_glossary_checkbox.isChecked(),
@@ -1167,6 +1172,8 @@ class ModelSettingsWidget(QGroupBox):
             'debug_operation_filters': self.debug_operation_filters_edit.text().strip(),
             'debug_max_log_mb': self.debug_max_log_mb_spin.value(),
         }
+        settings.update(self.fallback_panel.get_config())
+        return settings
         
     
     def set_settings(self, settings: dict):
@@ -1249,6 +1256,7 @@ class ModelSettingsWidget(QGroupBox):
             self.debug_logging_checkbox.setChecked(bool(settings.get('debug_logging_enabled', False)))
             self.debug_operation_filters_edit.setText(settings.get('debug_operation_filters', '') or '')
             self.debug_max_log_mb_spin.setValue(int(settings.get('debug_max_log_mb', 256) or 256))
+            self.fallback_panel.set_config(settings)
             
         finally:
             self.blockSignals(False)

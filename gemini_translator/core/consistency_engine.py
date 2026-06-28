@@ -18,7 +18,20 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from ..api.errors import NetworkError, RateLimitExceededError, TemporaryRateLimitError
+from ..api.errors import (
+    ContentFilterError,
+    NetworkError,
+    PartialGenerationError,
+    RateLimitExceededError,
+    TemporaryRateLimitError,
+)
+from ..api.config import _load_providers_config
+from .worker_helpers.content_filter_fallback import (
+    NoFallbackKeysError,
+    green_keys_for_provider,
+    is_content_block_exception,
+    run_sync_fallback_loop,
+)
 from ..api.factory import get_api_handler_class
 from ..api import config as api_config
 from ..utils.text import repair_json_string
@@ -2136,9 +2149,57 @@ class ConsistencyEngine(QObject):
             if inspect.isawaitable(response):
                 response = self._run_handler_awaitable(response)
             return response
+        except (ContentFilterError, PartialGenerationError) as exc:
+            self._invalidate_cached_handler(cache_key, handler)
+            if (
+                not config.get("_is_fallback_attempt")
+                and config.get("content_filter_fallback_enabled")
+                and is_content_block_exception(exc)
+            ):
+                return self._run_consistency_content_filter_fallback(prompt, config)
+            raise
         except Exception:
             self._invalidate_cached_handler(cache_key, handler)
             raise
+
+    def _run_consistency_content_filter_fallback(self, prompt: str, config: Dict[str, Any]) -> str:
+        """Re-run a content-blocked consistency prompt against the fallback provider."""
+        provider_id = str(config.get("content_filter_fallback_provider") or "").strip()
+        model_name = str(config.get("content_filter_fallback_model") or "").strip()
+        if not provider_id:
+            raise NoFallbackKeysError("Резервный провайдер не выбран.")
+
+        provider_info = (_load_providers_config().get(provider_id) or {})
+        model_config = (provider_info.get("models", {}) or {}).get(model_name, {})
+        model_id = model_config.get("id", model_name)
+
+        pool = green_keys_for_provider(self.settings_manager, provider_id, model_id)
+        if not pool:
+            raise NoFallbackKeysError(f"Нет зелёных ключей для провайдера '{provider_id}'.")
+
+        fb_config = {
+            "provider": provider_id,
+            "model": model_name,
+            "temperature": config.get("content_filter_fallback_temperature", 0.3),
+            "temperature_override_enabled": bool(
+                config.get("content_filter_fallback_temperature_override", True)
+            ),
+            "thinking_enabled": bool(config.get("content_filter_fallback_thinking_enabled", False)),
+            "thinking_budget": config.get("content_filter_fallback_thinking_budget", 0),
+            "thinking_level": config.get("content_filter_fallback_thinking_level", "minimal"),
+            "proxy_settings": config.get("proxy_settings"),
+            "_is_fallback_attempt": True,
+        }
+
+        self._emit_log_message(
+            f"🛡️➡️ [Consistency] Контент заблокирован. Резерв: "
+            f"{provider_id}/{model_id} ({len(pool)} ключей)."
+        )
+        return run_sync_fallback_loop(
+            pool=pool,
+            call_for_key=lambda key: self._call_api_with_cached_handler(prompt, fb_config, key),
+            log=self._emit_log_message,
+        )
 
     def _call_api(self, prompt: str, config: Dict[str, Any], api_key: str) -> str:
         return self._call_api_with_cached_handler(prompt, config, api_key)

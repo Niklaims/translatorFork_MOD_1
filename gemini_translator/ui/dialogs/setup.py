@@ -139,26 +139,34 @@ def _create_tasks_tab_scroll_area(task_management_widget, translation_options_wi
     tasks_splitter = QSplitter(QtCore.Qt.Orientation.Vertical)
     tasks_splitter.setChildrenCollapsible(False)
 
-    task_management_widget.setMinimumHeight(TASK_LIST_MIN_HEIGHT)
     task_management_widget.setSizePolicy(
         QtWidgets.QSizePolicy.Policy.Preferred,
         QtWidgets.QSizePolicy.Policy.Expanding,
     )
-    translation_options_widget.setMinimumHeight(
-        max(TASK_OPTIONS_MIN_HEIGHT, translation_options_widget.minimumSizeHint().height())
-    )
+    
+    t_min = max(TASK_LIST_MIN_HEIGHT, task_management_widget.minimumSizeHint().height())
+    o_min = max(TASK_OPTIONS_MIN_HEIGHT, translation_options_widget.minimumSizeHint().height())
+    
+    task_management_widget.setMinimumHeight(t_min)
+    translation_options_widget.setMinimumHeight(o_min)
 
     tasks_splitter.addWidget(task_management_widget)
     tasks_splitter.addWidget(translation_options_widget)
     tasks_splitter.setStretchFactor(0, 5)
-    tasks_splitter.setStretchFactor(1, 1)
+    tasks_splitter.setStretchFactor(1, 0)
     tasks_splitter.setCollapsible(0, False)
     tasks_splitter.setCollapsible(1, True)
-    tasks_splitter.setSizes([560, TASK_OPTIONS_MIN_HEIGHT])
-    tasks_splitter.setMinimumHeight(TASKS_TAB_MIN_HEIGHT)
+    tasks_splitter.setSizes([max(560, t_min), o_min])
+    tasks_min_height = max(TASKS_TAB_MIN_HEIGHT, t_min + o_min + 24)
+    tasks_splitter.setMinimumHeight(tasks_min_height)
 
     tasks_tab_layout.addWidget(tasks_splitter, 1)
-    tasks_tab_container.setMinimumHeight(TASKS_TAB_MIN_HEIGHT)
+    # Don't pin the container's minimumHeight here. OverlayTabWidget.addTab() later
+    # adds a top margin (to clear the floating tab bar), so the container's real
+    # minimum is its layout's minimumSizeHint (splitter min + margins). An explicit
+    # setMinimumHeight() overrides that hint with a value computed *before* the margin
+    # exists, leaving the scroll area ~45px short and clipping the bottom control.
+    # Letting the layout drive the minimum keeps the whole tab scrollable.
 
     tasks_scroll = QScrollArea()
     tasks_scroll.setWidgetResizable(True)

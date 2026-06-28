@@ -168,6 +168,37 @@ class ModelSettingsWidgetTests(unittest.TestCase):
         widget.set_settings({"skip_content_filter_retry": False})
         self.assertFalse(widget.get_settings()["skip_content_filter_retry"])
 
+    def test_content_filter_fallback_round_trips_and_defaults_off(self):
+        widget = self._create_widget()
+
+        self.assertTrue(hasattr(widget, "fallback_panel"))
+        self.assertIn("content_filter_fallback_enabled", widget.get_settings())
+        self.assertFalse(widget.get_settings()["content_filter_fallback_enabled"])
+
+        provider_id, model_name = "", ""
+        for pid, pdata in api_config.api_providers().items():
+            models = pdata.get("models", {})
+            if models:
+                provider_id, model_name = pid, next(iter(models))
+                break
+        self.assertTrue(provider_id, "no provider with models available in api_config")
+
+        widget.set_settings(
+            {
+                "content_filter_fallback_enabled": True,
+                "content_filter_fallback_provider": provider_id,
+                "content_filter_fallback_model": model_name,
+                "content_filter_fallback_temperature": 0.6,
+                "content_filter_fallback_temperature_override": True,
+            }
+        )
+
+        out = widget.get_settings()
+        self.assertTrue(out["content_filter_fallback_enabled"])
+        self.assertEqual(out["content_filter_fallback_provider"], provider_id)
+        self.assertEqual(out["content_filter_fallback_model"], model_name)
+        self.assertAlmostEqual(out["content_filter_fallback_temperature"], 0.6)
+
     def test_workascii_section_hides_technical_fields_and_shows_auth_buttons(self):
         widget = self._create_widget()
 
