@@ -42,6 +42,14 @@ class _SettingsManagerStub:
         self.saved_last_prompt_preset_name = payload
         return True
 
+    def save_last_system_prompt_text(self, payload):
+        self.saved_last_system_prompt_text = payload
+        return True
+
+    def save_last_system_prompt_preset_name(self, payload):
+        self.saved_last_system_prompt_preset_name = payload
+        return True
+
 
 class _DictWidgetStub:
     def __init__(self, settings):
@@ -111,6 +119,8 @@ class _SetupSettingsHarness:
     _prepare_for_close = InitialSetupDialog._prepare_for_close
     _return_to_main_menu_from_button = InitialSetupDialog._return_to_main_menu_from_button
     _is_queue_autosave_enabled = InitialSetupDialog._is_queue_autosave_enabled
+    _is_show_chapter_char_count_enabled = InitialSetupDialog._is_show_chapter_char_count_enabled
+    _save_prompt_session_state = InitialSetupDialog._save_prompt_session_state
 
     def __init__(self, settings_manager=None):
         self.settings_manager = settings_manager or _SettingsManagerStub()
@@ -143,6 +153,7 @@ class _SetupSettingsHarness:
         self.glossary_widget = _DictWidgetStub([])
         self.prevent_sleep_checkbox = _CheckBoxStub(True)
         self.queue_autosave_checkbox = _CheckBoxStub(False)
+        self.show_chapter_chars_checkbox = _CheckBoxStub(True)
         self.selected_file = None
         self.output_folder = None
         self.html_files = []
@@ -194,6 +205,7 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(state["ui_theme_colors"]["accent"], "#ff8800")
         self.assertTrue(state["prevent_sleep_during_translation"])
         self.assertFalse(state["queue_autosave_enabled"])
+        self.assertTrue(state["show_chapter_char_count"])
 
     def test_collect_global_ui_settings_merges_legacy_and_full_session(self):
         settings_manager = _SettingsManagerStub(
@@ -250,6 +262,7 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(settings_manager.saved_full_session["ui_theme_colors"]["accent"], "#ff8800")
         self.assertTrue(settings_manager.saved_full_session["prevent_sleep_during_translation"])
         self.assertFalse(settings_manager.saved_full_session["queue_autosave_enabled"])
+        self.assertTrue(settings_manager.saved_full_session["show_chapter_char_count"])
         self.assertTrue(settings_manager.saved_full_session["auto_translation"]["filter_redirect_enabled"])
         self.assertEqual(
             settings_manager.saved_full_session["auto_translation"]["filter_redirect_provider"],

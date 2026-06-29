@@ -21,6 +21,9 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.filtered_count = 0
         self.error_count = 0
         self.total_tasks = 0
+        self.input_tokens_used = 0
+        self.output_tokens_used = 0
+        self.total_tokens_used = 0
         self._uses_topic_subscription = False
         self._pending_task_state = None
 
@@ -43,6 +46,7 @@ class StatusBarWidget(QtWidgets.QWidget):
             self.bus.subscribe("session_started", self._on_session_started)
             self.bus.subscribe("session_finished", self._on_session_finished)
             self.bus.subscribe("task_state_changed", self._on_task_state_changed)
+            self.bus.subscribe("token_usage_updated", self._on_token_usage_updated)
             self._uses_topic_subscription = True
         elif self.bus and hasattr(self.bus, "event_posted"):
             self.bus.event_posted.connect(self.on_event)
@@ -119,6 +123,9 @@ class StatusBarWidget(QtWidgets.QWidget):
         elif event_name == "task_state_changed":
             self._on_task_state_changed(event_data)
 
+        elif event_name == "token_usage_updated":
+            self._on_token_usage_updated(event_data)
+
     def _on_session_started(self, event_data: dict):
         data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
         self.start_session(data.get("total_tasks", 0))
@@ -132,6 +139,23 @@ class StatusBarWidget(QtWidgets.QWidget):
         self._pending_task_state = full_state if isinstance(full_state, list) else None
         if not self._status_flush_timer.isActive():
             self._status_flush_timer.start(STATUS_FLUSH_INTERVAL_MS)
+
+    def _on_token_usage_updated(self, event_data: dict):
+        data = event_data.get("data", {}) if isinstance(event_data, dict) else {}
+        try:
+            input_tokens = int(data.get("input_tokens", 0) or 0)
+            output_tokens = int(data.get("output_tokens", 0) or 0)
+            total_tokens = int(data.get("total_tokens", input_tokens + output_tokens) or 0)
+        except (TypeError, ValueError):
+            return
+
+        if total_tokens <= 0 and input_tokens <= 0 and output_tokens <= 0:
+            return
+
+        self.input_tokens_used += max(0, input_tokens)
+        self.output_tokens_used += max(0, output_tokens)
+        self.total_tokens_used += max(0, total_tokens)
+        self._update_display()
 
     def _flush_pending_task_state(self):
         ui_state_list = self._pending_task_state
@@ -180,6 +204,9 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.filtered_count = 0
         self.error_count = 0
         self.total_tasks = 0
+        self.input_tokens_used = 0
+        self.output_tokens_used = 0
+        self.total_tokens_used = 0
         self.progress_bar_text.setValue(0)
         self._update_display()
 
@@ -193,8 +220,9 @@ class StatusBarWidget(QtWidgets.QWidget):
 
     def _update_display(self):
         """Обновляет текстовое и графическое представление прогресс-бара."""
+        token_suffix = self._format_token_usage_suffix()
         if self.total_tasks == 0:
-            self.progress_bar_text.setFormat("Нет задач")
+            self.progress_bar_text.setFormat(f"Нет задач{token_suffix}")
             return
 
         processed_count = self.success_count + self.filtered_count + self.error_count
@@ -203,7 +231,7 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.progress_bar_text.setFormat(
             f"Успех: {self.success_count} | В работе: {self.in_progress_count} | "
             f"Фильтр: {self.filtered_count} | Ошибки: {self.error_count} | "
-            f"Готово: {processed_count}/{self.total_tasks} (%p%)"
+            f"Готово: {processed_count}/{self.total_tasks} (%p%){token_suffix}"
         )
 
         self.part_success.setVisible(self.success_count > 0)
@@ -219,6 +247,26 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.color_bar_layout.setStretch(2, self.filtered_count)
         self.color_bar_layout.setStretch(3, self.error_count)
         self.color_bar_layout.setStretch(4, remaining_count)
+
+    @staticmethod
+    def _format_compact_number(value: int) -> str:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}K"
+        return str(value)
+
+    def _format_token_usage_suffix(self) -> str:
+        if self.total_tokens_used <= 0:
+            return ""
+        total = self._format_compact_number(self.total_tokens_used)
+        input_tokens = self._format_compact_number(self.input_tokens_used)
+        output_tokens = self._format_compact_number(self.output_tokens_used)
+        return f" | Токены: ~{total} (вх. {input_tokens} / вых. {output_tokens})"
 
     def show_message(self, message: str, temporary: bool = True, duration_ms: int = 3000):
         """
@@ -258,6 +306,7 @@ class StatusBarWidget(QtWidgets.QWidget):
                     bus.unsubscribe("session_started", self._on_session_started)
                     bus.unsubscribe("session_finished", self._on_session_finished)
                     bus.unsubscribe("task_state_changed", self._on_task_state_changed)
+                    bus.unsubscribe("token_usage_updated", self._on_token_usage_updated)
                 elif hasattr(bus, "event_posted"):
                     bus.event_posted.disconnect(self.on_event)
             except (TypeError, RuntimeError, ValueError):

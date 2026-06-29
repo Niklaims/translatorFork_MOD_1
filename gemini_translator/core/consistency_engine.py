@@ -454,6 +454,10 @@ class _ConsistencyMockWorker:
             raise OperationCancelledError("Cancelled by user")
 
     def _post_event(self, name: str, data: dict = None):
+        if name == 'token_usage_updated':
+            if self._parent_engine and hasattr(self._parent_engine, "token_usage_updated"):
+                self._parent_engine.token_usage_updated.emit(data or {})
+            return
         if name != 'log_message':
             return
         message = data.get('message', '') if data else ''
@@ -481,6 +485,7 @@ class ConsistencyEngine(QObject):
     chunk_analyzed = pyqtSignal(dict)             # результат анализа чанка
     error_occurred = pyqtSignal(str)
     log_message = pyqtSignal(str)
+    token_usage_updated = pyqtSignal(dict)
     key_discarded = pyqtSignal(str, str)             # api_key, sanitized reason
     finished = pyqtSignal(list)                   # список всех найденных проблем
     fix_progress = pyqtSignal(int, int, str)      # current, total, chapter_name (для массового исправления)

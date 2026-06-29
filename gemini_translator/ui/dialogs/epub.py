@@ -1752,9 +1752,11 @@ class TranslatedChaptersManagerDialog(QDialog):
         # Колонка 2: Выбор файла
         # Для добавленного вручную файла сразу создаем комбобокс с этим файлом
         combo = NoScrollComboBox()
-        icon = "📄"
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(24)
+        file_icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
         fname = os.path.basename(file_path)
-        combo.addItem(f"{icon} {fname}", userData=file_path)
+        combo.addItem(file_icon, fname, userData=file_path)
         combo.setCurrentIndex(0)
         combo.currentIndexChanged.connect(self._update_preview_button_state)
         self.table.setCellWidget(row, self.COL_FILE, combo)
@@ -1950,14 +1952,18 @@ class TranslatedChaptersManagerDialog(QDialog):
         item_path.setFlags(item_path.flags() & ~QtCore.Qt.ItemFlag.ItemIsEditable)
 
         combo = NoScrollComboBox()
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(24)
+        file_icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
+        validated_icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogApplyButton)
 
         versions = self.project_manager.get_versions_for_original(internal_path)
         sorted_versions = sort_translation_versions_for_epub_build(versions, self.translated_folder)
 
         for version_info in sorted_versions:
-            icon = "✅" if version_info['suffix'] == '_validated.html' else "📄"
-            display_text = f"{icon} {os.path.basename(version_info['filepath'])}"
-            combo.addItem(display_text, userData=version_info['filepath'])
+            icon = validated_icon if version_info['suffix'] == '_validated.html' else file_icon
+            display_text = os.path.basename(version_info['filepath'])
+            combo.addItem(icon, display_text, userData=version_info['filepath'])
 
         combo.setCurrentIndex(0 if combo.count() else -1)
         combo.currentIndexChanged.connect(self._update_preview_button_state)
@@ -2021,9 +2027,11 @@ class TranslatedChaptersManagerDialog(QDialog):
         
         def clone_combo(old_combo):
             new_combo = NoScrollComboBox()
+            new_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            new_combo.setMinimumContentsLength(24)
             if old_combo:
                 for i in range(old_combo.count()):
-                    new_combo.addItem(old_combo.itemText(i), userData=old_combo.itemData(i))
+                    new_combo.addItem(old_combo.itemIcon(i), old_combo.itemText(i), userData=old_combo.itemData(i))
                 new_combo.setCurrentIndex(old_combo.currentIndex())
             new_combo.currentIndexChanged.connect(self._update_preview_button_state)
             return new_combo

@@ -331,6 +331,20 @@ class _StatusBarStub:
         self.engine = engine
 
 
+class _SoftStopHarness:
+    _on_soft_stop_clicked = GenerationSessionDialog._on_soft_stop_clicked
+    _post_event = GenerationSessionDialog._post_event
+
+    def __init__(self):
+        self.bus = _EventBusStub()
+        self.engine = SimpleNamespace(session_id="session-1")
+        self.orchestrator = None
+        self._pipeline_stop_requested = False
+        self.is_soft_stopping = False
+        self.soft_stop_btn = QtWidgets.QPushButton("Завершить плавно")
+        self.hard_stop_btn = QtWidgets.QPushButton("❌ Прервать")
+
+
 class _ProviderComboStub:
     def __init__(self):
         self.currentIndexChanged = _SignalStub()
@@ -418,6 +432,20 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertIn("manual_stop_requested", event_names)
         self.assertIn("generation_finished", event_names)
         self.assertNotIn("managed_session_completed", event_names)
+
+    def test_soft_stop_requests_engine_stop_in_parallel_mode(self):
+        harness = _SoftStopHarness()
+        self.addCleanup(harness.soft_stop_btn.deleteLater)
+        self.addCleanup(harness.hard_stop_btn.deleteLater)
+
+        harness._on_soft_stop_clicked()
+
+        event_names = [event["event"] for event in harness.bus.event_posted.emitted]
+        self.assertIn("soft_stop_requested", event_names)
+        self.assertTrue(harness.is_soft_stopping)
+        self.assertTrue(harness._pipeline_stop_requested)
+        self.assertFalse(harness.soft_stop_btn.isEnabled())
+        self.assertTrue(harness.hard_stop_btn.isEnabled())
 
     def test_bottom_status_bar_uses_generation_session_bus_and_engine(self):
         harness = _BottomStatusBarHarness()

@@ -2446,15 +2446,24 @@ class GenerationSessionPage(ShellPage):
         self._refresh_pipeline_table()
 
     def _on_soft_stop_clicked(self):
-        """Инициирует ПЛАВНУЮ остановку через оркестратор."""
+        """Инициирует плавную остановку текущей сессии генерации."""
         self._pipeline_stop_requested = True
+        if self.is_soft_stopping:
+            return
+
+        self.is_soft_stopping = True
+        self.soft_stop_btn.setText("Завершение...")
+        self.soft_stop_btn.setEnabled(False)
+        self.hard_stop_btn.setEnabled(True)
+
         if self.orchestrator and self.orchestrator._is_running:
-            self.is_soft_stopping = True
-            self.soft_stop_btn.setText("Завершение...")
-            self.soft_stop_btn.setEnabled(False)
-            self.hard_stop_btn.setEnabled(False) 
             # Просто говорим оркестратору начать процедуру плавной остановки
             self.orchestrator.stop()
+            return
+
+        if self.engine and self.engine.session_id:
+            self._post_event('log_message', {'message': "[SYSTEM] Отправка запроса на плавную остановку сессии…"})
+            self._post_event('soft_stop_requested')
 
     def _on_hard_stop_clicked(self):
         """Инициирует ЭКСТРЕННУЮ, немедленную остановку."""

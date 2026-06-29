@@ -56,9 +56,13 @@ class UiTopicSubscriptionTests(unittest.TestCase):
             self.assertIn("session_started", bus.subscriptions)
             self.assertIn("session_finished", bus.subscriptions)
             self.assertIn("task_state_changed", bus.subscriptions)
+            self.assertIn("token_usage_updated", bus.subscriptions)
 
             bus.emit("session_started", {"total_tasks": 2})
             self.assertEqual(widget.total_tasks, 2)
+            bus.emit("token_usage_updated", {"input_tokens": 1200, "output_tokens": 300})
+            self.assertEqual(widget.total_tokens_used, 1500)
+            self.assertIn("Токены: ~1.5K", widget.progress_bar_text.format())
         finally:
             widget.close()
             widget.close()

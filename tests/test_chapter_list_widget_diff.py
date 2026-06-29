@@ -196,6 +196,38 @@ class DiffGateTests(unittest.TestCase):
         self.assertIsNotNone(reorder_widget)
         self.assertGreaterEqual(reorder_widget.height(), reorder_widget.sizeHint().height())
 
+    def test_display_text_includes_chapter_char_count_when_enabled(self):
+        widget = self._make_widget()
+        widget.set_chapter_char_counts({"/tmp/chapter.xhtml": 12345})
+        widget.set_show_chapter_char_count(True)
+
+        display_text, tooltip = widget._get_display_texts(("epub", "/tmp/book.epub", "/tmp/chapter.xhtml"))
+
+        self.assertIn("12 345 симв.", display_text)
+        self.assertIn("Размер главы: 12 345 симв.", tooltip)
+
+    def test_batch_display_text_sums_chapter_char_counts_when_enabled(self):
+        widget = self._make_widget()
+        widget.set_chapter_char_counts({"/tmp/a.xhtml": 1000, "/tmp/b.xhtml": 2500})
+        widget.set_show_chapter_char_count(True)
+
+        display_text, tooltip = widget._get_display_texts(
+            ("epub_batch", "/tmp/book.epub", ["/tmp/a.xhtml", "/tmp/b.xhtml"])
+        )
+
+        self.assertIn("3 500 симв.", display_text)
+        self.assertIn("Размер пакета: 3 500 симв.", tooltip)
+
+    def test_display_text_omits_chapter_char_count_when_disabled(self):
+        widget = self._make_widget()
+        widget.set_chapter_char_counts({"/tmp/chapter.xhtml": 12345})
+        widget.set_show_chapter_char_count(False)
+
+        display_text, tooltip = widget._get_display_texts(("epub", "/tmp/book.epub", "/tmp/chapter.xhtml"))
+
+        self.assertNotIn("симв.", display_text)
+        self.assertNotIn("Размер главы", tooltip)
+
 
 
 import uuid

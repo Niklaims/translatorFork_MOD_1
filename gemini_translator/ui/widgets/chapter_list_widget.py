@@ -172,8 +172,42 @@ class ChapterListWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._is_session_active = False
+        self._show_chapter_char_count = False
+        self._chapter_char_counts = {}
         self._init_ui()
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+
+    def set_show_chapter_char_count(self, enabled: bool):
+        self._show_chapter_char_count = bool(enabled)
+
+    def set_chapter_char_counts(self, char_counts: dict | None):
+        self._chapter_char_counts = {
+            str(chapter): int(count or 0)
+            for chapter, count in (char_counts or {}).items()
+            if chapter is not None
+        }
+
+    @staticmethod
+    def _format_char_count(value: int) -> str:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        if value <= 0:
+            return ""
+        return f"{value:,}".replace(",", " ")
+
+    def _char_count_for_chapter(self, chapter_path) -> int:
+        if not self._show_chapter_char_count:
+            return 0
+        return int(self._chapter_char_counts.get(str(chapter_path), 0) or 0)
+
+    def _char_suffix_for_chapters(self, chapters) -> str:
+        if not self._show_chapter_char_count:
+            return ""
+        total = sum(self._char_count_for_chapter(chapter) for chapter in (chapters or []))
+        formatted = self._format_char_count(total)
+        return f" · {formatted} симв." if formatted else ""
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -835,9 +869,13 @@ class ChapterListWidget(QWidget):
                 display_text = f"{prefix} из {len(content_data)} глав"
                 if content_data:
                     display_text += f" (начиная с '{os.path.basename(str(content_data[0]))}')"
+                display_text += self._char_suffix_for_chapters(content_data)
 
                 tooltip_header = "Главы для генерации глоссария:\n" if task_type == "glossary_batch_task" else "Содержимое пакета:\n"
                 tooltip_text = tooltip_header + "\n".join(map(str, content_data))
+                char_suffix = self._char_suffix_for_chapters(content_data)
+                if char_suffix:
+                    tooltip_text += f"\n\nРазмер пакета: {char_suffix.strip(' ·')}"
 
             # --- Одиночная глава EPUB ---
             elif task_type == "epub":
@@ -846,7 +884,12 @@ class ChapterListWidget(QWidget):
 
                 original_filename = os.path.basename(epub_path)
                 display_text = f"📄 HTML: {os.path.basename(chapter_path)}"
+                char_suffix = self._char_suffix_for_chapters([chapter_path])
+                if char_suffix:
+                    display_text += char_suffix
                 tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+                if char_suffix:
+                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
 
             # --- Часть главы (чанк) EPUB ---
             elif task_type == "epub_chunk":
@@ -857,7 +900,12 @@ class ChapterListWidget(QWidget):
 
                 original_filename = os.path.basename(epub_path)
                 display_text = f"쪼 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
+                char_suffix = self._char_suffix_for_chapters([chapter_path])
+                if char_suffix:
+                    display_text += char_suffix
                 tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+                if char_suffix:
+                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
 
             # --- Прямой перевод текста (НОВЫЙ БЛОК) ---
             elif task_type == "raw_text_translation":

@@ -113,6 +113,8 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+SESSION_PERSISTENCE_SETTING_KEY = "queue_autosave_enabled"
+
 ERROR_TYPE_TRANSLATIONS = {
     'gender_mismatch': 'Несовпадение рода',
     'term_inconsistency': 'Несогласованность терминов',
@@ -331,6 +333,9 @@ class ConsistencyValidatorPage(ShellPage):
         self.current_problem = None
         self.current_chapter = None
         self._restored_session_data = None
+        self._token_input_total = 0
+        self._token_output_total = 0
+        self._token_total = 0
 
         # Файл сессии
         self.session_file = Path(os.getcwd()) / "consistency_session.json"
@@ -409,6 +414,11 @@ class ConsistencyValidatorPage(ShellPage):
         self.progress_bar.setVisible(False)
         self.progress_bar.setFixedWidth(200)
         toolbar_layout.addWidget(self.progress_bar)
+
+        self.token_usage_label = QLabel("Токены: 0")
+        self.token_usage_label.setToolTip("Оценка токенов, потраченных в текущем сеансе проверки и исправлений.")
+        self.token_usage_label.setStyleSheet(f"color: {theme_manager.color('text_secondary')};")
+        toolbar_layout.addWidget(self.token_usage_label)
         
         toolbar_layout.addStretch()
         
@@ -905,6 +915,7 @@ class ConsistencyValidatorPage(ShellPage):
         self.engine.finished.connect(self.on_analysis_finished)
         self.engine.error_occurred.connect(self.on_engine_error)
         self.engine.log_message.connect(self._log)
+        self.engine.token_usage_updated.connect(self.on_token_usage_updated)
         self.engine.key_discarded.connect(self.on_key_discarded)
         self.engine.fix_progress.connect(self.on_fix_progress)
         self.engine.fix_completed.connect(self.on_single_fix_completed)
@@ -1174,6 +1185,28 @@ class ConsistencyValidatorPage(ShellPage):
     def _save_shared_sleep_prevention_setting(self, enabled: bool):
         save_prevent_sleep_setting(self.settings_manager, enabled)
 
+    def _is_session_persistence_enabled(self) -> bool:
+        settings_manager = getattr(self, "settings_manager", None)
+        if settings_manager is None:
+            return True
+        for loader_name in ("load_full_session_settings", "load_settings"):
+            loader = getattr(settings_manager, loader_name, None)
+            if not callable(loader):
+                continue
+            try:
+                settings = loader()
+            except Exception:
+                continue
+            if isinstance(settings, dict) and SESSION_PERSISTENCE_SETTING_KEY in settings:
+                return bool(settings.get(SESSION_PERSISTENCE_SETTING_KEY))
+        return True
+
+    def _current_session_persistence_enabled(self) -> bool:
+        checker = getattr(self, "_is_session_persistence_enabled", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(ConsistencyValidatorPage._is_session_persistence_enabled(self))
+
     def _on_notifications_toggled(self, checked):
         from PyQt6.QtCore import QSettings
         settings = QSettings("SiberianTeam", "TranslatorFork")
@@ -1275,6 +1308,7 @@ class ConsistencyValidatorPage(ShellPage):
             config['_consistency_resume_state'] = resume_state
 
         self.problems_table.setRowCount(0)
+        self._reset_token_usage()
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
@@ -1318,6 +1352,47 @@ class ConsistencyValidatorPage(ShellPage):
             self.engine, selected_chapters, config, active_keys, mode)
         self.analysis_thread.error.connect(self.on_error)
         self.analysis_thread.start()
+
+    def _reset_token_usage(self):
+        self._token_input_total = 0
+        self._token_output_total = 0
+        self._token_total = 0
+        self._update_token_usage_label()
+
+    @staticmethod
+    def _format_compact_tokens(value: int) -> str:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}K"
+        return str(value)
+
+    def _update_token_usage_label(self):
+        total = self._format_compact_tokens(self._token_total)
+        input_tokens = self._format_compact_tokens(self._token_input_total)
+        output_tokens = self._format_compact_tokens(self._token_output_total)
+        self.token_usage_label.setText(f"Токены: ~{total}")
+        self.token_usage_label.setToolTip(
+            f"Оценка токенов за текущий сеанс: всего ~{total}, "
+            f"вход ~{input_tokens}, выход ~{output_tokens}."
+        )
+
+    @pyqtSlot(dict)
+    def on_token_usage_updated(self, usage: dict):
+        try:
+            input_tokens = int((usage or {}).get('input_tokens', 0) or 0)
+            output_tokens = int((usage or {}).get('output_tokens', 0) or 0)
+            total_tokens = int((usage or {}).get('total_tokens', input_tokens + output_tokens) or 0)
+        except (TypeError, ValueError):
+            return
+        self._token_input_total += max(0, input_tokens)
+        self._token_output_total += max(0, output_tokens)
+        self._token_total += max(0, total_tokens)
+        self._update_token_usage_label()
 
     def _stop_analysis(self):
         """Останавливает анализ."""
@@ -2438,6 +2513,8 @@ class ConsistencyValidatorPage(ShellPage):
         Проверяет наличие файла сессии и предлагает восстановить.
         Игнорирует project_glossary.json из-за несовместимости форматов.
         """
+        if not ConsistencyValidatorPage._current_session_persistence_enabled(self):
+            return
         if not self.session_file.exists():
             return
             
@@ -2598,6 +2675,8 @@ class ConsistencyValidatorPage(ShellPage):
 
     def _save_session(self):
         """Сохраняет текущее состояние сессии в consistency_session.json."""
+        if not ConsistencyValidatorPage._current_session_persistence_enabled(self):
+            return
         try:
             tmp_file = None
             data = self._build_session_payload()

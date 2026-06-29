@@ -3542,7 +3542,10 @@ class TranslationValidatorPage(ShellPage):
         self.table_results.removeCellWidget(row, 1)
 
         if show_structural_details:
-            details_button = QPushButton("См. детали…")
+            details_button = QPushButton("Детали")
+            details_button.setIcon(self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_MessageBoxWarning))
+            details_button.setMinimumWidth(96)
+            details_button.setToolTip("Показать детали структурных ошибок")
             errors = data['structural_errors']
             details_button.clicked.connect(lambda checked=False, e=errors: self.show_structure_details(e))
             self.table_results.setCellWidget(row, 1, details_button)

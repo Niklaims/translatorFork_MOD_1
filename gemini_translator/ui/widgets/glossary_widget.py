@@ -27,6 +27,7 @@ PROJECT_GLOSSARY_FILENAME = "project_glossary.json"
 PROJECT_GLOSSARY_AUTOSAVE_FILENAME = "project_glossary.autosave.json"
 PROJECT_GLOSSARY_STATE_FILENAME = "project_glossary_state.json"
 GLOSSARY_TABLE_ROW_HEIGHT = 36
+GLOSSARY_PAGE_SIZE = 500
 
 
 def sorted_glossary_entries(entries: list[dict]) -> list[dict]:
@@ -217,7 +218,7 @@ class GlossaryWidget(QWidget):
         self._saved_glossary_snapshot = []
         # --- АТРИБУТЫ ДЛЯ ЕДИНОГО ВЕРТИКАЛЬНОГО СПИСКА ---
         self._full_glossary_data = []
-        self.items_per_page = 0
+        self.items_per_page = GLOSSARY_PAGE_SIZE
         self.current_page = 0
         self.total_items = 0
         
@@ -255,7 +256,7 @@ class GlossaryWidget(QWidget):
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         main_layout.addWidget(self.table)
 
-        # --- ПАНЕЛЬ ПАГИНАЦИИ (оставлена для совместимости, но больше не показывается) ---
+        # --- ПАНЕЛЬ ПАГИНАЦИИ ---
         pagination_widget = QWidget()
         self.pagination_widget = pagination_widget
         pagination_layout = QHBoxLayout(pagination_widget)
@@ -485,7 +486,7 @@ class GlossaryWidget(QWidget):
         except Exception:
             state = {}
 
-        state["current_page"] = 0
+        state["current_page"] = int(getattr(self, "current_page", 0) or 0)
         try:
             state["vertical_scroll_value"] = int(self.table.verticalScrollBar().value())
         except Exception:
@@ -512,17 +513,14 @@ class GlossaryWidget(QWidget):
         except (TypeError, ValueError):
             scroll_value = 0
 
-        if scroll_value <= 0:
-            try:
-                legacy_page = int((state or {}).get("current_page", 0))
-            except (TypeError, ValueError):
-                legacy_page = 0
-            if legacy_page > 0 and self.table.rowCount() > 0:
-                target_row = min(legacy_page * 100, self.table.rowCount() - 1)
-                target_item = self.table.item(target_row, 0)
-                if target_item:
-                    QTimer.singleShot(0, lambda item=target_item: self.table.scrollToItem(item))
-                return
+        try:
+            saved_page = int((state or {}).get("current_page", 0))
+        except (TypeError, ValueError):
+            saved_page = 0
+
+        if saved_page > 0 and self.total_pages > 1:
+            self.current_page = max(0, min(saved_page, self.total_pages - 1))
+            self._load_current_page()
 
         QTimer.singleShot(0, lambda value=scroll_value: self.table.verticalScrollBar().setValue(value))
 
@@ -533,6 +531,13 @@ class GlossaryWidget(QWidget):
 
     def _sort_full_glossary_data(self):
         self._full_glossary_data = sorted_glossary_entries(self._full_glossary_data)
+
+    def _page_start_index(self) -> int:
+        return max(0, int(self.current_page or 0) * max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE)))
+
+    def _coerce_current_page(self):
+        self.total_items = len(self._full_glossary_data)
+        self.current_page = max(0, min(int(self.current_page or 0), self.total_pages - 1))
 
     def _find_entry_index(self, target_entry) -> int | None:
         for index, entry in enumerate(self._full_glossary_data):
@@ -601,7 +606,7 @@ class GlossaryWidget(QWidget):
         }
         
         # Вставляем в начало текущей страницы для визуального удобства
-        start_index = 0
+        start_index = self._page_start_index()
         self._full_glossary_data.insert(start_index, new_entry)
         
         # Перезагружаем таблицу, чтобы увидеть новую пустую строку
@@ -620,7 +625,7 @@ class GlossaryWidget(QWidget):
         selected_rows_on_page = sorted(list(set(index.row() for index in self.table.selectedIndexes())), reverse=True)
         if not selected_rows_on_page: return
 
-        start_index = 0
+        start_index = self._page_start_index()
         
         self.table.blockSignals(True)
         # Удаляем из полного списка по реальным индексам
@@ -630,6 +635,7 @@ class GlossaryWidget(QWidget):
                 del self._full_glossary_data[index_in_full_list]
         
         # Перезагружаем текущую страницу
+        self._coerce_current_page()
         self._load_current_page()
         self.table.blockSignals(False)
         self.glossary_changed.emit()
@@ -671,9 +677,9 @@ class GlossaryWidget(QWidget):
                 self._sort_full_glossary_data()
                 new_index = self._find_entry_index(entry)
                 if new_index is not None:
-                    self.current_page = 0
+                    self.current_page = new_index // max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
                     self._load_current_page()
-                    new_row = new_index
+                    new_row = new_index - self._page_start_index()
                     if 0 <= new_row < self.table.rowCount():
                         self.table.selectRow(new_row)
                         target_item = self.table.item(new_row, 0)
@@ -695,7 +701,9 @@ class GlossaryWidget(QWidget):
     # --- МЕТОДЫ ПАГИНАЦИИ ---
     @property
     def total_pages(self) -> int:
-        return 1
+        total = len(self._full_glossary_data)
+        page_size = max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
+        return max(1, (total + page_size - 1) // page_size)
 
     def _load_current_page(self):
         self.table.blockSignals(True)
@@ -703,10 +711,11 @@ class GlossaryWidget(QWidget):
         self.table.setUpdatesEnabled(False)
         self.table.setRowCount(0)
         self.total_items = len(self._full_glossary_data)
-        
-        self.current_page = 0
-        start_index = 0
-        end_index = self.total_items
+
+        self._coerce_current_page()
+        page_size = max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE))
+        start_index = self._page_start_index()
+        end_index = min(start_index + page_size, self.total_items)
         
         page_data = self._full_glossary_data[start_index:end_index] # Срез ссылок на словари
         
@@ -765,13 +774,14 @@ class GlossaryWidget(QWidget):
     def _update_pagination_controls(self):
         total_pg = self.total_pages
         current_pg = self.current_page + 1
-        self.page_info_label.setText(f"Всего: {self.total_items}")
+        self.page_info_label.setText(f"Страница {current_pg} / {total_pg} · Всего: {self.total_items}")
         is_not_first = self.current_page > 0
         self.first_page_button.setEnabled(is_not_first)
         self.prev_page_button.setEnabled(is_not_first)
         is_not_last = self.current_page < total_pg - 1
         self.next_page_button.setEnabled(is_not_last)
         self.last_page_button.setEnabled(is_not_last)
+        self.pagination_widget.setVisible(self.total_items > max(1, int(self.items_per_page or GLOSSARY_PAGE_SIZE)))
 
     def _go_to_first_page(self):
         self.commit_active_editor()
@@ -782,21 +792,21 @@ class GlossaryWidget(QWidget):
 
     def _go_to_prev_page(self):
         self.commit_active_editor()
-        self.current_page = 0
+        self.current_page = max(0, self.current_page - 1)
         self._save_project_view_state()
         # Разрываем стек вызовов.
         QTimer.singleShot(0, self._load_current_page)
 
     def _go_to_next_page(self):
         self.commit_active_editor()
-        self.current_page = 0
+        self.current_page = min(self.total_pages - 1, self.current_page + 1)
         self._save_project_view_state()
         # Разрываем стек вызовов.
         QTimer.singleShot(0, self._load_current_page)
 
     def _go_to_last_page(self):
         self.commit_active_editor()
-        self.current_page = 0
+        self.current_page = self.total_pages - 1
         self._save_project_view_state()
         QTimer.singleShot(0, self._load_current_page)
         

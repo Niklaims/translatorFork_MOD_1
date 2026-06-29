@@ -46,6 +46,17 @@ class _RetrySettingsStub:
         return True
 
 
+class _SessionSettingsStub:
+    def __init__(self, queue_autosave_enabled=True):
+        self.queue_autosave_enabled = bool(queue_autosave_enabled)
+
+    def load_full_session_settings(self):
+        return {"queue_autosave_enabled": self.queue_autosave_enabled}
+
+    def load_settings(self):
+        return {}
+
+
 class _ConsistencyDialogHarness:
     on_engine_error = ConsistencyValidatorDialog.on_engine_error
     on_error = ConsistencyValidatorDialog.on_error
@@ -88,13 +99,27 @@ class _ConsistencyDialogHarness:
 class _SaveSessionHarness:
     _save_session = ConsistencyValidatorDialog._save_session
 
-    def __init__(self, session_file, payload):
+    def __init__(self, session_file, payload, *, queue_autosave_enabled=True):
         self.session_file = Path(session_file)
         self.payload = payload
         self._restored_session_data = None
+        self.settings_manager = _SessionSettingsStub(queue_autosave_enabled)
 
     def _build_session_payload(self):
         return self.payload
+
+
+class _RestoreOfferHarness:
+    _check_for_previous_session = ConsistencyValidatorDialog._check_for_previous_session
+    _is_session_persistence_enabled = ConsistencyValidatorDialog._is_session_persistence_enabled
+
+    def __init__(self, session_file, *, queue_autosave_enabled=True):
+        self.session_file = Path(session_file)
+        self.settings_manager = _SessionSettingsStub(queue_autosave_enabled)
+        self.restore_called = False
+
+    def _restore_session(self, data):
+        self.restore_called = True
 
 
 class ConsistencyResponseNormalizationTests(unittest.TestCase):
@@ -815,6 +840,31 @@ class ConsistencyDialogErrorHandlingTests(unittest.TestCase):
 
             self.assertEqual(session_file.read_text(encoding="utf-8"), '{"stable": true}\n')
             self.assertEqual(list(Path(temp_dir).glob(".consistency_session.json.*.tmp")), [])
+
+    def test_save_session_skips_file_when_session_persistence_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_file = Path(temp_dir) / "consistency_session.json"
+            harness = _SaveSessionHarness(
+                session_file,
+                {"problems": [{"id": 1}]},
+                queue_autosave_enabled=False,
+            )
+
+            harness._save_session()
+
+            self.assertFalse(session_file.exists())
+
+    def test_restore_offer_is_not_shown_when_session_persistence_disabled(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            session_file = Path(temp_dir) / "consistency_session.json"
+            session_file.write_text('{"timestamp": "now", "problems": []}\n', encoding="utf-8")
+            harness = _RestoreOfferHarness(session_file, queue_autosave_enabled=False)
+
+            with patch("gemini_translator.ui.dialogs.consistency_checker.QMessageBox.question") as question:
+                harness._check_for_previous_session()
+
+            question.assert_not_called()
+            self.assertFalse(harness.restore_called)
 
     def test_batch_fix_error_restores_original_problem_map(self):
         harness = _ConsistencyDialogHarness()

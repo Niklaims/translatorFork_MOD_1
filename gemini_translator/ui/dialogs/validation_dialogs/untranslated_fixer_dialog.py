@@ -2270,6 +2270,9 @@ class AITranslationPage(ShellPage):
 
         self.translated_results = []
         self.is_session_active = False
+        self._token_input_total = 0
+        self._token_output_total = 0
+        self._token_total = 0
 
         self.page_title = f"AI-ассистент перевода ({len(self.tasks_payloads)} пакетов)"
         
@@ -2382,6 +2385,11 @@ class AITranslationPage(ShellPage):
         info_layout.addWidget(self.load_info_label)
         
         perf_layout.addWidget(info_container)
+
+        self.token_usage_label = QLabel("Токены: 0")
+        self.token_usage_label.setStyleSheet(f"color: {theme_manager.color('text_muted')}; font-size: 9pt;")
+        self.token_usage_label.setToolTip("Оценка токенов, потраченных в текущей AI-сессии.")
+        perf_layout.addWidget(self.token_usage_label)
         
         bottom_layout.addLayout(perf_layout)
         bottom_layout.addStretch()
@@ -2563,6 +2571,7 @@ class AITranslationPage(ShellPage):
             self.settings_manager.save_last_untranslated_prompt_text(self.prompt_widget.get_prompt())
             
             self.translated_results = []
+            self._reset_token_usage()
             self._update_apply_button()
             
             tasks_to_add = []
@@ -2609,6 +2618,49 @@ class AITranslationPage(ShellPage):
                     if res_html:
                         self.translated_results.append(res_html)
                         self._update_apply_button()
+
+        if event_name == 'token_usage_updated':
+            self._on_token_usage_updated(data)
+
+    def _reset_token_usage(self):
+        self._token_input_total = 0
+        self._token_output_total = 0
+        self._token_total = 0
+        self._update_token_usage_label()
+
+    @staticmethod
+    def _format_compact_tokens(value: int) -> str:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = 0
+        if value >= 1_000_000:
+            return f"{value / 1_000_000:.1f}M"
+        if value >= 1_000:
+            return f"{value / 1_000:.1f}K"
+        return str(value)
+
+    def _update_token_usage_label(self):
+        total = self._format_compact_tokens(self._token_total)
+        input_tokens = self._format_compact_tokens(self._token_input_total)
+        output_tokens = self._format_compact_tokens(self._token_output_total)
+        self.token_usage_label.setText(f"Токены: ~{total}")
+        self.token_usage_label.setToolTip(
+            f"Оценка токенов за текущую AI-сессию: всего ~{total}, "
+            f"вход ~{input_tokens}, выход ~{output_tokens}."
+        )
+
+    def _on_token_usage_updated(self, data: dict):
+        try:
+            input_tokens = int((data or {}).get('input_tokens', 0) or 0)
+            output_tokens = int((data or {}).get('output_tokens', 0) or 0)
+            total_tokens = int((data or {}).get('total_tokens', input_tokens + output_tokens) or 0)
+        except (TypeError, ValueError):
+            return
+        self._token_input_total += max(0, input_tokens)
+        self._token_output_total += max(0, output_tokens)
+        self._token_total += max(0, total_tokens)
+        self._update_token_usage_label()
 
     def _set_ui_active(self, active: bool):
         self.is_session_active = active

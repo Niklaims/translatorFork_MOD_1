@@ -11,6 +11,7 @@ import certifi
 from PyQt6.QtWidgets import QApplication
 from ..utils.async_helpers import run_sync
 from ..utils.debug_logger import create_operation_trace
+from ..utils.helpers import estimate_gemini_tokens
 from .errors import (
     OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
     ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
@@ -89,6 +90,28 @@ class BaseApiHandler:
         # The old run_until_complete here cannot run on an already-running shared
         # loop. Kept as a method so existing setup_client callers stay valid.
         return
+
+    def _estimate_token_usage(self, prompt, response_text) -> dict:
+        input_tokens = estimate_gemini_tokens(prompt)
+        output_tokens = estimate_gemini_tokens(response_text)
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "estimated": True,
+            "model_id": getattr(self.worker, "model_id", None),
+            "provider": (getattr(self.worker, "model_config", {}) or {}).get("provider"),
+        }
+
+    def _post_token_usage(self, prompt, response_text) -> None:
+        try:
+            usage = self._estimate_token_usage(prompt, response_text)
+        except Exception:
+            return
+
+        poster = getattr(self.worker, "_post_event", None)
+        if callable(poster):
+            poster("token_usage_updated", usage)
 
     def setup_client(self, client_override=None, proxy_settings=None):
         """Базовая настройка."""
@@ -413,6 +436,7 @@ class BaseApiHandler:
                     raise
 
             self._finalize_debug_trace(trace, started_at=started_at, status="success")
+            self._post_token_usage(prompt, result)
             return result
         except Exception as exc:
             self._finalize_debug_trace(
