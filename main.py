@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import QApplication
 from gemini_translator.api.managers import ApiKeyManager
 from gemini_translator.utils.glossary_tools import ContextManager
 from gemini_translator.ui.dialogs.setup import InitialSetupDialog
-from gemini_translator.ui.dialogs.misc import StartupToolDialog
 from gemini_translator.ui.dialogs.glossary import MainWindow as GlossaryToolWindow
 from gemini_translator.ui.dialogs.validation import TranslationValidatorDialog
 from gemini_translator.utils.settings import SettingsManager, configure_settings_scope
@@ -552,10 +551,6 @@ def run_emergency_viewer():
 
         reset_timer.start(2000)
         return
-        QtCore.QTimer.singleShot(2000, lambda: (
-            copy_button.setText("Скопировать ошибку"),
-            copy_button.setEnabled(True)
-        ))
 
     copy_button.clicked.connect(copy_action)
 
@@ -671,19 +666,6 @@ class ValidatorStartupDialog(QtWidgets.QDialog):
         self.original_epub_path = epub
         self._finalize_project_selection()
         return
-        folder = QtWidgets.QFileDialog.getExistingDirectory(
-            self, "Выберите папку с переводами")
-        if not folder:
-            return
-
-        epub, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Выберите исходный EPUB", "", "*.epub")
-        if not epub:
-            return
-
-        self.output_folder = folder
-        self.original_epub_path = epub
-        self._finalize_project_selection()
 
     def _finalize_project_selection(self):
         self._offer_cleanup_old_translations()
@@ -1100,7 +1082,7 @@ if __name__ == "__main__":
     
     # --- ЛОКАЛИЗАЦИЯ СТАНДАРТНЫХ ЭЛЕМЕНТОВ QT ---
     # Загружаем русскую локализацию для контекстных меню (ПКМ) и диалогов Qt (QMessageBox, QInputDialog и т.д.)
-    from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale
+    from PyQt6.QtCore import QTranslator, QLibraryInfo
     
     # Локализация базовых компонентов (кнопки, меню)
     qtbase_translator = QTranslator(app)

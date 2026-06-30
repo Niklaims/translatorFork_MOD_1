@@ -19,7 +19,6 @@ import uuid
 import asyncio
 
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, CancelledError
-import concurrent.futures
 
 from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtCore import QObject

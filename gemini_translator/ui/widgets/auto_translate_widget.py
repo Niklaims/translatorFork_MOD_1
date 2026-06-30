@@ -790,11 +790,6 @@ class AutoTranslateWidget(QWidget):
         if token_count <= 0:
             return None, None
         return max(500, min(int(token_count), 350000)), "Gemini tokens"
-        chars_per_token = api_config.UNIFIED_INPUT_CHARS_PER_TOKEN
-        profile_name = "единая токен-оценка"
-        estimated_chars = int(round(token_count * chars_per_token))
-        estimated_chars = max(500, min(estimated_chars, 350000))
-        return estimated_chars, profile_name
 
     def _update_translation_profile_summary(self):
         mode_titles = {
