@@ -21,6 +21,7 @@ import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from gemini_translator.api import config as api_config
+from gemini_translator.api.errors import NetworkError, TemporaryRateLimitError
 from gemini_translator.api.factory import get_api_handler_class
 
 from .models import PreparedRulateMetadata, QidianBookMetadata, RulateBookDraft
@@ -55,6 +56,7 @@ RULATE_BOOK_TYPE_SELECTOR = 'a.create-card.card-book[href*="typ=A"]'
 RULATE_CHINESE_CATEGORY_TITLE = "Китайские"
 QIDIAN_COVER_PROMPT_CHAPTER_COUNT = 3
 QIDIAN_COVER_PROMPT_MAX_CHARS = 18000
+AI_REQUEST_RETRY_ATTEMPTS = 3
 TOMATO_WEB_URL_ENV = "TOMATO_NOVEL_WEB_URL"
 TOMATO_WEB_PASSWORD_ENV = "TOMATO_NOVEL_WEB_PASSWORD"
 TOMATO_SAVE_DIR_ENV = "TOMATO_NOVEL_SAVE_DIR"
@@ -1319,33 +1321,47 @@ def _run_ai_request(
         raise ValueError(f"У провайдера '{provider_id}' не указан handler_class.")
 
     handler_class = get_api_handler_class(handler_class_name)
-    handler = handler_class(worker)
-    client = SimpleNamespace(api_key=api_key)
-    proxy_settings = settings_manager.load_proxy_settings() if settings_manager else None
-    if not handler.setup_client(client_override=client, proxy_settings=proxy_settings):
-        raise ValueError(f"Не удалось подготовить клиент провайдера '{provider_id}'.")
+    retryable_errors = (TemporaryRateLimitError, NetworkError)
+    for attempt in range(1, AI_REQUEST_RETRY_ATTEMPTS + 1):
+        handler = handler_class(worker)
+        client = SimpleNamespace(api_key=api_key)
+        proxy_settings = settings_manager.load_proxy_settings() if settings_manager else None
+        if not handler.setup_client(client_override=client, proxy_settings=proxy_settings):
+            raise ValueError(f"Не удалось подготовить клиент провайдера '{provider_id}'.")
 
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(
-            handler.execute_api_call(
-                prompt,
-                log_prefix,
-                allow_incomplete=False,
-                debug=False,
-                use_stream=True,
-                max_output_tokens=max_output_tokens,
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(
+                handler.execute_api_call(
+                    prompt,
+                    log_prefix,
+                    allow_incomplete=False,
+                    debug=False,
+                    use_stream=True,
+                    max_output_tokens=max_output_tokens,
+                )
             )
-        )
-    finally:
-        close_coro = getattr(handler, "_close_thread_session_internal", None)
-        if callable(close_coro):
-            try:
-                loop.run_until_complete(close_coro())
-            except Exception:
-                pass
-        loop.close()
+        except retryable_errors as error:
+            if attempt >= AI_REQUEST_RETRY_ATTEMPTS:
+                raise
+            delay = max(0, int(getattr(error, "delay_seconds", 30)))
+            log_callback(
+                "WARNING",
+                f"AI: временная ошибка провайдера, повтор {attempt + 1}/{AI_REQUEST_RETRY_ATTEMPTS} через {delay}с: {error}",
+            )
+            if delay:
+                time.sleep(delay)
+        finally:
+            close_coro = getattr(handler, "_close_thread_session_internal", None)
+            if callable(close_coro):
+                try:
+                    loop.run_until_complete(close_coro())
+                except Exception:
+                    pass
+            loop.close()
+
+    raise RuntimeError("AI-запрос завершился без результата.")
 
 
 class QidianFetchWorker(QThread):
