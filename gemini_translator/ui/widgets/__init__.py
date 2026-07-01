@@ -27,7 +27,7 @@ from .status_bar_widget import StatusBarWidget
 from .task_management_widget import TaskManagementWidget
 from .translation_options_widget import TranslationOptionsWidget
 from .common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox # <-- Добавь импорт
-
+from .sidebar_widget import SidebarWidget
 # Опционально: можно определить __all__, чтобы указать,
 # какие имена экспортируются при 'from .widgets import *'
 __all__ = [

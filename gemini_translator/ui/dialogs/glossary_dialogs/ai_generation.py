@@ -2205,13 +2205,20 @@ class GenerationSessionPage(ShellPage):
         else:
             num_active_keys = len(self.key_widget.get_active_keys())
             pipeline_ready = (not self.pipeline_enabled_checkbox.isChecked()) or bool(self.pipeline_steps)
-            can_start = all([
-                self.epub_path,
-                self.html_files, 
-                num_active_keys > 0,
-                pipeline_ready,
-            ])
+            
+            reasons = []
+            if not self.epub_path: reasons.append("Нет EPUB файла")
+            if not self.html_files: reasons.append("Не выбраны главы")
+            if num_active_keys == 0: reasons.append("Не выбраны активные ключи")
+            if not pipeline_ready: reasons.append("Включена очередь (пайплайн), но список шагов пуст")
+            
+            can_start = len(reasons) == 0
             self.start_btn.setEnabled(can_start)
+            
+            if not can_start:
+                self.start_btn.setToolTip("Запуск невозможен:\n- " + "\n- ".join(reasons))
+            else:
+                self.start_btn.setToolTip("Запустить генерацию глоссария")
 
         # 2. Логика кнопки "Применить"
         # Видна, если сессия НЕ активна И в глоссарии есть хотя бы одна запись

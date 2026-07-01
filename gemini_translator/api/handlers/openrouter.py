@@ -239,8 +239,24 @@ class OpenRouterApiHandler(BaseApiHandler):
                             f"Model {self.worker.model_id} is not allowed for this API key: {response_text[:150]}"
                         )
                     if response.status in [401, 403]: raise RateLimitExceededError(f"Ошибка доступа ({response.status}): {response_text[:150]}")
-                    if response.status == 402 or "quota" in txt_low: raise RateLimitExceededError("Недостаточно средств/Квота (402).")
-                    if response.status == 429: raise TemporaryRateLimitError("Лимит запросов (429).", delay_seconds=20)
+                    
+                    if response.status in [429, 402] or "quota" in txt_low:
+                        key_manager = getattr(self.worker, 'api_key_manager', None)
+                        if key_manager:
+                            new_key = key_manager.rotate_on_limit_error(self.worker.api_key)
+                            if new_key:
+                                self.worker.api_key = new_key
+                                headers["Authorization"] = f"Bearer {new_key}"
+                                self.worker._post_event('log_message', {
+                                    'message': f"🔄 OpenRouter: Ротация ключа, переключаемся на ...{new_key[-4:]}"
+                                })
+                                continue
+                        
+                        if response.status == 429:
+                            raise TemporaryRateLimitError("Лимит запросов (429).", delay_seconds=20)
+                        else:
+                            raise RateLimitExceededError("Недостаточно средств/Квота (402).")
+                            
                     if response.status == 404: raise ModelNotFoundError(f"Модель {self.worker.model_id} не найдена (404).")
                     
                     raise NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")

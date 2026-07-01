@@ -80,7 +80,7 @@ from ..widgets import (
     KeyManagementWidget, TranslationOptionsWidget, ModelSettingsWidget,
     ProjectPathsWidget, GlossaryWidget, PresetWidget, ProjectActionsWidget,
     TaskManagementWidget, LogWidget, StatusBarWidget, ManualTranslationWidget,
-    AutoTranslateWidget
+    AutoTranslateWidget, SidebarWidget
 )
 from ..widgets.common_widgets import NoScrollSpinBox
 from .epub import EpubHtmlSelectorDialog, TranslatedChaptersManagerDialog
@@ -326,7 +326,7 @@ class InitialSetupPage(ShellPage):
         self.prefill_data = prefill_data
 
 
-        self.setMinimumSize(700, 550) # Компактный размер
+        self.setMinimumSize(1050, 650)
         self._apply_initial_geometry()
 
         app = QtWidgets.QApplication.instance()
@@ -434,14 +434,15 @@ class InitialSetupPage(ShellPage):
             return
 
         available_geometry = screen.availableGeometry()
-        width = int(self.minimumWidth() * 1.6)
-        width = min(width, int(available_geometry.width() * 0.92))
-        height = int(available_geometry.height() * 0.88)
-        height = min(height, int(available_geometry.height() * 0.92))
+        width = max(1200, int(self.minimumWidth() * 1.2))
+        width = min(width, int(available_geometry.width() * 0.95))
+        height = max(900, int(self.minimumHeight() * 1.2))
+        height = min(height, int(available_geometry.height() * 0.95))
 
-        # Делаем первичную геометрию заранее, чтобы окно не "отскакивало",
-        # если пользователь начинает перетаскивать его сразу после запуска.
         self.resize(width, height)
+        # Принудительно разворачиваем ГЛАВНОЕ окно на весь экран, чтобы точно всё влезло
+        if self.window():
+            self.window().showMaximized()
         self.move(
             available_geometry.center().x() - self.width() // 2,
             available_geometry.center().y() - self.height() // 2
@@ -454,7 +455,7 @@ class InitialSetupPage(ShellPage):
         Версия 3.0: Объединенная вкладка 'Настройки' (Ключи + Модель).
         """
         content_layout = QVBoxLayout(self.main_content_widget)
-        content_layout.setContentsMargins(10, 10, 10, 0)
+        content_layout.setContentsMargins(10, 10, 10, 10)
         content_layout.setSpacing(0)
 
         # --- ШАГ 1: СОЗДАЕМ ВСЕ КАСТОМНЫЕ ВИДЖЕТЫ-КОМПОНЕНТЫ ---
@@ -547,42 +548,94 @@ class InitialSetupPage(ShellPage):
         settings_layout.addWidget(self.chapter_display_group, 0)
         self.program_settings_tab = self._create_program_settings_tab()
         self.model_settings_widget.prettify_checkbox.setVisible(True)
-        # --- ШАГ 3: СОБИРАЕМ QTabWidget ---
-        self.tabs_group = OverlayTabWidget()
-        self.tabs_group.setDocumentMode(False)
+        # --- ШАГ 3: СОБИРАЕМ Sidebar + QStackedWidget ---
+        middle_layout = QHBoxLayout()
+        middle_layout.setSpacing(15)
+        
+        self.sidebar_widget = SidebarWidget(
+            sections=[
+                ("🎛️", "Настройки API"),
+                ("📋", "Список Задач"),
+                ("📝", "Логирование"),
+                ("📚", "Глоссарий"),
+                ("✨", "Промпт"),
+                ("✍️", "Ручной перевод"),
+                ("🤖", "Автоперевод")
+            ],
+            version=getattr(self, 'version', ''),
+            parent=self.main_content_widget
+        )
+        self.sidebar_widget.section_changed.connect(self._on_main_tab_changed)
+        middle_layout.addWidget(self.sidebar_widget)
+        
+        right_panel = QFrame()
+        right_panel.setObjectName("rightPanelBase")
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+        
+        self.tabs_group = QStackedWidget()
         tabs_group = self.tabs_group
+        self.sidebar_widget.section_changed.connect(tabs_group.setCurrentIndex)
 
         program_scroll = QScrollArea()
         program_scroll.setWidgetResizable(True)
         program_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         program_scroll.setWidget(self.program_settings_tab)
-        tabs_group.addTab(program_scroll, "Настройки приложения")
 
-        # Вкладка 2: Настройки (Объединенная)
+        # Вкладка 0: Настройки (Объединенная)
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         settings_scroll.setWidget(settings_tab)
-        tabs_group.addTab(settings_scroll, "Настройки")
+        tabs_group.addWidget(settings_scroll)
 
-        # Вкладка 3: Список Задач + Оптимизация
+        # Вкладка 1: Список Задач + Оптимизация
         tasks_scroll, self.tasks_splitter = _create_tasks_tab_scroll_area(
             self.task_management_widget,
             self.translation_options_widget,
         )
-        tabs_group.addTab(tasks_scroll, "Список Задач")
+        tabs_group.addWidget(tasks_scroll)
 
         # Остальные вкладки
-        tabs_group.addTab(self.log_widget, "Логирование")
-        self.glossary_tab_index = tabs_group.addTab(self.glossary_widget, "Глоссарий")
-        tabs_group.addTab(self.preset_widget, "Промпт")
-        tabs_group.addTab(self.manual_translation_widget, "Ручной перевод")
-        self.auto_translate_tab_index = tabs_group.addTab(self.auto_translate_widget, "Автоперевод")
+        tabs_group.addWidget(self.log_widget)
+        self.glossary_tab_index = tabs_group.addWidget(self.glossary_widget)
+
+        preset_scroll = QScrollArea()
+        preset_scroll.setWidgetResizable(True)
+        preset_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        preset_scroll.setWidget(self.preset_widget)
+        tabs_group.addWidget(preset_scroll)
+
+        manual_scroll = QScrollArea()
+        manual_scroll.setWidgetResizable(True)
+        manual_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        manual_scroll.setWidget(self.manual_translation_widget)
+        tabs_group.addWidget(manual_scroll)
+
+        auto_translate_scroll = QScrollArea()
+        auto_translate_scroll.setWidgetResizable(True)
+        auto_translate_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        auto_translate_scroll.setWidget(self.auto_translate_widget)
+        self.auto_translate_tab_index = tabs_group.addWidget(auto_translate_scroll)
+        
+        self.program_settings_tab_index = tabs_group.addWidget(program_scroll)
+
         tabs_group.currentChanged.connect(self._on_main_tab_changed)
 
         # --- ШАГ 4: КОМПОНОВКА ОСНОВНОГО ОКНА ---
-        content_layout.addWidget(self.paths_widget)
-        content_layout.addWidget(tabs_group, 1)
+        right_layout.addWidget(self.paths_widget)
+        
+        central_frame = QFrame()
+        central_frame.setObjectName("centralWorkingArea")
+        central_layout = QVBoxLayout(central_frame)
+        central_layout.setContentsMargins(10, 10, 10, 10)
+        central_layout.addWidget(tabs_group)
+        
+        right_layout.addWidget(central_frame, 1)
+        
+        middle_layout.addWidget(right_panel, 1)
+        content_layout.addLayout(middle_layout, 1)
 
         # Нижняя панель с кнопками
         action_bar = QFrame(self.main_content_widget)
@@ -591,7 +644,7 @@ class InitialSetupPage(ShellPage):
         bottom_panel_layout.setContentsMargins(10, 8, 10, 8)
         bottom_panel_layout.setSpacing(10)
 
-        self.use_project_settings_btn = QtWidgets.QPushButton("Глобальные настройки")
+        self.use_project_settings_btn = QtWidgets.QPushButton("Режим: Глобальные настройки")
         self.use_project_settings_btn.setObjectName("contextToggleButton")
         self.use_project_settings_btn.setCheckable(True)
         self.use_project_settings_btn.setChecked(False)
@@ -977,15 +1030,27 @@ class InitialSetupPage(ShellPage):
         save_layout.setSpacing(8)
 
         save_row = QHBoxLayout()
-        self.save_app_settings_btn = QPushButton("Сохранить настройки")
-        self.save_app_settings_btn.setObjectName("primaryActionButton")
-        self.save_app_settings_btn.setMinimumHeight(34)
-        self.save_app_settings_btn.setToolTip(
-            "Сохраняет текущую модель, ключи, промпт, системные инструкции, "
-            "оптимизацию, автоперевод и настройки интерфейса."
-        )
-        self.save_app_settings_btn.clicked.connect(self._save_settings_from_app_tab)
-        save_row.addWidget(self.save_app_settings_btn)
+        self.save_project_settings_btn = QPushButton("💾 Сохранить для проекта")
+        self.save_project_settings_btn.setObjectName("compactActionButton")
+        self.save_project_settings_btn.setMinimumHeight(34)
+        self.save_project_settings_btn.setToolTip("Сохраняет текущие настройки в файл проекта (project_settings.json).")
+        self.save_project_settings_btn.clicked.connect(self._save_project_settings_only)
+        
+        self.save_global_settings_btn = QPushButton("💾 Сохранить глобально")
+        self.save_global_settings_btn.setObjectName("compactActionButton")
+        self.save_global_settings_btn.setMinimumHeight(34)
+        self.save_global_settings_btn.setToolTip("Сохраняет текущие настройки как глобальные по умолчанию.")
+        self.save_global_settings_btn.clicked.connect(lambda: self._save_global_ui_settings())
+
+        self.reset_settings_btn = QPushButton("🔄 Сбросить настройки")
+        self.reset_settings_btn.setObjectName("dangerActionButton")
+        self.reset_settings_btn.setMinimumHeight(34)
+        self.reset_settings_btn.setToolTip("Удаляет текущий файл настроек, возвращая их к стандартным.")
+        self.reset_settings_btn.clicked.connect(self._reset_to_default_settings)
+
+        save_row.addWidget(self.save_project_settings_btn)
+        save_row.addWidget(self.save_global_settings_btn)
+        save_row.addWidget(self.reset_settings_btn)
 
         self.save_settings_status_label = QLabel("Изменения помечаются звёздочкой в заголовке.")
         self.save_settings_status_label.setObjectName("helperLabel")
@@ -2004,6 +2069,10 @@ class InitialSetupPage(ShellPage):
             self._refresh_dirty_window_title()
 
         print(f"[SETTINGS] Глобальные настройки сохранены в: {self.settings_manager.config_file}")
+        if hasattr(self, 'save_settings_status_label'):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.save_settings_status_label.setText(f"✅ Глобальные настройки сохранены · {timestamp}")
+            self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('success')};")
 
     def _save_current_ui_settings(self):
         """Сохраняет текущее состояние UI в активный файл настроек."""
@@ -3502,6 +3571,10 @@ class InitialSetupPage(ShellPage):
             if isinstance(auto_translation_settings, dict):
                 self.auto_translate_widget.set_settings(auto_translation_settings)
 
+            if 'last_prompt_preset' in settings:
+                preset_name = settings['last_prompt_preset']
+                if preset_name:
+                    self.preset_widget.set_preset_by_name(preset_name)
             if 'custom_prompt' in settings:
                 self.preset_widget.set_prompt(settings['custom_prompt'])
 
@@ -3619,6 +3692,29 @@ class InitialSetupPage(ShellPage):
         self.is_settings_dirty = False
         self._refresh_dirty_window_title()
         print("[SETTINGS] Настройки проекта сохранены.")
+        if hasattr(self, 'save_settings_status_label'):
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.save_settings_status_label.setText(f"✅ Настройки проекта сохранены · {timestamp}")
+            self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('success')};")
+
+    def _reset_to_default_settings(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Сброс настроек")
+        msg.setText("Сбросить текущие настройки до стандартных?")
+        msg.setInformativeText("Файл настроек будет удален. Рекомендуется перезапустить приложение после сброса.")
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            config_path = self.settings_manager.config_file
+            if os.path.exists(config_path):
+                try:
+                    os.remove(config_path)
+                    print(f"[SETTINGS] Удален файл настроек: {config_path}")
+                except Exception as e:
+                    print(f"[SETTINGS] Ошибка удаления файла настроек: {e}")
+            if hasattr(self, 'save_settings_status_label'):
+                self.save_settings_status_label.setText(f"🔄 Настройки сброшены. Перезапустите приложение.")
+                self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('warning')};")
+            QMessageBox.information(self, "Сброс завершен", "Настройки сброшены до стандартных.\nЧтобы изменения полностью вступили в силу, пожалуйста, перезапустите приложение.")
 
 
 
@@ -3671,14 +3767,20 @@ class InitialSetupPage(ShellPage):
 
         # --- Условие для основного перевода (требует ключи) ---
         num_active_keys = len(self.key_management_widget.get_active_keys())
-        can_start_translation = all([
-            self.selected_file,
-            self.output_folder,
-            self.html_files,
-            num_active_keys > 0
-        ])
+        
+        reasons = []
+        if not self.selected_file: reasons.append("Не выбран EPUB файл")
+        if not self.output_folder: reasons.append("Не выбрана папка проекта")
+        if not self.html_files: reasons.append("Не выбраны главы для перевода")
+        if num_active_keys == 0: reasons.append("Не выбраны активные ключи")
+        
+        can_start_translation = len(reasons) == 0
 
         self.start_btn.setEnabled(can_start_translation)
+        if not can_start_translation:
+            self.start_btn.setToolTip("Запуск невозможен:\n- " + "\n- ".join(reasons))
+        else:
+            self.start_btn.setToolTip("Запустить перевод")
 
         # --- Условие для генерации глоссария (НЕ требует ключи здесь) ---
         can_generate_glossary = bool(self.selected_file and self.output_folder and self.html_files)
@@ -4256,6 +4358,7 @@ class InitialSetupPage(ShellPage):
         Централизованно включает/выключает все элементы управления на время перевода.
         """
         is_session_active = not enabled
+        if not hasattr(self, 'start_btn'): return
 
         # Кнопки Старт/Стоп
         self.start_btn.setEnabled(not is_session_active)
@@ -6422,6 +6525,7 @@ class InitialSetupPage(ShellPage):
             'api_keys': active_keys,
             'full_glossary_data': full_glossary_data,
             'custom_prompt': self.preset_widget.get_prompt() or api_config.default_prompt(),
+            'last_prompt_preset': self.preset_widget.get_current_preset_name(),
             'auto_translation': self.auto_translate_widget.get_settings(),
             PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
             'auto_start': True,
@@ -6665,10 +6769,26 @@ class InitialSetupPage(ShellPage):
         if hasattr(self, 'glossary_widget'):
             self.glossary_widget.set_project_path(self.output_folder)
 
-        # --- "УМНАЯ" ЗАГРУЗКА ГЛОССАРИЯ (ЦЕНТРАЛИЗОВАННАЯ) ---
+        # --- "УМНАЯ" ЗАГРУЗКА ГЛОССАРИЯ И НАСТРОЕК (ЦЕНТРАЛИЗОВАННАЯ) ---
         if self.output_folder and self.output_folder != self.current_project_folder_loaded:
             print(f"[INFO] Обнаружена смена проекта. Загрузка глоссария для: {os.path.basename(self.output_folder)}")
             self._load_project_glossary(self.output_folder)
+            
+            # НОВОЕ: Авто-переключение на настройки проекта, если они существуют
+            project_settings_path = os.path.join(self.output_folder, "project_settings.json")
+            if os.path.exists(project_settings_path):
+                print(f"[INFO] Найдены настройки проекта. Автоматическое переключение на локальный режим.")
+                self.use_project_settings_btn.blockSignals(True)
+                self.use_project_settings_btn.setChecked(True)
+                self.use_project_settings_btn.blockSignals(False)
+                self._toggle_project_settings_mode(True)
+            else:
+                print(f"[INFO] Настроек проекта нет. Включение глобального режима.")
+                self.use_project_settings_btn.blockSignals(True)
+                self.use_project_settings_btn.setChecked(False)
+                self.use_project_settings_btn.blockSignals(False)
+                self._toggle_project_settings_mode(False)
+
             self.current_project_folder_loaded = self.output_folder
         # --------------------------------------------------------
 
@@ -6710,43 +6830,8 @@ class InitialSetupPage(ShellPage):
 
     def _toggle_project_settings_mode(self, use_local):
         """
-        Переключает UI между глобальными настройками и настройками проекта,
-        НЕ затрагивая глоссарий. Использует self.settings_manager для глобальных операций.
+        Переключает UI между глобальными настройками и настройками проекта (без подтверждений).
         """
-        is_currently_local = not use_local
-
-        if self.is_settings_dirty:
-            msg_box = QMessageBox(self)
-            msg_box.setIcon(QMessageBox.Icon.Question)
-            msg_box.setWindowTitle("Несохраненные изменения")
-
-            if is_currently_local:
-                msg_box.setText("Вы изменили настройки текущего проекта.")
-                msg_box.setInformativeText("Сохранить изменения в файл 'project_settings.json' перед переключением на глобальные?")
-                save_btn_text = "Сохранить в Проект"
-            else:
-                msg_box.setText("Вы изменили глобальные настройки.")
-                msg_box.setInformativeText("Перезаписать глобальные настройки перед переключением на проект?")
-                save_btn_text = "Перезаписать Глобальные"
-
-            save_btn = msg_box.addButton(save_btn_text, QMessageBox.ButtonRole.AcceptRole)
-            discard_btn = msg_box.addButton("Не сохранять", QMessageBox.ButtonRole.DestructiveRole)
-            cancel_btn = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
-            msg_box.exec()
-            clicked = msg_box.clickedButton()
-
-            if clicked == save_btn:
-                if is_currently_local:
-                    self._save_project_settings_only()
-                else:
-                    self._save_global_ui_settings()
-            elif clicked == cancel_btn:
-                self.use_project_settings_btn.blockSignals(True)
-                self.use_project_settings_btn.setChecked(is_currently_local)
-                self.use_project_settings_btn.blockSignals(False)
-                return
-
-        # --- Основная логика ЗАГРУЗКИ (БЕЗ глоссария) ---
         if use_local:
             print("[SETTINGS] Переключение на настройки проекта…")
             project_settings_path = os.path.join(self.output_folder, "project_settings.json")
@@ -6755,19 +6840,18 @@ class InitialSetupPage(ShellPage):
                 local_settings = local_manager.load_full_session_settings()
                 self.global_settings = self._get_full_ui_settings()
                 self._apply_full_ui_settings(local_settings)
-                self.local_set = True
             else:
-                print("[INFO] Файл настроек проекта не найден. Используются текущие настройки UI.")
+                print("[INFO] Файл настроек проекта не найден. Сохраняем текущие настройки как настройки проекта.")
+                self.global_settings = self._get_full_ui_settings()
+            self.local_set = True
         else:
             print("[SETTINGS] Переключение на глобальные настройки…")
-            if self.global_settings:
+            if getattr(self, 'global_settings', None):
                 self._apply_full_ui_settings(self.global_settings)
             self.local_set = False
-        # Сбрасываем флаг "грязных" настроек ПОСЛЕ любого переключения.
-        # Теперь это работает корректно, т.к. _apply_full_ui_settings не генерирует сигналы.
+
         self.is_settings_dirty = False
         self.setWindowTitle(self.windowTitle().replace("*", ""))
-
         self._update_context_button_style(use_local)
 
     def _handle_task_reanimation(self, task_ids: list):
@@ -6826,11 +6910,11 @@ class InitialSetupPage(ShellPage):
     def _update_context_button_style(self, is_local_mode):
         """Обновляет текст, подсказку и стиль кнопки контекста."""
         if is_local_mode:
-            self.use_project_settings_btn.setText("Настройки проекта")
+            self.use_project_settings_btn.setText("Режим: Настройки проекта")
             self.use_project_settings_btn.setToolTip("Используются локальные настройки из файла project_settings.json\nНажмите, чтобы вернуться к глобальным.")
 
         else:
-            self.use_project_settings_btn.setText("Глобальные настройки")
+            self.use_project_settings_btn.setText("Режим: Глобальные настройки")
             self.use_project_settings_btn.setToolTip("Используются глобальные настройки из домашней директории.\nНажмите, чтобы переключиться на настройки проекта (будет создан файл, если его нет).")
 
     def update_keys_count(self):

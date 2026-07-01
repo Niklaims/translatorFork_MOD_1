@@ -349,6 +349,27 @@ class PresetWidget(QWidget):
         # 3. Убираем звездочку, если она есть, чтобы вернуть "чистое" имя
         return current_text.replace('*', '')
         
+    def set_preset_by_name(self, clean_name):
+        """
+        Устанавливает пресет по его 'чистому' имени.
+        Учитывает, что в комбобоксе имя может быть со звездочкой.
+        """
+        if not clean_name:
+            return False
+            
+        # Пытаемся найти точное совпадение
+        index = self.prompt_combo.findText(clean_name)
+        
+        # Если не нашли, ищем со звездочкой
+        if index == -1:
+            index = self.prompt_combo.findText(f"{clean_name}*")
+            
+        if index != -1:
+            self.prompt_combo.setCurrentIndex(index)
+            return True
+            
+        return False
+        
     def save_last_session_state(self):
         """Сохраняет имя текущего выбранного пресета в настройки."""
         if self.save_last_preset:

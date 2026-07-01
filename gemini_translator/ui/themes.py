@@ -208,31 +208,46 @@ QRadioButton {
 QFrame#projectHeaderCard,
 QFrame#projectPathCard,
 QFrame#projectStatsCard,
-QFrame#projectActionsCard,
 QFrame#actionBar,
+QFrame#statusBarSurface {
+    background-color: __PANEL_BG__;
+    border: 1px solid __BORDER__;
+    border-radius: 8px;
+    margin-top: 8px;
+    margin-bottom: 8px;
+}
+
+QFrame#projectActionsCard,
 QFrame#keyTransferColumn,
 QFrame#keyPanelSurface,
 QWidget#keyTransferColumn,
 QWidget#keyPanelSurface,
 QFrame#keyStatusCard,
-QFrame#statusSurface,
-QGroupBox {
-    background-color: __PANEL_BG__;
-    border: 1px solid __BORDER__;
-    border-radius: 12px;
+QFrame#statusSurface {
+    background-color: transparent;
+    border: none;
+    border-radius: 0px;
 }
 
 QGroupBox {
-    margin-top: 12px;
-    padding-top: 6px;
+    background-color: __PANEL_BG__;
+    border: 1px solid __BORDER__;
+    border-radius: 8px;
+    margin-top: 18px;
+    margin-bottom: 6px;
+    padding: 8px 6px 6px 6px;
 }
 
 QGroupBox::title {
     subcontrol-origin: margin;
     subcontrol-position: top left;
-    padding: 0 8px;
-    left: 12px;
+    padding: 0 4px;
+    left: 8px;
+    top: 0px;
+    background-color: transparent;
+    border: none;
     color: __ACCENT__;
+    font-size: 9pt;
     font-weight: 600;
 }
 
@@ -267,6 +282,44 @@ QLabel#projectCardDetail,
 QLabel#mutedLabel,
 QLabel#helperLabel {
     color: __TEXT_SECONDARY__;
+}
+
+/* Sidebar Styling */
+QFrame#sidebarWidget,
+QFrame#centralWorkingArea {
+    background-color: __PANEL_BG__;
+    border: 1px solid __BORDER__;
+    border-radius: 8px;
+}
+
+QPushButton#sidebarNavButton {
+    background: transparent;
+    color: __TEXT_PRIMARY__;
+    border: none;
+    border-radius: 8px;
+    padding: 6px 8px;
+    text-align: left;
+    font-size: 10pt;
+    font-weight: 500;
+}
+
+QPushButton#sidebarNavButton:hover {
+    background-color: __ACCENT_HOVER_SOFT__;
+    color: __TEXT_PRIMARY__;
+}
+
+QPushButton#sidebarNavButton[active="true"] {
+    background-color: __ACCENT_SOFT_BG__;
+    color: __TITLE_TEXT__;
+    border-left: 3px solid __ACCENT__;
+    border-top-left-radius: 4px;
+    border-bottom-left-radius: 4px;
+    font-weight: 600;
+}
+
+QLabel#sidebarVersionLabel {
+    color: __TEXT_MUTED__;
+    font-size: 8pt;
 }
 
 QLabel#projectCardValue {
@@ -1038,17 +1091,34 @@ QDialog, QMainWindow {
 QFrame#projectHeaderCard,
 QFrame#projectPathCard,
 QFrame#projectStatsCard,
-QFrame#projectActionsCard,
 QFrame#actionBar,
+QFrame#statusBarSurface {
+    background-color: __PANEL_GLASS__;
+    border: 1px solid __BORDER__;
+    border-radius: 8px;
+    margin-top: 8px;
+    margin-bottom: 8px;
+}
+
+QFrame#projectActionsCard,
 QFrame#keyTransferColumn,
 QFrame#keyPanelSurface,
 QWidget#keyTransferColumn,
 QWidget#keyPanelSurface,
 QFrame#keyStatusCard,
-QFrame#statusSurface,
+QFrame#statusSurface {
+    background-color: transparent;
+    border: none;
+}
+
 QGroupBox {
     background-color: __PANEL_GLASS__;
     border: 1px solid __BORDER__;
+}
+
+QGroupBox::title {
+    background-color: transparent;
+    border: none;
 }
 QLineEdit,
 QTextEdit,

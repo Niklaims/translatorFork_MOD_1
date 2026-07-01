@@ -135,12 +135,25 @@ class DeepseekApiHandler(BaseApiHandler):
                         # Стандартные ошибки
                         if response.status == 401:
                             raise RateLimitExceededError(f"Неверный токен (…{self.worker.api_key[-4:]}) DeepSeek.")
-                        if response.status == 402:
-                            raise RateLimitExceededError("Недостаточно средств на балансе DeepSeek (402).")
+                        if response.status in [429, 402]:
+                            key_manager = getattr(self.worker, 'api_key_manager', None)
+                            if key_manager:
+                                new_key = key_manager.rotate_on_limit_error(self.worker.api_key)
+                                if new_key:
+                                    self.worker.api_key = new_key
+                                    headers["Authorization"] = f"Bearer {new_key}"
+                                    self.worker._post_event('log_message', {
+                                        'message': f"🔄 DeepSeek: Ротация ключа, переключаемся на ...{new_key[-4:]}"
+                                    })
+                                    retry_count += 1
+                                    continue
+                            
+                            if response.status == 429:
+                                raise TemporaryRateLimitError("Превышен лимит запросов DeepSeek (429).", delay_seconds=20)
+                            else:
+                                raise RateLimitExceededError("Недостаточно средств на балансе DeepSeek (402).")
                         if response.status == 404:
                             raise ModelNotFoundError(f"Модель {self.worker.model_id} недоступна.")
-                        if response.status == 429:
-                            raise TemporaryRateLimitError("Превышен лимит запросов DeepSeek (429).", delay_seconds=20)
                         
                         # Любая другая ошибка
                         raise NetworkError(f"Ошибка DeepSeek ({response.status}): {error_text[:200]}")

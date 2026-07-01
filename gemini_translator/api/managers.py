@@ -93,6 +93,42 @@ class ApiKeyManager:
                 self.paused_keys.discard(key)
                 print(f"[API KEY] Ключ …{key[-4:]} снят с паузы и возвращен в ротацию.")
 
+    def rotate_on_limit_error(self, current_key):
+        """Вызывается при 429/402. Паузит текущий ключ и выдаёт следующий."""
+        with self.lock:
+            if current_key:
+                self.paused_keys.add(current_key)
+                self.active_keys.discard(current_key)
+            
+            for _ in range(len(self.api_keys)):
+                key = self.api_keys[self.current_index]
+                self.current_index = (self.current_index + 1) % len(self.api_keys)
+                
+                if key not in self.exhausted_keys and key not in self.paused_keys and key not in self.active_keys:
+                    self.active_keys.add(key)
+                    return key
+            return None
+
+    def add_keys(self, keys: list):
+        """Добавляет ключи в пул."""
+        with self.lock:
+            for key in keys:
+                if key not in self.api_keys:
+                    self.api_keys.append(key)
+
+    def replace_keys(self, keys: list):
+        """Полностью заменяет пул ключей (для UI)."""
+        with self.lock:
+            self.api_keys = list(dict.fromkeys(keys))
+            self.current_index = 0
+            self.exhausted_keys.intersection_update(self.api_keys)
+            self.active_keys.intersection_update(self.api_keys)
+            self.paused_keys.intersection_update(self.api_keys)
+
+    def are_all_keys_exhausted(self):
+        """Проверяет, все ли ключи в пуле исчерпаны"""
+        with self.lock:
+            return len(self.exhausted_keys) >= len(self.api_keys)
 
     def mark_key_exhausted(self, key):
         """Помечает ключ как исчерпанный"""

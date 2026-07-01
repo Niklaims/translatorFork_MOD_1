@@ -9,13 +9,14 @@ from gemini_translator.ui import theme_manager
 STATUS_FLUSH_INTERVAL_MS = 100
 
 
-class StatusBarWidget(QtWidgets.QWidget):
+class StatusBarWidget(QtWidgets.QFrame):
     """
-    Виджет, отображающий многоцветный прогресс-бар и текстовый статус.
+    Виджет, объединяющий индикатор прогресса и текстовые статусы.
     """
 
     def __init__(self, parent=None, event_bus=None, engine=None):
         super().__init__(parent)
+        self.setObjectName("statusBarSurface")
         self.success_count = 0
         self.in_progress_count = 0
         self.filtered_count = 0
@@ -57,7 +58,7 @@ class StatusBarWidget(QtWidgets.QWidget):
         main_layout = QtWidgets.QStackedLayout(self)
         main_layout.setStackingMode(QtWidgets.QStackedLayout.StackingMode.StackAll)
         main_layout.setContentsMargins(0, 0, 0, 0)
-        self.setFixedHeight(28)
+        self.setFixedHeight(38)
 
         color_bar_widget = QtWidgets.QWidget()
         self.color_bar_layout = QtWidgets.QHBoxLayout(color_bar_widget)
@@ -93,6 +94,8 @@ class StatusBarWidget(QtWidgets.QWidget):
                 border-radius: 5px;
                 text-align: center;
                 color: {theme_manager.color('text_primary')};
+                font-size: 15px;
+                font-weight: bold;
             }}
             QProgressBar::chunk {{ background-color: transparent; }}
         """
@@ -229,9 +232,7 @@ class StatusBarWidget(QtWidgets.QWidget):
         self.progress_bar_text.setValue(processed_count)
 
         self.progress_bar_text.setFormat(
-            f"Успех: {self.success_count} | В работе: {self.in_progress_count} | "
-            f"Фильтр: {self.filtered_count} | Ошибки: {self.error_count} | "
-            f"Готово: {processed_count}/{self.total_tasks} (%p%){token_suffix}"
+            f"Прогресс: {processed_count} из {self.total_tasks} (%p%){token_suffix}"
         )
 
         self.part_success.setVisible(self.success_count > 0)

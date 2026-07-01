@@ -1552,3 +1552,71 @@ def uses_legacy_worker_thread(provider_config: dict) -> bool:
     if provider_config.get("worker_runtime") == "thread":
         return True
     return provider_config.get("handler_class") in _SUBPROCESS_HANDLER_CLASSES
+
+def save_provider_api_keys(provider_id: str, keys: list[str]) -> bool:
+    """Сохраняет массив ключей для провайдера в api_providers.json."""
+    _ensure_configs_initialized()
+    normalized_provider = str(provider_id or "").strip()
+    if not normalized_provider:
+        return False
+        
+    try:
+        with open(_PROVIDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        if normalized_provider not in data:
+            data[normalized_provider] = {}
+            
+        data[normalized_provider]["api_keys"] = keys
+        
+        with open(_PROVIDERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            
+        if normalized_provider in _API_PROVIDERS:
+            _API_PROVIDERS[normalized_provider]["api_keys"] = keys
+            
+        return True
+    except Exception as e:
+        print(f"[CONFIG ERROR] Не удалось сохранить ключи для '{normalized_provider}': {e}")
+        return False
+
+def save_provider_model_state(provider_id: str, model_id: str, is_enabled: bool) -> bool:
+    """Сохраняет состояния моделей (enabled/disabled) в конфиг."""
+    _ensure_configs_initialized()
+    normalized_provider = str(provider_id or "").strip()
+    if not normalized_provider:
+        return False
+        
+    try:
+        with open(_PROVIDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        if normalized_provider not in data:
+            data[normalized_provider] = {}
+            
+        if "models" not in data[normalized_provider]:
+            data[normalized_provider]["models"] = {}
+            
+        if model_id not in data[normalized_provider]["models"]:
+            data[normalized_provider]["models"][model_id] = {}
+            
+        data[normalized_provider]["models"][model_id]["enabled"] = is_enabled
+        
+        with open(_PROVIDERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            
+        if normalized_provider in _API_PROVIDERS:
+            if "models" not in _API_PROVIDERS[normalized_provider]:
+                _API_PROVIDERS[normalized_provider]["models"] = {}
+            if model_id not in _API_PROVIDERS[normalized_provider]["models"]:
+                _API_PROVIDERS[normalized_provider]["models"][model_id] = {}
+            _API_PROVIDERS[normalized_provider]["models"][model_id]["enabled"] = is_enabled
+            
+            global _ALL_MODELS
+            _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+            
+        return True
+    except Exception as e:
+        print(f"[CONFIG ERROR] Не удалось сохранить состояние модели '{model_id}': {e}")
+        return False
+

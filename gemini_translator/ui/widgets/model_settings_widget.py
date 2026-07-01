@@ -1242,9 +1242,18 @@ class ModelSettingsWidget(QGroupBox):
             self.fuzzy_threshold_spin.setValue(settings.get('fuzzy_threshold', 100))
             
             system_instruction_text = settings.get('system_instruction')
+            system_instruction_preset = settings.get('system_instruction_preset')
             is_checked = bool(settings.get('use_system_instruction', bool(system_instruction_text)))
             self.system_instruction_checkbox.setChecked(is_checked)
             self.system_instruction_btn.setEnabled(is_checked)
+            
+            if system_instruction_preset and hasattr(self.system_instruction_editor_dialog, 'preset_widget'):
+                preset_widget = self.system_instruction_editor_dialog.preset_widget
+                # Unblock combo box so that _on_prompt_selected is triggered to update internal state
+                preset_widget.prompt_combo.blockSignals(False)
+                preset_widget.set_preset_by_name(system_instruction_preset)
+                preset_widget.prompt_combo.blockSignals(True)
+            
             if system_instruction_text:
                 self.system_instruction_editor_dialog.set_prompt(system_instruction_text)
     
