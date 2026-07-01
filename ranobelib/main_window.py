@@ -55,7 +55,7 @@ from constants import (
     SETTINGS_APP,
     SETTINGS_ORG,
 )
-from api_upload import ApiUploadWorker
+from api_upload import ApiUploadWorker, chapter_identity, existing_chapter_identities
 from dialogs import PreviewDialog, ProcessDialog
 from models import ChapterData
 from parsers import FileParser
@@ -178,6 +178,8 @@ class RanobeUploaderApp(QMainWindow):
         self._upload_errors = 0       # Feature 4: счётчик для уведомлений
         self._rulate_chapter_list = []  # v12: список глав с rulate
         self._last_lib_chapter = 0.0    # v12: номер последней главы на lib
+        self._existing_lib_chapter_keys: set[str] = set()
+        self._existing_lib_chapters: list[dict] = []
         self._process_dialogs: dict[str, ProcessDialog] = {}
         self._return_to_menu_handler = None
         self._rulate_media_metadata: dict = {}
@@ -1684,6 +1686,8 @@ class RanobeUploaderApp(QMainWindow):
         self.rulate_list_widget.clear()
         self.rulate_last_clicked_row = -1
         self._rulate_chapter_list = []
+        self._existing_lib_chapter_keys = set()
+        self._existing_lib_chapters = []
         self.progress_bar.setValue(0)
 
         # Если нужно определить последнюю главу на RanobeLib
@@ -1693,13 +1697,22 @@ class RanobeUploaderApp(QMainWindow):
             self._detector.log_signal.connect(
                 lambda level, msg: self._process_log("rulate_fetch", level, msg)
             )
+            self._detector.existing_chapters_signal.connect(self._on_existing_lib_chapters_detected)
             self._detector.result_signal.connect(self._on_last_chapter_detected)
             self._detector.finished_signal.connect(self._on_detector_finished)
             self._detector.start()
         else:
             self._last_lib_chapter = 0.0
+            self._existing_lib_chapter_keys = set()
+            self._existing_lib_chapters = []
             self.lbl_last_chapter.setText("Последняя глава на RanobeLib: — (пропуск отключён)")
             self._start_rulate_list_fetch()
+
+    def _on_existing_lib_chapters_detected(self, chapters: list):
+        self._existing_lib_chapters = list(chapters or [])
+        self._existing_lib_chapter_keys = existing_chapter_identities(
+            self._existing_lib_chapters
+        )
 
     def _on_last_chapter_detected(self, num: float, desc: str):
         """Получен номер последней главы с RanobeLib."""
@@ -1742,6 +1755,11 @@ class RanobeUploaderApp(QMainWindow):
         self.rulate_last_clicked_row = -1
 
         skip_num = self._last_lib_chapter
+        existing_keys = (
+            self._existing_lib_chapter_keys
+            if self.chk_skip_uploaded.isChecked()
+            else set()
+        )
         total = 0
         downloadable = 0
         skipped = 0
@@ -1749,14 +1767,24 @@ class RanobeUploaderApp(QMainWindow):
         for ch in chapters_info:
             title = ch.get("title", "")
             ch_num = ch.get("number", 0)
+            volume = str(ch.get("volume") or self.default_vol_input.text().strip() or "1")
             can_download = ch.get("downloadable", False)
             ch_id = ch.get("id", "")
 
             item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, ch)
 
+            chapter_key = chapter_identity(volume, ch_num)
+            already_uploaded = bool(existing_keys and chapter_key in existing_keys)
+            legacy_uploaded = (
+                not existing_keys
+                and skip_num > 0
+                and ch_num > 0
+                and ch_num <= skip_num
+            )
+
             # Если глава уже залита — снимаем галочку
-            if skip_num > 0 and ch_num > 0 and ch_num <= skip_num:
+            if already_uploaded or legacy_uploaded:
                 item.setCheckState(Qt.CheckState.Unchecked)
                 skipped += 1
             elif can_download:

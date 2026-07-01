@@ -1,6 +1,6 @@
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 TESTS_DIR = os.path.dirname(__file__)
@@ -68,3 +68,98 @@ def test_api_upload_retries_chapter_after_transient_error(monkeypatch):
     assert worker._ok == 1
     assert worker._errors == 0
     assert api_upload._chapter_identity("1", 2.0) in existing_keys
+
+
+def test_existing_chapter_identities_keep_restarted_numbers_separate():
+    existing = [{"volume": "1", "number": "1"}]
+
+    keys = api_upload.existing_chapter_identities(existing)
+
+    assert api_upload.chapter_identity("1", 1.0) in keys
+    assert api_upload.chapter_identity("2", 1.0) not in keys
+
+
+def test_latest_existing_chapter_uses_volume_before_number():
+    chapters = [
+        {"volume": "1", "number": "100"},
+        {"volume": "2", "number": "1"},
+    ]
+
+    latest = api_upload.latest_existing_chapter(chapters)
+
+    assert latest == {"volume": "2", "number": "1"}
+
+
+def test_api_upload_stops_before_schedule_goes_past_sixty_days(monkeypatch):
+    chapters = [
+        ChapterData("1", 1.0, "Too late", "Chapter body"),
+        ChapterData("1", 2.0, "Also too late", "Chapter body"),
+    ]
+    worker = ApiUploadWorker(
+        "https://ranobelib.me/ru/book/1--test-book/add-chapter",
+        chapters,
+        schedule_enabled=True,
+        start_time=datetime.now() + timedelta(days=61),
+        interval_minutes=10,
+        paid_enabled=False,
+        price=0,
+        force_num=True,
+    )
+    requests = []
+
+    monkeypatch.setattr(
+        api_upload,
+        "resolve_api_auth",
+        lambda slug: ({"access_token": "token"}, {"teams": [{"id": 100}]}),
+    )
+    monkeypatch.setattr(api_upload, "fetch_existing_chapters", lambda slug: [])
+    monkeypatch.setattr(api_upload, "_json_request", lambda *args, **kwargs: requests.append(args))
+
+    worker.run()
+
+    assert requests == []
+    assert worker._ok == 0
+    assert worker._errors == 0
+    assert worker._skipped == 2
+
+
+def test_api_upload_does_not_retry_publish_at_limit(monkeypatch):
+    chapter = ChapterData("1", 2.0, "Too late", "Chapter body")
+    worker = _api_worker(chapter)
+    worker.schedule_enabled = True
+    requests = []
+
+    def fake_json_request(pathname, **kwargs):
+        requests.append((pathname, kwargs))
+        raise api_upload.RanobeLibApiError(
+            "POST",
+            "/chapters",
+            422,
+            {"data": {"publish_at": ["must be before limit"]}},
+        )
+
+    monkeypatch.setattr(api_upload, "_json_request", fake_json_request)
+
+    handled = worker._upload_chapter(
+        0,
+        chapter,
+        manga_id=1,
+        token={"access_token": "token"},
+        existing_chapters=[
+            {
+                "volume": "1",
+                "number": "1",
+                "branch_id": 7,
+                "branches": [{"branch_id": 7, "teams": [{"id": 100}]}],
+                "teams": [{"id": 100}],
+            }
+        ],
+        existing_keys={api_upload._chapter_identity("1", "1")},
+        auth_team_ids=[100],
+    )
+
+    assert handled is True
+    assert len(requests) == 1
+    assert worker.is_running is False
+    assert worker._skipped == 1
+    assert worker._errors == 0
