@@ -9,6 +9,7 @@
     "post_session_creation_delay": 1.5,
     "file_suffix": "_translated_gemini.html",
     "shared_request_counter": false,
+    "dynamic_model_discovery": true,
     "reset_policy": {
       "type": "daily",
       "timezone": "America/Los_Angeles",
@@ -408,7 +409,7 @@
     }
   },
   "openmodel": {
-    "display_name": "OpenModel DeepSeek V4 Flash",
+    "display_name": "OpenModel",
     "provider": "openmodel",
     "handler_class": "OpenModelApiHandler",
     "base_url": "https://api.openmodel.ai",

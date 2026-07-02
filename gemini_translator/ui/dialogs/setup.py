@@ -80,7 +80,7 @@ from ..widgets import (
     KeyManagementWidget, TranslationOptionsWidget, ModelSettingsWidget,
     ProjectPathsWidget, GlossaryWidget, PresetWidget, ProjectActionsWidget,
     TaskManagementWidget, LogWidget, StatusBarWidget, ManualTranslationWidget,
-    AutoTranslateWidget, SidebarWidget
+    AutoTranslateWidget, SidebarWidget, ProviderModelsWidget
 )
 from ..widgets.common_widgets import NoScrollSpinBox
 from .epub import EpubHtmlSelectorDialog, TranslatedChaptersManagerDialog
@@ -1020,10 +1020,13 @@ class InitialSetupPage(ShellPage):
     # --------------------------------------------------------------------
 
     def _create_program_settings_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(8)
+        tabs = QTabWidget()
+        
+        # --- Tab 1: "Функции" ---
+        functions_tab = QWidget()
+        functions_layout = QVBoxLayout(functions_tab)
+        functions_layout.setContentsMargins(4, 4, 4, 4)
+        functions_layout.setSpacing(8)
 
         save_group = QGroupBox("Сохранение настроек")
         save_layout = QVBoxLayout(save_group)
@@ -1058,18 +1061,29 @@ class InitialSetupPage(ShellPage):
         save_row.addWidget(self.save_settings_status_label, 1)
         save_layout.addLayout(save_row)
 
-        layout.addWidget(save_group, 0)
+        functions_layout.addWidget(save_group, 0)
 
         self.session_behavior_group = self._create_session_behavior_group()
-        layout.addWidget(self.session_behavior_group, 0)
+        functions_layout.addWidget(self.session_behavior_group, 0)
 
         self.queue_persistence_group = self._create_queue_persistence_group()
-        layout.addWidget(self.queue_persistence_group, 0)
+        functions_layout.addWidget(self.queue_persistence_group, 0)
 
         self.appearance_group = self._create_appearance_group()
-        layout.addWidget(self.appearance_group, 0)
-        layout.addStretch(1)
-        return tab
+        functions_layout.addWidget(self.appearance_group, 0)
+        functions_layout.addStretch(1)
+        
+        tabs.addTab(functions_tab, "Функции")
+        
+        # --- Tab 2: "Провайдер" ---
+        self.provider_models_widget = ProviderModelsWidget(settings_manager=self.settings_manager, parent=self)
+        # Подключаем сигнал, чтобы другие виджеты могли обновить список доступных моделей
+        self.provider_models_widget.active_models_changed.connect(
+            lambda: self.model_settings_widget._refresh_current_provider_models() if hasattr(self, 'model_settings_widget') else None
+        )
+        tabs.addTab(self.provider_models_widget, "Провайдер")
+        
+        return tabs
 
     def _load_show_chapter_char_count_enabled(self) -> bool:
         for loader_name in ("load_full_session_settings", "load_settings"):

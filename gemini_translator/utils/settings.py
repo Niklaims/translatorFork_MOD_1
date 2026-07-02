@@ -557,6 +557,10 @@ class SettingsManager(QObject):
         with self.file_lock:
             return [item['key'] for item in self._cache.get('api_keys_with_status', [])]
 
+    def get_api_keys_for_provider(self, provider_id: str) -> list[str]:
+        with self.file_lock:
+            return [item['key'] for item in self._cache.get('api_keys_with_status', []) if item.get('provider') == provider_id]
+
     def save_api_keys(self, keys_list):
         key_statuses = [{"key": key, "provider": "gemini", "status_by_model": {}} for key in keys_list]
         return self.save_key_statuses(key_statuses)
@@ -606,7 +610,21 @@ class SettingsManager(QObject):
         normalized = api_config.set_custom_provider_models(custom_provider_models)
         with self.file_lock:
             self._cache["custom_provider_models"] = deepcopy(normalized)
-            self._save_to_disk_unsafe()
+        self._save_requested.emit()
+        return True
+
+    def get_active_models_for_provider(self, provider_id: str) -> list[str] | None:
+        with self.file_lock:
+            active_models = self._cache.get("active_models", {})
+            val = active_models.get(provider_id)
+            return deepcopy(val) if val is not None else None
+
+    def save_active_models_for_provider(self, provider_id: str, active_ids: list[str]):
+        with self.file_lock:
+            active_models = deepcopy(self._cache.get("active_models", {}))
+            active_models[provider_id] = active_ids
+            self._cache["active_models"] = active_models
+        self._save_requested.emit()
         return True
 
     def add_custom_provider_model(self, provider_id, display_name, model_config):
@@ -619,6 +637,16 @@ class SettingsManager(QObject):
             provider_models = custom_models.setdefault(provider_key, {})
             provider_models[model_name] = deepcopy(model_config or {})
             self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
+        self._save_requested.emit()
+        return True
+
+    def get_dynamic_provider_models(self) -> dict:
+        with self.file_lock:
+            return deepcopy(self._cache.get("dynamic_provider_models", {}))
+            
+    def save_dynamic_provider_models(self, models_dict: dict):
+        with self.file_lock:
+            self._cache["dynamic_provider_models"] = deepcopy(models_dict)
             self._save_to_disk_unsafe()
         return True
 

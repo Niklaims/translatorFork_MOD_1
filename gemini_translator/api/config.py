@@ -543,7 +543,7 @@ def _guess_local_endpoint_label(root_url: str) -> str:
     return parsed.netloc or "Local"
 
 
-def _iter_local_discovery_sources(provider_config: dict) -> list[dict]:
+def _iter_local_discovery_sources(provider_config: dict, provider_id: str | None = None) -> list[dict]:
     ordered_sources: dict[str, dict] = {}
 
     def register_candidate(url_text: str | None, label: str | None = None):
@@ -576,6 +576,14 @@ def _iter_local_discovery_sources(provider_config: dict) -> list[dict]:
             )
 
     register_candidate(provider_config.get("base_url"))
+    
+    if provider_id == "openrouter":
+        register_candidate("https://openrouter.ai/api/v1")
+    elif provider_id == "deepseek" or provider_id == "free_deepseek":
+        register_candidate("https://api.deepseek.com")
+    elif provider_id == "gemini":
+        register_candidate("https://generativelanguage.googleapis.com")
+        
     for model_config in provider_config.get("models", {}).values():
         if isinstance(model_config, dict):
             register_candidate(model_config.get("base_url"))
@@ -607,12 +615,16 @@ def _index_static_local_models(static_models: dict, provider_base_url: str | Non
     return by_model_and_url, by_model_id
 
 
-def _fetch_local_models_json(url: str) -> tuple[bool, object | None]:
+def _fetch_local_models_json(url: str, api_key: str | None = None) -> tuple[bool, object | None]:
     if requests is None:
         return False, None
+        
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        response = requests.get(url, timeout=_LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS)
+        response = requests.get(url, headers=headers, timeout=_LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS)
     except Exception:
         return False, None
 
@@ -625,12 +637,16 @@ def _fetch_local_models_json(url: str) -> tuple[bool, object | None]:
         return False, None
 
 
-def _post_local_models_json(url: str, payload: dict) -> tuple[bool, object | None]:
+def _post_local_models_json(url: str, payload: dict, api_key: str | None = None) -> tuple[bool, object | None]:
     if requests is None:
         return False, None
+        
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        response = requests.post(url, json=payload, timeout=_LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS)
+        response = requests.post(url, json=payload, headers=headers, timeout=_LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS)
     except Exception:
         return False, None
 
@@ -663,6 +679,16 @@ _LOCAL_DEFAULT_TEMPERATURE_KEYS = {
     "base_temperature",
     "default_temperature",
     "temperature",
+}
+_LOCAL_RPM_KEYS = {
+    "rpm",
+    "requests_per_minute",
+    "rate_limit_rpm",
+}
+_LOCAL_CONCURRENT_KEYS = {
+    "max_concurrent_requests",
+    "concurrent_requests",
+    "max_concurrent",
 }
 _LOCAL_PARAMETERS_TEXT_KEYS = {
     "modelfile",
@@ -799,6 +825,7 @@ def _extract_local_parameter_from_text_blocks(payload, parameter_names: set[str]
     return None
 
 
+
 def _extract_local_model_metadata(model_payload) -> dict:
     metadata = {}
     context_length = _extract_positive_int_by_keys(model_payload, _LOCAL_CONTEXT_LENGTH_KEYS)
@@ -830,15 +857,61 @@ def _extract_local_model_metadata(model_payload) -> dict:
         )
     if default_temperature is not None:
         metadata["default_temperature"] = default_temperature
+        
+    rpm = _extract_positive_int_by_keys(model_payload, _LOCAL_RPM_KEYS)
+    if rpm is not None:
+        metadata["rpm"] = rpm
+        
+    concurrent_requests = _extract_positive_int_by_keys(model_payload, _LOCAL_CONCURRENT_KEYS)
+    if concurrent_requests is not None:
+        metadata["max_concurrent_requests"] = concurrent_requests
 
     return metadata
 
 
 def _make_discovered_local_model_entry(model_id: str, model_payload=None) -> dict:
-    entry = {"id": model_id}
+    entry = {"id": model_id, "server_discovered": True}
     if isinstance(model_payload, dict):
         entry.update(_extract_local_model_metadata(model_payload))
     return entry
+
+
+def _extract_model_entries_from_google_payload(payload) -> list[dict]:
+    models = payload.get("models", []) if isinstance(payload, dict) else []
+    discovered = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("name", "").replace("models/", "")
+        if not model_id:
+            continue
+            
+        display_name = item.get("displayName") or model_id
+        
+        supported_methods = item.get("supportedGenerationMethods", [])
+        if "generateContent" not in supported_methods:
+            continue
+            
+        entry = {
+            "id": model_id,
+            "display_name": display_name,
+            "server_discovered": True
+        }
+        
+        if "inputTokenLimit" in item:
+            entry["context_length"] = item["inputTokenLimit"]
+            entry["context_window"] = item["inputTokenLimit"]
+        if "outputTokenLimit" in item:
+            entry["max_output_tokens"] = item["outputTokenLimit"]
+        if "temperature" in item:
+            entry["default_temperature"] = item["temperature"]
+        if "topP" in item:
+            entry["top_p"] = item["topP"]
+        if "topK" in item:
+            entry["top_k"] = item["topK"]
+            
+        discovered.append(entry)
+    return discovered
 
 
 def _extract_model_entries_from_ollama_payload(payload) -> list[dict]:
@@ -853,7 +926,7 @@ def _extract_model_entries_from_ollama_payload(payload) -> list[dict]:
     return discovered
 
 
-def _extract_model_entries_from_openai_payload(payload) -> list[dict]:
+def _extract_model_entries_from_openai_payload(payload, provider_id: str | None = None) -> list[dict]:
     if isinstance(payload, dict):
         models = payload.get("data", [])
     elif isinstance(payload, list):
@@ -864,6 +937,15 @@ def _extract_model_entries_from_openai_payload(payload) -> list[dict]:
     for item in models:
         if not isinstance(item, dict):
             continue
+            
+        if provider_id == "openrouter":
+            pricing = item.get("pricing")
+            if isinstance(pricing, dict):
+                prompt = pricing.get("prompt")
+                completion = pricing.get("completion")
+                if str(prompt) != "0" or str(completion) != "0":
+                    continue
+                    
         model_id = item.get("id") or item.get("model")
         if isinstance(model_id, str) and model_id.strip():
             discovered.append(_make_discovered_local_model_entry(model_id.strip(), item))
@@ -883,6 +965,8 @@ def _merge_discovered_local_model_entry(existing: dict | None, new_entry: dict) 
 def _discover_models_for_local_source(
     source: dict,
     include_details: bool = True,
+    api_key: str | None = None,
+    provider_id: str | None = None,
 ) -> tuple[bool, list[dict]]:
     discovered_by_id = {}
     is_successful = False
@@ -890,8 +974,24 @@ def _discover_models_for_local_source(
 
     if not root_url:
         return False, []
+        
+    if provider_id == "gemini":
+        url = _join_http_path(root_url, "/v1beta/models")
+        if api_key:
+            url += f"?key={api_key}"
+        ok, payload = _fetch_local_models_json(url)
+        if ok:
+            is_successful = True
+            for model_entry in _extract_model_entries_from_google_payload(payload):
+                model_id = model_entry.get("id")
+                if model_id:
+                    discovered_by_id[model_id] = _merge_discovered_local_model_entry(
+                        discovered_by_id.get(model_id),
+                        model_entry,
+                    )
+        return is_successful, list(discovered_by_id.values())
 
-    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/api/tags"))
+    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/api/tags"), api_key=api_key)
     if ok:
         is_successful = True
         for model_entry in _extract_model_entries_from_ollama_payload(payload):
@@ -902,10 +1002,10 @@ def _discover_models_for_local_source(
                     model_entry,
                 )
 
-    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/v1/models"))
+    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/v1/models"), api_key=api_key)
     if ok:
         is_successful = True
-        for model_entry in _extract_model_entries_from_openai_payload(payload):
+        for model_entry in _extract_model_entries_from_openai_payload(payload, provider_id=provider_id):
             model_id = model_entry.get("id")
             if model_id:
                 discovered_by_id[model_id] = _merge_discovered_local_model_entry(
@@ -913,10 +1013,21 @@ def _discover_models_for_local_source(
                     model_entry,
                 )
 
-    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/api/v0/models"))
+    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/models"), api_key=api_key)
     if ok:
         is_successful = True
-        for model_entry in _extract_model_entries_from_openai_payload(payload):
+        for model_entry in _extract_model_entries_from_openai_payload(payload, provider_id=provider_id):
+            model_id = model_entry.get("id")
+            if model_id:
+                discovered_by_id[model_id] = _merge_discovered_local_model_entry(
+                    discovered_by_id.get(model_id),
+                    model_entry,
+                )
+
+    ok, payload = _fetch_local_models_json(_join_http_path(root_url, "/api/v0/models"), api_key=api_key)
+    if ok:
+        is_successful = True
+        for model_entry in _extract_model_entries_from_openai_payload(payload, provider_id=provider_id):
             model_id = model_entry.get("id")
             if model_id:
                 discovered_by_id[model_id] = _merge_discovered_local_model_entry(
@@ -929,6 +1040,7 @@ def _discover_models_for_local_source(
             ok, payload = _post_local_models_json(
                 _join_http_path(root_url, "/api/show"),
                 {"model": model_id},
+                api_key=api_key,
             )
             if ok:
                 discovered_by_id[model_id] = _merge_discovered_local_model_entry(
@@ -939,7 +1051,8 @@ def _discover_models_for_local_source(
 
             quoted_model_id = quote(model_id, safe="")
             ok, payload = _fetch_local_models_json(
-                _join_http_path(root_url, f"/v1/models/{quoted_model_id}")
+                _join_http_path(root_url, f"/v1/models/{quoted_model_id}"),
+                api_key=api_key,
             )
             if ok:
                 discovered_by_id[model_id] = _merge_discovered_local_model_entry(
@@ -949,7 +1062,8 @@ def _discover_models_for_local_source(
                 continue
 
             ok, payload = _fetch_local_models_json(
-                _join_http_path(root_url, f"/api/v0/models/{quoted_model_id}")
+                _join_http_path(root_url, f"/api/v0/models/{quoted_model_id}"),
+                api_key=api_key,
             )
             if ok:
                 discovered_by_id[model_id] = _merge_discovered_local_model_entry(
@@ -979,6 +1093,14 @@ def _apply_discovered_local_model_metadata(model_config: dict, model_entry: dict
     default_temperature = _coerce_float(model_entry.get("default_temperature"))
     if default_temperature is not None:
         model_config["default_temperature"] = default_temperature
+        
+    rpm = _coerce_positive_int(model_entry.get("rpm"))
+    if rpm is not None:
+        model_config["rpm"] = rpm
+        
+    concurrent = _coerce_positive_int(model_entry.get("max_concurrent_requests"))
+    if concurrent is not None:
+        model_config["max_concurrent_requests"] = concurrent
 
     return model_config
 
@@ -987,10 +1109,9 @@ def _default_local_model_config(model_entry: dict, source: dict) -> dict:
     model_id = str(model_entry.get("id") or "").strip()
     config = {
         "id": model_id,
-        "rpm": 1000,
         "needs_chunking": True,
-        "max_concurrent_requests": 1,
         "base_url": source.get("chat_url"),
+        "server_discovered": True,
     }
     return _apply_discovered_local_model_metadata(config, model_entry)
 
@@ -1022,14 +1143,16 @@ def _build_local_model_entry(model_entry: dict, source: dict, static_by_model_an
 def _discover_local_provider_models(
     provider_config: dict,
     include_details: bool = True,
-) -> dict:
+    api_key: str | None = None,
+    provider_id: str | None = None,
+) -> tuple[bool, dict]:
     static_models = deepcopy(provider_config.get("models", {}))
     if not _local_model_discovery_enabled() or requests is None:
-        return static_models
+        return True, static_models
 
-    discovery_sources = _iter_local_discovery_sources(provider_config)
+    discovery_sources = _iter_local_discovery_sources(provider_config, provider_id=provider_id)
     if not discovery_sources:
-        return static_models
+        return True, static_models
 
     static_by_model_and_url, static_by_model_id = _index_static_local_models(
         static_models,
@@ -1042,6 +1165,8 @@ def _discover_local_provider_models(
         is_successful, model_entries = _discover_models_for_local_source(
             source,
             include_details=include_details,
+            api_key=api_key,
+            provider_id=provider_id,
         )
         if not is_successful:
             continue
@@ -1057,23 +1182,30 @@ def _discover_local_provider_models(
             discovered_models[display_name] = model_config
 
     if successful_sources > 0:
-        return discovered_models
-    return static_models
+        return True, discovered_models
+    return False, static_models
 
 
-def _provider_uses_dynamic_model_discovery(provider_id: str, provider_config: dict | None = None) -> bool:
+def _provider_uses_dynamic_model_discovery(provider_id: str, provider_config: dict | None = None, force: bool = False) -> bool:
     if provider_id == "local":
         return True
     provider_config = provider_config or _API_PROVIDERS.get(provider_id, {})
-    return bool(provider_config.get("dynamic_model_discovery"))
+    if provider_config.get("dynamic_model_discovery"):
+        return True
+    if force:
+        if provider_config.get("base_url"):
+            return True
+        if provider_id in ("openrouter", "deepseek", "free_deepseek", "gemini"):
+            return True
+    return False
 
 
-def _refresh_dynamic_provider_models(provider_id: str, force: bool = False) -> dict:
+def _refresh_dynamic_provider_models(provider_id: str, force: bool = False, api_key: str | None = None) -> dict:
     global _ALL_MODELS
 
     normalized_provider = str(provider_id or "").strip()
     provider_config = _API_PROVIDERS.get(normalized_provider, {})
-    if not normalized_provider or not _provider_uses_dynamic_model_discovery(normalized_provider, provider_config):
+    if not normalized_provider or not _provider_uses_dynamic_model_discovery(normalized_provider, provider_config, force=force):
         return {}
 
     with _DYNAMIC_PROVIDER_MODELS_LOCK:
@@ -1084,14 +1216,39 @@ def _refresh_dynamic_provider_models(provider_id: str, force: bool = False) -> d
         if not force and cached_models is not None and (now - cached_ts) < _LOCAL_MODEL_DISCOVERY_TTL_SECONDS:
             return cached_models
 
-        resolved_models = _discover_local_provider_models(
+        is_successful, resolved_models = _discover_local_provider_models(
             provider_config,
             include_details=force,
+            api_key=api_key,
+            provider_id=normalized_provider,
         )
-        _DYNAMIC_PROVIDER_MODELS[normalized_provider] = resolved_models
-        _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider] = now
-        _ALL_MODELS = _build_all_models(_compose_runtime_providers())
-        return resolved_models
+        print(f"[ModelDiscovery] Провайдер {normalized_provider}: найдено {len(resolved_models)} моделей, успех={is_successful}")
+
+        # Если поиск провалился (например, нет ключа или нет сети), мы НЕ ПЕРЕЗАПИСЫВАЕМ кэш,
+        # если он уже существует (чтобы модели не пропадали при смене вкладок).
+        if is_successful:
+            _DYNAMIC_PROVIDER_MODELS[normalized_provider] = resolved_models
+            _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider] = now
+            _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+
+            try:
+                from PyQt6 import QtWidgets
+                app = QtWidgets.QApplication.instance()
+                if app and hasattr(app, "get_settings_manager"):
+                    sm = app.get_settings_manager()
+                    sm.save_dynamic_provider_models(_DYNAMIC_PROVIDER_MODELS)
+                else:
+                    from gemini_translator.utils.settings import SettingsManager
+                    sm = SettingsManager()
+                    sm.save_dynamic_provider_models(_DYNAMIC_PROVIDER_MODELS)
+            except Exception as e:
+                print(f"[ModelDiscovery] Ошибка сохранения кэша: {e}")
+
+            return resolved_models
+        elif cached_models is not None:
+            return cached_models
+        else:
+            return {}
 
 # --- ЭТАП 3: ГЛАВНАЯ ФУНКЦИЯ-ИНИЦИАЛИЗАТОР ---
 def initialize_configs():
@@ -1111,6 +1268,16 @@ def initialize_configs():
     _INTERNAL_PROMPTS = _load_internal_prompts()
     _DYNAMIC_PROVIDER_MODELS = {}
     _DYNAMIC_PROVIDER_MODELS_TS = {}
+    
+    try:
+        from gemini_translator.utils.settings import SettingsManager
+        sm = SettingsManager()
+        _DYNAMIC_PROVIDER_MODELS.update(sm.get_dynamic_provider_models())
+        now = __import__('time').time()
+        for k in _DYNAMIC_PROVIDER_MODELS.keys():
+            _DYNAMIC_PROVIDER_MODELS_TS[k] = now
+    except Exception as e:
+        print(f"[CONFIG WARNING] Не удалось загрузить динамические модели: {e}")
 
     _API_PROVIDERS['dry_run'] = {
         "display_name": "Пробный запуск",
@@ -1189,17 +1356,28 @@ def all_models():
     _ensure_configs_initialized()
     return _build_all_models(api_providers())
 
-def ensure_dynamic_provider_models(provider_id: str | None, force: bool = False):
+def ensure_dynamic_provider_models(provider_id: str | None, force: bool = False, api_key: str | None = None):
     _ensure_configs_initialized()
     normalized_provider = str(provider_id or "").strip()
-    if normalized_provider and _provider_uses_dynamic_model_discovery(normalized_provider):
-        _refresh_dynamic_provider_models(normalized_provider, force=force)
+    if normalized_provider and _provider_uses_dynamic_model_discovery(normalized_provider, force=force):
+        _refresh_dynamic_provider_models(normalized_provider, force=force, api_key=api_key)
     if normalized_provider:
         return api_providers().get(normalized_provider, {})
     return api_providers()
 
-def refresh_dynamic_models(provider_id: str | None = None):
-    return ensure_dynamic_provider_models(provider_id, force=True)
+def ensure_dynamic_provider_models_async(provider_id: str | None, force: bool = False, api_key: str | None = None):
+    _ensure_configs_initialized()
+    normalized_provider = str(provider_id or "").strip()
+    if normalized_provider and _provider_uses_dynamic_model_discovery(normalized_provider, force=force):
+        def _fetch_task():
+            _refresh_dynamic_provider_models(normalized_provider, force=force, api_key=api_key)
+        threading.Thread(target=_fetch_task, daemon=True).start()
+    if normalized_provider:
+        return api_providers().get(normalized_provider, {})
+    return api_providers()
+
+def refresh_dynamic_models(provider_id: str | None = None, api_key: str | None = None):
+    return ensure_dynamic_provider_models(provider_id, force=True, api_key=api_key)
 
 def provider_display_map():
     _ensure_configs_initialized()

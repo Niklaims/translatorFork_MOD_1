@@ -413,7 +413,7 @@ class ModelSettingsWidget(QGroupBox):
         self._uses_broadcast_subscription = False
         self._provider_event_source_id = None
         # Виджету интересна только смена провайдера; не будимся на чужие события.
-        self._event_topics = ('provider_changed',)
+        self._event_topics = ('provider_changed', 'dynamic_models_updated')
         self._connect_to_bus()
 
         self.system_instruction_editor_dialog = SystemInstructionEditorDialog(self.settings_manager, self)
@@ -491,16 +491,7 @@ class ModelSettingsWidget(QGroupBox):
         )
         self.model_combo.view().setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
         left_layout.addWidget(self.model_combo, 0, 1)
-        self.refresh_models_btn = QPushButton("↻")
-        self.refresh_models_btn.setFixedWidth(34)
-        self.refresh_models_btn.setToolTip("Обновить список моделей от локального сервера.")
-        self.refresh_models_btn.clicked.connect(self._refresh_current_provider_models)
-        self.refresh_models_btn.setVisible(False)
-        left_layout.addWidget(self.refresh_models_btn, 0, 2)
-        self.add_custom_model_btn = QPushButton("+ своя")
-        self.add_custom_model_btn.setToolTip("Добавить модель в текущий сервис.")
-        self.add_custom_model_btn.clicked.connect(self._open_custom_model_dialog)
-        left_layout.addWidget(self.add_custom_model_btn, 0, 3)
+        # Кнопки "Обновить" и "+ своя" перенесены во вкладку Приложение -> Провайдер
         self.free_deepseek_tools_btn = QPushButton("DeepSeek")
         self.free_deepseek_tools_btn.setToolTip("Вход в DeepSeek и запуск FreeDeepseekAPI без консоли.")
         self.free_deepseek_tools_btn.clicked.connect(self._open_free_deepseek_dialog)
@@ -1077,15 +1068,10 @@ class ModelSettingsWidget(QGroupBox):
         self._current_provider_id = provider_id
         is_workascii = provider_id == "workascii_chatgpt"
         provider_config = api_config.api_providers().get(provider_id, {}) if provider_id else {}
-        is_dynamic_provider = provider_id == "local" or bool(provider_config.get("dynamic_model_discovery"))
         is_free_deepseek = provider_id == FREE_DEEPSEEK_PROVIDER_ID
         self.workascii_group.setVisible(is_workascii)
-        self.refresh_models_btn.setVisible(is_dynamic_provider)
-        self.refresh_models_btn.setEnabled(is_dynamic_provider)
         self.free_deepseek_tools_btn.setVisible(is_free_deepseek)
         self.free_deepseek_tools_btn.setEnabled(is_free_deepseek)
-        can_add_custom_model = bool(provider_id and provider_config)
-        self.add_custom_model_btn.setEnabled(can_add_custom_model)
 
     def _update_model_combo_popup_width(self):
         if not hasattr(self, "model_combo"):
@@ -1152,7 +1138,7 @@ class ModelSettingsWidget(QGroupBox):
             'segment_cjk_text': self.segment_text_checkbox.isChecked(),
             'fuzzy_threshold': self.fuzzy_threshold_spin.value(),
             'rpm_limit': self.rpm_spin.value(),
-            'rpd_limit': self.rpd_spin.value(), # <-- Добавлено поле RPD
+            'rpd_limit': self.rpd_spin.value(),
             'temperature': self.temperature_spin.value(),
             'temperature_override_enabled': self.temperature_override_checkbox.isChecked(),
             'use_system_instruction': self.system_instruction_checkbox.isChecked(),
@@ -1207,7 +1193,7 @@ class ModelSettingsWidget(QGroupBox):
                     self.model_combo.setCurrentIndex(0)
             
             self.rpm_spin.setValue(settings.get('rpm_limit', 10))
-            self.rpd_spin.setValue(settings.get('rpd_limit', 0)) # <-- Восстановление RPD
+            self.rpd_spin.setValue(settings.get('rpd_limit', 0))
             self.max_concurrent_spin.setValue(settings.get('max_concurrent_requests') or 0)
             
             
@@ -1304,6 +1290,12 @@ class ModelSettingsWidget(QGroupBox):
             provider_id = data.get('provider_id')
             if provider_id:
                 self.set_available_models(provider_id)
+        elif event.get('event') == 'dynamic_models_updated':
+            data = event.get('data', {}) or {}
+            updated_provider_id = data.get('provider_id')
+            current_provider_id = getattr(self, '_current_provider_id', None)
+            if updated_provider_id and updated_provider_id == current_provider_id:
+                self.set_available_models(updated_provider_id, fetch_async=False)
 
     def _connect_to_bus(self):
         if hasattr(self.bus, "subscribe"):
@@ -1339,7 +1331,6 @@ class ModelSettingsWidget(QGroupBox):
         if not provider_id:
             return
 
-        api_config.refresh_dynamic_models(provider_id)
         self.set_available_models(provider_id)
         self._emit_settings_changed()
     
@@ -1416,7 +1407,7 @@ class ModelSettingsWidget(QGroupBox):
         self._emit_settings_changed()
 
     @pyqtSlot(str) # <-- Делаем его слотом
-    def set_available_models(self, provider_id: str): # <-- Теперь принимает ID
+    def set_available_models(self, provider_id: str, fetch_async: bool = True): # <-- Теперь принимает ID и fetch_async
         """Обновляет список доступных моделей на основе ID провайдера."""
         current_model_name = self.model_combo.currentText()
         current_model_id = self.model_combo.currentData()
@@ -1436,13 +1427,22 @@ class ModelSettingsWidget(QGroupBox):
         self._update_provider_specific_controls(provider_id)
         
         if provider_id:
-            api_config.ensure_dynamic_provider_models(provider_id)
+            if fetch_async:
+                api_config.ensure_dynamic_provider_models_async(provider_id)
+            else:
+                api_config.ensure_dynamic_provider_models(provider_id)
             provider_config = api_config.api_providers().get(provider_id, {})
             models = provider_config.get("models", {})
             if models:
+                active_models = []
+                if hasattr(self.settings_manager, 'get_active_models_for_provider'):
+                    active_models = self.settings_manager.get_active_models_for_provider(provider_id)
+                if active_models is None:
+                    active_models = list(models.keys())
                 # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Сохраняем ID в userData ---
                 for display_name, config in models.items():
-                    self.model_combo.addItem(display_name, userData=config.get('id'))
+                    if display_name in active_models:
+                        self.model_combo.addItem(display_name, userData=config.get('id'))
         self._update_model_combo_popup_width()
         
         if self.model_combo.count() > 0:

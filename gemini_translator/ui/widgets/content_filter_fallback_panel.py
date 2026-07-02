@@ -1,5 +1,5 @@
 from PyQt6 import QtWidgets
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, pyqtSlot
 
 from gemini_translator.api import config as api_config
 from gemini_translator.core.worker_helpers.content_filter_fallback import (
@@ -84,6 +84,21 @@ class ContentFilterFallbackPanel(QtWidgets.QGroupBox):
         self.thinking_budget_spin.valueChanged.connect(self._on_interactive_change)
         self.thinking_level_combo.currentTextChanged.connect(self._on_interactive_change)
 
+        app = QtWidgets.QApplication.instance()
+        if app and hasattr(app, 'event_bus'):
+            if hasattr(app.event_bus, "subscribe"):
+                app.event_bus.subscribe('dynamic_models_updated', self.on_event)
+            elif hasattr(app.event_bus, "event_posted"):
+                app.event_bus.event_posted.connect(self.on_event)
+
+    @pyqtSlot(dict)
+    def on_event(self, event: dict):
+        if event.get('event') == 'dynamic_models_updated':
+            data = event.get('data', {}) or {}
+            updated_provider_id = data.get('provider_id')
+            if updated_provider_id and updated_provider_id == self.provider_combo.currentData():
+                self._reload_models()
+
     def _on_interactive_change(self, *args):
         self._update_enabled_state()
         self._emit_config_changed()
@@ -121,7 +136,7 @@ class ContentFilterFallbackPanel(QtWidgets.QGroupBox):
         provider_id = self.provider_combo.currentData()
         if provider_id:
             try:
-                api_config.ensure_dynamic_provider_models(provider_id)
+                api_config.ensure_dynamic_provider_models_async(provider_id)
             except Exception:
                 pass
         self._reload_models()
@@ -270,7 +285,7 @@ class ContentFilterFallbackPanel(QtWidgets.QGroupBox):
                 if index != -1:
                     self.provider_combo.setCurrentIndex(index)
                     try:
-                        api_config.ensure_dynamic_provider_models(provider_id)
+                        api_config.ensure_dynamic_provider_models_async(provider_id)
                     except Exception:
                         pass
 
