@@ -71,6 +71,19 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         self.system_instruction = None
         self.media_map = {}
 
+    def _truncate_sequential_reference(self, reference_text, reference_label="previous reference"):
+        if (
+            self.sequential_reference_char_limit
+            and reference_text
+            and len(reference_text) > self.sequential_reference_char_limit
+        ):
+            omitted = len(reference_text) - self.sequential_reference_char_limit
+            reference_text = (
+                reference_text[-self.sequential_reference_char_limit:]
+                + f"\n\n[{reference_label} truncated: {omitted} chars omitted from the beginning]"
+            )
+        return reference_text
+
     def _effective_translation_prompt(self):
         if self.sequential_mode:
             return api_config.default_sequential_prompt()
@@ -147,12 +160,10 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         except OSError:
             return ""
 
-        if self.sequential_reference_char_limit and len(reference_text) > self.sequential_reference_char_limit:
-            omitted = len(reference_text) - self.sequential_reference_char_limit
-            reference_text = (
-                reference_text[-self.sequential_reference_char_limit:]
-                + f"\n\n[previous chapter reference truncated: {omitted} chars omitted from the beginning]"
-            )
+        reference_text = self._truncate_sequential_reference(
+            reference_text,
+            "previous chapter reference",
+        )
 
         return f"Previous translated chapter: {previous_chapter_path}\n\n{reference_text}"
 
@@ -428,7 +439,14 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         )
         return user_prompt, self.system_instruction, debug_report, original_contents
 
-    def prepare_json_for_api(self, document_model, raw_source_text, system_instruction_text, current_chapters_list=None):
+    def prepare_json_for_api(
+        self,
+        document_model,
+        raw_source_text,
+        system_instruction_text,
+        current_chapters_list=None,
+        previous_chapter_reference=None,
+    ):
         glossary_string = self.context_manager.format_glossary_for_prompt(
             text_content=raw_source_text,
             current_chapters_list=current_chapters_list
@@ -437,7 +455,9 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         transport_payload = build_transport_payload(source_payload)
         payload_text = json.dumps(transport_payload, ensure_ascii=False, indent=2)
         base_text_for_api = f"\n```json\n{payload_text}\n```\n"
-        previous_reference = self._build_previous_chapter_reference(current_chapters_list)
+        previous_reference = previous_chapter_reference
+        if previous_reference is None:
+            previous_reference = self._build_previous_chapter_reference(current_chapters_list)
         user_prompt, _, debug_report = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,
@@ -447,7 +467,14 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         debug_report = f"{debug_report}\nTRANSPORT: JSON"
         return f"{user_prompt}\n\n{self.JSON_CONTRACT}", self.system_instruction, debug_report, source_payload
 
-    def prepare_json_batch_for_api(self, documents_payload, raw_source_text, system_instruction_text, current_chapters_list=None):
+    def prepare_json_batch_for_api(
+        self,
+        documents_payload,
+        raw_source_text,
+        system_instruction_text,
+        current_chapters_list=None,
+        previous_chapter_reference=None,
+    ):
         glossary_string = self.context_manager.format_glossary_for_prompt(
             text_content=raw_source_text,
             current_chapters_list=current_chapters_list
@@ -455,7 +482,9 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         payload = build_batch_translation_payload(documents_payload)
         payload_text = json.dumps(payload, ensure_ascii=False, indent=2)
         base_text_for_api = f"\n```json\n{payload_text}\n```\n"
-        previous_reference = self._build_previous_chapter_reference(current_chapters_list)
+        previous_reference = previous_chapter_reference
+        if previous_reference is None:
+            previous_reference = self._build_previous_chapter_reference(current_chapters_list)
         user_prompt, _, debug_report = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,
@@ -466,7 +495,14 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         debug_report = f"{debug_report}\nTRANSPORT: JSON_BATCH"
         return f"{user_prompt}\n\n{self.JSON_BATCH_CONTRACT}", self.system_instruction, debug_report, payload
         
-    def prepare_for_api(self, text_content, system_instruction_text, completion_data=None, current_chapters_list=None):
+    def prepare_for_api(
+        self,
+        text_content,
+        system_instruction_text,
+        completion_data=None,
+        current_chapters_list=None,
+        previous_chapter_reference=None,
+    ):
         """
         Готовит промпт. Версия 3.0: Корректно поддерживает режим завершения,
         сохраняя оригинальный промпт.
@@ -490,7 +526,9 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         # --- Собираем ОСНОВНУЮ часть промпта ---
         # Эта часть будет одинаковой и для первого, и для второго запуска
         base_text_for_api = f"\n```html\n{prettified_content}\n```\n"
-        previous_reference = self._build_previous_chapter_reference(current_chapters_list)
+        previous_reference = previous_chapter_reference
+        if previous_reference is None:
+            previous_reference = self._build_previous_chapter_reference(current_chapters_list)
         user_prompt_base, _, _ = self._build_with_placeholders(
             base_text_for_api,
             glossary_string,

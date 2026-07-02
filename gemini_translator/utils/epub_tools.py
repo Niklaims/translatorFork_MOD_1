@@ -163,6 +163,9 @@ def _leading_same_level_heading_sequence(soup):
             continue
 
         child_name = str(getattr(child, "name", "") or "").lower()
+        if not sequence and _is_ignorable_leading_media_block(child):
+            continue
+
         if child_name not in {"h2", "h3"}:
             break
 
@@ -179,6 +182,21 @@ def _leading_same_level_heading_sequence(soup):
 def _combine_heading_sequence_text(headings):
     parts = [extract_epub_heading_text(heading) for heading in headings]
     return _normalize_epub_heading_text(" ".join(part for part in parts if part))
+
+
+def _is_ignorable_leading_media_block(tag):
+    tag_name = str(getattr(tag, "name", "") or "").lower()
+    if tag_name not in {"p", "div", "figure"}:
+        return False
+
+    if tag.get_text(" ", strip=True):
+        return False
+
+    allowed_tags = {"br", "hr", "img", "svg", "picture", "source"}
+    for descendant in tag.find_all(True):
+        if str(descendant.name or "").lower() not in allowed_tags:
+            return False
+    return True
 
 
 def _replace_heading_sequence_with_h1(soup, headings, title):

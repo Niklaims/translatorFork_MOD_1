@@ -43,13 +43,57 @@ class EpubChunkProcessor(BaseTaskProcessor):
     def _normalize_body_wrapper(self, original_html: str, translated_html: str):
         return coerce_translated_body_block(original_html, translated_html)
 
-    async def _execute_json_chunk_pipeline(self, task_info, chapter_path, content_to_translate_for_api, log_prefix, use_stream, chunk_index, total_chunks, is_retry):
+    def _build_sequential_reference(self, task_info, chapter_path, chunk_index, total_chunks):
+        prompt_builder = getattr(self.worker, "prompt_builder", None)
+        if not prompt_builder or not getattr(prompt_builder, "sequential_mode", False):
+            return None
+
+        try:
+            chunk_index = int(chunk_index)
+        except (TypeError, ValueError):
+            return prompt_builder._build_previous_chapter_reference([chapter_path])
+
+        if chunk_index <= 0:
+            return prompt_builder._build_previous_chapter_reference([chapter_path])
+
+        previous_translation = ""
+        task_manager = getattr(self.worker, "task_manager", None)
+        if task_manager and hasattr(task_manager, "get_completed_previous_chunk_translation"):
+            try:
+                previous_translation = task_manager.get_completed_previous_chunk_translation(
+                    current_task_id=task_info[0] if task_info else None,
+                    chapter_path=chapter_path,
+                    chunk_index=chunk_index,
+                )
+            except Exception:
+                previous_translation = ""
+
+        previous_chunk_number = chunk_index
+        if not previous_translation:
+            return (
+                "PREVIOUS TRANSLATED CHUNK NOT AVAILABLE YET: "
+                f"{chapter_path} [{previous_chunk_number}/{total_chunks}]"
+            )
+
+        if hasattr(prompt_builder, "_truncate_sequential_reference"):
+            previous_translation = prompt_builder._truncate_sequential_reference(
+                previous_translation,
+                "previous chunk reference",
+            )
+
+        return (
+            f"Previous translated chunk: {chapter_path} "
+            f"[{previous_chunk_number}/{total_chunks}]\n\n{previous_translation}"
+        )
+
+    async def _execute_json_chunk_pipeline(self, task_info, chapter_path, content_to_translate_for_api, log_prefix, use_stream, chunk_index, total_chunks, is_retry, previous_reference=None):
         document_model = build_html_document_model(content_to_translate_for_api, document_id=chapter_path)
         user_prompt, _, _, source_payload = self.worker.prompt_builder.prepare_json_for_api(
             document_model=document_model,
             raw_source_text=content_to_translate_for_api,
             system_instruction_text=self.worker.system_instruction,
-            current_chapters_list=[chapter_path]
+            current_chapters_list=[chapter_path],
+            previous_chapter_reference=previous_reference,
         )
         operation_context = self._build_operation_context(
             task_info,
@@ -101,6 +145,13 @@ class EpubChunkProcessor(BaseTaskProcessor):
             result_payload = ((task_id, tuple(base_payload)), final_restored_html)
             return result_payload, True, 'SUCCESS', "Пропущено (нет текста, только медиа/теги)"
 
+        previous_reference = self._build_sequential_reference(
+            task_info=task_info,
+            chapter_path=chapter_path,
+            chunk_index=chunk_index,
+            total_chunks=total_chunks,
+        )
+
         use_json_pipeline = self._should_use_json_epub_pipeline() and not partial_translation
         if use_json_pipeline:
             try:
@@ -113,6 +164,7 @@ class EpubChunkProcessor(BaseTaskProcessor):
                     chunk_index=chunk_index,
                     total_chunks=total_chunks,
                     is_retry=is_retry,
+                    previous_reference=previous_reference,
                 )
                 if not getattr(self.worker, "force_accept", False):
                     original_chunk_with_placeholders = self.worker.prompt_builder._replace_media_with_placeholders(content_to_translate_for_api)
@@ -160,7 +212,8 @@ class EpubChunkProcessor(BaseTaskProcessor):
             text_content=content_to_translate_for_api,
             system_instruction_text=self.worker.system_instruction,
             completion_data=completion_data,
-            current_chapters_list=[chapter_path]
+            current_chapters_list=[chapter_path],
+            previous_chapter_reference=previous_reference,
         )
 
         newly_generated_part_raw = ""
