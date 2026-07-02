@@ -68,6 +68,7 @@ class _ToolCard(QtWidgets.QFrame):
         super().__init__(parent)
         self.setObjectName("toolHeroCard" if is_large else "toolCard")
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
 
         row = QtWidgets.QHBoxLayout(self)
         row.setContentsMargins(14, 13, 14, 13)

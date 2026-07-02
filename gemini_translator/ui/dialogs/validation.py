@@ -2805,6 +2805,7 @@ class TranslationValidatorPage(ShellPage):
         self.table_results = QTableWidget()
         self.table_results.setAlternatingRowColors(True)
         self.table_results.setMinimumHeight(180)
+        self.table_results.verticalHeader().setDefaultSectionSize(39)
         self.table_results.setItemDelegateForColumn(0, ChapterStatusDelegate(self.table_results))
         self.table_results.setColumnCount(4); self.table_results.setHorizontalHeaderLabels(["Исходный файл в EPUB", "Проблемы", "Длина (Ориг|Перевод)", "Статус"])
         

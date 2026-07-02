@@ -141,6 +141,7 @@ class ProjectPathsWidget(QWidget):
 
         self.stats_card = QFrame(self.header_card)
         self.stats_card.setObjectName("projectStatsCard")
+        self.stats_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         stats_layout = QVBoxLayout(self.stats_card)
         stats_layout.setContentsMargins(11, 9, 11, 9)
         stats_layout.setSpacing(5)
@@ -157,6 +158,8 @@ class ProjectPathsWidget(QWidget):
         self.chapters_meta_label.setObjectName("mutedLabel")
         self.chapters_meta_label.setWordWrap(True)
         stats_layout.addWidget(self.chapters_meta_label)
+        
+        stats_layout.addStretch(1)
 
         self.chapters_info_btn = QPushButton("Выбрать главы")
         self.chapters_info_btn.setObjectName("pathActionButton")
@@ -170,7 +173,6 @@ class ProjectPathsWidget(QWidget):
         )
         self.btn_swap_file.clicked.connect(self.swap_file_requested.emit)
         stats_layout.addWidget(self.btn_swap_file)
-        stats_layout.addStretch(1)
 
         cards_row.addWidget(self.file_card, 4)
         cards_row.addWidget(self.folder_card, 4)
@@ -203,6 +205,7 @@ class ProjectPathsWidget(QWidget):
     def _create_path_card(self, title, empty_value, empty_detail, button_text, slot):
         card = QFrame(self.header_card)
         card.setObjectName("projectPathCard")
+        card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         layout = QVBoxLayout(card)
         layout.setContentsMargins(11, 9, 11, 9)

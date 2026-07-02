@@ -6778,15 +6778,13 @@ class InitialSetupPage(ShellPage):
             project_settings_path = os.path.join(self.output_folder, "project_settings.json")
             if os.path.exists(project_settings_path):
                 print(f"[INFO] Найдены настройки проекта. Автоматическое переключение на локальный режим.")
-                self.use_project_settings_btn.blockSignals(True)
-                self.use_project_settings_btn.setChecked(True)
-                self.use_project_settings_btn.blockSignals(False)
+                with QtCore.QSignalBlocker(self.use_project_settings_btn):
+                    self.use_project_settings_btn.setChecked(True)
                 self._toggle_project_settings_mode(True)
             else:
                 print(f"[INFO] Настроек проекта нет. Включение глобального режима.")
-                self.use_project_settings_btn.blockSignals(True)
-                self.use_project_settings_btn.setChecked(False)
-                self.use_project_settings_btn.blockSignals(False)
+                with QtCore.QSignalBlocker(self.use_project_settings_btn):
+                    self.use_project_settings_btn.setChecked(False)
                 self._toggle_project_settings_mode(False)
 
             self.current_project_folder_loaded = self.output_folder

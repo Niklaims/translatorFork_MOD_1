@@ -2317,14 +2317,10 @@ def _selector_exists(page, selector: str) -> bool:
 
 def _wait_for_selector_attached(page, selector: str, timeout: int = 15000) -> bool:
     try:
-        page.wait_for_selector(selector, state="attached", timeout=timeout)
+        page.wait_for_selector(selector, state="attached", timeout=timeout, strict=False)
         return True
     except Exception:
-        try:
-            page.locator(selector).first().wait_for(state="attached", timeout=timeout)
-            return True
-        except Exception:
-            return False
+        return False
 
 
 def _select_first_plain_choice(page, selector: str) -> bool:

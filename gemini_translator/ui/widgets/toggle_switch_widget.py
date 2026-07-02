@@ -19,6 +19,18 @@ class ToggleSwitchWidget(QWidget):
         self.animation.setDuration(200)
         
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_colors_cache()
+
+    def _update_colors_cache(self):
+        self._bg_color_off = QColor(theme_manager.color("input_bg"))
+        self._bg_color_on = QColor(theme_manager.color("accent"))
+        self._border_color = QColor(theme_manager.color("border_strong"))
+        self._handle_color_on = QColor(theme_manager.color("text_primary"))
+        self._handle_color_off = QColor(theme_manager.color("text_secondary"))
+
+    def showEvent(self, event):
+        self._update_colors_cache()
+        super().showEvent(event)
 
     @pyqtProperty(float)
     def position(self):
@@ -50,8 +62,8 @@ class ToggleSwitchWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Вычисление цветов в зависимости от позиции анимации (0.0 -> 1.0)
-        bg_color_off = QColor(theme_manager.color("input_bg"))
-        bg_color_on = QColor(theme_manager.color("accent"))
+        bg_color_off = self._bg_color_off
+        bg_color_on = self._bg_color_on
         
         # Линейная интерполяция
         r = bg_color_off.red() + (bg_color_on.red() - bg_color_off.red()) * self._position
@@ -71,8 +83,7 @@ class ToggleSwitchWidget(QWidget):
         
         # Отрисовка бордера, если выключено (для контраста)
         if self._position < 1.0:
-            border_color = QColor(theme_manager.color("border_strong"))
-            border_pen = QPen(border_color, 1)
+            border_pen = QPen(self._border_color, 1)
             painter.setPen(border_pen)
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawPath(path)
@@ -86,7 +97,7 @@ class ToggleSwitchWidget(QWidget):
         handle_x = start_x + (end_x - start_x) * self._position
         handle_y = self.height() / 2
         
-        handle_color = QColor(theme_manager.color("text_primary")) if self._position > 0.5 else QColor(theme_manager.color("text_secondary"))
+        handle_color = self._handle_color_on if self._position > 0.5 else self._handle_color_off
         
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(handle_color)

@@ -38,6 +38,8 @@ from gemini_translator.ui.themes import (
 )
 from gemini_translator.ui import theme_manager
 
+RESTART_INFO = {}
+
 # ---------------------------------------------------------------------------
 # Gemini EPUB Translator - Точка входа в приложение
 

@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QToolBar, QSlider,
     QSizePolicy, QCheckBox, QMenu, QComboBox, QSpinBox, QDoubleSpinBox,
     QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit,
-    QSystemTrayIcon
+    QSystemTrayIcon, QGridLayout, QGroupBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings
 from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QTextBlockFormat, QDragEnterEvent, QDropEvent, QIcon
@@ -5954,7 +5954,8 @@ class MainWindow(QMainWindow):
         # Контролы
         controls_split = QHBoxLayout()
         controls_split.setSpacing(12)
-        workflow_controls = QVBoxLayout()
+        workflow_group = QGroupBox("Настройки генерации и перевода")
+        workflow_controls = QVBoxLayout(workflow_group)
         workflow_controls.setSpacing(8)
         top_controls = QHBoxLayout()
         middle_controls = QHBoxLayout()
@@ -6144,12 +6145,11 @@ class MainWindow(QMainWindow):
         workflow_controls.addLayout(script_controls)
         workflow_controls.addLayout(option_controls)
 
-        actions_panel_widget = QWidget()
-        actions_panel_widget.setMinimumWidth(210)
-        actions_panel_widget.setMaximumWidth(230)
-        actions_panel = QVBoxLayout(actions_panel_widget)
-        actions_panel.setContentsMargins(0, 0, 0, 0)
-        actions_panel.setSpacing(6)
+        actions_group = QGroupBox("Управление проектом")
+        actions_group.setMinimumWidth(210)
+        actions_group.setMaximumWidth(230)
+        actions_panel = QVBoxLayout(actions_group)
+        actions_panel.setSpacing(8)
 
         lbl_project_actions = QLabel("Проект")
         actions_panel.addWidget(lbl_project_actions)
@@ -6224,8 +6224,9 @@ class MainWindow(QMainWindow):
         actions_panel.addWidget(self.btn_export_video)
         actions_panel.addStretch(1)
 
-        controls_split.addLayout(workflow_controls, 1)
-        controls_split.addWidget(actions_panel_widget, 0)
+        controls_split.addWidget(workflow_group, 1)
+        controls_split.addWidget(actions_group, 0)
+        controls_split.setAlignment(Qt.AlignmentFlag.AlignTop)
         main_layout.addLayout(controls_split)
 
         self._on_engine_changed()

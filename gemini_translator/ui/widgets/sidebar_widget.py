@@ -1,4 +1,3 @@
-import os
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QSpacerItem, QSizePolicy, QFrame
 from PyQt6.QtCore import pyqtSignal, QPropertyAnimation
@@ -21,7 +20,7 @@ class SidebarWidget(QFrame):
         self.setFixedWidth(150)
         
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 5, 2, 5)
+        layout.setContentsMargins(2, 8, 2, 5)
         layout.setSpacing(2)
         
         # Заголовок
