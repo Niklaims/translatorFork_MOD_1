@@ -151,6 +151,35 @@ def test_rulate_worker_applies_full_site_titles_to_downloaded_chapters():
     assert chapters[1].title == "Второе длинное необрезанное название главы с сайта Rulate"
 
 
+def test_rulate_worker_infers_next_volume_when_numbers_restart():
+    worker = RulateDownloadWorker("https://tl.rulate.ru/book/1", "1")
+    infos = [
+        {"id": "101", "title": "Chapter 1 Start", "number": 1.0, "downloadable": True},
+        {"id": "102", "title": "Chapter 2 Middle", "number": 2.0, "downloadable": True},
+        {"id": "201", "title": "Chapter 1 Reset", "number": 1.0, "downloadable": True},
+        {"id": "202", "title": "Chapter 2 Continue", "number": 2.0, "downloadable": True},
+    ]
+
+    annotated = worker._annotate_chapter_infos(infos)
+
+    assert [chapter["volume"] for chapter in annotated] == ["1", "1", "2", "2"]
+    assert [chapter["number"] for chapter in annotated] == [1.0, 2.0, 1.0, 2.0]
+
+
+def test_rulate_worker_applies_inferred_volume_to_downloaded_chapter():
+    worker = RulateDownloadWorker("https://tl.rulate.ru/book/1", "1")
+    chapter = ChapterData("1", 1.0, "Short", "text")
+
+    worker._apply_chapter_info(
+        chapter,
+        {"title": "Chapter 1 Site title", "number": 1.0, "volume": "2"},
+    )
+
+    assert chapter.volume == "2"
+    assert chapter.number == 1.0
+    assert chapter.title == "Site title"
+
+
 def test_rulate_to_ranobelib_uses_qidian_rulate_cookie_profile():
     if "QIDIAN_RULATE_PROFILE_DIR" not in os.environ:
         assert ".qidian_rulate_creator" in str(QIDIAN_RULATE_PROFILE_DIR)

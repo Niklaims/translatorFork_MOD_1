@@ -25,6 +25,12 @@ from constants import (
     RUS_MONTHS,
     SELECTORS,
 )
+from api_upload import (
+    fetch_existing_chapters,
+    latest_existing_chapter,
+    _extract_slug_from_url,
+    _safe_float,
+)
 from models import ChapterData
 from parsers import FileParser
 from utils import format_num, format_timedelta, parse_vol_and_chapter
@@ -1251,6 +1257,7 @@ class RulateDownloadWorker(QThread):
 
                 self.log("INFO", f"Rulate: найдено {len(chapters_info)} глав "
                          f"({sum(1 for c in chapters_info if c['downloadable'])} доступно для скачивания)")
+                chapters_info = self._annotate_chapter_infos(chapters_info)
                 self.chapter_list_ready.emit(chapters_info)
 
         except Exception as e:
@@ -1268,6 +1275,80 @@ class RulateDownloadWorker(QThread):
         except (TypeError, ValueError):
             return 0
         return int(value) if value > 0 else 0
+
+    @staticmethod
+    def _number_key(number) -> str:
+        try:
+            return format_num(float(number))
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _next_volume_value(volume) -> str:
+        text = str(volume or "1").strip() or "1"
+        try:
+            numeric = float(text.replace(",", "."))
+            if numeric == int(numeric):
+                return str(int(numeric) + 1)
+        except (TypeError, ValueError):
+            pass
+
+        match = re.search(r"(\d+)(?!.*\d)", text)
+        if not match:
+            return text
+        next_number = str(int(match.group(1)) + 1)
+        return text[: match.start(1)] + next_number + text[match.end(1) :]
+
+    @staticmethod
+    def _should_start_next_volume(number: float, previous_number: float, seen_numbers: set[str]) -> bool:
+        if number <= 0:
+            return False
+        number_key = RulateDownloadWorker._number_key(number)
+        if number_key and number_key in seen_numbers:
+            return True
+
+        base = int(number)
+        return previous_number >= 10 and base <= 3 and number < previous_number
+
+    def _annotate_chapter_infos(self, infos: list[dict]) -> list[dict]:
+        current_volume = str(self.default_vol or "1").strip() or "1"
+        seen_numbers: set[str] = set()
+        previous_number = 0.0
+        annotated: list[dict] = []
+
+        for index, raw_info in enumerate(infos or [], start=1):
+            info = dict(raw_info or {})
+            title = info.get("title", "")
+            parsed_volume, parsed_number, _clean_title, _num_found = parse_vol_and_chapter(
+                title, current_volume, index
+            )
+
+            try:
+                number = float(info.get("number") or parsed_number or 0)
+            except (TypeError, ValueError):
+                number = float(parsed_number or 0)
+
+            parsed_volume = str(parsed_volume or current_volume)
+            if parsed_volume != current_volume:
+                current_volume = parsed_volume
+                seen_numbers.clear()
+                previous_number = 0.0
+            elif self._should_start_next_volume(number, previous_number, seen_numbers):
+                current_volume = self._next_volume_value(current_volume)
+                seen_numbers.clear()
+                previous_number = 0.0
+
+            info["volume"] = current_volume
+            info["number"] = number
+            info["order"] = index
+
+            number_key = self._number_key(number)
+            if number_key:
+                seen_numbers.add(number_key)
+                previous_number = number
+            annotated.append(info)
+
+        return annotated
 
     def _should_download_individually(self) -> bool:
         if not self.chapter_infos or len(self.chapter_ids or []) <= 1:
@@ -1300,6 +1381,8 @@ class RulateDownloadWorker(QThread):
         vol, number, clean_title, num_found = parse_vol_and_chapter(
             title, self.default_vol, fallback
         )
+        if info.get("volume") is not None:
+            vol = str(info.get("volume") or self.default_vol)
         if info.get("number"):
             try:
                 number = float(info["number"])
@@ -2731,6 +2814,7 @@ class LastChapterDetector(QThread):
     """
     log_signal = pyqtSignal(str, str)
     result_signal = pyqtSignal(float, str)  # (номер_главы, описание)
+    existing_chapters_signal = pyqtSignal(list)
     finished_signal = pyqtSignal()
 
     def __init__(self, ranobelib_url: str):
@@ -2751,6 +2835,29 @@ class LastChapterDetector(QThread):
     def stop(self):
         self.is_running = False
 
+    def _detect_via_api(self) -> tuple[float, str] | None:
+        try:
+            slug = _extract_slug_from_url(self.raw_url)
+            chapters = fetch_existing_chapters(slug)
+        except Exception as error:
+            self.log("WARNING", f"RanobeLib API detector failed, using browser fallback: {error}")
+            return None
+
+        self.existing_chapters_signal.emit(chapters)
+        latest = latest_existing_chapter(chapters)
+        if not latest:
+            self.log("INFO", "RanobeLib API: no existing chapters found.")
+            return 0.0, "API: no chapters"
+
+        number = _safe_float(latest.get("number"))
+        volume = latest.get("volume")
+        description = f"API: T.{volume} Ch.{format_num(number)}"
+        self.log(
+            "SUCCESS",
+            f"RanobeLib API: found {len(chapters)} existing chapters, latest {description}.",
+        )
+        return number, description
+
     def run(self):
         try:
             self._detect()
@@ -2764,6 +2871,11 @@ class LastChapterDetector(QThread):
         self.log("INFO", "Определяю последнюю залитую главу на RanobeLib…")
         last_chapter_num = 0.0
         last_chapter_desc = ""
+
+        api_result = self._detect_via_api()
+        if api_result is not None:
+            self.result_signal.emit(*api_result)
+            return
 
         try:
             with sync_playwright() as p:
