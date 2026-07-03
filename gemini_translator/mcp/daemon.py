@@ -42,6 +42,11 @@ TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 PIPELINE_METADATA_KEYS = {"pipeline_parent", "pipeline_step", "pipeline_index", "pipeline_total"}
 
 
+class _DaemonHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+    block_on_close = False
+
+
 class _HttpError(Exception):
     def __init__(self, status: int, message: str, payload: dict | None = None) -> None:
         super().__init__(message)
@@ -1031,7 +1036,7 @@ class McpDaemon:
                 return
 
             ensure_state_dirs(self.state_dir)
-            self._server = ThreadingHTTPServer((self.host, self.port), self._make_handler())
+            self._server = _DaemonHTTPServer((self.host, self.port), self._make_handler())
             self.host = str(self._server.server_address[0])
             self.port = int(self._server.server_address[1])
             self.started_at = utc_now()

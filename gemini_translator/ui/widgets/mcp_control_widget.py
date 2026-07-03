@@ -117,11 +117,9 @@ _ACTIVE_THREADS: set[QtCore.QThread] = set()
 _ACTIVE_WORKERS: dict[QtCore.QThread, McpActionWorker] = {}
 
 
-def _forget_finished_mcp_workers() -> None:
-    for thread in list(_ACTIVE_THREADS):
-        if not thread.isRunning():
-            _ACTIVE_THREADS.discard(thread)
-            _ACTIVE_WORKERS.pop(thread, None)
+def _forget_mcp_worker(thread: QtCore.QThread) -> None:
+    _ACTIVE_THREADS.discard(thread)
+    _ACTIVE_WORKERS.pop(thread, None)
 
 
 class McpControlWidget(QtWidgets.QFrame):
@@ -139,6 +137,7 @@ class McpControlWidget(QtWidgets.QFrame):
         self._worker = None
         self._worker_action = None
         self._worker_was_running = False
+        self._pending_worker_result = None
         self._closing = False
         self.setObjectName("mcpControlCard")
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Minimum)
@@ -281,13 +280,15 @@ class McpControlWidget(QtWidgets.QFrame):
         worker.finished.connect(thread.quit)
         worker.finished.connect(self._on_worker_finished)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(_forget_finished_mcp_workers)
+        thread.finished.connect(lambda thread=thread: self._on_worker_thread_finished(thread))
+        thread.finished.connect(thread.deleteLater)
         _ACTIVE_THREADS.add(thread)
         _ACTIVE_WORKERS[thread] = worker
         self._worker_thread = thread
         self._worker = worker
         self._worker_action = action
         self._worker_was_running = self._running
+        self._pending_worker_result = None
         self._sync_status_timer()
         thread.start()
 
@@ -295,16 +296,34 @@ class McpControlWidget(QtWidgets.QFrame):
         thread = self._worker_thread
         action = self._worker_action
         was_running = self._worker_was_running
+        self._pending_worker_result = (action, was_running, snapshot)
+        self._worker = None
+        if thread is not None:
+            thread.quit()
+            return
+        self._finish_worker_action(None)
+
+    def _on_worker_thread_finished(self, thread) -> None:
+        if thread is not self._worker_thread:
+            _forget_mcp_worker(thread)
+            return
+        self._finish_worker_action(thread)
+
+    def _finish_worker_action(self, thread) -> None:
+        result = self._pending_worker_result
         self._worker_thread = None
         self._worker = None
         self._worker_action = None
         self._worker_was_running = False
-        if not self._closing:
+        self._pending_worker_result = None
+        if thread is not None:
+            _forget_mcp_worker(thread)
+        if result is not None and not self._closing:
+            action, was_running, snapshot = result
             self.apply_status(snapshot)
             self._update_stop_on_quit_policy(action, was_running, snapshot)
         self.action_button.setEnabled(True)
-        if thread is not None:
-            thread.quit()
+        self._sync_status_timer()
 
     def _wait_for_worker(self) -> None:
         thread = self._worker_thread
@@ -319,11 +338,12 @@ class McpControlWidget(QtWidgets.QFrame):
         if thread.isRunning():
             thread.quit()
             thread.wait()
-        _forget_finished_mcp_workers()
+        _forget_mcp_worker(thread)
         self._worker_thread = None
         self._worker = None
         self._worker_action = None
         self._worker_was_running = False
+        self._pending_worker_result = None
         self.action_button.setEnabled(True)
         self._sync_status_timer()
 

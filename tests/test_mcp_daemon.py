@@ -112,6 +112,22 @@ def test_daemon_info_is_written(tmp_path):
         daemon.stop()
 
 
+def test_daemon_http_server_threads_do_not_block_pytest_shutdown(tmp_path):
+    from gemini_translator.mcp import daemon as daemon_module
+
+    server_class = getattr(daemon_module, "_DaemonHTTPServer", None)
+    assert server_class is not None
+    assert server_class.daemon_threads is True
+    assert server_class.block_on_close is False
+
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    try:
+        assert isinstance(daemon._server, server_class)
+    finally:
+        daemon.stop()
+
+
 def test_read_daemon_info_returns_empty_when_missing(tmp_path):
     assert read_daemon_info(tmp_path) == {}
 

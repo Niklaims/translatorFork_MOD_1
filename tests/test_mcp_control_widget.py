@@ -69,6 +69,17 @@ class _BlockingActionBackend(_ActionBackend):
         return McpStatusSnapshot(running=True, detail="127.0.0.1:4567")
 
 
+class _FakeThread:
+    def __init__(self):
+        self.quit_called = False
+
+    def quit(self):
+        self.quit_called = True
+
+    def isRunning(self):
+        return False
+
+
 class McpControlWidgetTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -259,6 +270,21 @@ class McpControlWidgetTests(unittest.TestCase):
         self.assertTrue(widget.action_button.isEnabled())
         self.assertEqual(widget.status_value_label.text(), "Запущен")
         self.assertEqual(widget.detail_label.text(), "127.0.0.1:4567")
+
+    def test_worker_finished_keeps_thread_active_until_qthread_finished(self):
+        widget = McpControlWidget(backend=_FakeBackend())
+        self.addCleanup(widget.close)
+        thread = _FakeThread()
+        widget._worker_thread = thread
+        widget._worker_action = "toggle"
+        widget._worker_was_running = False
+        widget.action_button.setEnabled(False)
+
+        widget._on_worker_finished(McpStatusSnapshot(running=True, detail="127.0.0.1:4567"))
+
+        self.assertTrue(thread.quit_called)
+        self.assertIs(widget._worker_thread, thread)
+        self.assertFalse(widget.action_button.isEnabled())
 
     def test_action_button_dispatches_toggle_without_sync_backend_call(self):
         backend = _ActionBackend()
