@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 import zipfile
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from PyQt6 import QtCore, QtWidgets
 
 from gemini_translator.api import config as api_config
 from gemini_translator.core.task_manager import ChapterQueueManager
+from gemini_translator.core.worker_helpers.taskers.epub_chunk_processor import EpubChunkProcessor
 from gemini_translator.core.translation_engine import normalize_sequential_parallel_settings
 from gemini_translator.core.worker_helpers.prompt_builder import PromptBuilder
 from gemini_translator.utils.epub_tools import TASK_SIZE_UNIT_CHARS
@@ -327,6 +329,83 @@ class SequentialTranslationTests(unittest.TestCase):
             builder._build_previous_chapter_reference(["Text/ch2.xhtml"]),
             "NO PREVIOUS TRANSLATED CHAPTER AVAILABLE.",
         )
+
+    def test_task_manager_returns_previous_completed_chunk_translation(self):
+        manager = ChapterQueueManager(event_bus=self.app.event_bus)
+        self.addCleanup(manager.clear_all_queues)
+        manager.clear_all_queues()
+        with manager._get_write_conn() as conn:
+            conn.execute("DELETE FROM chunk_results")
+
+        chain = [
+            ("epub_chunk", "book.epub", "Text/ch1.xhtml", "<p>one</p>", 0, 2, "", ""),
+            ("epub_chunk", "book.epub", "Text/ch1.xhtml", "<p>two</p>", 1, 2, "", ""),
+        ]
+        manager.set_pending_task_chains([chain])
+
+        first_task = manager.get_next_task("worker-1")
+        manager.task_done_with_content(
+            "worker-1",
+            first_task,
+            "<body><p>translated chunk one</p></body>",
+            "gemini",
+        )
+        second_task = manager.get_next_task("worker-1")
+
+        self.assertEqual(
+            manager.get_completed_previous_chunk_translation(
+                second_task[0],
+                "Text/ch1.xhtml",
+                1,
+            ),
+            "<body><p>translated chunk one</p></body>",
+        )
+
+    def test_epub_chunk_processor_uses_previous_chunk_reference_after_first_chunk(self):
+        manager = ChapterQueueManager(event_bus=self.app.event_bus)
+        self.addCleanup(manager.clear_all_queues)
+        manager.clear_all_queues()
+        with manager._get_write_conn() as conn:
+            conn.execute("DELETE FROM chunk_results")
+
+        chain = [
+            ("epub_chunk", "book.epub", "Text/ch2.xhtml", "<p>one</p>", 0, 2, "", ""),
+            ("epub_chunk", "book.epub", "Text/ch2.xhtml", "<p>two</p>", 1, 2, "", ""),
+        ]
+        manager.set_pending_task_chains([chain])
+        first_task = manager.get_next_task("worker-1")
+        manager.task_done_with_content(
+            "worker-1",
+            first_task,
+            "<body><p>готовый первый чанк</p></body>",
+            "gemini",
+        )
+        second_task = manager.get_next_task("worker-1")
+
+        prompt_builder = PromptBuilder(
+            custom_prompt="CUSTOM {text}",
+            context_manager=None,
+            use_system_instruction=False,
+            sequential_mode=True,
+            project_manager=None,
+            provider_file_suffix="_translated.html",
+            sequential_chapter_order=["Text/ch1.xhtml", "Text/ch2.xhtml"],
+        )
+        processor = EpubChunkProcessor(SimpleNamespace(
+            prompt_builder=prompt_builder,
+            task_manager=manager,
+        ))
+
+        reference = processor._build_sequential_reference(
+            task_info=second_task,
+            chapter_path="Text/ch2.xhtml",
+            chunk_index=1,
+            total_chunks=2,
+        )
+
+        self.assertIn("Previous translated chunk: Text/ch2.xhtml [1/2]", reference)
+        self.assertIn("готовый первый чанк", reference)
+        self.assertNotIn("Previous translated chapter: Text/ch1.xhtml", reference)
 
     def test_task_manager_runs_first_task_of_each_chain_in_parallel_only(self):
         manager = ChapterQueueManager(event_bus=self.app.event_bus)

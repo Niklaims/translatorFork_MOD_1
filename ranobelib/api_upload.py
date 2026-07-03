@@ -290,6 +290,39 @@ def _chapter_identity(volume, number) -> str:
     return f"{volume}:{format_num(_safe_float(number))}"
 
 
+def chapter_identity(volume, number) -> str:
+    return _chapter_identity(volume, number)
+
+
+def existing_chapter_identities(chapters: list[dict]) -> set[str]:
+    return {
+        _chapter_identity(chapter.get("volume"), chapter.get("number"))
+        for chapter in chapters or []
+    }
+
+
+def _volume_order_key(value) -> tuple[int, float, str]:
+    text = str(value or "").strip()
+    numeric = _safe_float(text, None)
+    if numeric is not None:
+        return 0, numeric, ""
+    return 1, 0.0, text.lower()
+
+
+def _existing_chapter_order_key(chapter: dict) -> tuple:
+    return (
+        _volume_order_key(chapter.get("volume")),
+        _safe_float(chapter.get("number")),
+        _safe_int(chapter.get("id"), 0),
+    )
+
+
+def latest_existing_chapter(chapters: list[dict]) -> dict | None:
+    if not chapters:
+        return None
+    return max(chapters, key=_existing_chapter_order_key)
+
+
 def _content_blocks(content: str) -> list[str]:
     text = (content or "").strip()
     if not text:
@@ -370,6 +403,15 @@ def _is_duplicate_error(error: Exception) -> bool:
     return "существ" in message or "already exists" in message or "exists" in message
 
 
+def _is_schedule_limit_error(error: Exception) -> bool:
+    if not isinstance(error, RanobeLibApiError):
+        return False
+    if error.status_code != 422:
+        return False
+    message = _stringify_payload(error.payload).lower()
+    return "publish_at" in message
+
+
 class ApiUploadWorker(QThread):
     log_signal = pyqtSignal(str, str)
     progress_signal = pyqtSignal(int)
@@ -399,6 +441,7 @@ class ApiUploadWorker(QThread):
         self.price = price
         self.force_num = force_num
         self.is_running = True
+        self.limit_date = datetime.now() + timedelta(days=60)
 
         self._ok = 0
         self._errors = 0
@@ -564,6 +607,15 @@ class ApiUploadWorker(QThread):
                 if _is_duplicate_error(error):
                     self._mark_existing_chapter(index, chapter, existing_keys)
                     return True
+                if _is_schedule_limit_error(error):
+                    self._skipped += 1
+                    self.is_running = False
+                    self.log(
+                        "ERROR",
+                        f"API: предел отложенной публикации в 60 дней для Т.{chapter.volume} "
+                        f"Гл.{format_num(chapter.number)}. Останавливаю без повторов: {error}",
+                    )
+                    return True
 
                 if attempt < MAX_RETRIES:
                     self.log(
@@ -621,6 +673,14 @@ class ApiUploadWorker(QThread):
 
             for index, chapter in enumerate(self.chapters_list):
                 if not self.is_running:
+                    self._skipped += total - index
+                    break
+
+                if (
+                    self.schedule_enabled
+                    and self.current_publish_time > self.limit_date
+                ):
+                    self.log("ERROR", "API: ПРЕДЕЛ В 60 ДНЕЙ. Остановка.")
                     self._skipped += total - index
                     break
 
