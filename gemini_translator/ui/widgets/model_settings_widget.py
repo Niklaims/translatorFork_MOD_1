@@ -1434,7 +1434,7 @@ class ModelSettingsWidget(QGroupBox):
             provider_config = api_config.api_providers().get(provider_id, {})
             models = provider_config.get("models", {})
             if models:
-                active_models = []
+                active_models = None
                 if hasattr(self.settings_manager, 'get_active_models_for_provider'):
                     active_models = self.settings_manager.get_active_models_for_provider(provider_id)
                 if active_models is None:

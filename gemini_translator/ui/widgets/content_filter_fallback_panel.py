@@ -151,13 +151,20 @@ class ContentFilterFallbackPanel(QtWidgets.QGroupBox):
         provider_cfg = api_config.api_providers().get(provider_id, {})
         models = provider_cfg.get("models", {}) if isinstance(provider_cfg, dict) else {}
 
+        active_models = None
+        if self.settings_manager and hasattr(self.settings_manager, 'get_active_models_for_provider'):
+            active_models = self.settings_manager.get_active_models_for_provider(provider_id)
+        if active_models is None:
+            active_models = list(models.keys())
+
         was_blocked = self.model_combo.signalsBlocked()
         self.model_combo.blockSignals(True)
         try:
             self.model_combo.clear()
             for model_name, model_cfg in models.items():
-                model_id = model_cfg.get("id") if isinstance(model_cfg, dict) else model_name
-                self.model_combo.addItem(model_name, userData=model_id)
+                if model_name in active_models:
+                    model_id = model_cfg.get("id") if isinstance(model_cfg, dict) else model_name
+                    self.model_combo.addItem(model_name, userData=model_id)
 
             index = self.model_combo.findText(str(selected_model)) if selected_model else -1
             if index != -1:

@@ -378,13 +378,11 @@ _INTERNAL_PROMPTS = {}
 _ALL_MODELS = {}
 _PROVIDER_DISPLAY_MAP = {}
 _ALL_TRANSLATED_SUFFIXES = []
-_DYNAMIC_PROVIDER_MODELS = {}
 _DYNAMIC_PROVIDER_MODELS_TS = {}
-_CUSTOM_PROVIDER_MODELS = {}
-_DYNAMIC_PROVIDER_MODELS_LOCK = threading.Lock()
 _LOCAL_MODEL_DISCOVERY_TTL_SECONDS = 15.0
 _LOCAL_MODEL_DISCOVERY_TIMEOUT_SECONDS = 0.75
 _LOCAL_MODEL_DISCOVERY_DISABLE_ENV = "GT_DISABLE_LOCAL_MODEL_DISCOVERY"
+
 
 # --- ПАРАМЕТРЫ РАСЧЕТА ТОКЕНОВ И РАЗМЕРОВ ---
 CHARS_PER_ASCII_TOKEN = 4.0
@@ -403,77 +401,140 @@ def _build_all_models(providers_config: dict) -> dict:
     }
 
 
-def _normalize_custom_provider_models(custom_provider_models) -> dict:
-    if not isinstance(custom_provider_models, dict):
-        return {}
-
-    normalized = {}
-    for provider_id, models in custom_provider_models.items():
-        provider_key = str(provider_id or "").strip()
-        if not provider_key or not isinstance(models, dict):
-            continue
-
-        normalized_models = {}
-        for display_name, model_config in models.items():
-            model_name = str(display_name or "").strip()
-            if not model_name:
-                continue
-
-            if isinstance(model_config, dict):
-                next_config = deepcopy(model_config)
-            else:
-                next_config = {"id": str(model_config or "").strip()}
-
-            model_id = str(next_config.get("id") or "").strip()
-            if not model_id:
-                model_id = model_name
-
-            next_config["id"] = model_id
-            next_config["user_defined"] = True
-            normalized_models[model_name] = next_config
-
-        if normalized_models:
-            normalized[provider_key] = normalized_models
-
-    return normalized
-
-
 def _compose_runtime_providers() -> dict:
-    providers = deepcopy(_API_PROVIDERS)
-    for provider_id, models in _DYNAMIC_PROVIDER_MODELS.items():
-        if provider_id in providers and models is not None:
-            providers[provider_id]["models"] = deepcopy(models)
-    for provider_id, models in _CUSTOM_PROVIDER_MODELS.items():
-        if provider_id not in providers or not isinstance(models, dict):
-            continue
-        merged_models = deepcopy(providers[provider_id].get("models", {}))
-        merged_models.update(deepcopy(models))
-        providers[provider_id]["models"] = merged_models
-    return providers
+    return deepcopy(_API_PROVIDERS)
 
-
-def set_custom_provider_models(custom_provider_models):
-    global _CUSTOM_PROVIDER_MODELS, _ALL_MODELS
-    _CUSTOM_PROVIDER_MODELS = _normalize_custom_provider_models(custom_provider_models)
-    if _API_PROVIDERS:
+def _save_models_to_json(provider_id: str, new_models: dict, clear_unlisted: bool = False) -> bool:
+    global _ALL_MODELS
+    normalized_provider = str(provider_id or "").strip()
+    if not normalized_provider or not new_models:
+        return False
+        
+    try:
+        with open(_PROVIDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        if normalized_provider not in data:
+            data[normalized_provider] = {}
+            
+        if "models" not in data[normalized_provider]:
+            data[normalized_provider]["models"] = {}
+            
+        if clear_unlisted:
+            preserved_models = {
+                name: cfg for name, cfg in data[normalized_provider]["models"].items()
+                if cfg.get("user_defined")
+            }
+            data[normalized_provider]["models"] = preserved_models
+            
+        for display_name, model_config in new_models.items():
+            data[normalized_provider]["models"][display_name] = deepcopy(model_config)
+            
+        with open(_PROVIDERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+            
+        if normalized_provider in _API_PROVIDERS:
+            if "models" not in _API_PROVIDERS[normalized_provider]:
+                _API_PROVIDERS[normalized_provider]["models"] = {}
+                
+            if clear_unlisted:
+                preserved_api_models = {
+                    name: cfg for name, cfg in _API_PROVIDERS[normalized_provider]["models"].items()
+                    if cfg.get("user_defined")
+                }
+                _API_PROVIDERS[normalized_provider]["models"] = preserved_api_models
+                
+            for display_name, model_config in new_models.items():
+                _API_PROVIDERS[normalized_provider]["models"][display_name] = deepcopy(model_config)
+                
         _ALL_MODELS = _build_all_models(_compose_runtime_providers())
-    return custom_provider_models_snapshot()
-
+        return True
+    except Exception as e:
+        print(f"[CONFIG ERROR] Не удалось сохранить новые модели в {normalized_provider}: {e}")
+        return False
 
 def add_custom_provider_model(provider_id: str, display_name: str, model_config: dict):
-    custom_models = custom_provider_models_snapshot()
     provider_key = str(provider_id or "").strip()
     model_name = str(display_name or "").strip()
     if not provider_key or not model_name:
-        return custom_models
+        return
+        
+    model_copy = deepcopy(model_config or {})
+    model_copy["user_defined"] = True
+    _save_models_to_json(provider_key, {model_name: model_copy})
 
-    provider_models = custom_models.setdefault(provider_key, {})
-    provider_models[model_name] = deepcopy(model_config or {})
-    return set_custom_provider_models(custom_models)
+def delete_model_from_json(provider_id: str, model_name: str) -> bool:
+    global _ALL_MODELS
+    normalized_provider = str(provider_id or "").strip()
+    if not normalized_provider or not model_name:
+        return False
+        
+    try:
+        with open(_PROVIDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        deleted = False
+        if normalized_provider in data and "models" in data[normalized_provider]:
+            if model_name in data[normalized_provider]["models"]:
+                del data[normalized_provider]["models"][model_name]
+                deleted = True
+                
+        if deleted:
+            with open(_PROVIDERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+                
+            if normalized_provider in _API_PROVIDERS and "models" in _API_PROVIDERS[normalized_provider]:
+                if model_name in _API_PROVIDERS[normalized_provider]["models"]:
+                    del _API_PROVIDERS[normalized_provider]["models"][model_name]
+                    
+            _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+            return True
+            
+        return False
+    except Exception as e:
+        print(f"[CONFIG ERROR] Не удалось удалить модель {model_name} из {normalized_provider}: {e}")
+        return False
 
-
-def custom_provider_models_snapshot():
-    return deepcopy(_CUSTOM_PROVIDER_MODELS)
+def clear_dynamic_models(provider_id: str) -> bool:
+    global _ALL_MODELS
+    normalized_provider = str(provider_id or "").strip()
+    if not normalized_provider:
+        return False
+        
+    try:
+        with open(_PROVIDERS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        deleted = False
+        if normalized_provider in data and "models" in data[normalized_provider]:
+            to_delete = []
+            for m_name, m_cfg in data[normalized_provider]["models"].items():
+                if m_cfg.get("server_discovered") is True or m_cfg.get("user_defined") is True:
+                    to_delete.append(m_name)
+                    
+            for m_name in to_delete:
+                del data[normalized_provider]["models"][m_name]
+                deleted = True
+                
+        if deleted:
+            with open(_PROVIDERS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+                
+            if normalized_provider in _API_PROVIDERS and "models" in _API_PROVIDERS[normalized_provider]:
+                for m_name in to_delete:
+                    if m_name in _API_PROVIDERS[normalized_provider]["models"]:
+                        del _API_PROVIDERS[normalized_provider]["models"][m_name]
+                        
+            _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+            
+        # Очищаем TS чтобы можно было заново загрузить
+        if normalized_provider in _DYNAMIC_PROVIDER_MODELS_TS:
+            del _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider]
+            
+        return deleted
+    except Exception as e:
+        print(f"[CONFIG ERROR] Не удалось очистить модели для {normalized_provider}: {e}")
+        return False
 
 
 def _local_model_discovery_enabled() -> bool:
@@ -553,9 +614,13 @@ def _iter_local_discovery_sources(provider_config: dict, provider_id: str | None
 
         source_key = root_url.lower()
         resolved_label = str(label or "").strip() or _guess_local_endpoint_label(root_url)
+        chat_url = _join_http_path(root_url, "/v1/chat/completions")
+        if provider_id == "openmodel":
+            chat_url = _join_http_path(root_url, "/v1/messages")
+            
         source_entry = {
             "root_url": root_url,
-            "chat_url": _join_http_path(root_url, "/v1/chat/completions"),
+            "chat_url": chat_url,
             "label": resolved_label,
         }
 
@@ -832,7 +897,7 @@ def _extract_local_model_metadata(model_payload) -> dict:
     if context_length is None:
         context_length = _extract_local_parameter_from_text_blocks(
             model_payload,
-            {"context_length", "context_window", "ctx_length", "n_ctx", "num_ctx"},
+            {"context_length", "context_window", "ctx_length", "n_ctx", "num_ctx", "max_model_len", "max_position_embeddings"},
             _coerce_positive_int,
         )
     if context_length is not None:
@@ -842,7 +907,7 @@ def _extract_local_model_metadata(model_payload) -> dict:
     if max_output_tokens is None:
         max_output_tokens = _extract_local_parameter_from_text_blocks(
             model_payload,
-            {"max_completion_tokens", "max_output_tokens", "max_response_tokens"},
+            {"max_completion_tokens", "max_output_tokens", "max_response_tokens", "max_tokens"},
             _coerce_positive_int,
         )
     if max_output_tokens is not None:
@@ -948,7 +1013,8 @@ def _extract_model_entries_from_openai_payload(payload, provider_id: str | None 
                     
         model_id = item.get("id") or item.get("model")
         if isinstance(model_id, str) and model_id.strip():
-            discovered.append(_make_discovered_local_model_entry(model_id.strip(), item))
+            model_id = model_id.strip()
+            discovered.append(_make_discovered_local_model_entry(model_id, item))
     return discovered
 
 
@@ -1087,8 +1153,6 @@ def _apply_discovered_local_model_metadata(model_config: dict, model_entry: dict
     max_output_tokens = _coerce_positive_int(model_entry.get("max_output_tokens"))
     if max_output_tokens is not None:
         model_config["max_output_tokens"] = max_output_tokens
-    else:
-        model_config.pop("max_output_tokens", None)
 
     default_temperature = _coerce_float(model_entry.get("default_temperature"))
     if default_temperature is not None:
@@ -1208,51 +1272,33 @@ def _refresh_dynamic_provider_models(provider_id: str, force: bool = False, api_
     if not normalized_provider or not _provider_uses_dynamic_model_discovery(normalized_provider, provider_config, force=force):
         return {}
 
-    with _DYNAMIC_PROVIDER_MODELS_LOCK:
-        cached_models = _DYNAMIC_PROVIDER_MODELS.get(normalized_provider)
-        cached_ts = _DYNAMIC_PROVIDER_MODELS_TS.get(normalized_provider, 0.0)
-        now = time.time()
+    cached_ts = _DYNAMIC_PROVIDER_MODELS_TS.get(normalized_provider, 0.0)
+    now = time.time()
 
-        if not force and cached_models is not None and (now - cached_ts) < _LOCAL_MODEL_DISCOVERY_TTL_SECONDS:
-            return cached_models
+    if not force and (now - cached_ts) < _LOCAL_MODEL_DISCOVERY_TTL_SECONDS:
+        return _API_PROVIDERS.get(normalized_provider, {}).get("models", {})
 
-        is_successful, resolved_models = _discover_local_provider_models(
-            provider_config,
-            include_details=force,
-            api_key=api_key,
-            provider_id=normalized_provider,
-        )
-        print(f"[ModelDiscovery] Провайдер {normalized_provider}: найдено {len(resolved_models)} моделей, успех={is_successful}")
+    is_successful, resolved_models = _discover_local_provider_models(
+        provider_config,
+        include_details=force,
+        api_key=api_key,
+        provider_id=normalized_provider,
+    )
+    if is_successful:
+        print(f"[ModelDiscovery] Провайдер {normalized_provider}: успешно загружено {len(resolved_models)} моделей с сервера.")
+    elif force:
+        print(f"[ModelDiscovery] Провайдер {normalized_provider}: не удалось обновить модели, используется кэш ({len(resolved_models)} моделей).")
 
-        # Если поиск провалился (например, нет ключа или нет сети), мы НЕ ПЕРЕЗАПИСЫВАЕМ кэш,
-        # если он уже существует (чтобы модели не пропадали при смене вкладок).
-        if is_successful:
-            _DYNAMIC_PROVIDER_MODELS[normalized_provider] = resolved_models
-            _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider] = now
-            _ALL_MODELS = _build_all_models(_compose_runtime_providers())
-
-            try:
-                from PyQt6 import QtWidgets
-                app = QtWidgets.QApplication.instance()
-                if app and hasattr(app, "get_settings_manager"):
-                    sm = app.get_settings_manager()
-                    sm.save_dynamic_provider_models(_DYNAMIC_PROVIDER_MODELS)
-                else:
-                    from gemini_translator.utils.settings import SettingsManager
-                    sm = SettingsManager()
-                    sm.save_dynamic_provider_models(_DYNAMIC_PROVIDER_MODELS)
-            except Exception as e:
-                print(f"[ModelDiscovery] Ошибка сохранения кэша: {e}")
-
-            return resolved_models
-        elif cached_models is not None:
-            return cached_models
-        else:
-            return {}
+    if is_successful:
+        _save_models_to_json(normalized_provider, resolved_models, clear_unlisted=True)
+        _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider] = now
+        return resolved_models
+    
+    return _API_PROVIDERS.get(normalized_provider, {}).get("models", {})
 
 # --- ЭТАП 3: ГЛАВНАЯ ФУНКЦИЯ-ИНИЦИАЛИЗАТОР ---
 def initialize_configs():
-    global _API_PROVIDERS, _DEFAULT_PROMPT, _DEFAULT_BASIC_TRANSLATION_PROMPT, _SHORT_BASIC_TRANSLATION_PROMPT, _DEFAULT_SEQUENTIAL_PROMPT, _DEFAULT_GLOSSARY_PROMPT, _DEFAULT_CORRECTION_PROMPT, _DEFAULT_UNTRANSLATED_PROMPT, _DEFAULT_MANUAL_TRANSLATION_PROMPT, _DEFAULT_WORD_EXCEPTIONS, _ALL_MODELS, _PROVIDER_DISPLAY_MAP, _ALL_TRANSLATED_SUFFIXES, _INTERNAL_PROMPTS, _DYNAMIC_PROVIDER_MODELS, _DYNAMIC_PROVIDER_MODELS_TS
+    global _API_PROVIDERS, _DEFAULT_PROMPT, _DEFAULT_BASIC_TRANSLATION_PROMPT, _SHORT_BASIC_TRANSLATION_PROMPT, _DEFAULT_SEQUENTIAL_PROMPT, _DEFAULT_GLOSSARY_PROMPT, _DEFAULT_CORRECTION_PROMPT, _DEFAULT_UNTRANSLATED_PROMPT, _DEFAULT_MANUAL_TRANSLATION_PROMPT, _DEFAULT_WORD_EXCEPTIONS, _ALL_MODELS, _PROVIDER_DISPLAY_MAP, _ALL_TRANSLATED_SUFFIXES, _INTERNAL_PROMPTS, _DYNAMIC_PROVIDER_MODELS_TS
     
     print("[CONFIG INFO] Централизованная инициализация конфигураций…")
     _API_PROVIDERS = _load_providers_config()
@@ -1266,18 +1312,7 @@ def initialize_configs():
     _DEFAULT_UNTRANSLATED_PROMPT = _load_default_untranslated_prompt()
     _DEFAULT_MANUAL_TRANSLATION_PROMPT = _load_default_manual_translation_prompt()
     _INTERNAL_PROMPTS = _load_internal_prompts()
-    _DYNAMIC_PROVIDER_MODELS = {}
     _DYNAMIC_PROVIDER_MODELS_TS = {}
-    
-    try:
-        from gemini_translator.utils.settings import SettingsManager
-        sm = SettingsManager()
-        _DYNAMIC_PROVIDER_MODELS.update(sm.get_dynamic_provider_models())
-        now = __import__('time').time()
-        for k in _DYNAMIC_PROVIDER_MODELS.keys():
-            _DYNAMIC_PROVIDER_MODELS_TS[k] = now
-    except Exception as e:
-        print(f"[CONFIG WARNING] Не удалось загрузить динамические модели: {e}")
 
     _API_PROVIDERS['dry_run'] = {
         "display_name": "Пробный запуск",

@@ -3,6 +3,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import tempfile
+import shutil
+from pathlib import Path
 from gemini_translator.api import config as api_config
 
 
@@ -17,13 +20,23 @@ class _DummyResponse:
 
 class LocalModelDiscoveryTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.temp_providers = os.path.join(self.temp_dir, "api_providers.json")
+        shutil.copyfile("config/api_providers.json", self.temp_providers)
+        
+        # Patch config module directly since it holds global state
+        self.patcher = patch.object(api_config, "_PROVIDERS_FILE", Path(self.temp_providers))
+        self.patcher.start()
+        
         api_config.initialize_configs()
 
     def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.temp_dir)
         api_config.initialize_configs()
 
     def test_refresh_dynamic_models_uses_server_inventory_for_local_provider(self):
-        def fake_get(url, timeout=None):
+        def fake_get(url, **kwargs):
             if url == "http://127.0.0.1:11434/api/tags":
                 return _DummyResponse(
                     200,
@@ -66,7 +79,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
                 return _DummyResponse(404, {})
             raise AssertionError(f"Unexpected discovery URL: {url}")
 
-        def fake_post(url, json=None, timeout=None):
+        def fake_post(url, json=None, **kwargs):
             if url == "http://127.0.0.1:11434/api/show" and json == {"model": "deepseek-r1:8b"}:
                 return _DummyResponse(
                     200,
@@ -113,7 +126,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
     def test_ensure_dynamic_models_skips_ollama_show_until_forced(self):
         post_calls = []
 
-        def fake_get(url, timeout=None):
+        def fake_get(url, **kwargs):
             if url == "http://127.0.0.1:11434/api/tags":
                 return _DummyResponse(200, {"models": [{"name": "deepseek-r1:8b"}]})
             if url in {
@@ -126,7 +139,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
                 return _DummyResponse(404, {})
             raise AssertionError(f"Unexpected discovery URL: {url}")
 
-        def fake_post(url, json=None, timeout=None):
+        def fake_post(url, json=None, **kwargs):
             post_calls.append((url, json))
             return _DummyResponse(200, {})
 
@@ -141,7 +154,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
         self.assertNotIn("default_temperature", local_models["DeepSeek R1 8B (Ollama)"])
 
     def test_refresh_dynamic_models_falls_back_to_static_config_when_servers_unreachable(self):
-        def fake_get(url, timeout=None):
+        def fake_get(url, **kwargs):
             raise OSError(f"Connection failed for {url}")
 
         with patch.dict(os.environ, {"GT_DISABLE_LOCAL_MODEL_DISCOVERY": "0"}), \
@@ -155,7 +168,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
         self.assertNotIn("max_output_tokens", local_models["Gemma 3 12B IT (LM Studio)"])
 
     def test_free_deepseek_provider_discovers_openai_compatible_models(self):
-        def fake_get(url, timeout=None):
+        def fake_get(url, **kwargs):
             if url == "http://127.0.0.1:9655/api/tags":
                 return _DummyResponse(404, {})
             if url == "http://127.0.0.1:9655/v1/models":
@@ -174,7 +187,7 @@ class LocalModelDiscoveryTests(unittest.TestCase):
                 return _DummyResponse(404, {})
             raise AssertionError(f"Unexpected discovery URL: {url}")
 
-        def fake_post(url, json=None, timeout=None):
+        def fake_post(url, json=None, **kwargs):
             return _DummyResponse(404, {})
 
         with patch.dict(os.environ, {"GT_DISABLE_LOCAL_MODEL_DISCOVERY": "0"}), \

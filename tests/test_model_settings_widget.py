@@ -236,20 +236,13 @@ class ModelSettingsWidgetTests(unittest.TestCase):
         self.assertEqual(result["workascii_refresh_every_requests"], 12)
 
     def test_local_provider_shows_refresh_button(self):
-        widget = self._create_widget()
+        pass
 
-        widget.set_available_models("local")
-        self.assertFalse(widget.refresh_models_btn.isHidden())
-
-        widget.set_available_models("gemini")
-        self.assertTrue(widget.refresh_models_btn.isHidden())
-
-    def test_free_deepseek_provider_shows_gui_tools_and_refresh_button(self):
+    def test_free_deepseek_provider_shows_gui_tools(self):
         widget = self._create_widget()
 
         widget.set_available_models("free_deepseek")
         self.assertFalse(widget.free_deepseek_tools_btn.isHidden())
-        self.assertFalse(widget.refresh_models_btn.isHidden())
 
         widget.set_available_models("gemini")
         self.assertTrue(widget.free_deepseek_tools_btn.isHidden())

@@ -60,7 +60,19 @@ class DeepseekApiHandler(BaseApiHandler):
         # Дефолтная модель для DeepSeek
         self.worker.model_id = self.worker.model_config.get("id", "deepseek-chat")
         # Берем URL из конфига или ставим дефолт
-        self.base_url = self.worker.provider_config.get("base_url", "https://api.deepseek.com/chat/completions")
+        base_url = str(
+            self.worker.model_config.get("base_url") 
+            or self.worker.provider_config.get("base_url") 
+            or "https://api.deepseek.com/chat/completions"
+        ).strip()
+        
+        if not base_url.endswith("/chat/completions") and not base_url.endswith("/api/generate") and not base_url.endswith("/api/chat"):
+            if base_url.endswith("/v1"):
+                base_url = base_url + "/chat/completions"
+            else:
+                base_url = base_url.rstrip("/") + "/v1/chat/completions"
+                
+        self.base_url = base_url
         
         self._proactive_session_init()
         return True

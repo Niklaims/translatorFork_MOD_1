@@ -151,7 +151,19 @@ class OpenRouterApiHandler(BaseApiHandler):
         else:
             self.is_dynamic_local = False
             # Если это не динамика, берем статический URL
-            self.base_url = self.worker.model_config.get("base_url") or self.worker.provider_config.get("base_url") or "https://openrouter.ai/api/v1/chat/completions"
+            base_url = str(
+                self.worker.model_config.get("base_url") 
+                or self.worker.provider_config.get("base_url") 
+                or "https://openrouter.ai/api/v1/chat/completions"
+            ).strip()
+            
+            if not base_url.endswith("/chat/completions") and not base_url.endswith("/api/generate") and not base_url.endswith("/api/chat"):
+                if base_url.endswith("/v1"):
+                    base_url = base_url + "/chat/completions"
+                else:
+                    base_url = base_url.rstrip("/") + "/v1/chat/completions"
+                    
+            self.base_url = base_url
 
         self._proactive_session_init()
         return True
@@ -260,54 +272,6 @@ class OpenRouterApiHandler(BaseApiHandler):
                     if response.status == 404: raise ModelNotFoundError(f"Модель {self.worker.model_id} не найдена (404).")
                     
                     raise NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")
-
-                if response.status != 200:
-                    continue
-
-                if request_uses_stream:
-                    collected_text = ""
-                    finish_reason = None
-                    raw_stream_lines = [] if (self._has_debug_trace() or debug) else None
-                    try:
-                        async for line in response.content:
-                            line_str = line.decode('utf-8').strip()
-                            if raw_stream_lines is not None:
-                                raw_stream_lines.append(line_str)
-                            if not line_str or line_str == 'data: [DONE]': continue
-                            if line_str.startswith('data: '):
-                                json_str = line_str[6:]
-                                try:
-                                    chunk = json.loads(json_str)
-                                    if 'choices' in chunk and chunk['choices']:
-                                        delta = chunk['choices'][0].get('delta', {})
-                                        content_part = delta.get('content', '')
-                                        if content_part: collected_text += content_part
-                                        if f_reason := chunk['choices'][0].get('finish_reason'): finish_reason = f_reason
-                                except json.JSONDecodeError: continue
-                    except Exception as stream_e:
-                        if collected_text: raise PartialGenerationError(f"Обрыв стрима: {stream_e}", partial_text=collected_text, reason="NETWORK_ERROR")
-                        raise stream_e
-                    
-                    if raw_stream_lines is not None:
-                        self._debug_record_response(
-                            "\n".join(raw_stream_lines),
-                            status=finish_reason or "stream",
-                            extra={"mode": "stream", "http_status": response.status},
-                        )
-
-                    if finish_reason == "length" and not allow_incomplete:
-                        raise PartialGenerationError("Превышен лимит токенов", partial_text=collected_text, reason="LENGTH")
-                    return collected_text
-                else:
-                    result = await response.json()
-                    self._debug_record_response(
-                        result,
-                        status="http_200",
-                        extra={"mode": "full", "http_status": response.status},
-                    )
-                    if 'choices' in result and result['choices']:
-                        return result['choices'][0]['message']['content']
-                    raise Exception(f"Пустой ответ: {result}")
 
         except asyncio.TimeoutError:
             raise NetworkError("Таймаут запроса.", delay_seconds=30)

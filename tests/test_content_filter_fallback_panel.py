@@ -63,14 +63,21 @@ class ContentFilterFallbackPanelTests(unittest.TestCase):
             for provider in self.providers.values()
             for name, model in provider["models"].items()
         }
-        self.patches = [
-            patch.object(api_config, "api_providers", return_value=self.providers),
-            patch.object(api_config, "all_models", return_value=self.all_models),
-            patch.object(api_config, "ensure_dynamic_provider_models"),
-        ]
-        for patcher in self.patches:
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        self.api_patch = patch.object(api_config, "api_providers", return_value=self.providers)
+        self.api_patch.start()
+        self.addCleanup(self.api_patch.stop)
+
+        self.models_patch = patch.object(api_config, "all_models", return_value=self.all_models)
+        self.models_patch.start()
+        self.addCleanup(self.models_patch.stop)
+
+        self.ensure_patch = patch.object(api_config, "ensure_dynamic_provider_models")
+        self.ensure_patch.start()
+        self.addCleanup(self.ensure_patch.stop)
+
+        self.ensure_async_patch = patch.object(api_config, "ensure_dynamic_provider_models_async")
+        self.ensure_async_patch.start()
+        self.addCleanup(self.ensure_async_patch.stop)
 
     def _create_panel(self, settings_manager=None):
         panel = ContentFilterFallbackPanel(settings_manager=settings_manager)
@@ -173,7 +180,7 @@ class ContentFilterFallbackPanelTests(unittest.TestCase):
 
     def test_set_config_ensures_dynamic_provider_models(self):
         panel = self._create_panel(FakeSettings())
-        ensure_mock = api_config.ensure_dynamic_provider_models
+        ensure_mock = api_config.ensure_dynamic_provider_models_async
 
         panel.set_config(
             {

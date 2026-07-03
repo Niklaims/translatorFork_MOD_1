@@ -149,7 +149,6 @@ class SettingsManager(QObject):
         """[Под замком] Читает файл с диска и обновляет кэш."""
         self._cache = self._load_unsafe()
         self._migrate_keys_in_cache()
-        self._apply_custom_provider_models_to_runtime()
 
     def _save_to_disk_unsafe(self):
         """
@@ -164,16 +163,11 @@ class SettingsManager(QObject):
             self._merge_disk_timestamps(disk_data)
 
         self._check_and_reset_limits_in_cache()
-        self._apply_custom_provider_models_to_runtime()
 
         # 3. Записываем итоговый результат (наши настройки + общая история)
         self._save_unsafe(self._cache)
         self._is_dirty = False
 
-    def _apply_custom_provider_models_to_runtime(self):
-        custom_provider_models = self._cache.get("custom_provider_models", {})
-        api_config.set_custom_provider_models(custom_provider_models)
-    
     def _merge_disk_timestamps(self, disk_data):
         """Вспомогательный метод: объединяет таймстампы из файла с текущим кэшем."""
         disk_keys = disk_data.get('api_keys_with_status', [])
@@ -602,17 +596,6 @@ class SettingsManager(QObject):
     
     def get_custom_prompt(self): return self._generic_loader('custom_prompt', '')
     def save_custom_prompt(self, prompt): return self._generic_saver('custom_prompt', prompt)
-    def get_custom_provider_models(self):
-        with self.file_lock:
-            return deepcopy(self._cache.get("custom_provider_models", {}))
-
-    def save_custom_provider_models(self, custom_provider_models):
-        normalized = api_config.set_custom_provider_models(custom_provider_models)
-        with self.file_lock:
-            self._cache["custom_provider_models"] = deepcopy(normalized)
-        self._save_requested.emit()
-        return True
-
     def get_active_models_for_provider(self, provider_id: str) -> list[str] | None:
         with self.file_lock:
             active_models = self._cache.get("active_models", {})
@@ -627,28 +610,6 @@ class SettingsManager(QObject):
         self._save_requested.emit()
         return True
 
-    def add_custom_provider_model(self, provider_id, display_name, model_config):
-        with self.file_lock:
-            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
-            provider_key = str(provider_id or "").strip()
-            model_name = str(display_name or "").strip()
-            if not provider_key or not model_name:
-                return False
-            provider_models = custom_models.setdefault(provider_key, {})
-            provider_models[model_name] = deepcopy(model_config or {})
-            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
-        self._save_requested.emit()
-        return True
-
-    def get_dynamic_provider_models(self) -> dict:
-        with self.file_lock:
-            return deepcopy(self._cache.get("dynamic_provider_models", {}))
-            
-    def save_dynamic_provider_models(self, models_dict: dict):
-        with self.file_lock:
-            self._cache["dynamic_provider_models"] = deepcopy(models_dict)
-            self._save_to_disk_unsafe()
-        return True
 
     def get_last_settings(self):
         with self.file_lock:

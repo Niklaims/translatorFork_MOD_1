@@ -613,8 +613,8 @@ class TranslationEngine(QObject):
         
 
         if error_type == 'model_not_found':
-            log_message = f"[FATAL] Нет Доступа.{reason_text}"
-            cancellation_reason = f"Доступ.{reason_text}"
+            log_message = f"[FATAL] Модель не найдена или недоступна.{reason_text}"
+            cancellation_reason = f"Модель не найдена.{reason_text}"
             self._post_event('log_message', {'message': log_message})
             # Просто останавливаем сессию, без дополнительного события для UI
             self.cancel_translation(reason=cancellation_reason)
@@ -753,7 +753,13 @@ class TranslationEngine(QObject):
         settings['proxy_settings'] = proxy_settings # <-- ДОБАВЛЯЕМ ЭТУ СТРОКУ
         
         # 1. Проверяем, существует ли TaskManager и есть ли в нем задачи
-        settings['model_id'] = settings.get('model_config', {}).get('id')
+        model_config = settings.get('model_config', {})
+        settings['model_id'] = model_config.get('id')
+        
+        # Валидация метаданных модели
+        if not model_config.get('context_length') or not model_config.get('max_output_tokens'):
+            self._end_session("У выбранной модели нет данных о context_length или max_output_tokens. Укажите их вручную в настройках провайдера (кнопка ℹ️).")
+            return
 
         if not self.task_manager or not self.task_manager.has_pending_tasks():
             self._end_session("Нет задач для перевода.")

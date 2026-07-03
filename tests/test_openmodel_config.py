@@ -12,7 +12,7 @@ class OpenModelConfigTests(unittest.TestCase):
     def test_openmodel_deepseek_v4_flash_provider_is_configured(self):
         provider = self.providers["openmodel"]
 
-        self.assertEqual(provider["handler_class"], "OpenModelApiHandler")
+        self.assertEqual(provider["handler_class"], "OpenRouterApiHandler")
         self.assertEqual(provider["base_url"], "https://api.openmodel.ai")
         self.assertTrue(provider["visible"])
 
