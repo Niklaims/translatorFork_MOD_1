@@ -311,6 +311,7 @@ class EPUBConverterThread(QThread):
 
     def _html_to_plain_text(self, html_content):
         text = html_content
+        text = re.sub(r"<(script|style|head)[^>]*>.*?</\1>", "", text, flags=re.IGNORECASE | re.DOTALL)
         text = re.sub(r"</(p|div|h[1-6]|li|blockquote)>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<hr\s*/?>", "\n***\n", text, flags=re.IGNORECASE)

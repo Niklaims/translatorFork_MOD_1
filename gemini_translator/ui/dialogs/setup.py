@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QTabBar
 )
 
-from PyQt6.QtCore import QMimeData, pyqtSlot, pyqtSignal, QThread, QItemSelectionModel, QItemSelection
+from PyQt6.QtCore import pyqtSlot, pyqtSignal, QThread, QItemSelectionModel, QItemSelection
 from ...scripts.package_filter_tasks import FilterPackagingDialog
 
 # --- Импорты из нашего проекта ---

@@ -182,12 +182,15 @@ class GeminiApiHandler(BaseApiHandler):
                                     
                                     # --- 1. ПРОВЕРКА НА ОШИБКУ ВНУТРИ СТРИМА (FIX) ---
                                     if 'error' in chunk_data:
+                                        if not collected_text:
+                                            self._raise_for_stream_error(chunk_data['error'])
+
                                         error_msg = chunk_data['error'].get('message', 'Unknown Stream Error')
                                         error_status = chunk_data['error'].get('status', 'API_ERROR')
                                         # Мы прерываемся, но СОХРАНЯЕМ накопленный текст (collected_text)
                                         raise PartialGenerationError(
-                                            f"Gemini Stream Error: {error_msg}", 
-                                            partial_text=collected_text, 
+                                            f"Gemini Stream Error: {error_msg}",
+                                            partial_text=collected_text,
                                             reason=error_status # Теперь причиной будет "INTERNAL" или код ошибки
                                         )
 
@@ -343,6 +346,38 @@ class GeminiApiHandler(BaseApiHandler):
             raise NetworkError(f"Ошибка сервера ({response.status}): {error_message}", delay_seconds=25)
         
         raise Exception(f"Неизвестная ошибка Gemini ({response.status}): {error_message}")
+
+    def _raise_for_stream_error(self, error_details: dict):
+        error_message = error_details.get('message') or str(error_details)
+        error_status = str(error_details.get('status') or 'API_ERROR').upper()
+        error_str = error_message.lower()
+
+        if error_status in {'UNAVAILABLE', 'RESOURCE_EXHAUSTED'}:
+            retry_delay_seconds = self._extract_retry_delay({'details': error_details.get('details', [])}, error_message)
+            if retry_delay_seconds is not None:
+                final_delay = retry_delay_seconds + 2
+                raise TemporaryRateLimitError(
+                    f"Gemini stream: временная перегрузка модели, пауза {final_delay}с. ({error_message[:100]})",
+                    delay_seconds=final_delay,
+                )
+            raise TemporaryRateLimitError(
+                f"Gemini stream: модель временно перегружена. ({error_message[:100]})",
+                delay_seconds=20,
+            )
+
+        is_model_error = (
+            error_status == 'NOT_FOUND'
+            or (
+                'model' in error_str
+                and ('not found' in error_str or 'is not supported' in error_str)
+            )
+        )
+        if is_model_error:
+            raise ModelNotFoundError(f"Модель недоступна: {error_message}")
+        if error_status in {'PERMISSION_DENIED', 'UNAUTHENTICATED'}:
+            raise RateLimitExceededError(f"Ошибка доступа Gemini stream: {error_message}")
+
+        raise NetworkError(f"Gemini stream error ({error_status}): {error_message}", delay_seconds=25)
 
     def _extract_retry_delay(self, error_details: dict, error_message: str) -> int | None:
         """
