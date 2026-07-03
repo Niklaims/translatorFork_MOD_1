@@ -16,7 +16,6 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot, QRect, QPoint, QTimer
 # Используем тот же самый делегат, что и в менеджере глоссариев
 from ..glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 from ....api import config as api_config
-from ..glossary_dialogs.ai_correction import CorrectionSessionDialog
 
 from ...widgets import (
     KeyManagementWidget, ModelSettingsWidget, LogWidget, PresetWidget

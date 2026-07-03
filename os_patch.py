@@ -857,7 +857,6 @@ def _patched_qmessagebox_critical(parent, title, text):
 
             reset_timer.start(2000)
             return
-            QTimer.singleShot(2000, lambda: copy_btn.setText("Скопировать ошибку") or copy_btn.setEnabled(True))
         
         copy_btn.clicked.connect(copy_action)
         kill_btn.clicked.connect(lambda: os._exit(1))

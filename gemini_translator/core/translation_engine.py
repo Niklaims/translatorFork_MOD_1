@@ -18,7 +18,6 @@ from ..core.task_manager import ChapterQueueManager
 from ..core.worker import UniversalWorker
 from ..core.async_worker_runtime import AsyncWorkerRuntime
 from ..utils.project_manager import TranslationProjectManager
-from ..utils.helpers import check_value 
 from ..api.managers import ApiKeyManager
 from ..core.chunk_assembler import ChunkAssembler
 from ..utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor

@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon, QGridLayout, QGroupBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings
-from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QTextBlockFormat, QDragEnterEvent, QDropEvent, QIcon
+from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QDragEnterEvent, QDropEvent, QIcon
 
 # Libraries
 try:
@@ -3756,8 +3756,6 @@ class GeminiWorker(QThread):
             if not await self._sleep_interruptibly(max(0.25, min(sleep_for, 5.0))):
                 raise ReaderWorkerStopped()
         raise ReaderWorkerStopped()
-
-        return False
 
     def _release_request_budget(self, model_id=None, budget_acquired=False, amount=1):
         if not budget_acquired or self.daily_request_limiter is None:
@@ -9034,21 +9032,6 @@ class MainWindow(QMainWindow):
             self.project_settings_manager.save_full_session_settings(data)
         return
 
-        data = {
-            "api_keys": self.api_keys,
-            "model": self.combo_model.currentText(),
-            "voice": self.combo_voices.currentData(), # Сохраняем чистый ID голоса
-            "speed": self.combo_speed.currentText(),
-            "chunk": self._chunk_setting_value(),
-            "record": self.chk_mp3.isChecked(),
-            "fast": self.chk_fast.isChecked()
-        }
-        with open("settings.json", "w") as f:
-            json.dump(data, f)
-
-
-
-
     def _refresh_project_settings_manager(self):
         if SettingsManager is None or not self.bm or not self.bm.book_dir:
             self.project_settings_manager = None
@@ -9181,98 +9164,6 @@ class MainWindow(QMainWindow):
         self._apply_reader_settings(data)
         self._update_key_state_ui()
         return
-
-        engine_id = data.get("engine", "live")
-        engine_idx = self.combo_engine.findData(engine_id)
-        if engine_idx >= 0:
-            self.combo_engine.setCurrentIndex(engine_idx)
-        else:
-            self.combo_engine.setCurrentIndex(0)
-
-        m = data.get("model")
-        if m and m in [self.combo_model.itemText(i) for i in range(self.combo_model.count())]:
-            self.combo_model.setCurrentText(m)
-
-        voice_mode = data.get("voice_mode", "single")
-        if engine_id == "flash_tts" and voice_mode == "author_gender":
-            voice_mode = "duo"
-        voice_mode_idx = self.combo_voice_mode.findData(voice_mode)
-        if voice_mode_idx >= 0:
-            self.combo_voice_mode.setCurrentIndex(voice_mode_idx)
-
-        v = data.get("voice")
-        if v and v in VOICES_MAP:
-            idx = self.combo_voices.findData(v)
-            if idx >= 0:
-                self.combo_voices.setCurrentIndex(idx)
-
-        v_secondary = data.get("voice_secondary")
-        if v_secondary and v_secondary in VOICES_MAP:
-            idx = self.combo_voice_secondary.findData(v_secondary)
-            if idx >= 0:
-                self.combo_voice_secondary.setCurrentIndex(idx)
-
-        v_tertiary = data.get("voice_tertiary")
-        if v_tertiary and v_tertiary in VOICES_MAP:
-            idx = self.combo_voice_tertiary.findData(v_tertiary)
-            if idx >= 0:
-                self.combo_voice_tertiary.setCurrentIndex(idx)
-
-        s = data.get("speed")
-        if s in SPEED_PROMPTS:
-            self.combo_speed.setCurrentText(s)
-
-        preprocess_model = data.get("preprocess_model")
-        if preprocess_model and preprocess_model in [self.combo_preprocess_model.itemText(i) for i in range(self.combo_preprocess_model.count())]:
-            self.combo_preprocess_model.setCurrentText(preprocess_model)
-        else:
-            default_preprocess_label = _default_preprocess_model_label(self.preprocess_models_map)
-            if default_preprocess_label:
-                self.combo_preprocess_model.setCurrentText(default_preprocess_label)
-
-        preprocess_profile = data.get("preprocess_profile")
-        if preprocess_profile and preprocess_profile in [self.combo_preprocess_profile.itemText(i) for i in range(self.combo_preprocess_profile.count())]:
-            self.combo_preprocess_profile.setCurrentText(preprocess_profile)
-
-        pipeline_mode = data.get("pipeline_mode", "auto")
-        pipeline_idx = self.combo_pipeline_mode.findData(pipeline_mode if engine_id == "flash_tts" else "auto")
-        if pipeline_idx >= 0:
-            self.combo_pipeline_mode.setCurrentIndex(pipeline_idx)
-
-        self.preprocess_directive = data.get("preprocess_directive") or DEFAULT_PREPROCESS_DIRECTIVE
-        self.tts_directive = data.get("tts_directive") or DEFAULT_TTS_DIRECTIVE
-
-        self._set_chunk_setting_value(data.get("chunk", FLASH_TTS_DEFAULT_BLOCK_UNITS))
-        self.chk_mp3.setChecked(data.get("record", True))
-        self.chk_fast.setChecked(data.get("fast", False))
-        return
-
-        if os.path.exists("settings.json"):
-            try:
-                with open("settings.json", "r") as f:
-                    data = json.load(f)
-                    self.api_keys = data.get("api_keys",[])
-                    
-                    # Восстанавливаем UI
-                    m = data.get("model")
-                    if m and m in[self.combo_model.itemText(i) for i in range(self.combo_model.count())]:
-                        self.combo_model.setCurrentText(m)
-                        
-                    # Загрузка голоса по его скрытому ID
-                    v = data.get("voice")
-                    if v and v in VOICES_MAP:
-                        idx = self.combo_voices.findData(v)
-                        if idx >= 0:
-                            self.combo_voices.setCurrentIndex(idx)
-                    
-                    s = data.get("speed")
-                    if s in SPEED_PROMPTS: self.combo_speed.setCurrentText(s)
-                    
-                    self._set_chunk_setting_value(data.get("chunk", FLASH_TTS_DEFAULT_BLOCK_UNITS))
-                    self.chk_mp3.setChecked(data.get("record", True))
-                    self.chk_fast.setChecked(data.get("fast", False))
-            except: 
-                pass
 
     def open_book_dialog(self):
         p, _ = QFileDialog.getOpenFileName(self, "Открыть книгу", "", READER_BOOK_FILE_FILTER)

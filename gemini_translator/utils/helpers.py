@@ -76,34 +76,6 @@ class TokenCounter:
         if not text:
             return 0
         return estimate_gemini_tokens(text)
-        
-        # Константы из конфига для более точного подсчета
-        # Мы могли бы импортировать config, но чтобы избежать циклических зависимостей,
-        # лучше продублировать эти простые значения здесь.
-        CHARS_PER_ASCII_TOKEN = 4.0
-        CHARS_PER_CYRILLIC_TOKEN = 2.2
-        CHARS_PER_CJK_TOKEN = 1.5 # CJK символы "тяжелее"
-
-        total_tokens = 0
-        
-        # Используем регулярные выражения для подсчета символов в каждой категории
-        # Латиница, цифры, знаки препинания и спецсимволы JSON
-        ascii_like_chars = len(re.findall(r'[a-zA-Z0-9\s.,:"{}\[\]_-]', text))
-        # Кириллица
-        cyrillic_chars = len(re.findall(r'[а-яА-ЯёЁ]', text))
-        # CJK (Китайский, Японский, Корейский)
-        cjk_chars = len(re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
-
-        # Считаем токены для каждой группы
-        total_tokens += ascii_like_chars / CHARS_PER_ASCII_TOKEN
-        total_tokens += cyrillic_chars / CHARS_PER_CYRILLIC_TOKEN
-        total_tokens += cjk_chars / CHARS_PER_CJK_TOKEN
-
-        # Другие символы (например, арабские, греческие и т.д.) считаем по средней норме
-        other_chars = len(text) - (ascii_like_chars + cyrillic_chars + cjk_chars)
-        total_tokens += other_chars / 2.5 # Среднее значение
-
-        return int(total_tokens)
 
     def estimate_cost(self, input_tokens, output_tokens, model_name="gemini-2.5-pro"):
         """Оценивает стоимость в USD"""
