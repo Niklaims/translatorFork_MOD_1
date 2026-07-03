@@ -125,6 +125,7 @@ class KeyManagementWidget(QWidget):
 
         self.current_active_keys_by_provider = {}
         self.current_model_id = None
+        self._skip_next_visual_active_snapshot = False
         if current_active_keys:
             provider_id = self.get_selected_provider() if hasattr(
                 self, 'provider_combo') else 'gemini'
@@ -225,6 +226,7 @@ class KeyManagementWidget(QWidget):
 
         self.key_status_card = self._create_key_status_card()
         self.mcp_control_card = McpControlWidget(self)
+        self.mcp_control_card.status_changed.connect(self._on_mcp_status_changed)
         self.mcp_control_card.setVisible(False)
 
         provider_layout.addWidget(self.provider_combo, 1)
@@ -363,6 +365,7 @@ class KeyManagementWidget(QWidget):
         self.active_empty_label = QLabel(
             "Активные ключи пока не выбраны. Перенесите их из общего пула."
         )
+        self._active_empty_default_text = self.active_empty_label.text()
         self.active_empty_label.setObjectName("helperLabel")
         self.active_empty_label.setWordWrap(True)
         active_layout.addWidget(self.active_empty_label)
@@ -593,6 +596,16 @@ class KeyManagementWidget(QWidget):
         ):
             button.setEnabled(enabled)
 
+    def _remember_active_keys_for_provider(self, provider_id: str | None) -> None:
+        if not provider_id or not api_config.provider_requires_api_key(provider_id):
+            return
+        if self.active_keys_list.count() == 0 and self.available_keys_list.count() == 0:
+            return
+        self.current_active_keys_by_provider[provider_id] = {
+            self.active_keys_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
+            for i in range(self.active_keys_list.count())
+        }
+
     def _apply_provider_mode(self, provider_id: str, provider_display_name: str):
         requires_api_key = self._provider_requires_api_key(provider_id)
         available_title = "2. Доступные ключи" if requires_api_key else "2. Настройка сессии"
@@ -608,29 +621,73 @@ class KeyManagementWidget(QWidget):
     def _current_raw_provider(self) -> str:
         return self.provider_combo.currentData()
 
+    def get_raw_selected_provider(self) -> str:
+        return self._current_raw_provider()
+
     def _is_mcp_provider_selected(self) -> bool:
         return self._current_raw_provider() == MCP_PROVIDER_ID
 
+    def is_mcp_provider_selected(self) -> bool:
+        return self._is_mcp_provider_selected()
+
+    def _emit_ai_provider_mode_changed(self, provider_id: str, *, is_mcp: bool) -> None:
+        self.bus.event_posted.emit({
+            'event': 'ai_provider_mode_changed',
+            'source': 'KeyManagementWidget',
+            'data': {
+                'provider_id': provider_id,
+                'is_mcp': bool(is_mcp),
+                'provider_widget_id': id(self),
+            }
+        })
+
+    def _on_mcp_status_changed(self, _snapshot=None) -> None:
+        if self._is_mcp_provider_selected():
+            self.active_keys_changed.emit()
+
     def _apply_mcp_provider_mode(self):
+        self._remember_active_keys_for_provider(self._last_real_provider_id)
         self.key_status_card.setVisible(False)
         self.mcp_control_card.setVisible(True)
+        self.mcp_control_card.set_auto_refresh_enabled(True)
         self.server_button.setVisible(False)
         self.available_keys_group.setEnabled(False)
         self.active_keys_group.setEnabled(False)
         self.available_keys_list.setEnabled(False)
         self.available_search_edit.setEnabled(False)
         self._set_key_action_controls_enabled(False)
+        self.available_keys_list.clear()
+        self.active_keys_list.clear()
+        self.active_key_count_label.setText("Выбрано: 0")
+        self.active_empty_label.setText(
+            "MCP не использует активные ключи. Управляйте задачами из подключенного AI-клиента."
+        )
+        self.active_empty_label.setVisible(True)
         self.available_keys_group.setTitle("2. Ключи недоступны (MCP сервер)")
         self.active_keys_group.setTitle("3. Управление ключами отключено для MCP")
         self.mcp_control_card.refresh_status()
+        self._emit_ai_provider_mode_changed(MCP_PROVIDER_ID, is_mcp=True)
+        self.active_keys_changed.emit()
 
     def _restore_key_provider_mode(self):
+        self.mcp_control_card.set_auto_refresh_enabled(False)
         self.key_status_card.setVisible(True)
         self.mcp_control_card.setVisible(False)
         self.available_keys_group.setEnabled(True)
         self.active_keys_group.setEnabled(True)
+        self.active_empty_label.setText(self._active_empty_default_text)
+
+    def can_start_ai_session(self) -> bool:
+        if self._is_mcp_provider_selected():
+            return self.mcp_control_card.has_connected_client()
+        return len(self.get_active_keys()) > 0
 
     def get_active_keys(self):
+        if self._is_mcp_provider_selected():
+            if self.mcp_control_card.has_connected_client():
+                placeholder = self._provider_placeholder_key(MCP_PROVIDER_ID)
+                return [placeholder] if placeholder else []
+            return []
         active_keys = [
             self.active_keys_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
             for i in range(self.active_keys_list.count())
@@ -659,7 +716,11 @@ class KeyManagementWidget(QWidget):
             self.provider_combo.blockSignals(True)
             self.provider_combo.setCurrentIndex(index_to_set)
             self.provider_combo.blockSignals(False)
-            self._on_provider_changed(index_to_set)
+            self._skip_next_visual_active_snapshot = True
+            try:
+                self._on_provider_changed(index_to_set)
+            finally:
+                self._skip_next_visual_active_snapshot = False
 
     def discard_active_key_for_session(self, api_key: str):
         if not api_key or not self._provider_requires_api_key():
@@ -811,6 +872,7 @@ class KeyManagementWidget(QWidget):
                 'provider_widget_id': id(self),
             }
         })
+        self._emit_ai_provider_mode_changed(provider_id, is_mcp=False)
 
         self._load_and_refresh_keys()
         self._update_server_button_visibility()
@@ -850,12 +912,10 @@ class KeyManagementWidget(QWidget):
             self._update_active_key_count()
             self.active_empty_label.setVisible(False)
             return
-        if self.active_keys_list.count() > 0:
-            current_visual_keys = {
-                self.active_keys_list.item(i).data(QtCore.Qt.ItemDataRole.UserRole)
-                for i in range(self.active_keys_list.count())
-            }
-            self.current_active_keys_by_provider[provider_id] = current_visual_keys
+        if getattr(self, "_skip_next_visual_active_snapshot", False):
+            self._skip_next_visual_active_snapshot = False
+        else:
+            self._remember_active_keys_for_provider(provider_id)
         # --- [PATCH END] ---
 
         loaded_statuses = self.settings_manager.load_key_statuses()

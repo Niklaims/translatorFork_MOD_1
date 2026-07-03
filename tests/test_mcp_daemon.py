@@ -4,15 +4,19 @@ import stat
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 import urllib.error
 import urllib.request
 
 import pytest
 
 from gemini_translator.mcp.client import DaemonClient, DaemonClientError, load_client
+from gemini_translator.mcp.client_sessions import list_active_client_sessions
+from gemini_translator.mcp.ai_bridge import create_gui_ai_task, load_gui_ai_task
 from gemini_translator.mcp.daemon import McpDaemon, read_daemon_info
 from gemini_translator.mcp.jobs import create_job, mark_finished, save_job
-from gemini_translator.mcp.paths import daemon_file
+from gemini_translator.mcp.paths import DEFAULT_DAEMON_PORT, daemon_file
 
 
 def _request(method, url, token, payload=None):
@@ -23,6 +27,33 @@ def _request(method, url, token, payload=None):
         request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request, timeout=5) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _open_sse(url):
+    request = urllib.request.Request(url, method="GET")
+    request.add_header("Accept", "text/event-stream")
+    return urllib.request.urlopen(request, timeout=5)
+
+
+def _read_sse_event(response, event_name, *, timeout=5):
+    deadline = time.time() + timeout
+    event = None
+    data_lines = []
+    while time.time() < deadline:
+        line = response.readline().decode("utf-8").rstrip("\n")
+        if line.endswith("\r"):
+            line = line[:-1]
+        if not line:
+            if event == event_name:
+                return "\n".join(data_lines)
+            event = None
+            data_lines = []
+            continue
+        if line.startswith("event:"):
+            event = line[len("event:") :].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+    raise AssertionError(f"SSE event {event_name!r} was not received")
 
 
 def test_daemon_rejects_missing_token(tmp_path):
@@ -121,6 +152,528 @@ def test_status_does_not_expose_daemon_token(tmp_path):
         daemon.stop()
 
 
+def test_status_reports_active_mcp_client_sessions(tmp_path):
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir(parents=True)
+    (clients_dir / "gemini.json").write_text(
+        json.dumps(
+            {
+                "id": "gemini",
+                "transport": "stdio",
+                "client_name": "Gemini",
+                "pid": os.getpid(),
+                "last_seen_epoch": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    try:
+        status_payload = _request("GET", f"{daemon.base_url}/status", daemon.token)
+
+        assert status_payload["mcp_clients"]["connected"] == 1
+        assert status_payload["mcp_clients"]["items"][0]["client_name"] == "Gemini"
+        assert status_payload["mcp_clients"]["items"][0]["transport"] == "stdio"
+    finally:
+        daemon.stop()
+
+
+def test_client_session_registry_ignores_recent_record_with_dead_pid(tmp_path):
+    clients_dir = tmp_path / "clients"
+    clients_dir.mkdir(parents=True)
+    stale_path = clients_dir / "dead.json"
+    stale_path.write_text(
+        json.dumps(
+            {
+                "id": "dead",
+                "transport": "stdio",
+                "client_name": "Dead client",
+                "pid": -1,
+                "last_seen_epoch": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_active_client_sessions(tmp_path) == []
+    assert not stale_path.exists()
+
+
+def test_daemon_sse_endpoint_registers_client_without_daemon_token(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        status_payload = _request("GET", f"{daemon.base_url}/status", daemon.token)
+
+        assert urlparse(endpoint).path == "/messages"
+        assert status_payload["mcp_clients"]["connected"] == 1
+        assert status_payload["mcp_clients"]["items"][0]["transport"] == "sse"
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_sse_messages_round_trip_mcp_json_rpc(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode("utf-8"),
+            method="POST",
+        )
+        request.add_header("Content-Type", "application/json")
+
+        with urllib.request.urlopen(request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+
+        payload = json.loads(_read_sse_event(response, "message"))
+
+        assert payload["jsonrpc"] == "2.0"
+        assert payload["id"] == 1
+        assert payload["result"]["serverInfo"]["name"] == "translatorFork"
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_ai_completion_uses_sse_sampling_client(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-1",
+                    "method": "initialize",
+                    "params": {"capabilities": {"sampling": {}}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        init_payload = json.loads(_read_sse_event(response, "message"))
+        assert init_payload["id"] == "init-1"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {
+                    "prompt": "Translate: hello",
+                    "system_instruction": "Return only the translation.",
+                    "timeout_sec": 5,
+                },
+            )
+
+            sampling_request = json.loads(_read_sse_event(response, "message"))
+            assert sampling_request["jsonrpc"] == "2.0"
+            assert sampling_request["method"] == "sampling/createMessage"
+            assert sampling_request["params"]["messages"][0]["content"]["text"] == "Translate: hello"
+            assert sampling_request["params"]["systemPrompt"] == "Return only the translation."
+
+            sampling_response = urllib.request.Request(
+                endpoint,
+                data=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": sampling_request["id"],
+                        "result": {
+                            "role": "assistant",
+                            "content": {"type": "text", "text": "привет"},
+                        },
+                    }
+                ).encode("utf-8"),
+                method="POST",
+            )
+            sampling_response.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(sampling_response, timeout=5) as post_response:
+                assert post_response.status in {200, 202}
+
+            completion = future.result(timeout=5)
+
+        assert completion == {
+            "ok": True,
+            "transport": "sampling",
+            "text": "привет",
+        }
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_ai_completion_falls_back_to_gui_ai_task_inbox(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-no-sampling",
+                    "method": "initialize",
+                    "params": {"capabilities": {}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        init_payload = json.loads(_read_sse_event(response, "message"))
+        assert init_payload["id"] == "init-no-sampling"
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {
+                    "prompt": "Translate: bridge",
+                    "system_instruction": "Return only the translation.",
+                    "timeout_sec": 5,
+                },
+            )
+
+            tasks_payload = {}
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                tasks_payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+                if tasks_payload["tasks"]:
+                    break
+                time.sleep(0.05)
+
+            task = tasks_payload["tasks"][0]
+            claim = _request(
+                "POST",
+                f"{daemon.base_url}/gui-ai-tasks/{task['id']}/claim",
+                daemon.token,
+                {"client_name": "Gemini"},
+            )
+            assert claim["task"]["prompt"] == "Translate: bridge"
+            assert claim["task"]["system_instruction"] == "Return only the translation."
+
+            _request(
+                "POST",
+                f"{daemon.base_url}/gui-ai-tasks/{task['id']}/complete",
+                daemon.token,
+                {"text": "мост"},
+            )
+            completion = future.result(timeout=5)
+
+        assert completion == {
+            "ok": True,
+            "transport": "inbox",
+            "task_id": task["id"],
+            "text": "мост",
+        }
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_ai_completion_inbox_failure_returns_http_error(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-no-sampling-fail",
+                    "method": "initialize",
+                    "params": {"capabilities": {}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        _read_sse_event(response, "message")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {"prompt": "Translate: fail", "timeout_sec": 5},
+            )
+
+            task_id = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                tasks_payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+                if tasks_payload["tasks"]:
+                    task_id = tasks_payload["tasks"][0]["id"]
+                    break
+                time.sleep(0.05)
+            assert task_id
+
+            _request(
+                "POST",
+                f"{daemon.base_url}/gui-ai-tasks/{task_id}/fail",
+                daemon.token,
+                {"error": "AI client refused"},
+            )
+
+            with pytest.raises(urllib.error.HTTPError) as error_info:
+                future.result(timeout=5)
+
+        assert error_info.value.code == 502
+        payload = json.loads(error_info.value.read().decode("utf-8"))
+        assert payload["ok"] is False
+        assert "AI client refused" in payload["error"]
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_ai_completion_inbox_failure_preserves_limit_payload(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-no-sampling-limit",
+                    "method": "initialize",
+                    "params": {"capabilities": {}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        _read_sse_event(response, "message")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {"prompt": "Translate: limit", "timeout_sec": 5},
+            )
+
+            task_id = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                tasks_payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+                if tasks_payload["tasks"]:
+                    task_id = tasks_payload["tasks"][0]["id"]
+                    break
+                time.sleep(0.05)
+            assert task_id
+
+            _request(
+                "POST",
+                f"{daemon.base_url}/gui-ai-tasks/{task_id}/fail",
+                daemon.token,
+                {
+                    "error": "usage limit reached",
+                    "reset_after_seconds": 120,
+                    "limit_window_seconds": 5 * 60 * 60,
+                },
+            )
+
+            with pytest.raises(urllib.error.HTTPError) as error_info:
+                future.result(timeout=5)
+
+        assert error_info.value.code == 502
+        payload = json.loads(error_info.value.read().decode("utf-8"))
+        assert payload["ok"] is False
+        assert payload["error"] == "usage limit reached"
+        assert payload["reset_after_seconds"] == 120
+        assert payload["limit_window_seconds"] == 5 * 60 * 60
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_ai_completion_cancel_stops_inbox_wait_and_hides_task(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    request_id = "cancel_inbox_request"
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-no-sampling-cancel",
+                    "method": "initialize",
+                    "params": {"capabilities": {}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        _read_sse_event(response, "message")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {"request_id": request_id, "prompt": "Translate: cancel", "timeout_sec": 5},
+            )
+
+            task_id = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                tasks_payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+                if tasks_payload["tasks"]:
+                    task_id = tasks_payload["tasks"][0]["id"]
+                    break
+                time.sleep(0.05)
+            assert task_id
+
+            cancel_payload = _request(
+                "POST",
+                f"{daemon.base_url}/ai/completions/{request_id}/cancel",
+                daemon.token,
+            )
+
+            with pytest.raises(urllib.error.HTTPError) as error_info:
+                future.result(timeout=5)
+
+        assert cancel_payload == {"ok": True, "cancelled": True, "request_id": request_id}
+        assert error_info.value.code == 499
+        payload = json.loads(error_info.value.read().decode("utf-8"))
+        assert payload["ok"] is False
+        assert "cancelled" in payload["error"]
+        assert _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)["tasks"] == []
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_hides_orphan_gui_ai_tasks_from_client(tmp_path):
+    task = create_gui_ai_task(tmp_path, {"prompt": "stale prompt"})
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    try:
+        payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+
+        assert payload["tasks"] == []
+        cancelled = load_gui_ai_task(tmp_path, task.id)
+        assert cancelled.status == "cancelled"
+        assert "no active application request" in cancelled.error
+    finally:
+        daemon.stop()
+
+
+def test_daemon_ai_completion_timeout_cancels_inbox_task(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        endpoint = _read_sse_event(response, "endpoint")
+
+        init_request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": "init-no-sampling-timeout",
+                    "method": "initialize",
+                    "params": {"capabilities": {}},
+                }
+            ).encode("utf-8"),
+            method="POST",
+        )
+        init_request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(init_request, timeout=5) as post_response:
+            assert post_response.status in {200, 202}
+        _read_sse_event(response, "message")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _request,
+                "POST",
+                f"{daemon.base_url}/ai/completions",
+                daemon.token,
+                {"request_id": "timeout_inbox_request", "prompt": "Translate: timeout", "timeout_sec": 1},
+            )
+
+            task_id = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                tasks_payload = _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)
+                if tasks_payload["tasks"]:
+                    task_id = tasks_payload["tasks"][0]["id"]
+                    break
+                time.sleep(0.05)
+            assert task_id
+
+            with pytest.raises(urllib.error.HTTPError) as error_info:
+                future.result(timeout=5)
+
+        assert error_info.value.code == 504
+        cancelled = load_gui_ai_task(tmp_path, task_id)
+        assert cancelled.status == "cancelled"
+        assert "timed out" in cancelled.error
+        assert _request("GET", f"{daemon.base_url}/gui-ai-tasks", daemon.token)["tasks"] == []
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
 def test_daemon_state_files_are_private(tmp_path):
     if os.name == "nt":
         pytest.skip("POSIX mode assertions do not apply on Windows")
@@ -171,6 +724,26 @@ def test_module_cli_status_without_daemon(tmp_path):
 
     assert result.returncode == 1
     assert "daemon is not running" in result.stdout
+
+
+def test_module_cli_serve_uses_stable_default_port(monkeypatch, tmp_path):
+    from gemini_translator.mcp import __main__ as mcp_main
+
+    calls = []
+
+    class FakeDaemon:
+        def __init__(self, state_dir, *, port=0):
+            calls.append({"state_dir": state_dir, "port": port})
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr(mcp_main, "McpDaemon", FakeDaemon)
+
+    result = mcp_main.main(["--state-dir", str(tmp_path), "daemon", "serve"])
+
+    assert result == 0
+    assert calls == [{"state_dir": tmp_path.resolve(), "port": DEFAULT_DAEMON_PORT}]
 
 
 def test_module_cli_status_with_corrupt_daemon_info_reports_json_error(tmp_path):

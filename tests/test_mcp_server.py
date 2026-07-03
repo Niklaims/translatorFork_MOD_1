@@ -7,6 +7,7 @@ from gemini_translator.mcp.server import McpStdioServer, TOOL_NAMES
 class FakeClient:
     def __init__(self):
         self.enqueued = []
+        self.failed_gui_ai_tasks = []
 
     def status(self):
         return {"ok": True, "daemon": {"pid": 1}, "queue": {}}
@@ -23,6 +24,27 @@ class FakeClient:
 
     def cancel_job(self, job_id):
         return {"ok": True, "job": {"id": job_id, "status": "cancelled"}}
+
+    def list_gui_ai_tasks(self):
+        return {"ok": True, "tasks": [{"id": "gui_ai_1", "status": "pending"}]}
+
+    def claim_gui_ai_task(self, task_id, client_name=""):
+        return {
+            "ok": True,
+            "task": {
+                "id": task_id,
+                "status": "claimed",
+                "claimed_by": client_name,
+                "prompt": "PROMPT FOR AI",
+            },
+        }
+
+    def submit_gui_ai_task_result(self, task_id, text):
+        return {"ok": True, "task": {"id": task_id, "status": "completed", "result_text": text}}
+
+    def fail_gui_ai_task(self, task_id, error, **details):
+        self.failed_gui_ai_tasks.append((task_id, error, details))
+        return {"ok": True, "task": {"id": task_id, "status": "failed", "error": error}}
 
 
 class FailingStatusClient(FakeClient):
@@ -173,10 +195,104 @@ def test_installer_tool_schemas_expose_supported_arguments():
     assert {"client", "server_name", "state_dir"} <= set(config_props)
 
 
+def test_gui_ai_inbox_tools_are_exposed_and_call_client():
+    fake = FakeClient()
+    server = McpStdioServer(client_factory=lambda: fake)
+    tools_response = server.handle_request({"jsonrpc": "2.0", "id": 8, "method": "tools/list"})
+    tools = {tool["name"]: tool for tool in tools_response["result"]["tools"]}
+
+    assert "list_gui_ai_tasks" in tools
+    assert "claim_gui_ai_task" in tools
+    assert "submit_gui_ai_task_result" in tools
+    assert "fail_gui_ai_task" in tools
+
+    claim_response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "claim_gui_ai_task",
+                "arguments": {"task_id": "gui_ai_1", "client_name": "Gemini"},
+            },
+        }
+    )
+    submit_response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "submit_gui_ai_task_result",
+                "arguments": {"task_id": "gui_ai_1", "text": "готово"},
+            },
+        }
+    )
+
+    assert claim_response["result"]["isError"] is False
+    assert '"claimed_by": "Gemini"' in claim_response["result"]["content"][0]["text"]
+    assert "PROMPT FOR AI" in claim_response["result"]["content"][0]["text"]
+    assert submit_response["result"]["isError"] is False
+    assert '"status": "completed"' in submit_response["result"]["content"][0]["text"]
+
+
+def test_fail_gui_ai_task_forwards_limit_details_to_client():
+    fake = FakeClient()
+    server = McpStdioServer(client_factory=lambda: fake)
+    tools_response = server.handle_request({"jsonrpc": "2.0", "id": 8, "method": "tools/list"})
+    tools = {tool["name"]: tool for tool in tools_response["result"]["tools"]}
+
+    fail_props = tools["fail_gui_ai_task"]["inputSchema"]["properties"]
+    assert {"reset_after_seconds", "limit_window_seconds"} <= set(fail_props)
+
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "fail_gui_ai_task",
+                "arguments": {
+                    "task_id": "gui_ai_1",
+                    "error": "usage limit reached",
+                    "reset_after_seconds": 120,
+                    "limit_window_seconds": 5 * 60 * 60,
+                },
+            },
+        }
+    )
+
+    assert response["result"]["isError"] is False
+    assert fake.failed_gui_ai_tasks == [
+        (
+            "gui_ai_1",
+            "usage limit reached",
+            {"reset_after_seconds": 120, "limit_window_seconds": 5 * 60 * 60},
+        )
+    ]
+
+
 def test_notification_without_id_returns_none():
     server = McpStdioServer(client_factory=lambda: FakeClient())
 
     assert server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+
+
+def test_stdio_server_marks_client_session_on_requests_and_notifications():
+    class RecordingSession:
+        def __init__(self):
+            self.methods = []
+
+        def touch(self, method=None):
+            self.methods.append(method)
+
+    session = RecordingSession()
+    server = McpStdioServer(client_factory=lambda: FakeClient(), client_session=session)
+
+    server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    server.handle_request({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    assert session.methods == ["initialize", "notifications/initialized"]
 
 
 def test_start_full_pipeline_enqueues_pipeline_job():

@@ -29,6 +29,8 @@ FREE_DEEPSEEK_SETTINGS_KEY = "free_deepseek_api_dir"
 MODEL_COMBO_MIN_WIDTH = 280
 MODEL_COMBO_POPUP_MIN_WIDTH = 460
 MODEL_COMBO_POPUP_MAX_WIDTH = 760
+MCP_MODEL_PLACEHOLDER = "Модель выбирает AI-приложение"
+MCP_MODEL_NAME = "MCP Client"
 
 
 class CustomModelDialog(QDialog):
@@ -412,8 +414,10 @@ class ModelSettingsWidget(QGroupBox):
         self._uses_topic_subscription = False
         self._uses_broadcast_subscription = False
         self._provider_event_source_id = None
+        self._mcp_mode = False
+        self._mcp_restore_provider_id = None
         # Виджету интересна только смена провайдера; не будимся на чужие события.
-        self._event_topics = ('provider_changed',)
+        self._event_topics = ('provider_changed', 'ai_provider_mode_changed')
         self._connect_to_bus()
 
         self.system_instruction_editor_dialog = SystemInstructionEditorDialog(self.settings_manager, self)
@@ -1146,7 +1150,8 @@ class ModelSettingsWidget(QGroupBox):
                 thinking_budget = self.thinking_budget_spin.value()
 
         settings = {
-            'model': current_display_name,
+            'model': MCP_MODEL_NAME if self._mcp_mode else current_display_name,
+            'mcp_mode': self._mcp_mode,
             'dynamic_glossary': self.dynamic_glossary_checkbox.isChecked(),
             'use_jieba': self.use_jieba_glossary_checkbox.isChecked(),
             'segment_cjk_text': self.segment_text_checkbox.isChecked(),
@@ -1182,6 +1187,64 @@ class ModelSettingsWidget(QGroupBox):
         settings.update(self.fallback_panel.get_config())
         return settings
         
+    def _mcp_model_controls(self):
+        controls = [
+            self.model_combo,
+            self.refresh_models_btn,
+            self.add_custom_model_btn,
+            self.free_deepseek_tools_btn,
+            self.rpm_row_widget,
+            self.concurrent_row_widget,
+            self.rpd_row_widget,
+            self.temperature_override_checkbox,
+            self.temperature_spin,
+            self.thinking_checkbox,
+            self.thinking_preset_combo,
+            self.thinking_budget_spin,
+            self.thinking_level_combo,
+        ]
+        return [control for control in controls if control is not None]
+
+    def set_mcp_mode(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled == self._mcp_mode:
+            return
+
+        if enabled:
+            self._mcp_restore_provider_id = getattr(self, "_current_provider_id", None)
+            self._mcp_mode = True
+            self.model_combo.blockSignals(True)
+            try:
+                self.model_combo.clear()
+                self.model_combo.addItem(MCP_MODEL_PLACEHOLDER, userData=None)
+                self.model_combo.setCurrentIndex(0)
+            finally:
+                self.model_combo.blockSignals(False)
+            for control in self._mcp_model_controls():
+                control.setEnabled(False)
+            self.refresh_models_btn.setVisible(False)
+            self.free_deepseek_tools_btn.setVisible(False)
+            self.rpm_recommendation_label.setText("(MCP)")
+            self.max_concurrent_recommendation_label.setText("(MCP)")
+            self.rpd_recommendation_label.setText("(MCP)")
+            self.temp_indicator.setText("AI-приложение")
+            self.temp_indicator.setStyleSheet(f"color: {theme_manager.color('text_muted')}; font-size: 10px;")
+            self._emit_settings_changed()
+            return
+
+        self._mcp_mode = False
+        for control in self._mcp_model_controls():
+            control.setEnabled(True)
+        self._on_temperature_override_toggled(self.temperature_override_checkbox.checkState().value)
+        self.on_thinking_toggled(self.thinking_checkbox.checkState().value)
+
+        provider_id = self._mcp_restore_provider_id or getattr(self, "_current_provider_id", None)
+        if provider_id:
+            self.set_available_models(provider_id)
+        else:
+            self._update_provider_specific_controls(provider_id)
+            self._emit_settings_changed()
+
     
     def set_settings(self, settings: dict):
         """Применяет настройки из словаря к виджетам, блокируя сигналы."""
@@ -1285,12 +1348,24 @@ class ModelSettingsWidget(QGroupBox):
     # --- ИЗМЕНЕНИЕ 2: Новый слот для прослушки шины ---
     @pyqtSlot(dict)
     def on_event(self, event: dict):
+        if event.get('event') == 'ai_provider_mode_changed':
+            data = event.get('data', {}) or {}
+            expected_source_id = getattr(self, '_provider_event_source_id', None)
+            event_source_id = data.get('provider_widget_id')
+            if expected_source_id is not None and event_source_id != expected_source_id:
+                return
+            self.set_mcp_mode(bool(data.get('is_mcp')))
+            return
+
         if event.get('event') == 'provider_changed':
             data = event.get('data', {}) or {}
             expected_source_id = getattr(self, '_provider_event_source_id', None)
             event_source_id = data.get('provider_widget_id')
             if expected_source_id is not None and event_source_id != expected_source_id:
                 return
+
+            if self._mcp_mode:
+                self.set_mcp_mode(False)
 
             provider_id = data.get('provider_id')
             if provider_id:
@@ -1409,6 +1484,10 @@ class ModelSettingsWidget(QGroupBox):
     @pyqtSlot(str) # <-- Делаем его слотом
     def set_available_models(self, provider_id: str): # <-- Теперь принимает ID
         """Обновляет список доступных моделей на основе ID провайдера."""
+        if self._mcp_mode:
+            self._mcp_restore_provider_id = provider_id or self._mcp_restore_provider_id
+            return
+
         current_model_name = self.model_combo.currentText()
         current_model_id = self.model_combo.currentData()
         saved_model_name = None

@@ -332,6 +332,8 @@ class _StatusBarStub:
 
 
 class _SoftStopHarness:
+    _emit_to_bus = staticmethod(GenerationSessionDialog._emit_to_bus)
+    _build_event = GenerationSessionDialog._build_event
     _on_soft_stop_clicked = GenerationSessionDialog._on_soft_stop_clicked
     _post_event = GenerationSessionDialog._post_event
 
@@ -343,6 +345,51 @@ class _SoftStopHarness:
         self.is_soft_stopping = False
         self.soft_stop_btn = QtWidgets.QPushButton("Завершить плавно")
         self.hard_stop_btn = QtWidgets.QPushButton("❌ Прервать")
+
+
+class _HardStopEngineStub:
+    def __init__(self):
+        self.session_id = "session-1"
+        self.cancel_reasons = []
+
+    def cancel_translation(self, reason=""):
+        self.cancel_reasons.append(reason)
+        self.session_id = None
+
+
+class _HardStopHarness:
+    _emit_to_bus = staticmethod(GenerationSessionDialog._emit_to_bus)
+    _build_event = GenerationSessionDialog._build_event
+    _on_hard_stop_clicked = GenerationSessionDialog._on_hard_stop_clicked
+    _request_immediate_engine_cancel = GenerationSessionPage._request_immediate_engine_cancel
+    _post_event_deferred = GenerationSessionDialog._post_event_deferred
+    _finish_forced_interrupt_close = GenerationSessionPage._finish_forced_interrupt_close
+    reject = GenerationSessionPage.reject
+    _post_event = GenerationSessionDialog._post_event
+
+    def __init__(self):
+        self.bus = _EventBusStub()
+        self.engine = _HardStopEngineStub()
+        self.orchestrator = None
+        self._pipeline_stop_requested = False
+        self.force_exit_on_interrupt = False
+        self.hard_stop_btn = QtWidgets.QPushButton("❌ Прервать")
+        self.soft_stop_btn = QtWidgets.QPushButton("Завершить плавно")
+        self.apply_btn = QtWidgets.QPushButton("Применить")
+        self.apply_btn.setVisible(False)
+        self.ui_active_states = []
+        self.saved_settings = 0
+        self.cleanup_calls = []
+        self.result_ready = _SignalStub()
+
+    def _set_ui_active(self, active):
+        self.ui_active_states.append(active)
+
+    def _save_persistent_ui_settings(self):
+        self.saved_settings += 1
+
+    def _cleanup(self, keep_recovery_file=False):
+        self.cleanup_calls.append(keep_recovery_file)
 
 
 class _ProviderComboStub:
@@ -446,6 +493,38 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         self.assertTrue(harness._pipeline_stop_requested)
         self.assertFalse(harness.soft_stop_btn.isEnabled())
         self.assertTrue(harness.hard_stop_btn.isEnabled())
+
+    def test_hard_stop_requests_engine_cancel_without_blocking_ui(self):
+        harness = _HardStopHarness()
+        self.addCleanup(harness.soft_stop_btn.deleteLater)
+        self.addCleanup(harness.hard_stop_btn.deleteLater)
+        self.addCleanup(harness.apply_btn.deleteLater)
+
+        harness._on_hard_stop_clicked()
+
+        self.assertEqual(harness.engine.cancel_reasons, [])
+        self.assertEqual(harness.ui_active_states, [False])
+        self.assertTrue(harness._pipeline_stop_requested)
+
+        self.app.processEvents()
+        event_names = [event["event"] for event in harness.bus.event_posted.emitted]
+        self.assertIn("manual_stop_requested", event_names)
+
+    def test_reject_while_running_requests_stop_and_closes_without_waiting_for_session_finished(self):
+        harness = _HardStopHarness()
+        self.addCleanup(harness.soft_stop_btn.deleteLater)
+        self.addCleanup(harness.hard_stop_btn.deleteLater)
+        self.addCleanup(harness.apply_btn.deleteLater)
+
+        harness.reject()
+
+        self.assertEqual(harness.cleanup_calls, [False])
+        self.assertEqual(harness.result_ready.emitted, [False])
+        self.assertEqual(harness.engine.cancel_reasons, [])
+
+        self.app.processEvents()
+        event_names = [event["event"] for event in harness.bus.event_posted.emitted]
+        self.assertIn("manual_stop_requested", event_names)
 
     def test_bottom_status_bar_uses_generation_session_bus_and_engine(self):
         harness = _BottomStatusBarHarness()

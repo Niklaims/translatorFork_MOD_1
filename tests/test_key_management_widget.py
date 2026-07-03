@@ -12,6 +12,7 @@ from gemini_translator.ui.widgets.key_management_widget import (
     KeyManagementWidget,
     MCP_PROVIDER_ID,
 )
+from gemini_translator.ui.widgets.mcp_control_widget import McpStatusSnapshot
 
 
 class _RecordingBus(QtCore.QObject):
@@ -276,6 +277,79 @@ class KeyManagementWidgetProviderModeTests(unittest.TestCase):
             with self.subTest(button=button.text()):
                 self.assertTrue(button.isEnabled())
 
+    def test_mcp_provider_hides_key_lists_without_losing_real_provider_selection(self):
+        provider_id = next(
+            provider_id
+            for provider_id, provider in api_config.api_providers().items()
+            if provider.get("visible", True)
+            and api_config.provider_requires_api_key(provider_id)
+        )
+        widget = KeyManagementWidget(
+            _KeyStatusSettingsStub(provider_id),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+        widget.set_active_keys_for_provider(provider_id, ["active-a"])
+        self.assertEqual(widget.active_keys_list.count(), 1)
+        self.assertGreater(widget.available_keys_list.count(), 0)
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertEqual(widget.get_selected_provider(), provider_id)
+        self.assertEqual(widget.available_keys_list.count(), 0)
+        self.assertEqual(widget.active_keys_list.count(), 0)
+        self.assertEqual(widget.active_key_count_label.text(), "Выбрано: 0")
+        self.assertIn("MCP", widget.active_empty_label.text())
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(provider_id))
+
+        self.assertEqual(widget.active_keys_list.count(), 1)
+        self.assertEqual(
+            widget.active_keys_list.item(0).data(QtCore.Qt.ItemDataRole.UserRole),
+            "active-a",
+        )
+        self.assertGreater(widget.available_keys_list.count(), 0)
+
+    def test_mcp_provider_can_start_ai_session_when_client_connected(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertFalse(widget.can_start_ai_session())
+
+        widget.mcp_control_card.apply_status(
+            McpStatusSnapshot(running=True, detail="127.0.0.1:6543", connected_clients=1)
+        )
+
+        self.assertTrue(widget.can_start_ai_session())
+
+    def test_mcp_provider_returns_virtual_key_only_when_client_connected(self):
+        widget = KeyManagementWidget(
+            _KeySettingsStub(),
+            server_manager=_ServerManagerStub(),
+        )
+        self.addCleanup(widget.close)
+        widget.mcp_control_card.refresh_status = lambda: None
+
+        widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+        self.assertEqual(widget.get_active_keys(), [])
+
+        widget.mcp_control_card.apply_status(
+            McpStatusSnapshot(running=True, detail="127.0.0.1:65016", connected_clients=1)
+        )
+
+        self.assertEqual(
+            widget.get_active_keys(),
+            [api_config.provider_placeholder_api_key(MCP_PROVIDER_ID)],
+        )
+
     def test_mcp_to_local_restores_groups_but_keeps_key_actions_disabled(self):
         widget = KeyManagementWidget(
             _KeySettingsStub(),
@@ -316,6 +390,38 @@ class KeyManagementWidgetProviderModeTests(unittest.TestCase):
                 [],
                 [event for event in emitted_events if event.get("event") == "provider_changed"],
             )
+        finally:
+            bus.event_posted.disconnect(emitted_events.append)
+            if old_bus is None:
+                if hasattr(self.app, "event_bus"):
+                    delattr(self.app, "event_bus")
+            else:
+                self.app.event_bus = old_bus
+
+    def test_mcp_provider_selection_exposes_raw_ai_mode_event(self):
+        bus = _RecordingBus()
+        old_bus = getattr(self.app, "event_bus", None)
+        self.app.event_bus = bus
+        emitted_events = []
+        bus.event_posted.connect(emitted_events.append)
+        try:
+            widget = KeyManagementWidget(_KeySettingsStub())
+            self.addCleanup(widget.close)
+            widget.mcp_control_card.refresh_status = lambda: None
+            emitted_events.clear()
+
+            widget.provider_combo.setCurrentIndex(widget.provider_combo.findData(MCP_PROVIDER_ID))
+
+            self.assertTrue(widget.is_mcp_provider_selected())
+            self.assertEqual(widget.get_raw_selected_provider(), MCP_PROVIDER_ID)
+            mcp_events = [
+                event
+                for event in emitted_events
+                if event.get("event") == "ai_provider_mode_changed"
+            ]
+            self.assertEqual(len(mcp_events), 1)
+            self.assertEqual(mcp_events[0]["data"]["provider_id"], MCP_PROVIDER_ID)
+            self.assertTrue(mcp_events[0]["data"]["is_mcp"])
         finally:
             bus.event_posted.disconnect(emitted_events.append)
             if old_bus is None:

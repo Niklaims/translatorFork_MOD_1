@@ -11,6 +11,7 @@ from gemini_translator.mcp.client_install import (
     handle_install_tool,
     install_claude_config,
 )
+from gemini_translator.mcp.paths import DEFAULT_DAEMON_PORT
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +29,14 @@ def test_build_codex_snippet_uses_toml_shape():
 
     assert "[mcp_servers.translatorFork]" in snippet["text"]
     assert "gemini_translator.mcp" in snippet["text"]
+
+
+def test_build_antigravity_snippet_uses_stable_sse_url():
+    snippet = build_config_snippet("antigravity", server_name="translatorFork")
+
+    assert snippet["mcpServers"]["translatorFork"] == {
+        "url": f"http://127.0.0.1:{DEFAULT_DAEMON_PORT}/sse"
+    }
 
 
 @pytest.mark.parametrize("client", ["codex", "claude", "generic", "antigravity"])

@@ -117,6 +117,19 @@ class McpControlWidgetTests(unittest.TestCase):
         self.assertEqual(widget.detail_label.text(), "127.0.0.1:5000")
         self.assertEqual(widget.action_button.text(), "Остановить")
 
+    def test_auto_refresh_timer_runs_only_when_enabled_and_daemon_running(self):
+        widget = McpControlWidget(backend=_FakeBackend())
+        self.addCleanup(widget.close)
+
+        widget.apply_status(McpStatusSnapshot(running=True, detail="127.0.0.1:5000"))
+        self.assertFalse(widget._status_timer.isActive())
+
+        widget.set_auto_refresh_enabled(True)
+        self.assertTrue(widget._status_timer.isActive())
+
+        widget.apply_status(McpStatusSnapshot(running=False))
+        self.assertFalse(widget._status_timer.isActive())
+
     def test_apply_error_status_keeps_card_usable(self):
         widget = McpControlWidget(backend=_FakeBackend())
         self.addCleanup(widget.close)
@@ -141,6 +154,52 @@ class McpControlWidgetTests(unittest.TestCase):
         self.assertEqual(snapshot.detail, "stdio + local daemon")
         self.assertIsNone(snapshot.error)
 
+    def test_backend_status_treats_unreachable_stale_daemon_as_off(self):
+        backend = McpControlBackend()
+
+        class Client:
+            def status(self):
+                raise DaemonClientError("<urlopen error [Errno 61] Connection refused>")
+
+        with mock.patch("gemini_translator.mcp.client.load_client", return_value=Client()):
+            snapshot = backend.status()
+
+        self.assertFalse(snapshot.running)
+        self.assertEqual(snapshot.detail, "stdio + local daemon")
+        self.assertIsNone(snapshot.error)
+
+    def test_backend_stop_treats_unreachable_stale_daemon_as_off(self):
+        backend = McpControlBackend()
+
+        class Client:
+            def shutdown(self):
+                raise DaemonClientError("<urlopen error [Errno 61] Connection refused>")
+
+        with mock.patch("gemini_translator.mcp.client.load_client", return_value=Client()):
+            snapshot = backend.stop()
+
+        self.assertFalse(snapshot.running)
+        self.assertEqual(snapshot.detail, "stdio + local daemon")
+        self.assertIsNone(snapshot.error)
+
+    def test_backend_status_reads_connected_mcp_client_count(self):
+        backend = McpControlBackend()
+
+        class Client:
+            def status(self):
+                return {
+                    "ok": True,
+                    "daemon": {"host": "127.0.0.1", "port": 6543},
+                    "mcp_clients": {"connected": 1, "items": [{"client_name": "Gemini"}]},
+                }
+
+        with mock.patch("gemini_translator.mcp.client.load_client", return_value=Client()):
+            snapshot = backend.status()
+
+        self.assertTrue(snapshot.running)
+        self.assertEqual(snapshot.detail, "127.0.0.1:6543")
+        self.assertEqual(snapshot.connected_clients, 1)
+
     def test_execute_action_sync_runs_start_then_stop(self):
         backend = _ActionBackend()
         widget = McpControlWidget(backend=backend)
@@ -157,6 +216,38 @@ class McpControlWidgetTests(unittest.TestCase):
         self.assertEqual(backend.stopped, 1)
         self.assertEqual(widget.status_value_label.text(), "Выключен")
         self.assertEqual(widget.action_button.text(), "Запустить")
+
+    def test_app_quit_stops_daemon_started_by_this_widget(self):
+        backend = _ActionBackend()
+        widget = McpControlWidget(backend=backend)
+        self.addCleanup(widget.close)
+
+        widget._execute_action_sync("toggle")
+        widget._on_app_about_to_quit()
+
+        self.assertEqual(backend.started, 1)
+        self.assertEqual(backend.stopped, 1)
+        self.assertFalse(widget._stop_on_app_quit)
+
+    def test_app_quit_does_not_stop_daemon_discovered_by_status(self):
+        backend = _ActionBackend()
+        widget = McpControlWidget(backend=backend)
+        self.addCleanup(widget.close)
+
+        widget.apply_status(McpStatusSnapshot(running=True, detail="127.0.0.1:4567"))
+        widget._on_app_about_to_quit()
+
+        self.assertEqual(backend.stopped, 0)
+
+    def test_close_stops_daemon_started_by_this_widget(self):
+        backend = _ActionBackend()
+        widget = McpControlWidget(backend=backend)
+
+        widget._execute_action_sync("toggle")
+        widget.close()
+
+        self.assertEqual(backend.started, 1)
+        self.assertEqual(backend.stopped, 1)
 
     def test_worker_finished_reenables_button_and_applies_status(self):
         widget = McpControlWidget(backend=_FakeBackend())

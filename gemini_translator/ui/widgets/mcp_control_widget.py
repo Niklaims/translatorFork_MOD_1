@@ -13,6 +13,42 @@ class McpStatusSnapshot:
     running: bool
     detail: str = "stdio + local daemon"
     error: str | None = None
+    connected_clients: int = 0
+
+
+def _snapshot_from_status_payload(payload) -> McpStatusSnapshot:
+    daemon = payload.get("daemon", {}) if isinstance(payload, dict) else {}
+    host = daemon.get("host", "127.0.0.1")
+    port = daemon.get("port", "")
+    clients = payload.get("mcp_clients", {}) if isinstance(payload, dict) else {}
+    try:
+        connected_clients = int(clients.get("connected") or 0)
+    except (TypeError, ValueError, OverflowError):
+        connected_clients = 0
+    return McpStatusSnapshot(
+        running=True,
+        detail=f"{host}:{port}",
+        connected_clients=max(0, connected_clients),
+    )
+
+
+def _daemon_error_means_not_running(message: str) -> bool:
+    text = str(message or "").lower()
+    markers = (
+        "daemon is not running",
+        "connection refused",
+        "connection reset",
+        "connection aborted",
+        "timed out",
+        "timeout",
+        "failed to establish",
+        "actively refused",
+        "errno 61",
+        "errno 111",
+        "winerror 10061",
+        "urlopen error",
+    )
+    return any(marker in text for marker in markers)
 
 
 class McpControlBackend:
@@ -22,23 +58,17 @@ class McpControlBackend:
         try:
             payload = load_client().status()
         except DaemonClientError as exc:
-            if str(exc) == "daemon is not running":
+            if _daemon_error_means_not_running(str(exc)):
                 return McpStatusSnapshot(running=False, detail="stdio + local daemon")
             return McpStatusSnapshot(running=False, detail="stdio + local daemon", error=str(exc))
-        daemon = payload.get("daemon", {}) if isinstance(payload, dict) else {}
-        host = daemon.get("host", "127.0.0.1")
-        port = daemon.get("port", "")
-        return McpStatusSnapshot(running=True, detail=f"{host}:{port}")
+        return _snapshot_from_status_payload(payload)
 
     def start(self) -> McpStatusSnapshot:
         from gemini_translator.mcp.client import ensure_daemon_process
 
         client = ensure_daemon_process()
         payload = client.status()
-        daemon = payload.get("daemon", {}) if isinstance(payload, dict) else {}
-        host = daemon.get("host", "127.0.0.1")
-        port = daemon.get("port", "")
-        return McpStatusSnapshot(running=True, detail=f"{host}:{port}")
+        return _snapshot_from_status_payload(payload)
 
     def stop(self) -> McpStatusSnapshot:
         from gemini_translator.mcp.client import DaemonClientError, load_client
@@ -46,6 +76,8 @@ class McpControlBackend:
         try:
             load_client().shutdown()
         except DaemonClientError as exc:
+            if _daemon_error_means_not_running(str(exc)):
+                return McpStatusSnapshot(running=False, detail="stdio + local daemon")
             return McpStatusSnapshot(running=False, detail="stdio + local daemon", error=str(exc))
         return McpStatusSnapshot(running=False, detail="stdio + local daemon")
 
@@ -94,16 +126,26 @@ def _forget_finished_mcp_workers() -> None:
 
 class McpControlWidget(QtWidgets.QFrame):
     refresh_requested = QtCore.pyqtSignal()
+    status_changed = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None, *, backend=None):
         super().__init__(parent)
         self.backend = backend or McpControlBackend()
         self._running = False
+        self._last_status = McpStatusSnapshot(running=False)
+        self._auto_refresh_enabled = False
+        self._stop_on_app_quit = False
         self._worker_thread = None
         self._worker = None
+        self._worker_action = None
+        self._worker_was_running = False
         self._closing = False
         self.setObjectName("mcpControlCard")
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Minimum)
+
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setInterval(2500)
+        self._status_timer.timeout.connect(self._poll_status_if_running)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 4, 6, 4)
@@ -123,12 +165,14 @@ class McpControlWidget(QtWidgets.QFrame):
 
         self.status_value_label = QLabel("Выключен")
         self.status_value_label.setObjectName("keyStatusMetricValue")
+        self.status_value_label.setMaximumWidth(78)
         status_row.addWidget(self.status_value_label)
         status_row.addStretch(1)
         text_col.addLayout(status_row)
 
         self.detail_label = QLabel("stdio + local daemon")
         self.detail_label.setObjectName("mutedLabel")
+        self.detail_label.setMaximumWidth(112)
         text_col.addWidget(self.detail_label)
         layout.addLayout(text_col)
 
@@ -147,8 +191,20 @@ class McpControlWidget(QtWidgets.QFrame):
         self.apply_status(McpStatusSnapshot(running=False))
         self.action_button.clicked.connect(lambda: self._dispatch_action("toggle"))
         self.config_button.clicked.connect(self.copy_codex_config)
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._on_app_about_to_quit)
+
+    def sizeHint(self) -> QtCore.QSize:
+        hint = super().sizeHint()
+        return QtCore.QSize(min(hint.width(), 320), hint.height())
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        return QtCore.QSize(min(hint.width(), 300), hint.height())
 
     def apply_status(self, snapshot: McpStatusSnapshot) -> None:
+        self._last_status = snapshot
         self._running = bool(snapshot.running) and not snapshot.error
         if snapshot.error:
             self.status_value_label.setText("Ошибка")
@@ -159,11 +215,37 @@ class McpControlWidget(QtWidgets.QFrame):
         else:
             self.status_value_label.setText("Выключен")
             self.setToolTip("")
-        self.detail_label.setText(snapshot.detail or "stdio + local daemon")
+        detail_text = snapshot.detail or "stdio + local daemon"
+        if self._running and snapshot.connected_clients:
+            client_label = "клиент" if snapshot.connected_clients == 1 else "клиентов"
+            detail_text = f"{detail_text} · {client_label}: {snapshot.connected_clients}"
+        self.detail_label.setText(detail_text)
         self.action_button.setText("Остановить" if self._running else "Запустить")
         self._apply_button_style()
+        self._sync_status_timer()
+        self.status_changed.emit(snapshot)
+
+    def has_connected_client(self) -> bool:
+        return self._running and self._last_status.connected_clients > 0
+
+    def set_auto_refresh_enabled(self, enabled: bool) -> None:
+        self._auto_refresh_enabled = bool(enabled)
+        self._sync_status_timer()
+
+    def _sync_status_timer(self) -> None:
+        should_run = self._auto_refresh_enabled and self._running and self._worker_thread is None
+        if should_run and not self._status_timer.isActive():
+            self._status_timer.start()
+        elif not should_run and self._status_timer.isActive():
+            self._status_timer.stop()
+
+    def _poll_status_if_running(self) -> None:
+        if not self._running or self._worker_thread is not None:
+            return
+        self.refresh_status()
 
     def _execute_action_sync(self, action: str) -> McpStatusSnapshot:
+        was_running = self._running
         try:
             if action == "status":
                 snapshot = self.backend.status()
@@ -176,7 +258,16 @@ class McpControlWidget(QtWidgets.QFrame):
         except Exception as exc:
             snapshot = McpStatusSnapshot(running=False, detail="ошибка MCP", error=str(exc))
         self.apply_status(snapshot)
+        self._update_stop_on_quit_policy(action, was_running, snapshot)
         return snapshot
+
+    def _update_stop_on_quit_policy(self, action: str, was_running: bool, snapshot: McpStatusSnapshot) -> None:
+        if action != "toggle" or snapshot.error:
+            return
+        if not was_running and snapshot.running:
+            self._stop_on_app_quit = True
+        elif was_running and not snapshot.running:
+            self._stop_on_app_quit = False
 
     def _dispatch_action(self, action: str) -> None:
         if self._worker_thread is not None:
@@ -195,14 +286,22 @@ class McpControlWidget(QtWidgets.QFrame):
         _ACTIVE_WORKERS[thread] = worker
         self._worker_thread = thread
         self._worker = worker
+        self._worker_action = action
+        self._worker_was_running = self._running
+        self._sync_status_timer()
         thread.start()
 
     def _on_worker_finished(self, snapshot: McpStatusSnapshot) -> None:
         thread = self._worker_thread
+        action = self._worker_action
+        was_running = self._worker_was_running
         self._worker_thread = None
         self._worker = None
+        self._worker_action = None
+        self._worker_was_running = False
         if not self._closing:
             self.apply_status(snapshot)
+            self._update_stop_on_quit_policy(action, was_running, snapshot)
         self.action_button.setEnabled(True)
         if thread is not None:
             thread.quit()
@@ -223,10 +322,35 @@ class McpControlWidget(QtWidgets.QFrame):
         _forget_finished_mcp_workers()
         self._worker_thread = None
         self._worker = None
+        self._worker_action = None
+        self._worker_was_running = False
         self.action_button.setEnabled(True)
+        self._sync_status_timer()
+
+    def _on_app_about_to_quit(self) -> None:
+        if not self._stop_on_app_quit:
+            return
+        self._wait_for_worker()
+        if not self._running:
+            self._stop_on_app_quit = False
+            return
+        try:
+            snapshot = self.backend.stop()
+        except Exception as exc:
+            snapshot = McpStatusSnapshot(running=False, detail="ошибка остановки MCP", error=str(exc))
+        self._stop_on_app_quit = False
+        self.apply_status(snapshot)
 
     def closeEvent(self, event) -> None:
         self._closing = True
+        self._status_timer.stop()
+        self._on_app_about_to_quit()
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(self._on_app_about_to_quit)
+            except TypeError:
+                pass
         self._wait_for_worker()
         super().closeEvent(event)
 

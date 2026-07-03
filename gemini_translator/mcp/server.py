@@ -5,8 +5,10 @@ from pathlib import Path
 import sys
 from typing import Any, Callable
 
+from .client_sessions import McpClientSession
 from .client import ensure_daemon_process
 from .commands import CommandBuildError, build_cli_command
+from .ai_bridge import gui_ai_failure_details
 from .jobs import redact_for_mcp
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -23,6 +25,10 @@ TOOL_NAMES = [
     "get_job_status",
     "list_jobs",
     "cancel_job",
+    "list_gui_ai_tasks",
+    "claim_gui_ai_task",
+    "submit_gui_ai_task_result",
+    "fail_gui_ai_task",
     "install_mcp_client",
     "print_mcp_config",
 ]
@@ -200,6 +206,49 @@ TOOL_DEFINITIONS = [
         ),
     },
     {
+        "name": "list_gui_ai_tasks",
+        "description": "List GUI AI prompts waiting for a connected MCP client.",
+        "inputSchema": _schema({}),
+    },
+    {
+        "name": "claim_gui_ai_task",
+        "description": "Claim a pending GUI AI prompt and return the prompt text.",
+        "inputSchema": _schema(
+            {
+                "task_id": {"type": "string", "description": "GUI AI task id."},
+                "client_name": {"type": "string", "description": "Name of the claiming AI client."},
+            },
+            required=["task_id"],
+        ),
+    },
+    {
+        "name": "submit_gui_ai_task_result",
+        "description": "Submit the assistant text for a claimed GUI AI prompt.",
+        "inputSchema": _schema(
+            {
+                "task_id": {"type": "string", "description": "GUI AI task id."},
+                "text": {"type": "string", "description": "Assistant response text."},
+            },
+            required=["task_id", "text"],
+        ),
+    },
+    {
+        "name": "fail_gui_ai_task",
+        "description": "Mark a GUI AI prompt as failed.",
+        "inputSchema": _schema(
+            {
+                "task_id": {"type": "string", "description": "GUI AI task id."},
+                "error": {"type": "string", "description": "Failure reason."},
+                "retry_after_seconds": {"type": "number", "description": "Temporary retry delay in seconds."},
+                "reset_after_seconds": {"type": "number", "description": "Limit reset delay in seconds."},
+                "limit_window_seconds": {"type": "number", "description": "AI client quota window in seconds."},
+                "window_seconds": {"type": "number", "description": "AI client quota window in seconds."},
+                "error_type": {"type": "string", "description": "Machine-readable failure category."},
+            },
+            required=["task_id", "error"],
+        ),
+    },
+    {
         "name": "install_mcp_client",
         "description": "Install or update a desktop AI client MCP configuration.",
         "inputSchema": _schema(
@@ -227,20 +276,29 @@ TOOL_DEFINITIONS = [
 
 
 class McpStdioServer:
-    def __init__(self, client_factory: Callable[[], Any]):
+    def __init__(self, client_factory: Callable[[], Any], client_session: Any | None = None):
         self._client_factory = client_factory
+        self._client_session = client_session
 
     def handle_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         if not isinstance(request, dict):
             return self._error(None, -32600, "Invalid Request")
-        if "id" not in request:
-            return None
 
         request_id = request.get("id")
         method = request.get("method")
+        if self._client_session is not None:
+            self._client_session.touch(method)
+        if "id" not in request:
+            return None
 
         try:
             if method == "initialize":
+                if self._client_session is not None:
+                    params = request.get("params") or {}
+                    capabilities = params.get("capabilities") if isinstance(params, dict) else None
+                    setter = getattr(self._client_session, "set_client_capabilities", None)
+                    if callable(setter):
+                        setter(capabilities if isinstance(capabilities, dict) else {})
                 return self._response(request_id, self._initialize())
             if method == "ping":
                 return self._response(request_id, {})
@@ -286,6 +344,34 @@ class McpStdioServer:
             if not job_id:
                 return self._tool_result({"ok": False, "error": "job_id is required"}, is_error=True)
             return self._tool_result(self._client().cancel_job(job_id))
+        if name == "list_gui_ai_tasks":
+            return self._tool_result(self._client().list_gui_ai_tasks())
+        if name == "claim_gui_ai_task":
+            task_id = arguments.get("task_id")
+            if not task_id:
+                return self._tool_result({"ok": False, "error": "task_id is required"}, is_error=True)
+            return self._tool_result(
+                self._client().claim_gui_ai_task(task_id, arguments.get("client_name") or ""),
+                redact=False,
+            )
+        if name == "submit_gui_ai_task_result":
+            task_id = arguments.get("task_id")
+            if not task_id:
+                return self._tool_result({"ok": False, "error": "task_id is required"}, is_error=True)
+            return self._tool_result(
+                self._client().submit_gui_ai_task_result(task_id, arguments.get("text") or "")
+            )
+        if name == "fail_gui_ai_task":
+            task_id = arguments.get("task_id")
+            if not task_id:
+                return self._tool_result({"ok": False, "error": "task_id is required"}, is_error=True)
+            return self._tool_result(
+                self._client().fail_gui_ai_task(
+                    task_id,
+                    arguments.get("error") or "AI client failed",
+                    **gui_ai_failure_details(arguments),
+                )
+            )
         if name in {"install_mcp_client", "print_mcp_config"}:
             return self._call_client_install_tool(name, arguments)
         if name == "start_full_pipeline":
@@ -346,8 +432,9 @@ class McpStdioServer:
             is_error=True,
         )
 
-    def _tool_result(self, payload, is_error: bool = False) -> dict[str, Any]:
-        text = json.dumps(redact_for_mcp(payload), ensure_ascii=False, indent=2, sort_keys=True)
+    def _tool_result(self, payload, is_error: bool = False, *, redact: bool = True) -> dict[str, Any]:
+        output = redact_for_mcp(payload) if redact else payload
+        text = json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True)
         return {
             "content": [{"type": "text", "text": text}],
             "isError": bool(is_error),
@@ -401,20 +488,27 @@ def build_pipeline_payload(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_stdio_server(state_dir: Path) -> None:
-    server = McpStdioServer(client_factory=lambda: ensure_daemon_process(state_dir))
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            request = json.loads(line)
-            response = server.handle_request(request)
-        except json.JSONDecodeError as exc:
-            response = server._error(None, -32700, f"Parse error: {exc}")
+    client_session = McpClientSession(state_dir, client_name="MCP client", transport="stdio")
+    server = McpStdioServer(
+        client_factory=lambda: ensure_daemon_process(state_dir),
+        client_session=client_session,
+    )
+    try:
+        for line in sys.stdin:
+            if not line.strip():
+                continue
+            try:
+                request = json.loads(line)
+                response = server.handle_request(request)
+            except json.JSONDecodeError as exc:
+                response = server._error(None, -32700, f"Parse error: {exc}")
 
-        if response is None:
-            continue
-        sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+            if response is None:
+                continue
+            sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    finally:
+        client_session.close()
 
 
 __all__ = [

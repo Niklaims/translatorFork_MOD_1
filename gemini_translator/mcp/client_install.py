@@ -8,6 +8,8 @@ import shutil
 import sys
 from typing import Any
 
+from .paths import default_daemon_port
+
 CLIENTS_WITH_MCP_SERVERS = {"claude", "generic", "antigravity"}
 SAFE_INSTALL_MODES = {"auto", "print", "write"}
 SERVER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -29,6 +31,10 @@ def _server_command(*, state_dir: str | Path | None = None) -> dict[str, Any]:
     }
 
 
+def _sse_server_config() -> dict[str, str]:
+    return {"url": f"http://127.0.0.1:{default_daemon_port()}/sse"}
+
+
 def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
@@ -38,6 +44,13 @@ def _validate_server_name(server_name: str) -> str:
     if not SERVER_NAME_PATTERN.fullmatch(value):
         raise ValueError("server_name must contain only letters, digits, underscores, or hyphens")
     return value
+
+
+def _toml_string(value: str) -> str:
+    text = str(value)
+    if "'" not in text and "\n" not in text and "\r" not in text:
+        return f"'{text}'"
+    return json.dumps(text)
 
 
 def build_config_snippet(
@@ -50,16 +63,19 @@ def build_config_snippet(
     server_name = _validate_server_name(server_name)
     command = _server_command(state_dir=state_dir)
 
+    if normalized_client == "antigravity":
+        return {"mcpServers": {server_name: _sse_server_config()}}
+
     if normalized_client in CLIENTS_WITH_MCP_SERVERS:
         return {"mcpServers": {server_name: command}}
 
     if normalized_client == "codex":
-        args = ", ".join(json.dumps(arg) for arg in command["args"])
-        env = ", ".join(f"{key} = {json.dumps(value)}" for key, value in command["env"].items())
+        args = ", ".join(_toml_string(arg) for arg in command["args"])
+        env = ", ".join(f"{key} = {_toml_string(value)}" for key, value in command["env"].items())
         return {
             "text": (
                 f"[mcp_servers.{server_name}]\n"
-                f"command = {json.dumps(command['command'])}\n"
+                f"command = {_toml_string(command['command'])}\n"
                 f"args = [{args}]\n"
                 f"env = {{ {env} }}\n"
             )

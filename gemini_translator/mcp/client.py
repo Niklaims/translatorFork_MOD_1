@@ -16,7 +16,9 @@ ALLOWED_DAEMON_HOSTS = {"127.0.0.1", "localhost"}
 
 
 class DaemonClientError(RuntimeError):
-    pass
+    def __init__(self, message, payload=None):
+        super().__init__(message)
+        self.payload = payload if isinstance(payload, dict) else {}
 
 
 class DaemonClient:
@@ -50,17 +52,18 @@ class DaemonClient:
         host = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
         return f"http://{host}:{self.port}"
 
-    def request(self, method, path, payload=None):
+    def request(self, method, path, payload=None, *, timeout=5):
         data = None if payload is None else json.dumps(payload).encode("utf-8")
         request = Request(f"{self.base_url}{path}", data=data, method=str(method).upper())
         request.add_header(TOKEN_HEADER, self.token)
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urlopen(request, timeout=5) as response:
+            with urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
-            raise DaemonClientError(self._http_error_message(exc)) from exc
+            payload = self._http_error_payload(exc)
+            raise DaemonClientError(str(payload.get("error") or exc), payload=payload) from exc
         except URLError as exc:
             raise DaemonClientError(str(exc)) from exc
         except json.JSONDecodeError as exc:
@@ -81,16 +84,50 @@ class DaemonClient:
     def cancel_job(self, job_id):
         return self.request("POST", f"/jobs/{quote(str(job_id), safe='')}/cancel")
 
+    def request_ai_completion(self, payload, timeout=None):
+        return self.request("POST", "/ai/completions", payload, timeout=timeout or 1805)
+
+    def cancel_ai_completion(self, request_id):
+        return self.request("POST", f"/ai/completions/{quote(str(request_id), safe='')}/cancel", timeout=2)
+
+    def list_gui_ai_tasks(self):
+        return self.request("GET", "/gui-ai-tasks")
+
+    def claim_gui_ai_task(self, task_id, client_name=""):
+        return self.request(
+            "POST",
+            f"/gui-ai-tasks/{quote(str(task_id), safe='')}/claim",
+            {"client_name": client_name},
+        )
+
+    def submit_gui_ai_task_result(self, task_id, text):
+        return self.request(
+            "POST",
+            f"/gui-ai-tasks/{quote(str(task_id), safe='')}/complete",
+            {"text": text},
+        )
+
+    def fail_gui_ai_task(self, task_id, error, **details):
+        payload = {"error": error}
+        payload.update({key: value for key, value in details.items() if value is not None})
+        return self.request(
+            "POST",
+            f"/gui-ai-tasks/{quote(str(task_id), safe='')}/fail",
+            payload,
+        )
+
     def shutdown(self):
         return self.request("POST", "/shutdown")
 
     @staticmethod
-    def _http_error_message(exc: HTTPError) -> str:
+    def _http_error_payload(exc: HTTPError) -> dict:
         try:
             payload = json.loads(exc.read().decode("utf-8"))
         except Exception:
-            return str(exc)
-        return str(payload.get("error") or exc)
+            return {"ok": False, "error": str(exc)}
+        if isinstance(payload, dict):
+            return payload
+        return {"ok": False, "error": str(payload)}
 
 
 def load_client(state_dir: Path | None = None):

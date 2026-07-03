@@ -8,7 +8,7 @@ import sys
 from .client_install import handle_install_tool
 from .client import DaemonClientError, load_client
 from .daemon import McpDaemon
-from .paths import default_state_dir
+from .paths import default_daemon_port, default_state_dir
 
 CLIENT_CHOICES = ("codex", "claude", "antigravity", "generic")
 INSTALL_MODE_CHOICES = ("auto", "print", "write")
@@ -36,7 +36,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     daemon_parser = subparsers.add_parser("daemon")
     daemon_subparsers = daemon_parser.add_subparsers(dest="daemon_command", required=True)
-    daemon_subparsers.add_parser("serve")
+    serve_parser = daemon_subparsers.add_parser("serve")
+    serve_parser.add_argument("--port", type=int, default=default_daemon_port())
     daemon_subparsers.add_parser("status")
     daemon_subparsers.add_parser("stop")
 
@@ -89,7 +90,7 @@ def main(argv=None) -> int:
 
     if args.command == "daemon":
         if args.daemon_command == "serve":
-            McpDaemon(state_dir).serve_forever()
+            McpDaemon(state_dir, port=args.port).serve_forever()
             return 0
 
         try:
