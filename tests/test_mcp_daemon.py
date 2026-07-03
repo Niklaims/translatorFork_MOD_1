@@ -1,5 +1,6 @@
 import json
 import os
+from queue import Empty, Queue
 import stat
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import urllib.request
 import pytest
 
 from gemini_translator.mcp.client import DaemonClient, DaemonClientError, load_client
-from gemini_translator.mcp.client_sessions import list_active_client_sessions
+from gemini_translator.mcp.client_sessions import McpClientSession, list_active_client_sessions
 from gemini_translator.mcp.ai_bridge import create_gui_ai_task, load_gui_ai_task
 from gemini_translator.mcp.daemon import McpDaemon, read_daemon_info
 from gemini_translator.mcp.jobs import create_job, mark_finished, save_job
@@ -199,6 +200,28 @@ def test_client_session_registry_ignores_recent_record_with_dead_pid(tmp_path):
 
     assert list_active_client_sessions(tmp_path) == []
     assert not stale_path.exists()
+
+
+def test_daemon_stop_signals_sse_sessions_before_server_shutdown(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    session = McpClientSession(tmp_path, client_name="test", transport="sse")
+    event_queue = Queue()
+    daemon._sse_sessions[session.id] = (session, event_queue)
+
+    class Server:
+        def shutdown(self):
+            try:
+                payload = event_queue.get_nowait()
+            except Empty as exc:
+                raise AssertionError("SSE session was not signaled before server shutdown") from exc
+            assert payload is None
+
+        def server_close(self):
+            pass
+
+    daemon._server = Server()
+
+    daemon.stop()
 
 
 def test_daemon_sse_endpoint_registers_client_without_daemon_token(tmp_path):

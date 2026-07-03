@@ -105,6 +105,33 @@ class GlossaryManagerTableLayoutTests(unittest.TestCase):
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
 
+    def test_analysis_buttons_survive_repeated_reflow(self):
+        page = GlossaryManagerPage(mode="child")
+        self.addCleanup(page.close)
+        page.set_glossary(
+            [
+                {
+                    "original": "Alpha",
+                    "rus": "Альфа",
+                    "note": "",
+                }
+            ],
+            run_analysis=False,
+        )
+
+        page._reflow_analysis_buttons()
+        page._reflow_analysis_buttons()
+
+        layout_widgets = [
+            page.analysis_layout.itemAt(index).widget()
+            for index in range(page.analysis_layout.count())
+        ]
+
+        self.assertIn(page.analyze_button, layout_widgets)
+        self.assertIn(page.ai_correction_button, layout_widgets)
+        self.assertIn(page.group_analysis_button, layout_widgets)
+        self.assertIn(page.freq_analysis_button, layout_widgets)
+
 
 if __name__ == "__main__":
     unittest.main()

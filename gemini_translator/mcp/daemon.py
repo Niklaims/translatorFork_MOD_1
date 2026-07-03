@@ -137,13 +137,6 @@ class McpDaemon:
         server = self._server
         thread = self._server_thread
 
-        if server is not None:
-            server.shutdown()
-            server.server_close()
-
-        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=5)
-
         with self._lock:
             sse_sessions = list(self._sse_sessions.values())
             self._sse_sessions.clear()
@@ -153,9 +146,7 @@ class McpDaemon:
             self._active_ai_request_cancellations.clear()
             active_task_ids = list(self._active_ai_request_tasks.values())
             self._active_ai_request_tasks.clear()
-            self._server = None
-            self._server_thread = None
-            self._remove_daemon_info()
+
         for session, event_queue in sse_sessions:
             session.close()
             event_queue.put(None)
@@ -168,6 +159,18 @@ class McpDaemon:
                 cancel_gui_ai_task(self.state_dir, task_id, "daemon stopped")
             except (FileNotFoundError, ValueError, OSError):
                 pass
+
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+        with self._lock:
+            self._server = None
+            self._server_thread = None
+            self._remove_daemon_info()
 
     def status_payload(self) -> dict:
         jobs = list_jobs(self.state_dir)

@@ -3486,7 +3486,11 @@ class GlossaryManagerPage(ShellPage):
         self.reflow_timer.start()
 
     def _reflow_analysis_buttons(self):
-        visible_buttons = [btn for btn in self.static_analysis_buttons + self.dynamic_analysis_buttons if btn.isVisible()]
+        visible_buttons = [
+            btn
+            for btn in self.static_analysis_buttons + self.dynamic_analysis_buttons
+            if not btn.isHidden()
+        ]
         
         while self.analysis_layout.count():
             item = self.analysis_layout.takeAt(0)
