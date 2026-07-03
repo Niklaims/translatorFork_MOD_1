@@ -93,6 +93,12 @@ def test_build_codex_snippet_includes_env_and_state_dir():
     assert "/tmp/state" in text
 
 
+def test_build_codex_snippet_preserves_explicit_state_dir_string():
+    snippet = build_config_snippet("codex", server_name="translatorFork", state_dir="D:/tmp/state")
+
+    assert "'--state-dir', 'D:/tmp/state', 'server'" in snippet["text"]
+
+
 def test_install_claude_config_creates_backup_and_preserves_existing(tmp_path):
     path = tmp_path / "claude.json"
     path.write_text(json.dumps({"mcpServers": {"other": {"command": "old"}}}), encoding="utf-8")

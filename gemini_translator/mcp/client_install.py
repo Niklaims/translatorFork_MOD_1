@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -19,10 +20,14 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def _state_dir_arg(state_dir: str | Path) -> str:
+    return os.path.expanduser(os.fspath(state_dir))
+
+
 def _server_command(*, state_dir: str | Path | None = None) -> dict[str, Any]:
     args = ["-m", "gemini_translator.mcp"]
     if state_dir:
-        args.extend(["--state-dir", str(Path(state_dir).expanduser().resolve())])
+        args.extend(["--state-dir", _state_dir_arg(state_dir)])
     args.append("server")
     return {
         "command": sys.executable,
