@@ -92,6 +92,31 @@ def test_validate_html_structure_accepts_multi_h2_heading_collapsed_by_ai():
     assert '<h2>Glava 42 Review: Hidden plot</h2>' not in repaired
 
 
+def test_validate_html_structure_accepts_multi_h2_heading_after_media_placeholder():
+    original = (
+        '<body class="chapter">'
+        '<p><!-- MEDIA_0 --></p>'
+        '<h2>Chapter 45</h2>'
+        '<h2>End of Trial</h2>'
+        '<p>First paragraph.</p>'
+        '</body>'
+    )
+    translated = (
+        '<body class="chapter">'
+        '<p><!-- MEDIA_0 --></p>'
+        '<h2>Chapter 45: End of Trial</h2>'
+        '<p>Translated paragraph.</p>'
+        '</body>'
+    )
+
+    is_valid, reason, repaired = validate_html_structure(original, translated)
+
+    assert is_valid, reason
+    assert '<p><!-- MEDIA_0 --></p>' in repaired
+    assert '<h1>Chapter 45: End of Trial</h1>' in repaired
+    assert '<h2>Chapter 45: End of Trial</h2>' not in repaired
+
+
 def test_normalize_translated_body_wrapper_repairs_inner_html_response():
     original = '<body id="main"><p>Source text.</p></body>'
     translated = '<p>Переведенный текст.</p>'

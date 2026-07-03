@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from PyQt6 import QtWidgets
+from PyQt6 import QtWidgets, sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
@@ -44,6 +44,15 @@ from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
 
 
 QIDIAN_CREATOR_UI_STATE_KEY = "qidian_creator_ui"
+
+
+def _qt_object_is_alive(obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        return not sip.isdeleted(obj)
+    except TypeError:
+        return True
 
 
 class QidianCreatorPage(ShellPage):
@@ -387,6 +396,8 @@ class QidianCreatorPage(ShellPage):
         worker.start()
 
     def _apply_qidian_metadata(self, metadata: QidianBookMetadata) -> None:
+        if not _qt_object_is_alive(self):
+            return
         self._qidian_metadata = metadata
         self.original_title_edit.setText(metadata.title_original)
         self.author_edit.setText(metadata.author_name)
@@ -399,6 +410,8 @@ class QidianCreatorPage(ShellPage):
         self._update_action_state()
 
     def _apply_prepared_metadata(self, prepared: PreparedRulateMetadata) -> None:
+        if not _qt_object_is_alive(self):
+            return
         self._prepared_metadata = prepared
         self.english_title_edit.setText(prepared.english_title)
         self.translated_title_edit.setText(prepared.translated_title)
@@ -415,6 +428,8 @@ class QidianCreatorPage(ShellPage):
         self._update_action_state()
 
     def _apply_cover_prompt(self, prompt: str) -> None:
+        if not _qt_object_is_alive(self):
+            return
         self.cover_prompt_edit.setPlainText(prompt)
         self._update_action_state()
 
@@ -471,21 +486,34 @@ class QidianCreatorPage(ShellPage):
         )
 
     def _update_action_state(self) -> None:
-        self.prepare_ai_btn.setEnabled(True)
-        self.login_rulate_btn.setEnabled(True)
-        self.fill_rulate_btn.setEnabled(True)
+        if not _qt_object_is_alive(self):
+            return
+        self._set_button_enabled(self.prepare_ai_btn, True)
+        self._set_button_enabled(self.login_rulate_btn, True)
+        self._set_button_enabled(self.fill_rulate_btn, True)
+
+    def _set_button_enabled(self, button: QPushButton | None, enabled: bool) -> None:
+        if _qt_object_is_alive(button):
+            button.setEnabled(enabled)
 
     def _worker_finished(self, worker, button: QPushButton) -> None:
         if worker in self._workers:
             self._workers.remove(worker)
-        button.setEnabled(True)
+        if not _qt_object_is_alive(self):
+            return
+        self._set_button_enabled(button, True)
         self._update_action_state()
 
     def _log(self, level: str, message: str) -> None:
         if level == "DEBUG" and not message:
             return
-        self.log_edit.appendPlainText(f"[{level}] {message}")
-        self.log_edit.verticalScrollBar().setValue(self.log_edit.verticalScrollBar().maximum())
+        if not _qt_object_is_alive(self):
+            return
+        log_edit = getattr(self, "log_edit", None)
+        if not _qt_object_is_alive(log_edit):
+            return
+        log_edit.appendPlainText(f"[{level}] {message}")
+        log_edit.verticalScrollBar().setValue(log_edit.verticalScrollBar().maximum())
 
     def _set_cover_preview(self, image_data: bytes) -> None:
         pixmap = QPixmap()

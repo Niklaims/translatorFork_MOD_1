@@ -658,6 +658,86 @@ class ChapterQueueManager(QObject):
             self._log(log_payload)
             self.notify_task_dirty(task_info[0])
 
+    def _payload_is_chunk(self, payload, chapter_path: str, chunk_index: int) -> bool:
+        if not payload or len(payload) <= 4 or payload[0] != 'epub_chunk':
+            return False
+        try:
+            payload_chunk_index = int(payload[4])
+        except (TypeError, ValueError):
+            return False
+        return str(payload[2]) == str(chapter_path) and payload_chunk_index == chunk_index
+
+    def _translation_from_chunk_rows(self, rows, chapter_path: str, chunk_index: int) -> str:
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'], object_hook=tuple_deserializer)
+            except Exception:
+                continue
+            if self._payload_is_chunk(payload, chapter_path, chunk_index):
+                return row['translated_content'] or ""
+        return ""
+
+    def get_completed_previous_chunk_translation(self, current_task_id, chapter_path: str, chunk_index: int) -> str:
+        try:
+            target_chunk_index = int(chunk_index) - 1
+        except (TypeError, ValueError):
+            return ""
+        if target_chunk_index < 0:
+            return ""
+
+        current_task_id_str = str(current_task_id) if current_task_id else ""
+        chapter_path = str(chapter_path)
+
+        with self._get_read_only_conn() as conn:
+            if current_task_id_str:
+                current_row = conn.execute(
+                    "SELECT chain_id, chain_index FROM tasks WHERE task_id = ?",
+                    (current_task_id_str,),
+                ).fetchone()
+                if (
+                    current_row
+                    and current_row['chain_id'] is not None
+                    and current_row['chain_index'] is not None
+                    and int(current_row['chain_index']) > 0
+                ):
+                    previous_rows = conn.execute(
+                        """
+                        SELECT t.payload, cr.translated_content
+                        FROM tasks AS t
+                        JOIN chunk_results AS cr ON cr.task_id = t.task_id
+                        WHERE t.status = 'completed'
+                          AND t.chain_id = ?
+                          AND t.chain_index = ?
+                        ORDER BY t.sequence DESC
+                        """,
+                        (
+                            current_row['chain_id'],
+                            int(current_row['chain_index']) - 1,
+                        ),
+                    ).fetchall()
+                    translated_content = self._translation_from_chunk_rows(
+                        previous_rows,
+                        chapter_path,
+                        target_chunk_index,
+                    )
+                    if translated_content:
+                        return translated_content
+
+            fallback_rows = conn.execute(
+                """
+                SELECT t.payload, cr.translated_content
+                FROM tasks AS t
+                JOIN chunk_results AS cr ON cr.task_id = t.task_id
+                WHERE t.status = 'completed'
+                ORDER BY t.sequence DESC
+                """
+            ).fetchall()
+            return self._translation_from_chunk_rows(
+                fallback_rows,
+                chapter_path,
+                target_chunk_index,
+            )
+
     def task_done_with_content(self, worker_id: str, task_info: tuple, translated_content, provider_id: str):
         """
         Атомарно помечает задачу как выполненную и сохраняет ее результат.

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import QtWidgets  # noqa: F401  (ensures a QApplication-capable env import)
+from PyQt6 import QtWidgets, sip
 
 from gemini_translator.ui.pages.qidian_creator_page import QIDIAN_CREATOR_UI_STATE_KEY, QidianCreatorPage
 from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
@@ -85,6 +85,18 @@ class _UiStateHarness:
         self.translator_team_combo = _ComboField()
 
 
+class _WorkerFinishedHarness:
+    _worker_finished = QidianCreatorPage._worker_finished
+    _set_button_enabled = QidianCreatorPage._set_button_enabled
+    _update_action_state = QidianCreatorPage._update_action_state
+
+    def __init__(self, worker):
+        self._workers = [worker]
+        self.prepare_ai_btn = None
+        self.login_rulate_btn = None
+        self.fill_rulate_btn = None
+
+
 class QidianCreatorPageContractTests(unittest.TestCase):
     def test_is_shell_page_subclass(self):
         self.assertTrue(issubclass(QidianCreatorPage, ShellPage))
@@ -149,3 +161,16 @@ class QidianCreatorPageContractTests(unittest.TestCase):
                 }
             },
         )
+
+    def test_worker_finished_ignores_deleted_button(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        _ = app
+        worker = object()
+        button = QtWidgets.QPushButton()
+        page = _WorkerFinishedHarness(worker)
+
+        sip.delete(button)
+
+        page._worker_finished(worker, button)
+
+        self.assertEqual(page._workers, [])
