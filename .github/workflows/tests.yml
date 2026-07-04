@@ -32,4 +32,17 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Run checks
-        run: python tools/run_checks.py
+        shell: pwsh
+        run: |
+          python tools/run_checks.py *> run_checks.log
+          $status = $LASTEXITCODE
+          Get-Content run_checks.log
+          exit $status
+
+      - name: Upload run check log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-checks-log
+          path: run_checks.log
+          if-no-files-found: ignore
