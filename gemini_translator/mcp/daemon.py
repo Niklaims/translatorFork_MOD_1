@@ -40,6 +40,8 @@ from .worker import cancel_process, run_job
 TOKEN_HEADER = "X-Translator-MCP-Token"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 PIPELINE_METADATA_KEYS = {"pipeline_parent", "pipeline_step", "pipeline_index", "pipeline_total"}
+SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
+SSE_QUEUE_POLL_INTERVAL_SECONDS = 0.1
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -939,12 +941,17 @@ class McpDaemon:
                     self.end_headers()
                     self._write_sse_event("endpoint", endpoint)
 
+                    next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
                     while True:
                         try:
-                            payload = event_queue.get(timeout=15)
+                            payload = event_queue.get(timeout=SSE_QUEUE_POLL_INTERVAL_SECONDS)
                         except Empty:
+                            now = time.monotonic()
+                            if now < next_keepalive_at:
+                                continue
                             self.wfile.write(b": keepalive\n\n")
                             self.wfile.flush()
+                            next_keepalive_at = now + SSE_KEEPALIVE_INTERVAL_SECONDS
                             continue
                         if payload is None:
                             break

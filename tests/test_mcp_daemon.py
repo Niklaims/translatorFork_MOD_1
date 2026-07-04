@@ -128,6 +128,13 @@ def test_daemon_http_server_threads_do_not_block_pytest_shutdown(tmp_path):
         daemon.stop()
 
 
+def test_sse_loop_polls_queue_faster_than_keepalive():
+    from gemini_translator.mcp import daemon as daemon_module
+
+    assert daemon_module.SSE_QUEUE_POLL_INTERVAL_SECONDS < 1.0
+    assert daemon_module.SSE_KEEPALIVE_INTERVAL_SECONDS > daemon_module.SSE_QUEUE_POLL_INTERVAL_SECONDS
+
+
 def test_read_daemon_info_returns_empty_when_missing(tmp_path):
     assert read_daemon_info(tmp_path) == {}
 
@@ -253,6 +260,26 @@ def test_daemon_sse_endpoint_registers_client_without_daemon_token(tmp_path):
         assert urlparse(endpoint).path == "/messages"
         assert status_payload["mcp_clients"]["connected"] == 1
         assert status_payload["mcp_clients"]["items"][0]["transport"] == "sse"
+    finally:
+        if response is not None:
+            response.close()
+        daemon.stop()
+
+
+def test_daemon_stop_after_sse_client_close_returns_quickly(tmp_path):
+    daemon = McpDaemon(tmp_path)
+    daemon.start_in_thread()
+    response = None
+    try:
+        response = _open_sse(f"{daemon.base_url}/sse")
+        _read_sse_event(response, "endpoint")
+        response.close()
+        response = None
+
+        started = time.monotonic()
+        daemon.stop()
+
+        assert time.monotonic() - started < 1.0
     finally:
         if response is not None:
             response.close()
