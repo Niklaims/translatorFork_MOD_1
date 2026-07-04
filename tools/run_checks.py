@@ -33,17 +33,27 @@ def _emit_github_error(message: str) -> None:
     print(f"::error file=tools/run_checks.py,line=1::{_github_escape(message)}", flush=True)
 
 
+def _subprocess_creationflags(platform_name: str | None = None) -> int:
+    platform_name = os.name if platform_name is None else platform_name
+    if platform_name != "nt":
+        return 0
+    return int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+
 def _run(label: str, command: list[str]) -> int:
     print(f"[checks] {label}", flush=True)
-    completed = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    run_kwargs = {
+        "cwd": PROJECT_ROOT,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    creationflags = _subprocess_creationflags()
+    if creationflags:
+        run_kwargs["creationflags"] = creationflags
+    completed = subprocess.run(command, **run_kwargs)
     output = completed.stdout or ""
     if output:
         print(output, end="" if output.endswith("\n") else "\n", flush=True)

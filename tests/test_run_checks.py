@@ -50,3 +50,9 @@ def test_run_checks_emits_github_annotation_with_failure_tail(monkeypatch, capsy
     assert "[checks] pytest mcp daemon failed with exit code 2" in captured.err
     assert "::error file=tools/run_checks.py,line=1::" in captured.out
     assert "pytest mcp daemon failed with exit code 2%0Aline 1%0Aline 2%0Aline 3" in captured.out
+
+
+def test_run_checks_isolates_windows_child_process_group(monkeypatch):
+    monkeypatch.setattr(run_checks.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
+
+    assert run_checks._subprocess_creationflags("nt") == 512
