@@ -1,6 +1,7 @@
 import json
 import os
 from queue import Empty, Queue
+import socket
 import stat
 import subprocess
 import sys
@@ -19,6 +20,8 @@ from gemini_translator.mcp.daemon import McpDaemon, read_daemon_info
 from gemini_translator.mcp.jobs import create_job, mark_finished, save_job
 from gemini_translator.mcp.paths import DEFAULT_DAEMON_PORT, daemon_file
 
+_SSE_SOCKET_TIMEOUT = 0.2
+
 
 def _request(method, url, token, payload=None):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
@@ -30,10 +33,51 @@ def _request(method, url, token, payload=None):
         return json.loads(response.read().decode("utf-8"))
 
 
+class _RawSseResponse:
+    def __init__(self, sock: socket.socket, reader):
+        self._sock = sock
+        self._reader = reader
+
+    def readline(self):
+        return self._reader.readline()
+
+    def close(self):
+        try:
+            self._reader.close()
+        finally:
+            self._sock.close()
+
+
 def _open_sse(url):
-    request = urllib.request.Request(url, method="GET")
-    request.add_header("Accept", "text/event-stream")
-    return urllib.request.urlopen(request, timeout=5)
+    parsed = urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    sock = socket.create_connection((host, port), timeout=5)
+    try:
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Accept: text/event-stream\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        sock.sendall(request)
+        reader = sock.makefile("rb")
+        status_line = reader.readline().decode("iso-8859-1", errors="replace").strip()
+        if " 200 " not in f" {status_line} ":
+            raise AssertionError(f"SSE endpoint returned {status_line!r}")
+        while True:
+            header_line = reader.readline()
+            if header_line in {b"\r\n", b"\n", b""}:
+                break
+        sock.settimeout(_SSE_SOCKET_TIMEOUT)
+        return _RawSseResponse(sock, reader)
+    except Exception:
+        sock.close()
+        raise
 
 
 def _read_sse_event(response, event_name, *, timeout=5):
@@ -41,7 +85,16 @@ def _read_sse_event(response, event_name, *, timeout=5):
     event = None
     data_lines = []
     while time.time() < deadline:
-        line = response.readline().decode("utf-8").rstrip("\n")
+        try:
+            raw_line = response.readline()
+        except (OSError, TimeoutError, socket.timeout) as exc:
+            if time.time() < deadline:
+                continue
+            raise AssertionError(f"SSE event {event_name!r} was not received") from exc
+        if not raw_line:
+            time.sleep(0.01)
+            continue
+        line = raw_line.decode("utf-8").rstrip("\n")
         if line.endswith("\r"):
             line = line[:-1]
         if not line:
