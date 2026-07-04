@@ -48,5 +48,5 @@ def test_run_checks_emits_github_annotation_with_failure_tail(monkeypatch, capsy
 
     captured = capsys.readouterr()
     assert "[checks] pytest mcp daemon failed with exit code 2" in captured.err
-    assert "::error file=tools/run_checks.py,line=1::" in captured.err
-    assert "pytest mcp daemon failed with exit code 2%0Aline 1%0Aline 2%0Aline 3" in captured.err
+    assert "::error file=tools/run_checks.py,line=1::" in captured.out
+    assert "pytest mcp daemon failed with exit code 2%0Aline 1%0Aline 2%0Aline 3" in captured.out

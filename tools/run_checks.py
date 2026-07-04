@@ -30,7 +30,7 @@ def _output_tail(output: str) -> str:
 def _emit_github_error(message: str) -> None:
     if os.environ.get("GITHUB_ACTIONS", "").lower() != "true":
         return
-    print(f"::error file=tools/run_checks.py,line=1::{_github_escape(message)}", file=sys.stderr, flush=True)
+    print(f"::error file=tools/run_checks.py,line=1::{_github_escape(message)}", flush=True)
 
 
 def _run(label: str, command: list[str]) -> int:
