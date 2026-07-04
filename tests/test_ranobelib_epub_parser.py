@@ -151,6 +151,34 @@ def test_rulate_worker_applies_full_site_titles_to_downloaded_chapters():
     assert chapters[1].title == "Второе длинное необрезанное название главы с сайта Rulate"
 
 
+def test_rulate_worker_bulk_downloads_plain_fractional_chapters():
+    worker = RulateDownloadWorker(
+        "https://tl.rulate.ru/book/1",
+        "1",
+        chapter_ids=["101", "102"],
+        chapter_infos=[
+            {"id": "101", "title": "Chapter 12.1 Side Story", "number": 12.1},
+            {"id": "102", "title": "Chapter 12.2 Side Story", "number": 12.2},
+        ],
+    )
+
+    assert not worker._should_download_individually()
+
+
+def test_rulate_worker_downloads_explicit_parts_individually():
+    worker = RulateDownloadWorker(
+        "https://tl.rulate.ru/book/1",
+        "1",
+        chapter_ids=["101", "102"],
+        chapter_infos=[
+            {"id": "101", "title": "Chapter 12 Side Story Part 1", "number": 12.1},
+            {"id": "102", "title": "Chapter 12 Side Story Part 2", "number": 12.2},
+        ],
+    )
+
+    assert worker._should_download_individually()
+
+
 def test_rulate_worker_infers_next_volume_when_numbers_restart():
     worker = RulateDownloadWorker("https://tl.rulate.ru/book/1", "1")
     infos = [
