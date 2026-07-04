@@ -47,8 +47,8 @@ jobs:
           if (Test-Path run_checks.log) {
             $raw = Get-Content run_checks.log -Raw
             $clean = (($raw -replace '\s+', ' ') -replace '[^A-Za-z0-9_. -]', '_').Trim()
-            if ($clean.Length -gt 160) {
-              $clean = $clean.Substring(0, 160)
+            if ($clean.Length -gt 180) {
+              $clean = $clean.Substring($clean.Length - 180, 180)
             }
             if ($clean) {
               $name = "run-checks-log-$clean"
