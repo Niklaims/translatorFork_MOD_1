@@ -23,6 +23,32 @@ from gemini_translator.mcp.paths import DEFAULT_DAEMON_PORT, daemon_file
 _SSE_SOCKET_TIMEOUT = 0.2
 
 
+class _SocketLineReader:
+    def __init__(self, sock: socket.socket):
+        self._sock = sock
+        self._buffer = bytearray()
+
+    def readline(self) -> bytes:
+        while True:
+            newline_index = self._buffer.find(b"\n")
+            if newline_index >= 0:
+                line = bytes(self._buffer[: newline_index + 1])
+                del self._buffer[: newline_index + 1]
+                return line
+
+            chunk = self._sock.recv(4096)
+            if not chunk:
+                if self._buffer:
+                    line = bytes(self._buffer)
+                    self._buffer.clear()
+                    return line
+                return b""
+            self._buffer.extend(chunk)
+
+    def close(self) -> None:
+        return None
+
+
 def _request(method, url, token, payload=None):
     data = None if payload is None else json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=data, method=method)
@@ -48,6 +74,30 @@ class _RawSseResponse:
             self._sock.close()
 
 
+class _FakeSseSocket:
+    def __init__(self, payload: bytes):
+        self._payload = bytearray(payload)
+        self.sent = b""
+        self.closed = False
+        self.timeout = None
+
+    def sendall(self, payload: bytes):
+        self.sent += payload
+
+    def recv(self, _size: int):
+        if not self._payload:
+            return b""
+        chunk = bytes(self._payload[:7])
+        del self._payload[:7]
+        return chunk
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
+
+    def close(self):
+        self.closed = True
+
+
 def _open_sse(url):
     parsed = urlparse(url)
     host = parsed.hostname or "127.0.0.1"
@@ -65,7 +115,7 @@ def _open_sse(url):
             "\r\n"
         ).encode("ascii")
         sock.sendall(request)
-        reader = sock.makefile("rb")
+        reader = _SocketLineReader(sock)
         status_line = reader.readline().decode("iso-8859-1", errors="replace").strip()
         if " 200 " not in f" {status_line} ":
             raise AssertionError(f"SSE endpoint returned {status_line!r}")
@@ -78,6 +128,28 @@ def _open_sse(url):
     except Exception:
         sock.close()
         raise
+
+
+def test_open_sse_reads_lines_without_socket_makefile(monkeypatch):
+    fake_socket = _FakeSseSocket(
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/event-stream\r\n"
+        b"\r\n"
+        b"event: endpoint\n"
+        b"data: http://127.0.0.1:1234/messages?session_id=fake\n"
+        b"\n"
+    )
+    monkeypatch.setattr(socket, "create_connection", lambda *_args, **_kwargs: fake_socket)
+
+    response = _open_sse("http://127.0.0.1:1234/sse")
+    try:
+        endpoint = _read_sse_event(response, "endpoint", timeout=1)
+    finally:
+        response.close()
+
+    assert endpoint == "http://127.0.0.1:1234/messages?session_id=fake"
+    assert fake_socket.closed is True
+    assert b"GET /sse HTTP/1.1" in fake_socket.sent
 
 
 def _read_sse_event(response, event_name, *, timeout=5):
