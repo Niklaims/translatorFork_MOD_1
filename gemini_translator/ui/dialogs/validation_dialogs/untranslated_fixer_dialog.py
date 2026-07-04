@@ -2545,7 +2545,7 @@ class AITranslationPage(ShellPage):
         if accepted:
             self.accept()
         else:
-            QDialog.reject(self)
+            self.reject()
 
     def _on_start_stop_clicked(self):
         if self.is_session_active:
