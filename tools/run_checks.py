@@ -61,7 +61,18 @@ def main(argv: list[str] | None = None) -> int:
         pytest_args = list(args.pytest_args)
         if pytest_args[:1] == ["--"]:
             pytest_args = pytest_args[1:]
-        checks.append(("pytest", [sys.executable, "-m", "pytest", "-q", *pytest_args]))
+        if pytest_args:
+            checks.append(("pytest", [sys.executable, "-m", "pytest", "-q", *pytest_args]))
+        else:
+            checks.extend(
+                [
+                    ("pytest mcp daemon", [sys.executable, "-m", "pytest", "-q", "tests/test_mcp_daemon.py"]),
+                    (
+                        "pytest",
+                        [sys.executable, "-m", "pytest", "-q", "--ignore=tests/test_mcp_daemon.py"],
+                    ),
+                ]
+            )
 
     for label, command in checks:
         exit_code = _run(label, command)
