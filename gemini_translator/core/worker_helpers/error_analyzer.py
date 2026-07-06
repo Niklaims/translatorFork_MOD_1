@@ -41,11 +41,23 @@ class ErrorAnalyzer:
         if exc is None:
             return None
 
+        raw_package_text = getattr(exc, 'raw_package_text', '') or ''
+        exc_str = str(exc)
+
+        if raw_package_text.strip():
+            prefix_of_raw = raw_package_text.strip()[:30]
+            if prefix_of_raw and prefix_of_raw in exc_str:
+                exc_str = exc_str[:exc_str.find(prefix_of_raw)].rstrip()
+                if not exc_str.endswith(':'):
+                    exc_str += ':'
+                exc_str += f"\n\n{raw_package_text}"
+                raw_package_text = ""
+
         sections = [
             f"Задача: {task_name}",
             f"Тип ошибки: {error_type.name}",
             f"Класс исключения: {type(exc).__name__}",
-            f"Сообщение: {str(exc)}",
+            f"Сообщение: {exc_str}",
         ]
 
         reason = getattr(exc, 'reason', None)
@@ -60,7 +72,6 @@ class ErrorAnalyzer:
         if cause:
             sections.append(f"Связанная ошибка: {type(cause).__name__}: {cause}")
 
-        raw_package_text = getattr(exc, 'raw_package_text', '') or ''
         if raw_package_text.strip():
             sections.append("Полученный пакет/сырой ответ:")
             sections.append(raw_package_text)

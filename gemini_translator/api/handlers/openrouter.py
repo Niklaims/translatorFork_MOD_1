@@ -247,10 +247,15 @@ class OpenRouterApiHandler(BaseApiHandler):
                     txt_low = response_text.lower()
                     
                     if self._is_model_access_denied_error(response.status, response_text):
-                        raise ModelNotFoundError(
+                        e = ModelNotFoundError(
                             f"Model {self.worker.model_id} is not allowed for this API key: {response_text[:150]}"
                         )
-                    if response.status in [401, 403]: raise RateLimitExceededError(f"Ошибка доступа ({response.status}): {response_text[:150]}")
+                        e.raw_package_text = response_text
+                        raise e
+                    if response.status in [401, 403]:
+                        e = RateLimitExceededError(f"Ошибка доступа ({response.status}): {response_text[:150]}")
+                        e.raw_package_text = response_text
+                        raise e
                     
                     if response.status in [429, 402] or "quota" in txt_low:
                         key_manager = getattr(self.worker, 'api_key_manager', None)
@@ -271,7 +276,9 @@ class OpenRouterApiHandler(BaseApiHandler):
                             
                     if response.status == 404: raise ModelNotFoundError(f"Модель {self.worker.model_id} не найдена (404).")
                     
-                    raise NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")
+                    e = NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")
+                    e.raw_package_text = response_text
+                    raise e
 
         except asyncio.TimeoutError:
             raise NetworkError("Таймаут запроса.", delay_seconds=30)

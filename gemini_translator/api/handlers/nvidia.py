@@ -540,6 +540,8 @@ class NvidiaApiHandler(BaseApiHandler):
                 ValidationFailedError,
                 TemporaryRateLimitError,
             ) as error:
+                if 'error_text' in locals() and not getattr(error, 'raw_package_text', None):
+                    error.raw_package_text = error_text
                 raise error
             except Exception as error:
                 traceback.print_exc()

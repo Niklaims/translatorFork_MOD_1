@@ -257,10 +257,19 @@ class DeepseekApiHandler(BaseApiHandler):
             except (aiohttp.ClientError, OSError) as e:
                 error_msg = f"Сбой сети/SSL ({type(e).__name__}) при запросе к DeepSeek: {e}"
                 raise NetworkError(error_msg, delay_seconds=20) from e
-            except (RateLimitExceededError, ContentFilterError, NetworkError, 
-                    PartialGenerationError, ModelNotFoundError, LocationBlockedError, 
-                    ValidationFailedError, TemporaryRateLimitError) as e:
-                raise e
+            except (
+                RateLimitExceededError,
+                ContentFilterError,
+                NetworkError,
+                PartialGenerationError,
+                ModelNotFoundError,
+                LocationBlockedError,
+                ValidationFailedError,
+                TemporaryRateLimitError,
+            ) as error:
+                if 'error_text' in locals() and not getattr(error, 'raw_package_text', None):
+                    error.raw_package_text = error_text
+                raise error
             
             except Exception as e:
                 import traceback

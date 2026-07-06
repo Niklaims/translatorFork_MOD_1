@@ -137,6 +137,7 @@ class GeminiApiHandler(BaseApiHandler):
             print(f"--- GEMINI DEBUG REQUEST PAYLOAD ---\n{debug_payload_str}\n----------------------------------")
 
         try:
+            raw_error_text = None
             async with session.post(url, headers=headers, json=payload) as response:
                 
                 if response.status != 200:
@@ -277,6 +278,8 @@ class GeminiApiHandler(BaseApiHandler):
         except (RateLimitExceededError, ContentFilterError, NetworkError, 
                 PartialGenerationError, ModelNotFoundError, LocationBlockedError, 
                 ValidationFailedError, TemporaryRateLimitError) as e:
+            if raw_error_text and not getattr(e, 'raw_package_text', None):
+                e.raw_package_text = raw_error_text
             raise e
         
         except Exception as e:

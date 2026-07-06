@@ -139,16 +139,17 @@ def migrate_theme_mode(settings: dict | None) -> str:
 
 
 def _read_settings(settings_manager) -> dict:
-    for name in ("load_full_session_settings", "load_settings"):
+    combined = {}
+    for name in ("load_settings", "load_full_session_settings"):
         loader = getattr(settings_manager, name, None)
         if callable(loader):
             try:
                 data = loader()
+                if isinstance(data, dict) and data:
+                    combined.update(data)
             except Exception:
                 continue
-            if isinstance(data, dict) and data:
-                return data
-    return {}
+    return combined
 
 
 def _declares_attr(obj, name: str) -> bool:

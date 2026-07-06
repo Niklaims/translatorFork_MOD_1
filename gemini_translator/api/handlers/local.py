@@ -196,9 +196,13 @@ class LocalApiHandler(BaseApiHandler):
             if response.status_code >= 500:
                 if response.status_code == 503:
                      raise NetworkError(f"Сервер занят/загружается (503). Повтор через 30с.", delay_seconds=30)
-                raise NetworkError(f"Ошибка сервера (код {response.status_code}): {response_text[:150]}", delay_seconds=30)
+                e = NetworkError(f"Ошибка сервера (код {response.status_code}): {response_text[:150]}", delay_seconds=30)
+                e.raw_package_text = response_text
+                raise e
             
-            raise Exception(f"Ошибка API ({response.status_code}): {response_text[:200]}")
+            e = Exception(f"Ошибка API ({response.status_code}): {response_text[:200]}")
+            e.raw_package_text = response_text
+            raise e
 
         # --- Перехват исключений requests ---
         except (

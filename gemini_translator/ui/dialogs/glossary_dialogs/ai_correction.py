@@ -1195,9 +1195,11 @@ class CorrectionSessionPage(ShellPage):
         data_as_free_text = "\n".join(output_lines)
         data_as_free_text = re.sub(r'\n---\s*\n\s*---\n', r'\n---\n', data_as_free_text)
         data_as_free_text = re.sub(r'\n{3,}', r'\n\n', data_as_free_text)
-        # if found_blocks.get('patterns'):
-            # print(data_as_free_text)
-        estimated_tokens = TokenCounter().estimate_tokens(data_as_free_text)
+        
+        # Учитываем также вес системного промпта
+        temp_prompt = self._build_final_prompt(found_blocks, context_was_added)
+        full_text_for_estimation = temp_prompt + "\n\n" + data_as_free_text
+        estimated_tokens = TokenCounter().estimate_tokens(full_text_for_estimation)
 
         return (data_as_free_text, estimated_tokens, found_blocks, context_was_added,
                 actual_hidden_count, actual_neighbors_count, actual_pattern_count)

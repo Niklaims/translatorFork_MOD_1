@@ -415,6 +415,12 @@ class GenerationSessionPage(ShellPage):
 
     def _merge_initial_ui_settings(self, initial_ui_settings):
         merged = dict(initial_ui_settings or {})
+        
+        # Не наследуем системные инструкции из основного окна.
+        # Они будут загружены ниже, если были сохранены именно для генерации глоссария.
+        merged['system_instruction'] = None
+        merged['use_system_instruction'] = False
+
         initial_has_sleep_setting = PREVENT_SLEEP_SETTING_KEY in merged
 
         def shared_sleep_setting():
@@ -1284,9 +1290,6 @@ class GenerationSessionPage(ShellPage):
 
         initial_settings = dict(settings)
         has_saved_task_size = bool(initial_settings.pop('_glossary_generation_saved_task_size', False))
-        # Не наследуем системные инструкции из основного окна.
-        initial_settings['system_instruction'] = None
-        initial_settings['use_system_instruction'] = False
         if not has_saved_task_size and not initial_settings.get('glossary_task_size_limit_override'):
             # The glossary dialog has its own model-based batch-size heuristic.
             # A task_size_limit inherited from the main translation window is only
