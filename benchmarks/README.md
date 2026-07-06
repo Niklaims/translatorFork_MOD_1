@@ -16,6 +16,12 @@ $env:GEMINI_API_KEY = "..."
 python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark.example.json --models gemini-flash-env
 ```
 
+Compare several models with one prompt:
+
+```powershell
+python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark.example.json --compare-models-with-prompt project-default --models gemini-flash-env,local-openai-compatible
+```
+
 Each run writes:
 
 - `results.json` with full machine-readable results;

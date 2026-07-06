@@ -4,13 +4,11 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 from pathlib import Path
-import traceback
 from typing import Any
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from ...api import config as api_config
-from ...benchmark.runner import BenchmarkRunner
 from ...utils.document_importer import DOCUMENT_INPUT_FILTER, extract_document_chapters
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.dialogs.benchmark import BenchmarkRunWorker
@@ -34,6 +32,7 @@ class PromptBenchmarkPage(ShellPage):
         self._loading_case = False
         self._loading_prompt = False
         self._loading_model = False
+        self._saved_run_focus: dict[str, str] = {}
         self._build_ui()
         self._load_ui_state()
         self._populate_from_config()
@@ -93,9 +92,9 @@ class PromptBenchmarkPage(ShellPage):
 
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.addTab(self._build_run_tab(), "Запуск")
-        self.tabs.addTab(self._build_cases_tab(), "Cases")
-        self.tabs.addTab(self._build_prompts_tab(), "Prompts")
-        self.tabs.addTab(self._build_models_tab(), "Models")
+        self.tabs.addTab(self._build_cases_tab(), "Фрагменты")
+        self.tabs.addTab(self._build_prompts_tab(), "Промпты")
+        self.tabs.addTab(self._build_models_tab(), "Модели")
         self.tabs.addTab(self._build_json_tab(), "JSON")
         root.addWidget(self.tabs, 1)
 
@@ -131,17 +130,55 @@ class PromptBenchmarkPage(ShellPage):
         layout = QtWidgets.QVBoxLayout(widget)
         layout.setSpacing(10)
 
+        scenario_group = QtWidgets.QGroupBox("Сценарий")
+        scenario_layout = QtWidgets.QGridLayout(scenario_group)
+        self.run_scenario_combo = QtWidgets.QComboBox()
+        self.run_scenario_combo.addItem("Своя матрица", "matrix")
+        self.run_scenario_combo.addItem("Сравнить модели одним промптом", "compare_models")
+        self.run_scenario_combo.addItem("Сравнить промпты на одной модели", "compare_prompts")
+        self.run_scenario_combo.addItem("Пробный запуск 1 x 1 x 1", "smoke")
+        self.run_scenario_combo.currentIndexChanged.connect(self._on_run_scenario_changed)
+
+        self.run_focus_case_combo = QtWidgets.QComboBox()
+        self.run_focus_prompt_combo = QtWidgets.QComboBox()
+        self.run_focus_model_combo = QtWidgets.QComboBox()
+        self.run_focus_case_combo.currentIndexChanged.connect(self._on_run_focus_changed)
+        self.run_focus_prompt_combo.currentIndexChanged.connect(self._on_run_focus_changed)
+        self.run_focus_model_combo.currentIndexChanged.connect(self._on_run_focus_changed)
+
+        self.apply_run_preset_btn = QtWidgets.QPushButton("Применить")
+        self.apply_run_preset_btn.clicked.connect(self._apply_run_preset)
+        self.run_hint_label = QtWidgets.QLabel("")
+        self.run_hint_label.setWordWrap(True)
+        self.run_estimate_label = QtWidgets.QLabel("Запусков: 0")
+
+        scenario_layout.addWidget(QtWidgets.QLabel("Режим:"), 0, 0)
+        scenario_layout.addWidget(self.run_scenario_combo, 0, 1)
+        scenario_layout.addWidget(QtWidgets.QLabel("Фрагмент:"), 0, 2)
+        scenario_layout.addWidget(self.run_focus_case_combo, 0, 3)
+        scenario_layout.addWidget(QtWidgets.QLabel("Промпт:"), 1, 0)
+        scenario_layout.addWidget(self.run_focus_prompt_combo, 1, 1)
+        scenario_layout.addWidget(QtWidgets.QLabel("Модель:"), 1, 2)
+        scenario_layout.addWidget(self.run_focus_model_combo, 1, 3)
+        scenario_layout.addWidget(self.apply_run_preset_btn, 0, 4)
+        scenario_layout.addWidget(self.run_estimate_label, 1, 4)
+        scenario_layout.addWidget(self.run_hint_label, 2, 0, 1, 5)
+        layout.addWidget(scenario_group)
+
         matrix_group = QtWidgets.QGroupBox("Матрица запуска")
         matrix_layout = QtWidgets.QHBoxLayout(matrix_group)
         self.run_cases_list = QtWidgets.QListWidget()
         self.run_cases_list.setAlternatingRowColors(True)
+        self.run_cases_list.itemChanged.connect(lambda _item: self._update_run_estimate())
         self.run_prompts_list = QtWidgets.QListWidget()
         self.run_prompts_list.setAlternatingRowColors(True)
+        self.run_prompts_list.itemChanged.connect(lambda _item: self._update_run_estimate())
         self.run_models_list = QtWidgets.QListWidget()
         self.run_models_list.setAlternatingRowColors(True)
-        matrix_layout.addWidget(self._checklist_panel("Cases", self.run_cases_list))
-        matrix_layout.addWidget(self._checklist_panel("Prompts", self.run_prompts_list))
-        matrix_layout.addWidget(self._checklist_panel("Models", self.run_models_list))
+        self.run_models_list.itemChanged.connect(lambda _item: self._update_run_estimate())
+        matrix_layout.addWidget(self._checklist_panel("Фрагменты", self.run_cases_list))
+        matrix_layout.addWidget(self._checklist_panel("Промпты", self.run_prompts_list))
+        matrix_layout.addWidget(self._checklist_panel("Модели", self.run_models_list))
         layout.addWidget(matrix_group, 2)
 
         options_group = QtWidgets.QGroupBox("Параметры запуска")
@@ -154,6 +191,7 @@ class PromptBenchmarkPage(ShellPage):
         self.limit_spin.setRange(0, 100000)
         self.limit_spin.setSpecialValueText("без лимита")
         self.limit_spin.setValue(0)
+        self.limit_spin.valueChanged.connect(lambda _value: self._update_run_estimate())
         options_layout.addWidget(self.prompt_only_check, 0, 0, 1, 2)
         options_layout.addWidget(self.save_prompts_check, 0, 2, 1, 2)
         options_layout.addWidget(QtWidgets.QLabel("Лимит запусков:"), 0, 4)
@@ -164,7 +202,7 @@ class PromptBenchmarkPage(ShellPage):
         self.summary_table = QtWidgets.QTableWidget(0, 8)
         self.summary_table.setAlternatingRowColors(True)
         self.summary_table.setHorizontalHeaderLabels(
-            ["Prompt", "Model", "Runs", "OK", "Errors", "Avg score", "Avg latency", "Avg input"]
+            ["Промпт", "Модель", "Запусков", "OK", "Ошибки", "Avg score", "Avg latency", "Avg input"]
         )
         self.summary_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeMode.Stretch)
         self.summary_table.verticalHeader().setVisible(False)
@@ -623,7 +661,19 @@ class PromptBenchmarkPage(ShellPage):
         self.prompt_only_check.setChecked(bool(saved.get("prompt_only", True)))
         self.save_prompts_check.setChecked(bool(saved.get("save_prompts", True)))
         self.limit_spin.setValue(int(saved.get("limit", 0) or 0))
+        scenario = str(saved.get("run_scenario") or "matrix")
+        scenario_index = self.run_scenario_combo.findData(scenario)
+        if scenario_index >= 0:
+            self.run_scenario_combo.blockSignals(True)
+            self.run_scenario_combo.setCurrentIndex(scenario_index)
+            self.run_scenario_combo.blockSignals(False)
+        self._saved_run_focus = {
+            "case": str(saved.get("focus_case") or ""),
+            "prompt": str(saved.get("focus_prompt") or ""),
+            "model": str(saved.get("focus_model") or ""),
+        }
         self.tabs.setCurrentIndex(int(saved.get("tab", 0) or 0))
+        self._update_run_scenario_controls()
 
     def _save_ui_state(self):
         if self.settings_manager is None:
@@ -637,6 +687,10 @@ class PromptBenchmarkPage(ShellPage):
                         "prompt_only": self.prompt_only_check.isChecked(),
                         "save_prompts": self.save_prompts_check.isChecked(),
                         "limit": self.limit_spin.value(),
+                        "run_scenario": self._run_scenario(),
+                        "focus_case": self._combo_value(self.run_focus_case_combo),
+                        "focus_prompt": self._combo_value(self.run_focus_prompt_combo),
+                        "focus_model": self._combo_value(self.run_focus_model_combo),
                         "tab": self.tabs.currentIndex(),
                     }
                 }
@@ -838,6 +892,7 @@ class PromptBenchmarkPage(ShellPage):
             self._clear_model_form()
 
     def _refresh_run_lists(self):
+        previous_scenario = self._run_scenario()
         self._set_checklist_items(
             self.run_cases_list,
             [str(item.get("id") or "") for item in self.config_data.get("cases", []) if str(item.get("id") or "")],
@@ -850,6 +905,12 @@ class PromptBenchmarkPage(ShellPage):
             self.run_models_list,
             [str(item.get("id") or "") for item in self.config_data.get("models", []) if str(item.get("id") or "")],
         )
+        self._refresh_run_focus_combos()
+        if previous_scenario != "matrix":
+            self._apply_run_preset()
+        else:
+            self._update_run_scenario_controls()
+            self._update_run_estimate()
 
     def _set_checklist_items(self, list_widget: QtWidgets.QListWidget, ids: list[str]):
         had_items = list_widget.count() > 0
@@ -876,6 +937,150 @@ class PromptBenchmarkPage(ShellPage):
         state = QtCore.Qt.CheckState.Checked if checked else QtCore.Qt.CheckState.Unchecked
         for index in range(list_widget.count()):
             list_widget.item(index).setCheckState(state)
+        self._update_run_estimate()
+
+    def _run_scenario(self) -> str:
+        combo = getattr(self, "run_scenario_combo", None)
+        if combo is None:
+            return "matrix"
+        return str(combo.currentData() or "matrix")
+
+    def _combo_value(self, combo: QtWidgets.QComboBox) -> str:
+        value = combo.currentData()
+        if value is None:
+            value = combo.currentText()
+        return str(value or "").strip()
+
+    def _list_ids(self, list_widget: QtWidgets.QListWidget) -> list[str]:
+        return [list_widget.item(index).text() for index in range(list_widget.count())]
+
+    def _checked_count(self, list_widget: QtWidgets.QListWidget) -> int:
+        return len(self._selected_ids(list_widget))
+
+    def _set_combo_items(self, combo: QtWidgets.QComboBox, ids: list[str], preferred: str = ""):
+        current = preferred or self._combo_value(combo)
+        combo.blockSignals(True)
+        combo.clear()
+        for item_id in ids:
+            combo.addItem(item_id, item_id)
+        if current:
+            index = combo.findData(current)
+            if index >= 0:
+                combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+    def _refresh_run_focus_combos(self):
+        self._set_combo_items(
+            self.run_focus_case_combo,
+            self._list_ids(self.run_cases_list),
+            self._saved_run_focus.get("case", ""),
+        )
+        self._set_combo_items(
+            self.run_focus_prompt_combo,
+            self._list_ids(self.run_prompts_list),
+            self._saved_run_focus.get("prompt", ""),
+        )
+        self._set_combo_items(
+            self.run_focus_model_combo,
+            self._list_ids(self.run_models_list),
+            self._saved_run_focus.get("model", ""),
+        )
+        self._saved_run_focus = {}
+
+    def _set_checked_ids(self, list_widget: QtWidgets.QListWidget, selected_ids: set[str]):
+        list_widget.blockSignals(True)
+        for index in range(list_widget.count()):
+            item = list_widget.item(index)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked
+                if item.text() in selected_ids
+                else QtCore.Qt.CheckState.Unchecked
+            )
+        list_widget.blockSignals(False)
+
+    def _first_id(self, list_widget: QtWidgets.QListWidget) -> str:
+        return list_widget.item(0).text() if list_widget.count() else ""
+
+    def _focus_or_first(self, combo: QtWidgets.QComboBox, list_widget: QtWidgets.QListWidget) -> str:
+        value = self._combo_value(combo)
+        return value or self._first_id(list_widget)
+
+    def _on_run_scenario_changed(self):
+        self._update_run_scenario_controls()
+        if self._run_scenario() != "matrix":
+            self._apply_run_preset()
+        else:
+            self._update_run_estimate()
+
+    def _on_run_focus_changed(self):
+        if self._run_scenario() != "matrix":
+            self._apply_run_preset()
+        else:
+            self._update_run_estimate()
+
+    def _update_run_scenario_controls(self):
+        if not hasattr(self, "run_hint_label"):
+            return
+        scenario = self._run_scenario()
+        is_compare_models = scenario == "compare_models"
+        is_compare_prompts = scenario == "compare_prompts"
+        is_smoke = scenario == "smoke"
+        self.run_focus_case_combo.setEnabled(is_smoke)
+        self.run_focus_prompt_combo.setEnabled(is_compare_models or is_smoke)
+        self.run_focus_model_combo.setEnabled(is_compare_prompts or is_smoke)
+        hints = {
+            "matrix": "Ручной режим: отмеченные фрагменты, промпты и модели образуют матрицу запуска.",
+            "compare_models": "Один выбранный промпт будет прогнан на всех отмеченных моделях.",
+            "compare_prompts": "Все отмеченные промпты будут прогнаны на одной выбранной модели.",
+            "smoke": "Один фрагмент, один промпт и одна модель для быстрой проверки настроек.",
+        }
+        self.run_hint_label.setText(hints.get(scenario, hints["matrix"]))
+
+    def _apply_run_preset(self):
+        scenario = self._run_scenario()
+        if scenario == "matrix":
+            self._update_run_scenario_controls()
+            self._update_run_estimate()
+            return
+
+        all_cases = set(self._list_ids(self.run_cases_list))
+        all_prompts = set(self._list_ids(self.run_prompts_list))
+        all_models = set(self._list_ids(self.run_models_list))
+        selected_cases = set(self._selected_ids(self.run_cases_list))
+        selected_prompts = set(self._selected_ids(self.run_prompts_list))
+        selected_models = set(self._selected_ids(self.run_models_list))
+        prompt_id = self._focus_or_first(self.run_focus_prompt_combo, self.run_prompts_list)
+        model_id = self._focus_or_first(self.run_focus_model_combo, self.run_models_list)
+        case_id = self._focus_or_first(self.run_focus_case_combo, self.run_cases_list)
+
+        if scenario == "compare_models":
+            self._set_checked_ids(self.run_cases_list, selected_cases or all_cases)
+            self._set_checked_ids(self.run_prompts_list, {prompt_id} if prompt_id else set())
+            self._set_checked_ids(self.run_models_list, selected_models or all_models)
+        elif scenario == "compare_prompts":
+            self._set_checked_ids(self.run_cases_list, selected_cases or all_cases)
+            self._set_checked_ids(self.run_prompts_list, selected_prompts or all_prompts)
+            self._set_checked_ids(self.run_models_list, {model_id} if model_id else set())
+        elif scenario == "smoke":
+            self._set_checked_ids(self.run_cases_list, {case_id} if case_id else set())
+            self._set_checked_ids(self.run_prompts_list, {prompt_id} if prompt_id else set())
+            self._set_checked_ids(self.run_models_list, {model_id} if model_id else set())
+        self._update_run_scenario_controls()
+        self._update_run_estimate()
+
+    def _update_run_estimate(self):
+        if not hasattr(self, "run_estimate_label"):
+            return
+        cases = self._checked_count(self.run_cases_list)
+        prompts = self._checked_count(self.run_prompts_list)
+        models = self._checked_count(self.run_models_list)
+        total = cases * prompts * models
+        limit = self.limit_spin.value() if hasattr(self, "limit_spin") else 0
+        effective = min(total, limit) if limit > 0 else total
+        suffix = f" (лимит: {effective})" if limit > 0 and effective < total else ""
+        self.run_estimate_label.setText(
+            f"Запусков: {effective}{suffix}  |  {cases} x {prompts} x {models}"
+        )
 
     def _selected_ids(self, list_widget: QtWidgets.QListWidget) -> list[str]:
         return [
@@ -885,6 +1090,8 @@ class PromptBenchmarkPage(ShellPage):
         ]
 
     def _filters(self) -> dict[str, set[str]] | None:
+        if self._run_scenario() != "matrix":
+            self._apply_run_preset()
         sections = [
             ("cases", self.run_cases_list, "case"),
             ("prompts", self.run_prompts_list, "prompt"),

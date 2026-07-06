@@ -2,9 +2,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from docx import Document
 
+from gemini_translator.benchmark import cli as benchmark_cli
 from gemini_translator.benchmark.evaluator import evaluate_translation
 from gemini_translator.benchmark.runner import BenchmarkRunner, summarize_results
 
@@ -138,6 +140,54 @@ class PromptBenchmarkRunnerTests(unittest.TestCase):
         self.assertEqual(summary[0]["prompt_id"], "b")
         self.assertEqual(summary[0]["avg_score"], 95)
         self.assertEqual(summary[1]["errors"], 1)
+
+
+class PromptBenchmarkCliTests(unittest.TestCase):
+    def test_compare_models_with_prompt_sets_single_prompt_filter(self):
+        class _Runner:
+            output_dir = Path("out")
+
+            def run(self):
+                return {"summary": [], "results": []}
+
+        with patch.object(benchmark_cli, "BenchmarkRunner", return_value=_Runner()) as runner_cls:
+            code = benchmark_cli.main(
+                [
+                    "benchmark.json",
+                    "--compare-models-with-prompt",
+                    "prompt-a",
+                    "--models",
+                    "model-a,model-b",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        kwargs = runner_cls.call_args.kwargs
+        self.assertEqual(kwargs["filters"]["prompts"], {"prompt-a"})
+        self.assertEqual(kwargs["filters"]["models"], {"model-a", "model-b"})
+
+    def test_compare_prompts_with_model_sets_single_model_filter(self):
+        class _Runner:
+            output_dir = Path("out")
+
+            def run(self):
+                return {"summary": [], "results": []}
+
+        with patch.object(benchmark_cli, "BenchmarkRunner", return_value=_Runner()) as runner_cls:
+            code = benchmark_cli.main(
+                [
+                    "benchmark.json",
+                    "--compare-prompts-with-model",
+                    "model-a",
+                    "--prompts",
+                    "prompt-a,prompt-b",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        kwargs = runner_cls.call_args.kwargs
+        self.assertEqual(kwargs["filters"]["models"], {"model-a"})
+        self.assertEqual(kwargs["filters"]["prompts"], {"prompt-a", "prompt-b"})
 
 
 if __name__ == "__main__":
