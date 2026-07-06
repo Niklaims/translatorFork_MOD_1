@@ -1224,6 +1224,36 @@
       }
     }
   },
+  "__mcp_server__": {
+    "display_name": "MCP сервер",
+    "handler_class": "McpApiHandler",
+    "is_async": true,
+    "worker_runtime": "thread",
+    "visible": false,
+    "needs_warmup": false,
+    "base_timeout": 1800,
+    "requires_api_key": false,
+    "max_instances": 1,
+    "placeholder_api_key": "__mcp_client_session__",
+    "file_suffix": "_translated_mcp.html",
+    "shared_request_counter": false,
+    "reset_policy": {
+      "type": "rolling",
+      "duration_hours": 24
+    },
+    "models": {
+      "MCP Client": {
+        "id": "mcp-client",
+        "rpm": 1,
+        "rpd": 0,
+        "needs_chunking": true,
+        "context_length": 128000,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 8192,
+        "min_thinking_budget": false
+      }
+    }
+  },
   "web_chatgpt_free": {
     "display_name": "Web Interface (ChatGPT Free)",
     "handler_class": "BrowserApiHandler",

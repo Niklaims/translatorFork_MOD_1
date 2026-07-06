@@ -2523,7 +2523,7 @@ class AITranslationPage(ShellPage):
         self.bus.event_posted.emit(event)
 
     def _update_start_button_state(self):
-        can_start = not self.is_session_active and len(self.key_widget.get_active_keys()) > 0
+        can_start = not self.is_session_active and self.key_widget.can_start_ai_session()
         self.start_stop_btn.setEnabled(can_start)
 
     def _apply_initial_session_settings(self):
@@ -2556,13 +2556,13 @@ class AITranslationPage(ShellPage):
         else:
             self._set_ui_active(True)
             settings = self.get_settings()
-            if not settings.get('api_keys'):
+            if not self.key_widget.can_start_ai_session():
                 if self.suppress_popups:
-                    self.finish_reason = "No active API keys configured for untranslated fixer."
+                    self.finish_reason = "No active AI service session configured for untranslated fixer."
                     self._set_ui_active(False)
                     self._finish_auto_session(False)
                     return
-                QMessageBox.warning(self, "Нет ключей", "Не выбрано ни одного активного API ключа.")
+                QMessageBox.warning(self, "Нет сессии", "Нет активной сессии сервиса или подключенного MCP-клиента.")
                 self._set_ui_active(False)
                 return
 
@@ -2685,7 +2685,12 @@ class AITranslationPage(ShellPage):
 
     def get_settings(self):
         settings = self.model_settings_widget.get_settings()
-        settings['provider'] = self.key_widget.get_selected_provider()
+        provider_getter = getattr(
+            self.key_widget,
+            "get_raw_selected_provider",
+            self.key_widget.get_selected_provider,
+        )
+        settings['provider'] = provider_getter()
         settings['api_keys'] = self.key_widget.get_active_keys()
         settings['rpm_limit'] = self.rpm_spin.value()
         settings['max_concurrent_requests'] = self.concurrent_spin.value()

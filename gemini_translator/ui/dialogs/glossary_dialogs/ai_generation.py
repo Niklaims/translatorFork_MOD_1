@@ -331,6 +331,7 @@ class GenerationSessionPage(ShellPage):
         self.is_session_active = False
         self.is_soft_stopping = False
         self.force_exit_on_interrupt = False
+        self._forced_interrupt_close_finalized = False
         self._session_was_restored = False
         self._initial_load_done = False
         self._glossary_task_size_locked = False
@@ -403,15 +404,33 @@ class GenerationSessionPage(ShellPage):
                 self.glossary_widget.set_glossary(initial_glossary)
         
         
-    def _post_event(self, name: str, data: dict = None):
+    @staticmethod
+    def _emit_to_bus(bus, event: dict):
+        if hasattr(bus, "emit_event"):
+            bus.emit_event(event)
+        else:
+            bus.event_posted.emit(event)
+
+    def _build_event(self, name: str, data: dict = None):
         session_id = self.engine.session_id if self.engine and self.engine.session_id else None
-        event = {
+        return {
             'event': name,
             'source': 'GenerationSessionDialog',
             'session_id': session_id,
             'data': data or {}
         }
-        self.bus.event_posted.emit(event)
+
+    def _post_event(self, name: str, data: dict = None):
+        self._emit_to_bus(self.bus, self._build_event(name, data))
+
+    def _post_event_deferred(self, name: str, data: dict = None):
+        event = self._build_event(name, data)
+        bus = self.bus
+        emit_to_bus = self._emit_to_bus
+        QtCore.QTimer.singleShot(
+            0,
+            lambda event=event, bus=bus, emit_to_bus=emit_to_bus: emit_to_bus(bus, event),
+        )
 
     def _merge_initial_ui_settings(self, initial_ui_settings):
         merged = dict(initial_ui_settings or {})
@@ -1355,6 +1374,9 @@ class GenerationSessionPage(ShellPage):
     def _get_available_session_capacity(self) -> int:
         provider_id = self.key_widget.get_selected_provider()
         active_sessions = len(self.key_widget.get_active_keys())
+        can_start_ai_session = getattr(self.key_widget, "can_start_ai_session", None)
+        if active_sessions <= 0 and callable(can_start_ai_session) and can_start_ai_session():
+            return 1
         if active_sessions <= 0:
             return 0
         provider_limit = api_config.provider_max_instances(provider_id)
@@ -2203,12 +2225,11 @@ class GenerationSessionPage(ShellPage):
         if self.is_session_active:
             self.start_btn.setEnabled(False)
         else:
-            num_active_keys = len(self.key_widget.get_active_keys())
             pipeline_ready = (not self.pipeline_enabled_checkbox.isChecked()) or bool(self.pipeline_steps)
             can_start = all([
                 self.epub_path,
                 self.html_files, 
-                num_active_keys > 0,
+                self.key_widget.can_start_ai_session(),
                 pipeline_ready,
             ])
             self.start_btn.setEnabled(can_start)
@@ -2331,11 +2352,11 @@ class GenerationSessionPage(ShellPage):
             return
         
         
-        can_start = len(self.key_widget.get_active_keys()) > 0
+        can_start = self.key_widget.can_start_ai_session()
         if not can_start:
             msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Нет Ключей")
-            msg_box.setText("Запуск невозможен, так как вы не выбрали ни одного ключа.")
+            msg_box.setWindowTitle("Нет сессии")
+            msg_box.setText("Запуск невозможен: нет активной сессии сервиса или подключенного MCP-клиента.")
             yes_btn = msg_box.addButton("Понял", QMessageBox.ButtonRole.YesRole)
             no_btn = msg_box.addButton("Осознал", QMessageBox.ButtonRole.NoRole)
             msg_box.exec()
@@ -2510,11 +2531,24 @@ class GenerationSessionPage(ShellPage):
             # 1. Находим флаг нашего оркестратора и немедленно его снимаем
             orchestrator_flag_key = self.orchestrator.MANAGED_SESSION_FLAG_KEY if self.orchestrator else None
             if orchestrator_flag_key and self.bus.pop_data(orchestrator_flag_key, None):
-                 self._post_event('log_message', {'message': "[SYSTEM] Глобальный флаг управляемой сессии снят принудительно."})
+                 self._post_event_deferred('log_message', {'message': "[SYSTEM] Глобальный флаг управляемой сессии снят принудительно."})
 
             # 2. Отправляем команду на немедленную остановку движка
-            self._post_event('log_message', {'message': "[SYSTEM] Отправка запроса на ЭКСТРЕННУЮ остановку сессии…"})
-            self._post_event('manual_stop_requested')
+            self._post_event_deferred('log_message', {'message': "[SYSTEM] Отправка запроса на ЭКСТРЕННУЮ остановку сессии…"})
+            self._request_immediate_engine_cancel()
+            self._set_ui_active(False)
+            if self.force_exit_on_interrupt:
+                self._finish_forced_interrupt_close()
+
+    def _request_immediate_engine_cancel(self):
+        self._post_event_deferred('manual_stop_requested')
+
+    def _finish_forced_interrupt_close(self):
+        if getattr(self, "_forced_interrupt_close_finalized", False):
+            return
+        self._forced_interrupt_close_finalized = True
+        self._cleanup()
+        self.result_ready.emit(False)
 
     
     def _start_session(self):
@@ -2552,6 +2586,7 @@ class GenerationSessionPage(ShellPage):
         if current_pipeline_step_index <= 0:
             self.log_widget.clear()
         self.force_exit_on_interrupt = False
+        self._forced_interrupt_close_finalized = False
         self._session_finished_successfully = False
         self._set_ui_active(True)
         self.settings_manager.save_last_glossary_prompt_text(self.prompt_widget.get_prompt())
@@ -2686,7 +2721,12 @@ class GenerationSessionPage(ShellPage):
 
     def _get_common_settings(self):
         settings = self.model_settings_widget.get_settings()
-        settings['provider'] = self.key_widget.get_selected_provider()
+        provider_getter = getattr(
+            self.key_widget,
+            "get_raw_selected_provider",
+            self.key_widget.get_selected_provider,
+        )
+        settings['provider'] = provider_getter()
         settings['api_keys'] = self.key_widget.get_active_keys()
         model_name = settings.get('model')
         settings['model_config'] = api_config.all_models().get(model_name, {}).copy()
