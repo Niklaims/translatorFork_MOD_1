@@ -15,7 +15,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, Qt, pyqtSlot, QTimer
 
-from ..dialogs.glossary import GlossaryManagerPage, ImporterWizardDialog, MainWindow as GlossaryToolWindow
+from ..dialogs.glossary import (
+    GlossaryManagerPage,
+    ImporterWizardDialog,
+    MainWindow as GlossaryToolWindow,
+    MultiImportManagerDialog,
+)
 from ..dialogs.glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 from .ancestor_utils import find_ancestor_by_class_name
 from ...utils.settings import SettingsManager
@@ -75,6 +80,62 @@ def glossary_entry_key(entry) -> str:
     if not isinstance(entry, dict):
         return ""
     return str(entry.get("original", "") or "").strip().casefold()
+
+
+def normalize_imported_glossary_entry(entry) -> dict | None:
+    if not isinstance(entry, dict):
+        return None
+
+    clean_entry = entry.copy()
+    if not clean_entry.get("rus") and clean_entry.get("translation"):
+        clean_entry["rus"] = clean_entry.get("translation")
+
+    clean_entry["original"] = normalize_glossary_field(clean_entry.get("original"))
+    clean_entry["rus"] = normalize_glossary_field(clean_entry.get("rus"))
+    clean_entry["note"] = normalize_glossary_field(clean_entry.get("note"))
+    if "translation" in clean_entry:
+        clean_entry["translation"] = normalize_glossary_field(clean_entry.get("translation"))
+    if clean_entry.get("timestamp") is None:
+        clean_entry.pop("timestamp", None)
+
+    if not any(
+        clean_entry.get(field, "").strip()
+        for field in ("original", "rus", "note")
+    ):
+        return None
+    return clean_entry
+
+
+def merge_imported_glossary_entries(existing_entries, imported_entries) -> list[dict]:
+    merged_entries: list[dict] = []
+    key_to_index: dict[str, int] = {}
+
+    def add_entries(entries, *, update_existing: bool):
+        for entry in entries or []:
+            clean_entry = normalize_imported_glossary_entry(entry)
+            if clean_entry is None:
+                continue
+
+            key = glossary_entry_key(clean_entry)
+            if not key:
+                merged_entries.append(clean_entry)
+                continue
+
+            existing_index = key_to_index.get(key)
+            if existing_index is None:
+                key_to_index[key] = len(merged_entries)
+                merged_entries.append(clean_entry)
+                continue
+
+            if update_existing:
+                previous_timestamp = merged_entries[existing_index].get("timestamp")
+                merged_entries[existing_index].update(clean_entry)
+                if previous_timestamp and "timestamp" not in clean_entry:
+                    merged_entries[existing_index]["timestamp"] = previous_timestamp
+
+    add_entries(existing_entries, update_existing=False)
+    add_entries(imported_entries, update_existing=True)
+    return merged_entries
 
 
 class GeneratedTermsReviewDialog(QDialog):
@@ -822,20 +883,115 @@ class GlossaryWidget(QWidget):
     def clear(self):
         self.set_glossary([])
 
-    def _load_from_file(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Загрузить глоссарий из файла", "", "Все поддерживаемые (*.json *.txt);;JSON Files (*.json);;Text Files (*.txt)")
-        if not file_path: return
+    def _try_parse_standard_json_file(self, path):
         try:
-            with open(file_path, 'r', encoding='utf-8') as f: content = f.read()
-            if not content.strip(): QMessageBox.information(self, "Файл пуст", "Выбранный файл не содержит данных."); return
-            wizard = ImporterWizardDialog(initial_data=content, parent=self)
-            if wizard.exec() == QDialog.DialogCode.Accepted:
-                newly_imported_list = wizard.get_glossary()
-                if not newly_imported_list: QMessageBox.information(self, "Нет данных", "Мастер импорта не смог извлечь ни одной записи."); return
-                self.set_glossary(newly_imported_list)
-                QMessageBox.information(self, "Успех", f"Загружено {len(newly_imported_list)} терминов.")
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if not content.strip():
+                return []
+
+            data = json.loads(content)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                first_item_keys = data[0].keys()
+                has_translation = 'rus' in first_item_keys or 'translation' in first_item_keys
+                if 'original' in first_item_keys and has_translation:
+                    return data
+
+            if isinstance(data, dict) and data:
+                first_key = next(iter(data), None)
+                if first_key and isinstance(data[first_key], dict):
+                    first_item_keys = data[first_key].keys()
+                    has_translation = 'rus' in first_item_keys or 'translation' in first_item_keys
+                    if has_translation:
+                        return [
+                            {'original': term, **term_data}
+                            for term, term_data in data.items()
+                        ]
+
+            return None
+        except Exception:
+            return None
+
+    def _load_single_import_file(self, file_path):
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        if not content.strip():
+            QMessageBox.information(
+                self,
+                "Файл пуст",
+                f"Выбранный файл пуст:\n{file_path}",
+            )
+            return [], 1
+
+        wizard = ImporterWizardDialog(initial_data=content, parent=self)
+        if wizard.exec() == QDialog.DialogCode.Accepted:
+            return wizard.get_glossary(), 1
+        return [], 0
+
+    def _load_from_file(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Загрузить глоссарии из файлов",
+            "",
+            "Все поддерживаемые (*.json *.txt);;JSON Files (*.json);;Text Files (*.txt)",
+        )
+        if not file_paths:
+            return
+
+        try:
+            imported_entries, files_processed_count = [], 0
+
+            if len(file_paths) == 1:
+                imported_entries, files_processed_count = self._load_single_import_file(file_paths[0])
+            else:
+                pre_processed, to_configure = {}, []
+                for file_path in file_paths:
+                    parsed_data = self._try_parse_standard_json_file(file_path)
+                    if parsed_data is not None:
+                        pre_processed[file_path] = parsed_data
+                    else:
+                        to_configure.append(file_path)
+
+                if to_configure:
+                    manager = MultiImportManagerDialog(to_configure, pre_processed, self)
+                    if manager.exec() != QDialog.DialogCode.Accepted:
+                        return
+                    imported_entries, files_processed_count = manager.get_all_imported_entries()
+                else:
+                    for parsed_entries in pre_processed.values():
+                        imported_entries.extend(parsed_entries)
+                    files_processed_count = len(pre_processed)
+
+            if not imported_entries:
+                if files_processed_count > 0:
+                    QMessageBox.information(
+                        self,
+                        "Нет данных",
+                        "Импорт завершен, но не удалось извлечь ни одной записи.",
+                    )
+                return
+
+            previous_count = len(self.get_glossary())
+            merged_glossary = merge_imported_glossary_entries(self.get_glossary(), imported_entries)
+            self.set_glossary(merged_glossary)
+            delta = len(merged_glossary) - previous_count
+            QMessageBox.information(
+                self,
+                "Успех",
+                (
+                    f"Импортировано {len(imported_entries)} записей из "
+                    f"{files_processed_count} файл(ов).\n"
+                    f"В глоссарии теперь {len(merged_glossary)} записей "
+                    f"({delta:+d})."
+                ),
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка загрузки", f"Не удалось прочитать или обработать файл: {e}")
+            QMessageBox.critical(
+                self,
+                "Ошибка загрузки",
+                f"Не удалось прочитать или обработать файл: {e}",
+            )
+        return
             
     def _open_manager(self):
         # Ищем страницу/диалог настроек, чтобы взять путь проекта и выбрать способ открытия.
