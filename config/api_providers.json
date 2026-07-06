@@ -804,6 +804,45 @@
       }
     }
   },
+  "xai": {
+    "display_name": "xAI Grok API",
+    "provider": "xai",
+    "handler_class": "OpenRouterApiHandler",
+    "base_url": "https://api.x.ai/v1/chat/completions",
+    "base_timeout": 1200,
+    "is_async": true,
+    "needs_warmup": true,
+    "visible": true,
+    "file_suffix": "_translated_xai.html",
+    "shared_request_counter": false,
+    "reset_policy": {
+      "type": "rolling",
+      "duration_hours": 24
+    },
+    "models": {
+      "Grok 4.3": {
+        "id": "grok-4.3",
+        "rpm": 5,
+        "tpm": 50000,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 32768,
+        "context_length": 1000000,
+        "reasoning_effort": "low",
+        "min_thinking_budget": false
+      },
+      "Grok Build 0.1": {
+        "id": "grok-build-0.1",
+        "rpm": 5,
+        "tpm": 50000,
+        "needs_chunking": true,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 32768,
+        "context_length": 256000,
+        "min_thinking_budget": false
+      }
+    }
+  },
   "huggingface": {
     "display_name": "Hugging Face (Free)",
     "provider": "huggingface",
