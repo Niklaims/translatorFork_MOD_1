@@ -42,18 +42,26 @@ def sort_translation_versions_for_epub_build(versions, translated_folder):
         if suffix in IGNORED_VERSION_SUFFIXES or not rel_path:
             continue
         full_path = os.path.join(translated_folder, str(rel_path).replace("/", os.sep))
+        score = _version_file_score(translated_folder, suffix, rel_path)
         candidates.append({
             "suffix": suffix,
             "rel_path": rel_path,
             "filepath": full_path,
             "is_validated": suffix == VALIDATED_SUFFIX,
+            "_score": score,
         })
 
-    return sorted(
+    sorted_candidates = sorted(
         candidates,
-        key=lambda item: _version_file_score(translated_folder, item["suffix"], item["rel_path"]),
+        key=lambda item: (
+            item["is_validated"] and bool(item["_score"][0]),
+            item["_score"],
+        ),
         reverse=True,
     )
+    for item in sorted_candidates:
+        item.pop("_score", None)
+    return sorted_candidates
 
 
 def select_epub_build_translation_version(versions, translated_folder):

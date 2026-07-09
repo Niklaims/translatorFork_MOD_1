@@ -237,7 +237,7 @@ def test_choose_translation_rel_path_prefers_explicit_suffix():
     assert _choose_translation_rel_path(versions) == "b.html"
 
 
-def test_build_epub_uses_newest_translation_when_retry_is_newer(tmp_path):
+def test_build_epub_prefers_validated_translation_over_newer_retry(tmp_path):
     epub_path = tmp_path / "book.epub"
     project_dir = tmp_path / "project"
     output_path = tmp_path / "book_out.epub"
@@ -280,8 +280,8 @@ def test_build_epub_uses_newest_translation_when_retry_is_newer(tmp_path):
 
     assert payload["replaced_count"] == 1
     with zipfile.ZipFile(output_path, "r") as epub:
-        assert "OEBPS/ch1_translated_retry.html" in epub.namelist()
-        assert "fresh retry" in epub.read("OEBPS/ch1_translated_retry.html").decode("utf-8")
+        assert "OEBPS/ch1_validated.html" in epub.namelist()
+        assert "old accepted" in epub.read("OEBPS/ch1_validated.html").decode("utf-8")
 
 
 def test_safe_settings_masks_active_keys_by_provider():

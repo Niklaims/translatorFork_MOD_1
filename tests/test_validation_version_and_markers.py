@@ -69,7 +69,7 @@ def test_validation_keeps_validated_translation_preferred():
         shutil.rmtree(tmp_path.parent, ignore_errors=True)
 
 
-def test_epub_build_selects_newer_retry_over_older_validated():
+def test_epub_build_prefers_validated_over_newer_retry():
     tmp_path = _fresh_tmp_dir("epub_build_newest")
     retry_path = tmp_path / "Text" / "ch1_translated_retry.html"
     validated_path = tmp_path / "Text" / "ch1_validated.html"
@@ -80,6 +80,26 @@ def test_epub_build_selects_newer_retry_over_older_validated():
 
         os.utime(validated_path, (1000, 1000))
         os.utime(retry_path, (2000, 2000))
+
+        rel_path = select_epub_build_translation_version(
+            {
+                "_validated.html": "Text/ch1_validated.html",
+                "_translated_retry.html": "Text/ch1_translated_retry.html",
+            },
+            str(tmp_path),
+        )
+
+        assert rel_path == "Text/ch1_validated.html"
+    finally:
+        shutil.rmtree(tmp_path.parent, ignore_errors=True)
+
+
+def test_epub_build_uses_existing_translation_when_validated_file_is_missing():
+    tmp_path = _fresh_tmp_dir("epub_build_missing_validated")
+    translated_path = tmp_path / "Text" / "ch1_translated_retry.html"
+    translated_path.parent.mkdir()
+    try:
+        translated_path.write_text("<html><body><p>retry exists</p></body></html>", encoding="utf-8")
 
         rel_path = select_epub_build_translation_version(
             {
