@@ -1269,14 +1269,6 @@ class RulateDownloadWorker(QThread):
         return bool(re.search(r"(?:Часть|Part)\s*\d+\s*$", title or "", re.IGNORECASE))
 
     @staticmethod
-    def _chapter_base_number(number) -> int:
-        try:
-            value = float(number)
-        except (TypeError, ValueError):
-            return 0
-        return int(value) if value > 0 else 0
-
-    @staticmethod
     def _number_key(number) -> str:
         try:
             return format_num(float(number))
@@ -1354,22 +1346,18 @@ class RulateDownloadWorker(QThread):
         if not self.chapter_infos or len(self.chapter_ids or []) <= 1:
             return False
 
-        seen_bases = set()
+        seen_numbers = set()
         for info in self.chapter_infos:
             title = info.get("title", "")
             number = info.get("number", 0)
-            try:
-                numeric = float(number)
-            except (TypeError, ValueError):
-                numeric = 0.0
-            if self._chapter_has_part(title) or (numeric and numeric != int(numeric)):
+            if self._chapter_has_part(title):
                 return True
 
-            base = self._chapter_base_number(number)
-            if base and base in seen_bases:
+            number_key = self._number_key(number)
+            if number_key and number_key in seen_numbers:
                 return True
-            if base:
-                seen_bases.add(base)
+            if number_key:
+                seen_numbers.add(number_key)
         return False
 
     def _apply_chapter_info(self, chapter: ChapterData, info: dict | None):

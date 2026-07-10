@@ -261,8 +261,7 @@ class CorrectionSessionPage(ShellPage):
 
     def _update_start_button_state(self):
         if not self.is_session_active:
-            has_keys = len(self.key_widget.get_active_keys()) > 0
-            self.start_stop_btn.setEnabled(has_keys)
+            self.start_stop_btn.setEnabled(self.key_widget.can_start_ai_session())
             # Dry run доступен, если UI загружен (данные готовы к сбору)
             self.dry_run_btn.setEnabled(self._ui_is_fully_loaded)
 
@@ -1532,8 +1531,8 @@ class CorrectionSessionPage(ShellPage):
                 self.start_stop_btn.setEnabled(False)
         else:
             # Логика ЗАПУСКА
-            if not self.key_widget.get_active_keys():
-                QMessageBox.warning(self, "Нет ключей", "Не выбрано ни одного активного API ключа.")
+            if not self.key_widget.can_start_ai_session():
+                QMessageBox.warning(self, "Нет сессии", "Нет активной сессии сервиса или подключенного MCP-клиента.")
                 return
 
             # 1. Готовим задачу через общий метод
@@ -2485,7 +2484,12 @@ class CorrectionSessionPage(ShellPage):
 
     def get_settings(self):
         settings = self.model_settings_widget.get_settings()
-        settings['provider'] = self.key_widget.get_selected_provider()
+        provider_getter = getattr(
+            self.key_widget,
+            "get_raw_selected_provider",
+            self.key_widget.get_selected_provider,
+        )
+        settings['provider'] = provider_getter()
         settings['api_keys'] = self.key_widget.get_active_keys()
         model_name = settings.get('model')
         model_config = api_config.all_models().get(model_name, {}).copy()

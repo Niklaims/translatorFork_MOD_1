@@ -35,6 +35,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cases", help="Comma-separated case ids to run.")
     parser.add_argument("--prompts", help="Comma-separated prompt ids to run.")
     parser.add_argument("--models", help="Comma-separated model ids to run.")
+    parser.add_argument(
+        "--compare-models-with-prompt",
+        metavar="PROMPT_ID",
+        help="Run one prompt against selected/all models.",
+    )
+    parser.add_argument(
+        "--compare-prompts-with-model",
+        metavar="MODEL_ID",
+        help="Run selected/all prompts against one model.",
+    )
     parser.add_argument("--limit", type=int, help="Maximum number of matrix runs.")
     parser.add_argument(
         "--list",
@@ -45,12 +55,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.compare_models_with_prompt and args.prompts:
+        parser.error("Use either --compare-models-with-prompt or --prompts, not both.")
+    if args.compare_prompts_with_model and args.models:
+        parser.error("Use either --compare-prompts-with-model or --models, not both.")
     filters = {
         "cases": _csv_filter(args.cases),
         "prompts": _csv_filter(args.prompts),
         "models": _csv_filter(args.models),
     }
+    if args.compare_models_with_prompt:
+        filters["prompts"] = {args.compare_models_with_prompt.strip()}
+    if args.compare_prompts_with_model:
+        filters["models"] = {args.compare_prompts_with_model.strip()}
     filters = {key: value for key, value in filters.items() if value}
 
     try:

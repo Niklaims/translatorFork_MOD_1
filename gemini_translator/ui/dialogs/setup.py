@@ -118,6 +118,16 @@ def _instance_attr(obj, name: str, default=None):
         return default
 
 
+def _key_widget_can_start_ai_session(key_widget) -> bool:
+    can_start = getattr(key_widget, "can_start_ai_session", None)
+    if callable(can_start):
+        return bool(can_start())
+    active_keys_getter = getattr(key_widget, "get_active_keys", None)
+    if callable(active_keys_getter):
+        return bool(active_keys_getter())
+    return False
+
+
 def _format_duration(seconds: float) -> str:
     """Formats a rough duration estimate for display."""
     seconds = max(0, int(round(seconds)))
@@ -1541,6 +1551,8 @@ class InitialSetupPage(ShellPage):
     def _get_available_session_capacity(self) -> int:
         provider_id = self.key_management_widget.get_selected_provider()
         active_sessions = len(self.key_management_widget.get_active_keys())
+        if active_sessions <= 0 and self._can_start_ai_session():
+            return 1
         if active_sessions <= 0:
             return 0
         provider_config = api_config.api_providers().get(provider_id, {})
@@ -1561,6 +1573,9 @@ class InitialSetupPage(ShellPage):
         if provider_limit is None or provider_limit <= 0:
             provider_limit = active_sessions
         return min(active_sessions, provider_limit)
+
+    def _can_start_ai_session(self, key_widget=None) -> bool:
+        return _key_widget_can_start_ai_session(key_widget or self.key_management_widget)
 
     def _update_distribution_info_from_widget(self):
         num_chapters = len(self.html_files)
@@ -3785,14 +3800,14 @@ class InitialSetupPage(ShellPage):
             self.start_btn.setEnabled(False)
             return
 
-        # --- Условие для основного перевода (требует ключи) ---
-        num_active_keys = len(self.key_management_widget.get_active_keys())
+        # --- Условие для основного перевода (требует активную AI-сессию) ---
+        can_start_ai = _key_widget_can_start_ai_session(self.key_management_widget)
         
         reasons = []
         if not self.selected_file: reasons.append("Не выбран EPUB файл")
         if not self.output_folder: reasons.append("Не выбрана папка проекта")
         if not self.html_files: reasons.append("Не выбраны главы для перевода")
-        if num_active_keys == 0: reasons.append("Не выбраны активные ключи")
+        if not can_start_ai: reasons.append("Не выбраны активные ключи или нет активной AI-сессии")
         
         can_start_translation = len(reasons) == 0
 
@@ -3993,6 +4008,7 @@ class InitialSetupPage(ShellPage):
             if isinstance(pending_session_override, dict) and pending_session_override.get('api_keys')
             else self.key_management_widget.get_active_keys()
         )
+        service_session_ready = bool(active_keys_for_start) or _key_widget_can_start_ai_session(self.key_management_widget)
 
         # 2. Проверяем все условия для старта
         missing_start_requirements = []
@@ -4002,7 +4018,7 @@ class InitialSetupPage(ShellPage):
             missing_start_requirements.append("нет задач в очереди")
         if not self.output_folder:
             missing_start_requirements.append("не выбрана папка проекта")
-        if not active_keys_for_start:
+        if not service_session_ready:
             missing_start_requirements.append("нет активной сессии сервиса/ключей")
 
         if missing_start_requirements:
@@ -6358,6 +6374,7 @@ class InitialSetupPage(ShellPage):
             original_epub_path=getattr(self, 'selected_file', None),
             include_original=include_original,
         )
+        service_session_ready = _key_widget_can_start_ai_session(self.key_management_widget)
         active_keys = self.key_management_widget.get_active_keys()
 
         if not chapters_to_analyze:
@@ -6366,8 +6383,8 @@ class InitialSetupPage(ShellPage):
             self.check_ready()
             return
 
-        if not active_keys:
-            self._auto_log("AI-consistency пропущен: нет активных ключей для сессии.", force=True)
+        if not service_session_ready:
+            self._auto_log("AI-consistency пропущен: нет активной сессии сервиса.", force=True)
             self._reset_auto_workflow_state()
             self.check_ready()
             return
@@ -6518,7 +6535,12 @@ class InitialSetupPage(ShellPage):
 
     def get_settings(self):
         active_keys = self.key_management_widget.get_active_keys()
-        provider_id = self.key_management_widget.get_selected_provider()
+        provider_getter = getattr(
+            self.key_management_widget,
+            "get_raw_selected_provider",
+            self.key_management_widget.get_selected_provider,
+        )
+        provider_id = provider_getter()
 
         glossary_list = self.glossary_widget.get_glossary()
         full_glossary_data = {}

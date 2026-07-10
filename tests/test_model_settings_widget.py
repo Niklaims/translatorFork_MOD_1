@@ -247,6 +247,28 @@ class ModelSettingsWidgetTests(unittest.TestCase):
         widget.set_available_models("gemini")
         self.assertTrue(widget.free_deepseek_tools_btn.isHidden())
 
+    def test_mcp_mode_hides_stale_model_controls_and_returns_mcp_client_model(self):
+        widget = self._create_widget()
+        widget.set_available_models("gemini")
+        self.assertGreater(widget.model_combo.count(), 0)
+        stale_model = widget.model_combo.currentText()
+
+        widget.set_mcp_mode(True)
+
+        self.assertNotEqual(widget.model_combo.currentText(), stale_model)
+        self.assertEqual(widget.model_combo.currentText(), "Модель выбирает AI-приложение")
+        self.assertFalse(widget.model_combo.isEnabled())
+        self.assertFalse(widget.rpd_row_widget.isEnabled())
+        self.assertFalse(widget.temperature_override_checkbox.isEnabled())
+        self.assertEqual(widget.get_settings()["model"], "MCP Client")
+        self.assertTrue(widget.get_settings()["mcp_mode"])
+
+        widget.set_mcp_mode(False)
+
+        self.assertTrue(widget.model_combo.isEnabled())
+        self.assertTrue(widget.rpd_row_widget.isEnabled())
+        self.assertFalse(widget.get_settings()["mcp_mode"])
+
     def test_free_deepseek_dialog_persists_repo_path(self):
         widget = self._create_widget()
         dialog = FreeDeepseekApiDialog(widget.settings_manager, widget)

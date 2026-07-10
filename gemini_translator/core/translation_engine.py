@@ -169,6 +169,7 @@ class TranslationEngine(QObject):
         self.is_session_finishing = False
         self.is_soft_stopping = False
         self.session_settings = {}
+        self._last_mcp_limit_reason = ""
         self.power_inhibitor = PowerInhibitor()
         self.is_starting = False 
         # Менеджеры, создаваемые для каждой сессии
@@ -624,6 +625,8 @@ class TranslationEngine(QObject):
             if error_type == "quota_exceeded":
                 
                 self.api_key_manager.mark_key_exhausted(worker_key)
+                if self._is_mcp_session():
+                    self._last_mcp_limit_reason = self._build_mcp_limit_end_reason(original_exception)
                 self._post_event('log_message', {'message': f"[MANAGER] Ключ …{worker_key[-4:]} помечен как исчерпанный.{reason_text}"})
             
 
@@ -677,7 +680,7 @@ class TranslationEngine(QObject):
         if self.session_id:
             self._post_event('log_message', {'message': "[ERROR] Попытка запустить новую сессию, когда предыдущая еще активна."})
             return
-        
+
         full_glossary_dict = settings.get('full_glossary_data', {})
         use_jieba_for_glossary = settings.get('use_jieba', False)
         segment_cjk_text = settings.get('segment_cjk_text', False)
@@ -716,6 +719,7 @@ class TranslationEngine(QObject):
         self.paused_keys.clear()
         self.shutting_down_workers.clear()
         self.key_warning_counters.clear()
+        self._last_mcp_limit_reason = ""
         self.pending_launches = 0
         self.keys_map.clear()
         self.last_warning_times.clear()
@@ -1232,17 +1236,42 @@ class TranslationEngine(QObject):
                  if not self.api_key_manager.has_non_exhausted_keys():
                      self._post_event('log_message', {'message': "[MANAGER] ТУПИК: Оркестратор активен, но все ключи исчерпаны."})
                      self.show_summary_data()
-                     self._end_session("Все API ключи исчерпаны")
+                     self._end_session(self._exhausted_session_reason())
                  return
 
             # В обычном режиме отсутствие воркеров при is_finished=False — это проблема.
             if not self.api_key_manager.has_non_exhausted_keys():
                 self._post_event('log_message', {'message': "[MANAGER] РАБОТА ОСТАНОВЛЕНА: задачи есть, но все ключи исчерпаны."})
                 self.show_summary_data()
-                self._end_session("Все API ключи исчерпаны")
+                self._end_session(self._exhausted_session_reason())
             else:
                 self._try_launch_replacement()
         
+
+    def _is_mcp_session(self) -> bool:
+        settings = self.session_settings if isinstance(self.session_settings, dict) else {}
+        model_config = settings.get('model_config') if isinstance(settings.get('model_config'), dict) else {}
+        return bool(
+            settings.get('mcp_mode')
+            or settings.get('provider') == "__mcp_server__"
+            or model_config.get('provider') == "__mcp_server__"
+        )
+
+    def _build_mcp_limit_end_reason(self, original_exception) -> str:
+        window = str(getattr(original_exception, "mcp_limit_window", "") or "лимит AI-клиента")
+        reset_hint = str(getattr(original_exception, "mcp_reset_hint", "") or "")
+        reason = f"MCP AI-клиент упёрся в {window}"
+        if reset_hint:
+            reason = f"{reason}. {reset_hint}"
+        if original_exception:
+            reason = f"{reason}. Причина: {str(original_exception)}"
+        return reason
+
+    def _exhausted_session_reason(self) -> str:
+        if self._is_mcp_session() and self._last_mcp_limit_reason:
+            return self._last_mcp_limit_reason
+        return "Все API ключи исчерпаны"
+
 
     
     def show_summary_data(self):

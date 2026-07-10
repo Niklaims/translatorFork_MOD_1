@@ -1158,7 +1158,12 @@ class ConsistencyValidatorPage(ShellPage):
 
     def _get_current_config(self) -> dict:
         """Возвращает текущую конфигурацию из UI."""
-        provider_id = self.key_management_widget.get_selected_provider()
+        provider_getter = getattr(
+            self.key_management_widget,
+            "get_raw_selected_provider",
+            self.key_management_widget.get_selected_provider,
+        )
+        provider_id = provider_getter()
         
         # Получаем все настройки из ModelSettingsWidget (Thinking, Temperature, Model, etc.)
         config = self.model_settings_widget.get_settings()
@@ -1228,6 +1233,9 @@ class ConsistencyValidatorPage(ShellPage):
         """Возвращает список активных ключей для сессии."""
         return self.key_management_widget.get_active_keys()
 
+    def _can_start_ai_session(self) -> bool:
+        return self.key_management_widget.can_start_ai_session()
+
     def _store_pending_fix(self, path: str, new_content: str):
         """Сохраняет исправление и сразу обновляет главу в текущей сессии."""
         if not path or new_content is None:
@@ -1281,11 +1289,14 @@ class ConsistencyValidatorPage(ShellPage):
             QMessageBox.warning(self, "Предупреждение", "Нет глав для анализа.")
             return
 
-        active_keys = self._get_active_keys()
-        if not active_keys:
-            QMessageBox.warning(self, "Нет ключей", 
-                "Добавьте ключи в 'Активные ключи для сессии' для запуска анализа.")
+        if not self._can_start_ai_session():
+            QMessageBox.warning(
+                self,
+                "Нет сессии",
+                "Нет активной сессии сервиса или подключенного MCP-клиента для запуска анализа.",
+            )
             return
+        active_keys = self._get_active_keys()
 
         selected_chapters = self._get_selected_chapters()
         if not selected_chapters:
@@ -1966,11 +1977,14 @@ class ConsistencyValidatorPage(ShellPage):
         if self._is_thread_running('single_fix_thread'):
             return
 
-        active_keys = self._get_active_keys()
-        if not active_keys:
-            QMessageBox.warning(self, "Нет ключей", 
-                "Добавьте ключи в 'Активные ключи для сессии'.")
+        if not self._can_start_ai_session():
+            QMessageBox.warning(
+                self,
+                "Нет сессии",
+                "Нет активной сессии сервиса или подключенного MCP-клиента.",
+            )
             return
+        active_keys = self._get_active_keys()
 
         if not isinstance(self.current_problem, dict):
             QMessageBox.warning(self, "Ошибка", "Выбранная проблема имеет некорректный формат.")
@@ -2322,11 +2336,14 @@ class ConsistencyValidatorPage(ShellPage):
             QMessageBox.information(self, "Выбор", "Не выбрано ни одной проблемы для исправления.")
             return
 
-        active_keys = self._get_active_keys()
-        if not active_keys:
-            QMessageBox.warning(self, "Нет ключей", 
-                "Добавьте ключи в 'Активные ключи для сессии'.")
+        if not self._can_start_ai_session():
+            QMessageBox.warning(
+                self,
+                "Нет сессии",
+                "Нет активной сессии сервиса или подключенного MCP-клиента.",
+            )
             return
+        active_keys = self._get_active_keys()
 
         reply = QMessageBox.question(
             self, "Массовое исправление",

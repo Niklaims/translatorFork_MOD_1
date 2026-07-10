@@ -57,7 +57,16 @@ benchmarks/prompt_benchmark.example.json
 
 `Вывод` — папка, куда будут записаны отчёты. Если оставить пустой, будет создана новая папка внутри `benchmark_results`.
 
-Вкладка `Запуск` — выбор матрицы прогона. В списках `Cases`, `Prompts` и `Models` нужно отметить чекбоксами нужные элементы. Кнопки `Все` и `Нет` быстро включают или выключают список.
+Вкладка `Запуск` — выбор сценария и матрицы прогона. В списках `Фрагменты`, `Промпты` и `Модели` нужно отметить чекбоксами нужные элементы. Кнопки `Все` и `Нет` быстро включают или выключают список.
+
+`Сценарий` — быстрый режим запуска:
+
+- `Своя матрица` — ручной выбор любых фрагментов, промптов и моделей;
+- `Сравнить модели одним промптом` — один выбранный prompt против всех отмеченных моделей;
+- `Сравнить промпты на одной модели` — все отмеченные prompts против одной выбранной модели;
+- `Пробный запуск 1 x 1 x 1` — быстрый smoke-test одного фрагмента, prompt и модели.
+
+Счётчик `Запусков` показывает итоговое количество API-вызовов с учётом лимита.
 
 Вкладка `Cases` — добавление тестовых фрагментов, исходного текста, эталона, глоссария и проверок.
 
@@ -295,6 +304,18 @@ python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark
 ```powershell
 $env:GEMINI_API_KEY = "..."
 python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark.example.json --models gemini-flash-env
+```
+
+Сравнить модели одним prompt:
+
+```powershell
+python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark.example.json --compare-models-with-prompt project-default --models gemini-flash-env,local-openai-compatible
+```
+
+Сравнить prompts на одной модели:
+
+```powershell
+python -m gemini_translator.scripts.prompt_benchmark benchmarks\prompt_benchmark.example.json --compare-prompts-with-model gemini-flash-env --prompts project-default,compact-raw
 ```
 
 Запустить только выбранные cases и prompts:

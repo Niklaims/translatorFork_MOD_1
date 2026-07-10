@@ -12,6 +12,7 @@ if __name__ != "__main__":
     from .nvidia import NvidiaApiHandler
     from .openmodel import OpenModelApiHandler
     from .local import LocalApiHandler
+    from .mcp import McpApiHandler
     from .openrouter import OpenRouterApiHandler
     from .workascii_chatgpt import WorkAsciiChatGptApiHandler
 
@@ -24,6 +25,7 @@ if __name__ != "__main__":
         "NvidiaApiHandler",
         "OpenModelApiHandler",
         "LocalApiHandler",
+        "McpApiHandler",
         "OpenRouterApiHandler",
         "WorkAsciiChatGptApiHandler"
     ]

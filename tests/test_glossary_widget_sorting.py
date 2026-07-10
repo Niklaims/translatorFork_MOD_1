@@ -2,12 +2,17 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtWidgets
 
-from gemini_translator.ui.widgets.glossary_widget import GlossaryWidget, sorted_glossary_entries
+from gemini_translator.ui.widgets.glossary_widget import (
+    GlossaryWidget,
+    merge_imported_glossary_entries,
+    sorted_glossary_entries,
+)
 
 
 class GlossaryWidgetSortingTests(unittest.TestCase):
@@ -29,6 +34,24 @@ class GlossaryWidgetSortingTests(unittest.TestCase):
             [entry["original"] for entry in sorted_entries],
             ["Alpha", "beta", "zeta", ""],
         )
+
+    def test_merge_imported_glossary_entries_updates_existing_and_appends_new(self):
+        existing = [
+            {"original": "Alpha", "rus": "old", "note": "old note", "timestamp": 123.0},
+        ]
+        imported = [
+            {"original": "alpha", "translation": "new", "note": "new note"},
+            {"original": "Beta", "rus": "beta"},
+        ]
+
+        merged = merge_imported_glossary_entries(existing, imported)
+
+        by_key = {entry["original"].casefold(): entry for entry in merged}
+        self.assertEqual(len(merged), 2)
+        self.assertEqual(by_key["alpha"]["rus"], "new")
+        self.assertEqual(by_key["alpha"]["note"], "new note")
+        self.assertEqual(by_key["alpha"]["timestamp"], 123.0)
+        self.assertEqual(by_key["beta"]["rus"], "beta")
 
     def test_set_glossary_loads_current_page_only_when_paginated(self):
         widget = GlossaryWidget()
@@ -124,6 +147,42 @@ class GlossaryWidgetSortingTests(unittest.TestCase):
             self.assertEqual(restored_widget.current_page, 2)
             self.assertEqual(restored_widget.table.rowCount(), 1)
             self.assertEqual(restored_widget.table.item(0, 0).text(), "echo")
+
+    def test_load_from_file_accepts_multiple_files_without_replacing_existing(self):
+        widget = GlossaryWidget()
+        self.addCleanup(widget.close)
+        widget.set_glossary([
+            {"original": "Existing", "rus": "old"},
+            {"original": "Shared", "rus": "old"},
+        ])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            first_path = os.path.join(tmpdir, "first.json")
+            second_path = os.path.join(tmpdir, "second.json")
+            with open(first_path, "w", encoding="utf-8") as handle:
+                json.dump([
+                    {"original": "First", "rus": "one"},
+                    {"original": "Shared", "rus": "new"},
+                ], handle, ensure_ascii=False)
+            with open(second_path, "w", encoding="utf-8") as handle:
+                json.dump([
+                    {"original": "Second", "rus": "two"},
+                ], handle, ensure_ascii=False)
+
+            with (
+                patch(
+                    "gemini_translator.ui.widgets.glossary_widget.QFileDialog.getOpenFileNames",
+                    return_value=([first_path, second_path], ""),
+                ),
+                patch("gemini_translator.ui.widgets.glossary_widget.QMessageBox.information"),
+            ):
+                widget._load_from_file()
+
+        by_original = {entry["original"]: entry["rus"] for entry in widget.get_glossary()}
+        self.assertEqual(by_original["Existing"], "old")
+        self.assertEqual(by_original["Shared"], "new")
+        self.assertEqual(by_original["First"], "one")
+        self.assertEqual(by_original["Second"], "two")
 
 
 if __name__ == "__main__":

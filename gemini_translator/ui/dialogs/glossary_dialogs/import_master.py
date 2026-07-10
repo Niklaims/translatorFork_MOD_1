@@ -539,7 +539,7 @@ class MultiImportManagerDialog(QDialog):
             self.update_finish_button_state()
             return
             
-        wizard = ImporterWizardDialog(content, self, multi_file_mode=True)
+        wizard = ImporterWizardDialog(content, parent=self, multi_file_mode=True)
         if wizard.exec() == QDialog.DialogCode.Accepted:
             result = wizard.get_glossary()
             self.processed_data[path] = result

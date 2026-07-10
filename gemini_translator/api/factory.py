@@ -14,6 +14,7 @@ HANDLER_CLASS_MAP = {
     "OpenModelApiHandler": handlers.OpenModelApiHandler,
     "DryRunApiHandler": handlers.DryRunApiHandler,
     "LocalApiHandler": handlers.LocalApiHandler,
+    "McpApiHandler": handlers.McpApiHandler,
     "BrowserApiHandler": handlers.BrowserApiHandler,
     "WorkAsciiChatGptApiHandler": handlers.WorkAsciiChatGptApiHandler,
 }
