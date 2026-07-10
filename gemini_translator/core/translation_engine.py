@@ -1089,9 +1089,14 @@ class TranslationEngine(QObject):
                 
         self.shutting_down_workers.discard(worker_id)
 
-        # Проверка сессии
-        if not self._try_launch_replacement():
-            self._check_if_session_finished()
+        # Проверка сессии (откладываем на 0 мс, чтобы успели обработаться события fatal_error из очереди)
+        def _deferred_session_check():
+            if not self.session_id:
+                return
+            if not self._try_launch_replacement():
+                self._check_if_session_finished()
+                
+        QtCore.QTimer.singleShot(0, _deferred_session_check)
     
     def _try_launch_replacement(self):
         if self.is_cancelled or self.is_session_finishing or self.is_soft_stopping:

@@ -210,6 +210,14 @@ class GeminiApiHandler(BaseApiHandler):
                                 except json.JSONDecodeError:
                                     break
                                     
+                    except Exception as stream_e:
+                        if collected_text:
+                            raise PartialGenerationError(
+                                f"Обрыв стрима Gemini: {stream_e}", 
+                                partial_text=collected_text,
+                                reason="NETWORK_ERROR"
+                            )
+                        raise stream_e
                     finally: # Гарантируем вывод дампа даже при ошибке
                         if debug_stream_chunks is not None:
                             self._debug_record_response(

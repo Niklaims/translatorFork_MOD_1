@@ -69,12 +69,14 @@ class DryRunApiHandler(BaseApiHandler):
                 self._finalize_debug_trace(trace, started_at=started_at, status="success")
                 return user_translation
 
-            error = ModelNotFoundError("Пробный запуск отменен пользователем.")
+            from ..errors import OperationCancelledError
+            error = OperationCancelledError("Пробный запуск отменен пользователем.")
+            error.delay_seconds = 0
             self._debug_record_response(
                 {"mode": "dry_run", "cancelled": True},
                 status="cancelled",
             )
-            self.worker._post_event('log_message', {'message': "[INFO] Ручной ввод отменен. Симуляция ошибки 'Модель не найдена' для остановки сессии."})
+            self.worker._post_event('log_message', {'message': "[INFO] Ручной ввод отменен. Задача остановлена."})
             self._finalize_debug_trace(
                 trace,
                 started_at=started_at,

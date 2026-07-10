@@ -167,7 +167,7 @@ class ErrorAnalyzer:
 
         if error_for_rules == ErrorType.CANCEL:
             self._record_and_log_failure(task_info, error_for_history, exc)
-            return WorkerAction.RETRY_NON_COUNTABLE, error_for_rules, exc
+            return WorkerAction.FAIL_PERMANENTLY, error_for_rules, exc
 
         if (
             is_package_task

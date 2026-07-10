@@ -238,6 +238,13 @@ class EpubChunkProcessor(BaseTaskProcessor):
         except PartialGenerationError as e:
             if e.partial_text:
                 e.partial_text = clean_html_content(e.partial_text, is_html=False)
+                if partial_translation:
+                    cleaned_partial = clean_html_content(partial_translation, is_html=False)
+                    accumulated_raw_html, _ = self._merge_with_overlap_guard(
+                        cleaned_partial,
+                        e.partial_text
+                    )
+                    e.partial_text = accumulated_raw_html
             raise e
 
         cleaned_new_part_from_markdown = clean_html_content(newly_generated_part_raw, is_html=False)

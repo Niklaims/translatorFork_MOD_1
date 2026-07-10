@@ -19,6 +19,11 @@ GEMINI_CYRILLIC_CHARS_PER_TOKEN = 2.2
 GEMINI_CJK_CHARS_PER_TOKEN = 1.5
 GEMINI_OTHER_CHARS_PER_TOKEN = 2.5
 
+OPENROUTER_ASCII_CHARS_PER_TOKEN = 3.5
+OPENROUTER_CYRILLIC_CHARS_PER_TOKEN = 1.0
+OPENROUTER_CJK_CHARS_PER_TOKEN = 1.0
+OPENROUTER_OTHER_CHARS_PER_TOKEN = 1.5
+
 
 def estimate_gemini_tokens(text):
     """Estimate Gemini input tokens without an API round trip."""
@@ -36,6 +41,25 @@ def estimate_gemini_tokens(text):
         + (cyrillic_chars / GEMINI_CYRILLIC_CHARS_PER_TOKEN)
         + (cjk_chars / GEMINI_CJK_CHARS_PER_TOKEN)
         + (other_chars / GEMINI_OTHER_CHARS_PER_TOKEN)
+    )
+    return max(1, int(math.ceil(total_tokens)))
+
+def estimate_openrouter_tokens(text):
+    """Estimate tokens for OpenRouter, OpenAI, and other standard providers."""
+    if not text:
+        return 0
+
+    text = str(text)
+    ascii_like_chars = len(re.findall(r'[\x00-\x7f]', text))
+    cyrillic_chars = len(re.findall(r'[\u0400-\u04ff]', text))
+    cjk_chars = len(re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+    other_chars = max(0, len(text) - ascii_like_chars - cyrillic_chars - cjk_chars)
+
+    total_tokens = (
+        (ascii_like_chars / OPENROUTER_ASCII_CHARS_PER_TOKEN)
+        + (cyrillic_chars / OPENROUTER_CYRILLIC_CHARS_PER_TOKEN)
+        + (cjk_chars / OPENROUTER_CJK_CHARS_PER_TOKEN)
+        + (other_chars / OPENROUTER_OTHER_CHARS_PER_TOKEN)
     )
     return max(1, int(math.ceil(total_tokens)))
 # --- Добавляем глобальную проверку BeautifulSoup, так как она нужна в main.py ---
@@ -61,7 +85,8 @@ def format_size(size_bytes):
 
 class TokenCounter:
     """Подсчет токенов для отслеживания использования API"""
-    def __init__(self):
+    def __init__(self, provider="gemini"):
+        self.provider = provider
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.tokens_per_minute = []
@@ -75,7 +100,9 @@ class TokenCounter:
         """
         if not text:
             return 0
-        return estimate_gemini_tokens(text)
+        if self.provider == "gemini":
+            return estimate_gemini_tokens(text)
+        return estimate_openrouter_tokens(text)
 
     def estimate_cost(self, input_tokens, output_tokens, model_name="gemini-2.5-pro"):
         """Оценивает стоимость в USD"""

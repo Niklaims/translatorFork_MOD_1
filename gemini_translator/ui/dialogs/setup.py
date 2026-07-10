@@ -2755,9 +2755,15 @@ class InitialSetupPage(ShellPage):
         if not task_payloads:
             return "Очередь пуста. Добавьте главы или пересоберите задачи перед оценкой."
 
-        token_counter = TokenCounter()
+        settings = settings or self.get_settings()
+        
         model_config = settings.get('model_config') or {}
         model_name = settings.get('model') or model_config.get('id') or "Неизвестная модель"
+        provider = model_config.get('provider', '')
+        if not provider:
+            provider = "gemini" if "gemini" in model_name.lower() else "openrouter"
+            
+        token_counter = TokenCounter(provider=provider)
         prompt_tokens = token_counter.estimate_tokens(settings.get('custom_prompt'))
         system_tokens = 0
         if settings.get('use_system_instruction') and settings.get('system_instruction'):
@@ -6601,7 +6607,12 @@ class InitialSetupPage(ShellPage):
             settings = self.get_settings()
             dry_run_settings = settings.copy()
             dry_run_settings.update({
-                'provider': 'dry_run', 'api_keys': ['dry_run_dummy_key'], 'num_instances': 1, 'rpm_limit': 1000
+                'provider': 'dry_run', 
+                'api_keys': ['dry_run_dummy_key'], 
+                'num_instances': 1, 
+                'rpm_limit': 1000,
+                'brigade_size': 1,
+                'hello_task_enabled': False
             })
 
             # 3. Запускаем сессию (остальное без изменений)
@@ -6721,7 +6732,14 @@ class InitialSetupPage(ShellPage):
         if not self.selected_file or not self.html_files:
             QMessageBox.warning(self, "Ошибка", "Сначала выберите файл и главы")
             return
-        counter = TokenCounter()
+        settings = self.get_settings()
+        model_config = settings.get('model_config') or {}
+        model_name = settings.get('model') or model_config.get('id') or "Неизвестная модель"
+        provider = model_config.get('provider', '')
+        if not provider:
+            provider = "gemini" if "gemini" in model_name.lower() else "openrouter"
+            
+        counter = TokenCounter(provider=provider)
         prompt_text = self.custom_prompt_edit.toPlainText() or " "
 
         # Собираем данные из новой таблицы глоссария в одну строку,

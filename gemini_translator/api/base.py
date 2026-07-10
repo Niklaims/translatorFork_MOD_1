@@ -92,15 +92,29 @@ class BaseApiHandler:
         return
 
     def _estimate_token_usage(self, prompt, response_text) -> dict:
-        input_tokens = estimate_gemini_tokens(prompt)
-        output_tokens = estimate_gemini_tokens(response_text)
+        provider = (getattr(self.worker, "model_config", {}) or {}).get("provider", "")
+        if not provider:
+            if "gemini" in type(self).__name__.lower():
+                provider = "gemini"
+            else:
+                provider = "openrouter"
+
+        if provider.lower() == "gemini":
+            from ..utils.helpers import estimate_gemini_tokens
+            input_tokens = estimate_gemini_tokens(prompt)
+            output_tokens = estimate_gemini_tokens(response_text)
+        else:
+            from ..utils.helpers import estimate_openrouter_tokens
+            input_tokens = estimate_openrouter_tokens(prompt)
+            output_tokens = estimate_openrouter_tokens(response_text)
+
         return {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
             "estimated": True,
             "model_id": getattr(self.worker, "model_id", None),
-            "provider": (getattr(self.worker, "model_config", {}) or {}).get("provider"),
+            "provider": provider,
         }
 
     def _post_token_usage(self, prompt, response_text) -> None:
@@ -171,7 +185,7 @@ class BaseApiHandler:
         timeout = aiohttp.ClientTimeout(total=api_timeout)
         # No explicit loop=: ClientSession binds to asyncio.get_running_loop(),
         # so the session and its connector always share the loop running this call.
-        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, read_bufsize=1048576 * 10)
         self._session_proxy_signature = desired_proxy_signature
         self._session_timeout = api_timeout
         self._session_ssl_context_signature = desired_ssl_context_signature
@@ -272,11 +286,11 @@ class BaseApiHandler:
         return default
 
     def _transient_disconnect_retry_attempts(self) -> int:
-        raw_value = self._config_value("transient_disconnect_retries", 1)
+        raw_value = self._config_value("transient_disconnect_retries", 3)
         try:
             return max(0, int(raw_value))
         except (TypeError, ValueError):
-            return 1
+            return 3
 
     def _transient_disconnect_retry_delay(self, attempt: int) -> float:
         raw_value = self._config_value("transient_disconnect_retry_delay_seconds", 1.0)

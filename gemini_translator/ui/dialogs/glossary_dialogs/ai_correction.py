@@ -1199,7 +1199,12 @@ class CorrectionSessionPage(ShellPage):
         # Учитываем также вес системного промпта
         temp_prompt = self._build_final_prompt(found_blocks, context_was_added)
         full_text_for_estimation = temp_prompt + "\n\n" + data_as_free_text
-        estimated_tokens = TokenCounter().estimate_tokens(full_text_for_estimation)
+        settings = self.get_settings() if hasattr(self, 'get_settings') else {}
+        model_name = settings.get('model_config', {}).get('name', 'unknown')
+        provider = settings.get('model_config', {}).get('provider', '')
+        if not provider:
+            provider = "gemini" if "gemini" in model_name.lower() else "openrouter"
+        estimated_tokens = TokenCounter(provider=provider).estimate_tokens(full_text_for_estimation)
 
         return (data_as_free_text, estimated_tokens, found_blocks, context_was_added,
                 actual_hidden_count, actual_neighbors_count, actual_pattern_count)
