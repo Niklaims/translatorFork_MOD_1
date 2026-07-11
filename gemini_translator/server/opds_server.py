@@ -360,8 +360,17 @@ class OPDSRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
             self.wfile.write(epub_data)
+        except ConnectionAbortedError:
+            print("[OPDS HTTP] Клиент прервал соединение при скачивании (это нормально для некоторых читалок).")
+        except BrokenPipeError:
+            print("[OPDS HTTP] Обрыв связи с клиентом (BrokenPipe).")
         except Exception as e:
-            self._send_error(500, f"Ошибка сборки ePub: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_error(500, f"Ошибка сборки ePub: {e}")
+            except Exception:
+                pass # Если заголовки уже отправлены, _send_error выдаст ошибку, игнорируем ее
 
     def _send_error(self, code: int, message: str):
         """Отправляет текстовое сообщение об ошибке."""
