@@ -526,9 +526,7 @@ class NvidiaApiHandler(BaseApiHandler):
             except asyncio.TimeoutError:
                 raise NetworkError("Таймаут соединения с NVIDIA NIM", delay_seconds=10)
             except (aiohttp.ClientError, OSError) as error:
-                error_msg = (
-                    f"Сбой сети/SSL ({type(error).__name__}) при запросе к NVIDIA NIM: {error}"
-                )
+                error_msg = self._format_transport_error(error, "NVIDIA NIM")
                 raise NetworkError(error_msg, delay_seconds=20) from error
             except (
                 RateLimitExceededError,

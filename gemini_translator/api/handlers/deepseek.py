@@ -230,7 +230,7 @@ class DeepseekApiHandler(BaseApiHandler):
             except asyncio.TimeoutError:
                 raise NetworkError("Таймаут соединения с DeepSeek", delay_seconds=10)
             except (aiohttp.ClientError, OSError) as e:
-                error_msg = f"Сбой сети/SSL ({type(e).__name__}) при запросе к DeepSeek: {e}"
+                error_msg = self._format_transport_error(e, "DeepSeek")
                 raise NetworkError(error_msg, delay_seconds=20) from e
             except (RateLimitExceededError, ContentFilterError, NetworkError, 
                     PartialGenerationError, ModelNotFoundError, LocationBlockedError, 
