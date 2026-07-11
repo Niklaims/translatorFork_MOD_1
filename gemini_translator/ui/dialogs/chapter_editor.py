@@ -8,9 +8,13 @@ import os
 import re
 import tempfile
 import zipfile
+from array import array
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from difflib import SequenceMatcher
+from html.parser import HTMLParser
+from itertools import repeat
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
@@ -73,6 +77,8 @@ class ProblemSpot:
     details: str
     target: str
     start: int = -1
+    end: int = -1
+    line: int = 1
 
 
 @dataclass
@@ -82,6 +88,198 @@ class BlockPreview:
     start: int
     end: int
     preview: str
+
+
+@dataclass
+class ParsedChapterText:
+    """Visible prose with a reversible mapping back to the XHTML source."""
+
+    text: str
+    raw_starts: list[int] | array
+    raw_ends: list[int] | array
+    tag_positions: dict[str, list[int]]
+
+    def raw_span(self, start: int, end: int) -> tuple[int, int]:
+        start = max(0, min(start, len(self.raw_starts)))
+        end = max(start, min(end, len(self.raw_starts)))
+        raw_start = -1
+        raw_end = -1
+        for index in range(start, end):
+            if self.raw_ends[index] <= self.raw_starts[index]:
+                continue
+            if raw_start < 0:
+                raw_start = self.raw_starts[index]
+            raw_end = self.raw_ends[index]
+        if raw_start < 0:
+            return -1, -1
+        return raw_start, raw_end
+
+    def context(self, start: int, end: int, limit: int = 110) -> str:
+        context_start = max(0, start - limit // 2)
+        context_end = min(len(self.text), end + limit // 2)
+        preview = SPACE_RE.sub(" ", self.text[context_start:context_end]).strip()
+        if context_start:
+            preview = "…" + preview.lstrip("…")
+        if context_end < len(self.text):
+            preview = preview.rstrip("…") + "…"
+        if len(preview) > limit:
+            preview = preview[: limit - 1].rstrip() + "…"
+        return preview
+
+
+class _ChapterMarkupParser(HTMLParser):
+    """Collect only reader-visible prose and retain source offsets.
+
+    XHTML formatting, tag attributes, comments, CSS and scripts must never be
+    interpreted as editorial prose.  ``HTMLParser`` also correctly handles a
+    ``>`` inside a quoted attribute, which the previous regular expressions did
+    not.
+    """
+
+    BLOCK_BOUNDARY_TAGS = {
+        "address",
+        "article",
+        "aside",
+        "blockquote",
+        "br",
+        "dd",
+        "div",
+        "dl",
+        "dt",
+        "figcaption",
+        "figure",
+        "footer",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "li",
+        "main",
+        "nav",
+        "ol",
+        "p",
+        "pre",
+        "section",
+        "table",
+        "tbody",
+        "td",
+        "tfoot",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+    # Typography checks are meaningless in metadata, code and embedded media.
+    EXCLUDED_TEXT_TAGS = {
+        "code",
+        "head",
+        "kbd",
+        "math",
+        "noscript",
+        "pre",
+        "samp",
+        "script",
+        "style",
+        "svg",
+        "template",
+    }
+
+    def __init__(self, source: str, *, collect_text: bool = True):
+        super().__init__(convert_charrefs=False)
+        self.source = source
+        self.collect_text = collect_text
+        self.line_starts = _build_line_starts(source)
+        self.text_parts: list[str] = []
+        self.raw_starts = array("I")
+        self.raw_ends = array("I")
+        self.tag_positions: dict[str, list[int]] = defaultdict(list)
+        self.excluded_depths: Counter[str] = Counter()
+        self.last_character = ""
+
+    def _source_offset(self) -> int:
+        line, column = self.getpos()
+        line_index = max(0, min(line - 1, len(self.line_starts) - 1))
+        return min(len(self.source), self.line_starts[line_index] + column)
+
+    def _text_is_visible(self) -> bool:
+        return not any(self.excluded_depths.values())
+
+    def _append(self, value: str, raw_start: int, raw_end: int) -> None:
+        if not value or not self.collect_text:
+            return
+        self.text_parts.append(value)
+        self.raw_starts.extend(repeat(raw_start, len(value)))
+        self.raw_ends.extend(repeat(raw_end, len(value)))
+        self.last_character = value[-1]
+
+    def _append_boundary(self, raw_position: int) -> None:
+        if self.last_character and self.last_character != "\n":
+            self._append("\n", raw_position, raw_position)
+
+    @staticmethod
+    def _local_tag(tag: str) -> str:
+        return tag.rsplit(":", 1)[-1].lower()
+
+    def handle_starttag(self, tag: str, _attrs) -> None:
+        tag = self._local_tag(tag)
+        position = self._source_offset()
+        text_was_visible = self._text_is_visible()
+        if text_was_visible:
+            self.tag_positions[tag].append(position)
+        if tag in self.BLOCK_BOUNDARY_TAGS and text_was_visible:
+            self._append_boundary(position)
+        if tag in self.EXCLUDED_TEXT_TAGS:
+            self.excluded_depths[tag] += 1
+
+    def handle_startendtag(self, tag: str, _attrs) -> None:
+        tag = self._local_tag(tag)
+        position = self._source_offset()
+        if self._text_is_visible():
+            self.tag_positions[tag].append(position)
+        if tag in self.BLOCK_BOUNDARY_TAGS and self._text_is_visible():
+            self._append_boundary(position)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = self._local_tag(tag)
+        position = self._source_offset()
+        if tag in self.EXCLUDED_TEXT_TAGS and self.excluded_depths[tag]:
+            self.excluded_depths[tag] -= 1
+        if tag in self.BLOCK_BOUNDARY_TAGS and self._text_is_visible():
+            self._append_boundary(position)
+
+    def handle_data(self, data: str) -> None:
+        if not self.collect_text or not data or not self._text_is_visible():
+            return
+        start = self._source_offset()
+        self.text_parts.append(data)
+        self.raw_starts.extend(range(start, start + len(data)))
+        self.raw_ends.extend(range(start + 1, start + len(data) + 1))
+        self.last_character = data[-1]
+
+    def _append_character_reference(self, reference: str) -> None:
+        if not self.collect_text or not self._text_is_visible():
+            return
+        start = self._source_offset()
+        decoded = html.unescape(reference)
+        self._append(decoded, start, min(len(self.source), start + len(reference)))
+
+    def handle_entityref(self, name: str) -> None:
+        self._append_character_reference(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self._append_character_reference(f"&#{name};")
+
+    def result(self) -> ParsedChapterText:
+        return ParsedChapterText(
+            text="".join(self.text_parts),
+            raw_starts=self.raw_starts,
+            raw_ends=self.raw_ends,
+            tag_positions=dict(self.tag_positions),
+        )
 
 
 def _hash_text(value: str) -> str:
@@ -149,6 +347,152 @@ def _line_from_position(line_starts: list[int], position: int) -> int:
     if not line_starts:
         return 1
     return bisect.bisect_right(line_starts, max(0, position)) or 1
+
+
+def _parse_chapter_text(
+    source: str,
+    *,
+    collect_text: bool = True,
+) -> ParsedChapterText:
+    parser = _ChapterMarkupParser(source or "", collect_text=collect_text)
+    try:
+        parser.feed(source or "")
+        parser.close()
+    except Exception:
+        # A partially edited tag must not break the editor or make raw markup
+        # look like prose.  Structural counts remain available as a fallback.
+        tag_positions: dict[str, list[int]] = defaultdict(list)
+        for match in re.finditer(r"<\s*([A-Za-z][\w:.-]*)\b", source or ""):
+            local_tag = match.group(1).rsplit(":", 1)[-1].lower()
+            tag_positions[local_tag].append(match.start())
+        return ParsedChapterText("", [], [], dict(tag_positions))
+    return parser.result()
+
+
+def _analyze_chapter_problems(
+    text: str,
+    original_text: str = "",
+    *,
+    parsed_original: ParsedChapterText | None = None,
+) -> list[ProblemSpot]:
+    """Return actionable chapter issues without linting XHTML formatting."""
+
+    issues: list[ProblemSpot] = []
+    line_starts = _build_line_starts(text)
+    parsed = _parse_chapter_text(text)
+
+    def add_problem(title: str, details: str, start: int, end: int) -> None:
+        if start < 0:
+            return
+        issues.append(
+            ProblemSpot(
+                title=title,
+                details=details,
+                target="translated",
+                start=start,
+                end=max(start, end),
+                line=_line_from_position(line_starts, start),
+            )
+        )
+
+    def add_visible_match(match: re.Match, title: str, details: str) -> None:
+        raw_start, raw_end = parsed.raw_span(match.start(), match.end())
+        if raw_start < 0:
+            return
+        context = parsed.context(match.start(), match.end())
+        if context:
+            details = f"{details}. Контекст: {context}"
+        add_problem(title, details, raw_start, raw_end)
+
+    for match in re.finditer(r"RESTORED_IMAGE_WARNING", text, re.IGNORECASE):
+        add_problem(
+            "Восстановленная картинка",
+            "В главе остался служебный маркер — проверьте восстановление изображения",
+            match.start(),
+            match.end(),
+        )
+
+    for match in re.finditer(r"(?<!\.)\.\.(?!\.)", parsed.text):
+        add_visible_match(match, "Подозрительные точки", "Похоже на двойную точку")
+
+    # Only horizontal whitespace between visible characters is suspicious.
+    # Indentation, line breaks and spacing between XHTML tags are intentional.
+    for match in re.finditer(r"(?<=\S)[ \t\u00a0]{2,}(?=\S)", parsed.text):
+        add_visible_match(
+            match,
+            "Лишние пробелы",
+            f"Пробелов подряд в тексте: {len(match.group(0))}",
+        )
+
+    paired_quote_indexes: set[int] = set()
+    for match in re.finditer(r'"[^"\r\n]{1,300}"', parsed.text):
+        paired_quote_indexes.update((match.start(), match.end() - 1))
+        add_visible_match(
+            match,
+            "Прямые кавычки",
+            "Замените прямые кавычки на типографские",
+        )
+    for match in re.finditer(r'"', parsed.text):
+        if match.start() in paired_quote_indexes:
+            continue
+        add_visible_match(
+            match,
+            "Непарная прямая кавычка",
+            "Проверьте кавычку и замените её на типографскую",
+        )
+
+    if original_text:
+        original = parsed_original or _parse_chapter_text(
+            original_text,
+            collect_text=False,
+        )
+        translation_p = len(parsed.tag_positions.get("p", []))
+        original_p = len(original.tag_positions.get("p", []))
+        if translation_p != original_p:
+            start = (parsed.tag_positions.get("p") or [0])[0]
+            add_problem(
+                "Количество абзацев",
+                f"В переводе {translation_p}, в оригинале {original_p}",
+                start,
+                min(len(text), start + 1),
+            )
+
+        heading_tags = [f"h{level}" for level in range(1, 7)]
+        changed_heading_tags = [
+            tag
+            for tag in heading_tags
+            if len(parsed.tag_positions.get(tag, []))
+            != len(original.tag_positions.get(tag, []))
+        ]
+        if changed_heading_tags:
+            translated_positions = [
+                position
+                for tag in heading_tags
+                for position in parsed.tag_positions.get(tag, [])
+            ]
+            start = min(translated_positions, default=0)
+            differences = ", ".join(
+                f"{tag}: {len(parsed.tag_positions.get(tag, []))} / "
+                f"{len(original.tag_positions.get(tag, []))}"
+                for tag in changed_heading_tags
+            )
+            add_problem(
+                "Структура заголовков",
+                f"Количество в переводе / оригинале — {differences}",
+                start,
+                min(len(text), start + 1),
+            )
+
+    # Rules are evaluated independently, but the list is more useful in source
+    # order and should not contain duplicate reports for the same range.
+    unique_issues = {
+        (problem.title, problem.start, problem.end): problem
+        for problem in issues
+    }
+    return sorted(
+        unique_issues.values(),
+        key=lambda problem: (problem.start, problem.end, problem.title),
+    )
 
 
 def _extract_blocks(text: str) -> list[BlockPreview]:
@@ -249,6 +593,7 @@ class ChapterEditorDialog(QDialog):
     SEARCH_DELAY_MS = 250
     MAX_SEARCH_RESULTS = 2000
     MAX_SEARCH_HIGHLIGHTS = 250
+    MAX_PROBLEM_HIGHLIGHTS = 300
     DIFF_TEXT_LIMIT = 600_000
     DIFF_LINE_LIMIT = 8000
 
@@ -279,8 +624,10 @@ class ChapterEditorDialog(QDialog):
         self._saved_text = ""
         self._saved_blocks = []
         self._original_text = ""
+        self._parsed_original_text: ParsedChapterText | None = None
         self._changed_lines = set()
         self._problem_spots = []
+        self._current_problem_index = -1
         self._search_results = []
         self._current_search_index = -1
         self._blocks_stale = True
@@ -502,6 +849,11 @@ class ChapterEditorDialog(QDialog):
         self._loading = True
         translated_text = _read_text_file(self.translated_path)
         self._original_text = _read_from_epub(self.original_epub_path, self.original_internal_path)
+        self._parsed_original_text = (
+            _parse_chapter_text(self._original_text, collect_text=False)
+            if self._original_text
+            else None
+        )
         self.translated_editor.setPlainText(translated_text)
         self.original_editor.setPlainText(
             self._original_text or "Оригинал главы не найден. Доступен только режим перевода."
@@ -702,11 +1054,22 @@ class ChapterEditorDialog(QDialog):
     def _refresh_analysis(self) -> None:
         current_text = self.translated_document.toPlainText()
         self._problem_spots = self._scan_problem_spots(current_text)
+        self._current_problem_index = -1
         self.issues_list.clear()
         for index, problem in enumerate(self._problem_spots):
-            item = QListWidgetItem(f"{problem.title}: {problem.details}")
+            item = QListWidgetItem(
+                f"{problem.title} · строка {problem.line}\n{problem.details}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(
+                f"{problem.title}\nСтрока {problem.line}\n{problem.details}"
+            )
             self.issues_list.addItem(item)
+        if not self._problem_spots:
+            empty_item = QListWidgetItem("Проблем не найдено")
+            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.issues_list.addItem(empty_item)
+        self.sidebar_tabs.setTabText(0, f"Проблемы ({len(self._problem_spots)})")
 
         line_count = current_text.count("\n") + 1 if current_text else 0
         if len(current_text) > self.DIFF_TEXT_LIMIT or line_count > self.DIFF_LINE_LIMIT:
@@ -739,51 +1102,11 @@ class ChapterEditorDialog(QDialog):
         self._apply_editor_decorations()
 
     def _scan_problem_spots(self, text: str) -> list[ProblemSpot]:
-        issues = []
-
-        def add_matches(pattern: str, title: str, details: str) -> None:
-            for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
-                issues.append(
-                    ProblemSpot(
-                        title=title,
-                        details=f"{details}: { _visible_preview(match.group(0), 120) }",
-                        target="translated",
-                        start=match.start(),
-                    )
-                )
-
-        add_matches(r"RESTORED_IMAGE_WARNING", "Восстановленная картинка", "Проверьте комментарий")
-        add_matches(r"(?<!\.)\.\.(?!\.)", "Подозрительные точки", "Похоже на двойную точку")
-        add_matches(r"(^|[^\s])\s{2,}([^\s]|$)", "Двойной пробел", "Есть серия пробелов")
-        add_matches(r"<p\b[^>]*>\s*[-—]", "Начало абзаца", "Проверьте оформление диалога")
-        add_matches(r"\"", "Прямые кавычки", "Возможно, нужны типографские кавычки")
-
-        if self._original_text:
-            translation_p = len(re.findall(r"<p\b", text, re.IGNORECASE))
-            original_p = len(re.findall(r"<p\b", self._original_text, re.IGNORECASE))
-            if translation_p != original_p:
-                issues.append(
-                    ProblemSpot(
-                        title="Количество абзацев",
-                        details=f"В переводе {translation_p}, в оригинале {original_p}",
-                        target="translated",
-                        start=0,
-                    )
-                )
-
-            translation_h = len(re.findall(r"<h[1-6]\b", text, re.IGNORECASE))
-            original_h = len(re.findall(r"<h[1-6]\b", self._original_text, re.IGNORECASE))
-            if translation_h != original_h:
-                issues.append(
-                    ProblemSpot(
-                        title="Количество заголовков",
-                        details=f"В переводе {translation_h}, в оригинале {original_h}",
-                        target="translated",
-                        start=0,
-                    )
-                )
-
-        return issues
+        return _analyze_chapter_problems(
+            text,
+            self._original_text,
+            parsed_original=self._parsed_original_text,
+        )
 
     def _refresh_block_table(self) -> None:
         translated_blocks = _extract_blocks(self.translated_document.toPlainText())
@@ -869,6 +1192,33 @@ class ChapterEditorDialog(QDialog):
         selection.format.setBackground(color)
         return selection
 
+    def _problem_selection(
+        self,
+        document: QTextDocument,
+        problem: ProblemSpot,
+        *,
+        active: bool = False,
+    ):
+        if problem.end <= problem.start:
+            return None
+        cursor = QTextCursor(document)
+        cursor.setPosition(problem.start)
+        cursor.setPosition(problem.end, QTextCursor.MoveMode.KeepAnchor)
+        if cursor.selection().isEmpty():
+            return None
+        selection = QTextEdit.ExtraSelection()
+        selection.cursor = cursor
+        danger_color = QColor(theme_manager.color("danger"))
+        selection.format.setUnderlineColor(danger_color)
+        selection.format.setUnderlineStyle(
+            QTextCharFormat.UnderlineStyle.WaveUnderline
+        )
+        if active:
+            active_background = QColor(danger_color)
+            active_background.setAlpha(55)
+            selection.format.setBackground(active_background)
+        return selection
+
     def _apply_editor_decorations(self) -> None:
         translated_selections = []
         original_selections = []
@@ -880,6 +1230,33 @@ class ChapterEditorDialog(QDialog):
                 QColor("#fff4d6"),
             )
             if selection:
+                translated_selections.append(selection)
+
+        problem_indexes = list(
+            range(min(len(self._problem_spots), self.MAX_PROBLEM_HIGHLIGHTS))
+        )
+        if (
+            0 <= self._current_problem_index < len(self._problem_spots)
+            and self._current_problem_index not in problem_indexes
+        ):
+            problem_indexes.append(self._current_problem_index)
+        for index in problem_indexes:
+            problem = self._problem_spots[index]
+            document = (
+                self.original_document
+                if problem.target == "original"
+                else self.translated_document
+            )
+            selection = self._problem_selection(
+                document,
+                problem,
+                active=index == self._current_problem_index,
+            )
+            if not selection:
+                continue
+            if problem.target == "original":
+                original_selections.append(selection)
+            else:
                 translated_selections.append(selection)
 
         for index, result in enumerate(self._search_results[: self.MAX_SEARCH_HIGHLIGHTS]):
@@ -925,8 +1302,13 @@ class ChapterEditorDialog(QDialog):
         index = item.data(Qt.ItemDataRole.UserRole)
         if index is None:
             return
-        problem = self._problem_spots[int(index)]
-        self._jump_to_position(problem.target, problem.start)
+        index = int(index)
+        if not 0 <= index < len(self._problem_spots):
+            return
+        self._current_problem_index = index
+        problem = self._problem_spots[index]
+        self._jump_to_position(problem.target, problem.start, problem.end)
+        self._apply_editor_decorations()
 
     def _jump_search_result(self, step: int) -> None:
         if not self._search_results:
