@@ -343,45 +343,72 @@ def collect_boundary_duplicate_findings(chapter_infos):
         if finding.get('chapter_path') and path
     }
 
-    ending_groups = {}
-    for info in chapter_infos:
-        for block in info['blocks'][-3:]:
-            ending_groups.setdefault(block['norm_text'], []).append((info, block))
+    # Compare endings strictly from the final block backwards. A group is allowed
+    # to reach the preceding block only while every later block already matches.
+    # This prevents an equal penultimate line from being reported when the actual
+    # final lines differ.
+    active_ending_groups = [[
+        (info, list(reversed(info['blocks'][-3:])))
+        for info in chapter_infos
+        if info.get('blocks')
+    ]]
+    ending_depth = 0
+    while active_ending_groups:
+        next_ending_groups = []
+        for active_group in active_ending_groups:
+            groups_by_text = {}
+            for info, reversed_tail in active_group:
+                if ending_depth >= len(reversed_tail):
+                    continue
+                block = reversed_tail[ending_depth]
+                groups_by_text.setdefault(block['norm_text'], []).append((info, reversed_tail))
 
-    for occurrences in ending_groups.values():
-        chapter_paths = {info['path'] for info, _ in occurrences}
-        if len(chapter_paths) < 2:
-            continue
+            for matching_group in groups_by_text.values():
+                chapter_paths = {info['path'] for info, _ in matching_group}
+                if len(chapter_paths) < 2:
+                    continue
 
-        chapter_names = ", ".join(sorted(os.path.basename(path) for path in chapter_paths))
-        for info, block in occurrences:
-            if block['tag_name'] == 'h1':
-                continue
+                # Keep prior suffix groups separate. Otherwise chapters with
+                # different final lines could be regrouped by a matching
+                # penultimate line on the next iteration.
+                next_ending_groups.append(matching_group)
+                chapter_names = ", ".join(sorted(os.path.basename(path) for path in chapter_paths))
 
-            block_key = (info['path'], tuple(block['tag_path']))
-            if block_key in existing_paths:
-                continue
+                for info, reversed_tail in matching_group:
+                    block = reversed_tail[ending_depth]
+                    if block['tag_name'] == 'h1':
+                        continue
 
-            preview = (
-                f"Глава: {info['name']}\n"
-                f"Повторяющийся хвост: {block['text']}\n\n"
-                f"Последние строки главы:\n{format_duplicate_preview_blocks(info['blocks'][-4:], [block['tag_path']])}\n\n"
-                f"Также встречается в главах:\n{chapter_names}"
-            )
-            findings.append({
-                'category': 'boundary',
-                'chapter_path': info['path'],
-                'chapter_name': info['name'],
-                'chapter_index': info['index'] + 1,
-                'tag_name': block['tag_name'],
-                'tag_paths': [list(block['tag_path'])],
-                'text': block['text'],
-                'block_count': 1,
-                'location': "Конец главы",
-                'reason': f"Одинаковая концовка встречается в {len(chapter_paths)} главах.",
-                'preview': preview,
-            })
-            existing_paths.add(block_key)
+                    block_key = (info['path'], tuple(block['tag_path']))
+                    if block_key in existing_paths:
+                        continue
+
+                    preview = (
+                        f"Глава: {info['name']}\n"
+                        f"Повторяющийся последовательный хвост: {block['text']}\n\n"
+                        f"Последние строки главы:\n{format_duplicate_preview_blocks(info['blocks'][-4:], [block['tag_path']])}\n\n"
+                        f"Также встречается в главах:\n{chapter_names}"
+                    )
+                    findings.append({
+                        'category': 'boundary',
+                        'chapter_path': info['path'],
+                        'chapter_name': info['name'],
+                        'chapter_index': info['index'] + 1,
+                        'tag_name': block['tag_name'],
+                        'tag_paths': [list(block['tag_path'])],
+                        'text': block['text'],
+                        'block_count': 1,
+                        'location': "Конец главы",
+                        'reason': (
+                            f"Одинаковая последовательная концовка встречается "
+                            f"в {len(chapter_paths)} главах."
+                        ),
+                        'preview': preview,
+                    })
+                    existing_paths.add(block_key)
+
+        active_ending_groups = next_ending_groups
+        ending_depth += 1
 
     return sorted(
         findings,
