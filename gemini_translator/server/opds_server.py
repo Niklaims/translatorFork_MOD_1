@@ -348,16 +348,21 @@ class OPDSRequestHandler(BaseHTTPRequestHandler):
 
             book = self.opds_manager.get_book(book_id)
             book_title = book["title"] if book else "book"
-            # Безопасное имя файла для заголовка Content-Disposition
-            safe_title = re.sub(r'[^\w\s\-]', '', book_title).strip()
-            if not safe_title:
-                safe_title = "book"
-            filename = f"{safe_title}.epub"
+            
+            import urllib.parse
+            # Строгие HTTP-клиенты (Node.js/Electron) падают, если в заголовке есть кириллица.
+            # Формируем ASCII версию для старых клиентов и UTF-8 для современных (RFC 5987)
+            ascii_title = re.sub(r'[^\x00-\x7F]', '', book_title).strip()
+            ascii_title = re.sub(r'[^\w\s\-]', '', ascii_title).strip()
+            if not ascii_title:
+                ascii_title = "book"
+                
+            encoded_title = urllib.parse.quote(book_title.encode('utf-8'))
 
             self.send_response(200)
             self.send_header("Content-Type", EPUB_MIME)
             self.send_header("Content-Length", str(len(epub_data)))
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+            self.send_header("Content-Disposition", f"attachment; filename=\"{ascii_title}.epub\"; filename*=UTF-8''{encoded_title}.epub")
             self.end_headers()
             self.wfile.write(epub_data)
         except ConnectionAbortedError:
