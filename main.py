@@ -27,6 +27,7 @@ from gemini_translator.api import config as api_config
 from gemini_translator.core.task_manager import ChapterQueueManager
 from gemini_translator.utils.proxy_tool import GlobalProxyController
 from gemini_translator.utils.server_manager import ServerManager
+from gemini_translator.server.opds_server import OPDSManager
 from gemini_translator.version import APP_VERSION
 from window_branding import install_window_title_branding
 from gemini_translator.ui.dialogs.proxy import ProxySettingsDialog
@@ -1132,6 +1133,7 @@ if __name__ == "__main__":
     os.makedirs(temp_folder, exist_ok=True)
     app.context_manager = ContextManager(temp_folder)
     app.server_manager = ServerManager(app.event_bus)
+    app.opds_manager = OPDSManager()
     print("[INFO] Инициализация TranslationEngine…")
 
     app.engine = TranslationEngine(task_manager=app.task_manager)
@@ -1190,6 +1192,9 @@ if __name__ == "__main__":
 
     # --- ЗАВЕРШЕНИЕ ---
     print(f"[INFO] Приложение завершает работу.")
+    # Останавливаем OPDS-сервер
+    if hasattr(app, 'opds_manager') and app.opds_manager.is_running():
+        app.opds_manager.stop()
     if hasattr(app, 'engine_thread') and app.engine_thread.isRunning():
         app.engine_thread.quit()
         app.engine_thread.wait()
