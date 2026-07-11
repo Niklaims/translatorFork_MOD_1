@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial
+import json
 
 # Для динамической сборки ePub
 from ..utils.epub_tools import EpubCreator
@@ -70,9 +71,12 @@ class OPDSManager:
     def __init__(self):
         self._lock = threading.Lock()
 
+        # Файл для сохранения состояния OPDS
+        self._state_file = os.path.join(os.path.expanduser("~"), ".gemini_translator_opds.json")
+
         # Словарь раздаваемых книг
         # Формат: { book_id: {"title": str, "author": str, "uuid": str, "chapters": list, "updated": str} }
-        self._books: dict = {}
+        self._books: dict = self._load_state()
 
         # Сервер
         self._server: ThreadingHTTPServer | None = None
@@ -84,6 +88,23 @@ class OPDSManager:
 
         # Галочка «автоматическая загрузка готовых глав»
         self.auto_publish: bool = False
+
+    # ─── Сохранение и загрузка состояния ────────────────────────────────
+    def _load_state(self) -> dict:
+        try:
+            if os.path.exists(self._state_file):
+                with open(self._state_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            print(f"[OPDS] Ошибка загрузки состояния: {e}")
+        return {}
+
+    def _save_state(self):
+        try:
+            with open(self._state_file, 'w', encoding='utf-8') as f:
+                json.dump(self._books, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[OPDS] Ошибка сохранения состояния: {e}")
 
     # ─── Управление списком глав ────────────────────────────────────────
     def add_or_update_book(self, book_id: str, title: str, author: str, chapters: list[dict]):
@@ -97,6 +118,7 @@ class OPDSManager:
                 "chapters": list(chapters),
                 "updated": _utc_now_iso()
             }
+            self._save_state()
 
     def get_book(self, book_id: str) -> dict | None:
         """Возвращает информацию о конкретной книге."""
@@ -106,12 +128,15 @@ class OPDSManager:
     def remove_book(self, book_id: str):
         """Удаляет книгу из раздачи."""
         with self._lock:
-            self._books.pop(book_id, None)
+            if book_id in self._books:
+                self._books.pop(book_id, None)
+                self._save_state()
 
     def clear_all_books(self):
         """Очищает список всех раздаваемых книг."""
         with self._lock:
             self._books.clear()
+            self._save_state()
 
     def chapter_count(self) -> int:
         """Общее количество глав во всех раздаваемых книгах."""

@@ -19,9 +19,11 @@ def temp_chapter_file(tmp_path):
 
 
 @pytest.fixture
-def opds_manager():
-    """Возвращает чистый экземпляр менеджера."""
+def opds_manager(tmp_path):
+    """Возвращает чистый экземпляр менеджера, использующий временный файл."""
     manager = OPDSManager()
+    manager._state_file = str(tmp_path / "test_opds_state.json")
+    manager._books = {} # Начинаем с чистого листа
     yield manager
     if manager.is_running():
         manager.stop()
