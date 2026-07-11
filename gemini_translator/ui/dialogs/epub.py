@@ -792,7 +792,7 @@ class EpubHtmlSelectorDialog(QDialog):
         """ЭТАП 2: Копирует EPUB в память и читает его структуру с учетом spine."""
         try:
             if not self.virtual_epub_path:
-                 self.virtual_epub_path = os.copy_to_mem(self.real_epub_path)
+                 self.virtual_epub_path = os.copy_to_mem(self.real_epub_path, unique=True)
                  if not self.virtual_epub_path:
                      raise IOError("Не удалось скопировать EPUB файл в память.")
             
