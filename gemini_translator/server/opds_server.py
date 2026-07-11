@@ -32,7 +32,7 @@ from ..utils.epub_tools import EpubCreator
 # ---------------------------------------------------------------------------
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
-OPDS_MIME = "application/atom+xml;profile=opds-catalog;kind=acquisition"
+OPDS_MIME = "application/atom+xml;profile=opds-catalog;kind=acquisition; charset=utf-8"
 EPUB_MIME = "application/epub+zip"
 
 
@@ -179,7 +179,6 @@ class OPDSManager:
         Описывает все книги, добавленные в раздачу.
         """
         now = _utc_now_iso()
-        display_host = self.host if self.host != "0.0.0.0" else "127.0.0.1"
 
         entries = []
         with self._lock:
@@ -194,9 +193,10 @@ class OPDSManager:
             ch_count = len(book["chapters"])
             summary = f"{ch_count} глав в раздаче" if ch_count else "Нет глав"
             
-            # В URL передаем book_id, чтобы знать, какую книгу собирать
+            # В URL передаем book_id. Делаем путь ОТНОСИТЕЛЬНЫМ (/download.epub), 
+            # чтобы читалка сама подставила нужный IP (Wi-Fi или локальный).
             safe_id = urllib.parse.quote(book_id)
-            download_url = f"http://{display_host}:{self.port}/download.epub?book_id={safe_id}"
+            download_url = f"/download.epub?book_id={safe_id}"
 
             entry = f"""
   <entry>
