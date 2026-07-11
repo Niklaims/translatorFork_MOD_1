@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial
 import json
+import socket
 
 # Для динамической сборки ePub
 from ..utils.epub_tools import EpubCreator
@@ -193,8 +194,19 @@ class OPDSManager:
         return self._server is not None and self._server_thread is not None and self._server_thread.is_alive()
 
     def get_url(self) -> str:
-        """Возвращает URL сервера для подключения."""
-        display_host = self.host if self.host != "0.0.0.0" else "127.0.0.1"
+        """Возвращает URL каталога."""
+        if self.host == "0.0.0.0":
+            # Пытаемся автоматически определить локальный IP-адрес ПК в Wi-Fi сети
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(('8.8.8.8', 80))
+                display_host = s.getsockname()[0]
+                s.close()
+            except Exception:
+                display_host = "127.0.0.1" # Фолбэк, если сети нет
+        else:
+            display_host = self.host
+            
         return f"http://{display_host}:{self.port}/opds"
 
     # ─── Генерация OPDS-каталога (Atom XML) ─────────────────────────────
