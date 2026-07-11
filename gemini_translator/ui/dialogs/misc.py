@@ -35,6 +35,7 @@ class KeyInputDialog(QDialog):
         layout.addWidget(info_label)
 
         self.keys_edit = QTextEdit()
+        self.keys_edit.setProperty("selectionTranslationDisabled", True)
         layout.addWidget(self.keys_edit)
 
         button_layout = QHBoxLayout()

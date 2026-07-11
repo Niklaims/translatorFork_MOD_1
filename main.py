@@ -36,6 +36,7 @@ from gemini_translator.ui.themes import (
     extract_theme_colors,
 )
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.selection_translator import install_selection_translator
 
 # ---------------------------------------------------------------------------
 # Gemini EPUB Translator - Точка входа в приложение
@@ -1120,6 +1121,7 @@ if __name__ == "__main__":
     app.initialize_managers()
     app.settings_manager = app.get_settings_manager()
     apply_saved_app_theme(app, app.settings_manager)
+    install_selection_translator(app)
     app.task_manager = ChapterQueueManager(event_bus=app.event_bus)
     app.global_version = APP_VERSION
     app.proxy_controller = GlobalProxyController(app.event_bus)
