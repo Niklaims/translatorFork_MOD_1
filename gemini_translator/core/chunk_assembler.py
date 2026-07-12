@@ -3,6 +3,7 @@ import threading
 import zipfile
 import re
 import json
+import time
 from collections import defaultdict, Counter
 from PyQt6 import QtWidgets
 from PyQt6 import QtCore
@@ -10,7 +11,11 @@ from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from ..api import config as api_config
 from ..utils.translated_paths import build_translated_output_path
 from ..utils.epub_tools import normalize_epub_chapter_heading_to_h1
-from ..utils.text import prettify_html, process_body_tag
+from ..utils.text import prettify_html, process_body_tag, validate_html_structure
+
+ASSEMBLY_VALIDATION_ERROR = "ASSEMBLY_VALIDATION"
+
+
 class ChunkAssembler(QObject):
     """
     Отслеживает и собирает переведенные чанки в финальные файлы глав.
@@ -270,6 +275,93 @@ class ChunkAssembler(QObject):
         })
         return True
 
+    def _handle_assembly_validation_failure(self, task_manager, task_ids: list, original_chapter_path: str, reason: str) -> None:
+        normalized_ids = [str(task_id) for task_id in task_ids if task_id]
+        if not normalized_ids:
+            return
+
+        placeholders = ','.join('?' for _ in normalized_ids)
+        retry_ids = []
+        fail_ids = []
+        timestamp = time.time()
+
+        with task_manager._get_write_conn() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    t.task_id,
+                    t.status,
+                    COUNT(te.error_id) AS validation_errors
+                FROM tasks AS t
+                LEFT JOIN task_errors AS te
+                  ON te.task_id = t.task_id
+                 AND te.error_type = ?
+                WHERE t.task_id IN ({placeholders})
+                GROUP BY t.task_id, t.status
+                """,
+                [ASSEMBLY_VALIDATION_ERROR, *normalized_ids],
+            ).fetchall()
+
+            for row in rows:
+                if row['status'] != 'completed':
+                    continue
+                if int(row['validation_errors'] or 0) >= 1:
+                    fail_ids.append(row['task_id'])
+                else:
+                    retry_ids.append(row['task_id'])
+
+            error_rows = [
+                (task_id, ASSEMBLY_VALIDATION_ERROR, timestamp)
+                for task_id in retry_ids + fail_ids
+            ]
+            if error_rows:
+                conn.executemany(
+                    "INSERT INTO task_errors (task_id, error_type, timestamp) VALUES (?, ?, ?)",
+                    error_rows,
+                )
+
+            if retry_ids:
+                retry_placeholders = ','.join('?' for _ in retry_ids)
+                conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET status = 'pending',
+                        priority = 1,
+                        worker_id = NULL
+                    WHERE task_id IN ({retry_placeholders})
+                    """,
+                    retry_ids,
+                )
+
+            if fail_ids:
+                fail_placeholders = ','.join('?' for _ in fail_ids)
+                conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET status = 'failed',
+                        worker_id = NULL
+                    WHERE task_id IN ({fail_placeholders})
+                    """,
+                    fail_ids,
+                )
+
+        if retry_ids:
+            self._post_event('log_message', {
+                'message': (
+                    f"[ASSEMBLER_VALIDATION] '{os.path.basename(original_chapter_path)}' "
+                    f"failed final integrity check and {len(retry_ids)} chunks were requeued. Reason: {reason}"
+                )
+            })
+        if fail_ids:
+            self._post_event('log_message', {
+                'message': (
+                    f"[ASSEMBLER_VALIDATION] '{os.path.basename(original_chapter_path)}' "
+                    f"failed final integrity check again; {len(fail_ids)} chunks were marked failed. Reason: {reason}"
+                )
+            })
+        if retry_ids or fail_ids:
+            task_manager._safe_request_ui_update()
+
     def _assemble_chapter_from_db(self, task_ids: list, original_chapter_path: str):
         """
         Извлекает результаты чанков из БД и собирает главу.
@@ -316,7 +408,12 @@ class ChunkAssembler(QObject):
             results_map = {row['task_id']: row['translated_content'] for row in results}
             chunk_infos = [{'task_id': row['task_id'], 'payload': json.loads(row['payload'])} for row in chunk_infos_rows]
             
-            first_payload = chunk_infos[0]['payload']
+            sorted_infos = sorted(chunk_infos, key=lambda x: x['payload'][4])
+            total_values = {info['payload'][5] for info in sorted_infos}
+            if len(total_values) != 1:
+                raise RuntimeError(f"Mixed chunk totals in assembly set: {sorted(total_values)}")
+
+            first_payload = sorted_infos[0]['payload']
             epub_path, total_chunks = first_payload[1], first_payload[5]
             prefix, suffix = self._resolve_wrapper(first_payload, original_chapter_path)
             
@@ -324,10 +421,22 @@ class ChunkAssembler(QObject):
 
             provider_id = Counter(row['provider_id'] for row in results).most_common(1)[0][0] if results else 'gemini'
             
-            sorted_chunks = [process_body_tag(results_map[info['task_id']], return_parts=False, body_content_only=True) for info in sorted(chunk_infos, key=lambda x: x['payload'][4])]
+            sorted_chunks = [process_body_tag(results_map[info['task_id']], return_parts=False, body_content_only=True) for info in sorted_infos]
             
             full_content = "".join(sorted_chunks)
             final_html = prefix + full_content + suffix
+            original_html = prefix + "".join(str(info['payload'][3] or "") for info in sorted_infos) + suffix
+            is_valid, reason, validated_html = validate_html_structure(original_html, final_html)
+            if not is_valid:
+                self._handle_assembly_validation_failure(
+                    app.task_manager,
+                    task_ids,
+                    original_chapter_path,
+                    reason,
+                )
+                raise RuntimeError(f"Final assembled chapter failed validation: {reason}")
+            final_html = validated_html
+
             if self.settings:
                 if self.settings.get("use_prettify", False):
                     final_html = prettify_html(final_html)
@@ -373,37 +482,35 @@ class ChunkAssembler(QObject):
         if not hasattr(app, 'task_manager'): return
 
         with app.task_manager._get_read_only_conn() as conn: # Используем 'with conn' для автоматических транзакций при чтении
-            query = "SELECT task_id, payload FROM tasks WHERE status = 'completed' AND payload LIKE '%\"epub_chunk\"%'"
+            query = "SELECT task_id, payload, sequence FROM tasks WHERE status = 'completed' AND payload LIKE '%\"epub_chunk\"%'"
             params = []
             filtered_chapter_paths = [str(path) for path in (chapter_paths or []) if path]
             if filtered_chapter_paths:
                 like_clause = " OR ".join("payload LIKE ?" for _ in filtered_chapter_paths)
                 query += f" AND ({like_clause})"
                 params = [f'%"{path}"%' for path in filtered_chapter_paths]
+            query += " ORDER BY sequence ASC"
             cursor = conn.execute(query, params)
             completed_chunks = cursor.fetchall()
         
         if not completed_chunks: return
 
-        chunks_by_chapter_and_index = defaultdict(lambda: defaultdict(list))
+        chunks_by_set_and_index = defaultdict(lambda: defaultdict(list))
         for row in completed_chunks:
             try:
                 payload = json.loads(row['payload'])
                 if payload[0] == 'epub_chunk' and len(payload) >= 6:
                     if filtered_chapter_paths and payload[2] not in filtered_chapter_paths:
                         continue
-                    chunks_by_chapter_and_index[payload[2]][payload[4]].append(
+                    total_chunks = int(payload[5])
+                    set_key = (payload[2], total_chunks)
+                    chunks_by_set_and_index[set_key][int(payload[4])].append(
                         {'task_id': row['task_id'], 'payload': payload}
                     )
-            except (json.JSONDecodeError, IndexError):
+            except (json.JSONDecodeError, IndexError, TypeError, ValueError):
                 continue
         
-        for chapter_path, grouped_chunks in chunks_by_chapter_and_index.items():
-            first_index_group = next(iter(grouped_chunks.values()), [])
-            if not first_index_group: continue
-            
-            total_chunks_needed = first_index_group[0]['payload'][5]
-            
+        for (chapter_path, total_chunks_needed), grouped_chunks in chunks_by_set_and_index.items():
             if not all(i in grouped_chunks for i in range(total_chunks_needed)):
                 continue
 
