@@ -1,4 +1,7 @@
 import json
+from threading import Event
+
+from PyQt6.QtGui import QImage
 
 from qidian_rulate.models import QidianBookMetadata
 from qidian_rulate.models import PreparedRulateMetadata, RulateBookDraft
@@ -6,6 +9,13 @@ from qidian_rulate import workers
 from gemini_translator.ui.dialogs import qidian_rulate_creator as creator_module
 from gemini_translator.ui.dialogs.qidian_rulate_creator import QidianRulateCreatorWindow
 from qidian_rulate.workers import (
+    CODEX_COVER_MODEL,
+    _append_codex_prompt,
+    _build_codex_cover_translation_prompt,
+    _build_codex_cover_exec_command,
+    _find_generated_cover,
+    _load_cover_image_from_file,
+    _cover_url_candidates,
     _is_browser_missing_error,
     _clean_qidian_description,
     _clean_qidian_chapter_text,
@@ -86,6 +96,83 @@ class _FillDescriptionHarness:
         self.logs.append((level, message))
 
 
+class _UploadCoverHarness:
+    _upload_generated_cover = RulateFillWorker._upload_generated_cover
+    _confirm_cover_cropper = RulateFillWorker._confirm_cover_cropper
+
+    def __init__(self, cover_path):
+        self.logs = []
+        self.draft = RulateBookDraft(
+            qidian=QidianBookMetadata(),
+            prepared=PreparedRulateMetadata(generated_cover_path=str(cover_path)),
+        )
+
+    def log(self, level, message):
+        self.logs.append((level, message))
+
+
+class _EmptyLocator:
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        return self
+
+    def count(self):
+        return 0
+
+    def wait_for(self, **kwargs):
+        return None
+
+
+class _VisibleLocator(_EmptyLocator):
+    def count(self):
+        return 1
+
+
+class _UploadFileLocator(_VisibleLocator):
+    def __init__(self):
+        self.files = []
+
+    def set_input_files(self, path):
+        self.files.append(path)
+
+
+class _UploadButtonLocator(_VisibleLocator):
+    def __init__(self):
+        self.clicks = []
+
+    def click(self, **kwargs):
+        self.clicks.append(kwargs)
+
+
+class _UploadCoverPage:
+    def __init__(self):
+        self.file_input = _UploadFileLocator()
+        self.ok_button = _UploadButtonLocator()
+        self.empty = _EmptyLocator()
+        self.visible = _VisibleLocator()
+        self.evaluated = []
+        self.timeouts = []
+
+    def evaluate(self, script, arg=None):
+        self.evaluated.append((script, arg))
+
+    def locator(self, selector):
+        if selector == "#general":
+            return self.visible
+        if 'input[type="file"]' in selector:
+            return self.file_input
+        if 'button[data-action="ok"]' in selector:
+            return self.ok_button
+        return self.empty
+
+    def wait_for_timeout(self, timeout):
+        self.timeouts.append(timeout)
+
+
 class _DescriptionPage:
     def __init__(self):
         self.filled_selectors = []
@@ -126,6 +213,25 @@ def test_validate_source_url_accepts_fanqie_book_links():
     assert validate_source_url("https://www.qidian.com/book/1041604040/")
     assert validate_source_url("https://fanqienovel.com/page/7229603492648717324")
     assert _fanqie_book_id("https://fanqienovel.com/page/7229603492648717324") == "7229603492648717324"
+
+
+def test_single_request_worker_reads_external_cancel_event():
+    cancel_event = Event()
+    worker = workers._SingleRequestWorker(
+        settings_manager=None,
+        provider_config={},
+        model_config={"id": "test-model"},
+        api_key="test-key",
+        model_settings={},
+        log_callback=lambda level, message: None,
+        cancel_event=cancel_event,
+    )
+
+    assert not worker.is_cancelled
+
+    cancel_event.set()
+
+    assert worker.is_cancelled
 
 
 def test_tomato_autostart_helpers_find_env_executable(monkeypatch, tmp_path):
@@ -217,6 +323,40 @@ def test_rulate_description_fill_does_not_insert_cover_url(monkeypatch):
 
     assert "#Book_new_img_url" not in [selector for selector, _value in filled]
     assert ('select[name="Book[status]"]', "1") in page.selected_options
+
+
+def test_rulate_description_fill_uses_up_to_15_tags(monkeypatch):
+    selected = []
+    monkeypatch.setattr(
+        workers,
+        "_select_magic_value",
+        lambda page, selector, value, allow_free: selected.append((selector, value)) or True,
+    )
+    harness = _FillDescriptionHarness()
+    harness.draft.prepared.tags = [f"tag-{index}" for index in range(20)]
+    page = _DescriptionPage()
+
+    harness._fill_description(page)
+
+    selected_tags = [value for selector, value in selected if selector == "#Book_tags"]
+    assert selected_tags == [f"tag-{index}" for index in range(15)]
+
+
+def test_rulate_description_fill_uses_up_to_7_genres(monkeypatch):
+    selected = []
+    monkeypatch.setattr(
+        workers,
+        "_select_magic_value",
+        lambda page, selector, value, allow_free: selected.append((selector, value)) or True,
+    )
+    harness = _FillDescriptionHarness()
+    harness.draft.prepared.genres = [f"genre-{index}" for index in range(10)]
+    page = _DescriptionPage()
+
+    harness._fill_description(page)
+
+    selected_genres = [value for selector, value in selected if selector == "#Book_genres"]
+    assert selected_genres == [f"genre-{index}" for index in range(7)]
 
 
 def test_parse_prepared_metadata_strips_json_fence_and_normalizes_lists(monkeypatch):
@@ -455,7 +595,9 @@ def test_build_catalog_prompt_contains_cover_context_and_no_translation_fields()
 
     assert "cover_prompt" in prompt
     assert "genres" in prompt
+    assert "от 3 до 7 жанров" in prompt
     assert "tags" in prompt
+    assert "до 15-ти существующих тегов Rulate" in prompt
     assert "translated_description:" not in prompt
     assert "\u0422\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0432\u044b\u0445 \u0433\u043b\u0430\u0432" in prompt
     assert "\u5947\u602a\u7684\u65c5\u793e\u5728\u96e8\u4e2d\u51fa\u73b0" in prompt
@@ -557,6 +699,166 @@ def test_clean_cover_prompt_response_strips_markdown_fence():
     assert clean_cover_prompt_response(response) == (
         'A hero in rain. Typography: The text "Название" written in neon font. --ar 2:3'
     )
+
+
+def test_upload_generated_cover_sets_rulate_file_input_and_confirms_cropper(tmp_path):
+    cover_path = tmp_path / "translated.png"
+    cover_path.write_bytes(b"image")
+    harness = _UploadCoverHarness(cover_path)
+    page = _UploadCoverPage()
+
+    harness._upload_generated_cover(page)
+
+    assert page.file_input.files == [str(cover_path)]
+    assert page.ok_button.clicks
+    assert page.evaluated[-1][1] == "general"
+    assert any(level == "SUCCESS" and str(cover_path) in message for level, message in harness.logs)
+
+
+def test_upload_generated_cover_skips_webp_because_rulate_input_does_not_accept_it(tmp_path):
+    cover_path = tmp_path / "source.webp"
+    cover_path.write_bytes(b"webp")
+    harness = _UploadCoverHarness(cover_path)
+    page = _UploadCoverPage()
+
+    harness._upload_generated_cover(page)
+
+    assert page.file_input.files == []
+    assert page.ok_button.clicks == []
+
+
+def test_codex_cover_translation_prompt_preserves_edit_requirements(tmp_path):
+    target_path = tmp_path / "translated.png"
+    prompt = _build_codex_cover_translation_prompt("Небесная башня", target_path)
+
+    assert "Remove every existing visible text element" in prompt
+    assert "ad banners" in prompt
+    assert '"Небесная башня"' in prompt
+    assert "2:3 aspect ratio" in prompt
+    assert "4K-quality" in prompt
+    assert str(target_path) in prompt
+
+
+def test_load_cover_image_from_file_reads_local_source_cover(tmp_path):
+    image_path = tmp_path / "source.png"
+    image = QImage(2, 3, QImage.Format.Format_RGB32)
+    image.fill(0xFF336699)
+    assert image.save(str(image_path), "PNG")
+
+    cover_image = _load_cover_image_from_file(image_path)
+
+    assert cover_image is not None
+    assert cover_image.width == 2
+    assert cover_image.height == 3
+    assert cover_image.content
+    assert cover_image.url == str(image_path.resolve())
+
+
+def test_qidian_cover_url_candidates_try_larger_yuewen_sizes_first():
+    candidates = _cover_url_candidates("https://bookcover.yuewen.com/qdbimg/349573/1041604040/180")
+
+    assert candidates[:4] == [
+        "https://bookcover.yuewen.com/qdbimg/349573/1041604040/600",
+        "https://bookcover.yuewen.com/qdbimg/349573/1041604040/480",
+        "https://bookcover.yuewen.com/qdbimg/349573/1041604040/300",
+        "https://bookcover.yuewen.com/qdbimg/349573/1041604040/180",
+    ]
+
+
+def test_codex_cover_exec_command_ignores_user_config(tmp_path):
+    target_path = tmp_path / "cover.png"
+    command = _build_codex_cover_exec_command(target_path, tmp_path)
+
+    assert "--ignore-user-config" in command
+    assert command.index("--ignore-user-config") > command.index("exec")
+
+
+def test_codex_cover_exec_command_uses_latest_recommended_model(tmp_path):
+    target_path = tmp_path / "cover.png"
+    command = _build_codex_cover_exec_command(target_path, tmp_path)
+    model_index = command.index("--model")
+
+    assert command[model_index + 1] == CODEX_COVER_MODEL == "gpt-5.5"
+    assert model_index > command.index("exec")
+
+
+def test_append_codex_prompt_separates_prompt_from_image_args(tmp_path):
+    image_path = tmp_path / "source.png"
+    target_path = tmp_path / "cover.png"
+    command = _build_codex_cover_exec_command(target_path, tmp_path, extra_args=["--image", str(image_path)])
+
+    _append_codex_prompt(command, "edit this cover")
+
+    assert command[-2:] == ["--", "edit this cover"]
+    assert command.index("--") > command.index(str(image_path))
+
+
+def test_find_generated_cover_copies_codex_generated_image_from_stdout(tmp_path):
+    codex_image_dir = tmp_path / ".codex" / "generated_images" / "abc"
+    codex_image_dir.mkdir(parents=True)
+    codex_image = codex_image_dir / "_image_id_.png"
+    codex_image.write_bytes(b"image")
+    target_path = tmp_path / "output" / "cover.png"
+    stdout = f"saved under:\n`{codex_image}`"
+
+    result = _find_generated_cover(tmp_path / "output", target_path, 0, codex_output=stdout)
+
+    assert result == target_path.resolve()
+    assert target_path.read_bytes() == b"image"
+
+
+def test_find_generated_cover_copies_sibling_when_stdout_has_placeholder(tmp_path):
+    codex_image_dir = tmp_path / ".codex" / "generated_images" / "abc"
+    codex_image_dir.mkdir(parents=True)
+    placeholder_path = codex_image_dir / "_image_id_.png"
+    real_image = codex_image_dir / "ig_real.png"
+    real_image.write_bytes(b"real-image")
+    target_path = tmp_path / "output" / "cover.png"
+    stdout = f"saved under:\n`{placeholder_path}`"
+
+    result = _find_generated_cover(tmp_path / "output", target_path, 0, codex_output=stdout)
+
+    assert result == target_path.resolve()
+    assert target_path.read_bytes() == b"real-image"
+
+
+def test_find_generated_cover_copies_from_codex_generated_image_directory(tmp_path):
+    codex_image_dir = tmp_path / ".codex" / "generated_images" / "019f3783-2bb2-7571-8a42-022f6f4f97c3"
+    codex_image_dir.mkdir(parents=True)
+    real_image = codex_image_dir / "ig_real.png"
+    real_image.write_bytes(b"real-image")
+    target_path = tmp_path / "output" / "cover.png"
+    stdout = f"generated under:\n`{codex_image_dir}`"
+
+    result = _find_generated_cover(tmp_path / "output", target_path, 0, codex_output=stdout)
+
+    assert result == target_path.resolve()
+    assert target_path.read_bytes() == b"real-image"
+
+
+def test_find_generated_cover_copies_from_codex_generated_image_wildcard(tmp_path):
+    codex_image_dir = tmp_path / ".codex" / "generated_images" / "019f3783-2bb2-7571-8a42-022f6f4f97c3"
+    codex_image_dir.mkdir(parents=True)
+    real_image = codex_image_dir / "ig_real.png"
+    real_image.write_bytes(b"real-image")
+    target_path = tmp_path / "output" / "cover.png"
+    stdout = f"Resolve-Path '{codex_image_dir}\\*.png'"
+
+    result = _find_generated_cover(tmp_path / "output", target_path, 0, codex_output=stdout)
+
+    assert result == target_path.resolve()
+    assert target_path.read_bytes() == b"real-image"
+
+
+def test_find_generated_cover_ignores_source_images(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source_path = output_dir / "book_source_20260706.webp"
+    source_path.write_bytes(b"source")
+
+    result = _find_generated_cover(output_dir, output_dir / "missing.png", 0)
+
+    assert result is None
 
 
 def test_browser_missing_error_is_detected_for_playwright_install_message():

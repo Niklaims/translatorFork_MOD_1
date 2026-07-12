@@ -67,6 +67,54 @@ MAX_NEW_TERMS_LIMIT = 1000
 NEW_TERMS_LIMIT_TOKENS_PER_TERM = 200
 
 
+def _prepare_glossary_tasks_background(epub_path, html_files, settings, task_manager):
+    """Read chapters, build glossary batches and store them off the GUI thread."""
+    from gemini_translator.utils.glossary_tools import TaskPreparer
+
+    chapters = list(html_files or [])
+    try:
+        real_chapter_sizes = {}
+        is_any_cjk = False
+        with zipfile.ZipFile(epub_path, 'r') as epub_zip:
+            for index, chapter in enumerate(chapters):
+                content = epub_zip.read(chapter).decode('utf-8', 'ignore')
+                real_chapter_sizes[chapter] = estimate_epub_chapter_input_size(
+                    content,
+                    settings.get('task_size_unit'),
+                )
+                if index < 3 and not is_any_cjk:
+                    is_any_cjk = LanguageDetector.is_cjk_text(content)
+
+        preparer = TaskPreparer(settings, real_chapter_sizes)
+        epub_tasks = preparer.prepare_tasks(chapters)
+        context_glossary_for_payload = {}
+        tasks_for_core_engine = []
+        for task_payload in epub_tasks:
+            task_type = task_payload[0]
+            if task_type == 'epub':
+                _, source_epub_path, chapter = task_payload
+                batch_chapters = (chapter,)
+            elif task_type == 'epub_batch':
+                _, source_epub_path, batch_chapters = task_payload
+            else:
+                continue
+            tasks_for_core_engine.append((
+                'glossary_batch_task',
+                source_epub_path,
+                batch_chapters,
+                context_glossary_for_payload,
+            ))
+
+        task_manager.set_pending_tasks(tasks_for_core_engine)
+        return {
+            'ok': True,
+            'task_count': len(tasks_for_core_engine),
+            'is_any_cjk': is_any_cjk,
+        }
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+
 class SequentialTaskProvider(QObject):
     """
     Класс-оркестратор для последовательной генерации глоссария.
@@ -301,6 +349,7 @@ class GenerationSessionPage(ShellPage):
     page_title = "Генерация глоссария AI"
     generation_finished = pyqtSignal(list, set)
     result_ready = pyqtSignal(bool)
+    task_preparation_finished = pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -350,6 +399,11 @@ class GenerationSessionPage(ShellPage):
         self._pending_new_terms_limit_user_defined = True
         self._new_terms_limit_user_defined = False
         self._changing_new_terms_limit_programmatically = False
+        self._glossary_rebuild_worker = None
+        self._glossary_rebuild_generation = 0
+        self._pending_glossary_rebuild_request = None
+        self._is_glossary_rebuilding = False
+        self._glossary_rebuild_failed = False
         
         app = QtWidgets.QApplication.instance()
         self.bus = event_bus
@@ -570,6 +624,9 @@ class GenerationSessionPage(ShellPage):
         return StatusBarWidget(self, event_bus=self.bus, engine=self.engine)
 
     def can_leave(self):
+        worker = getattr(self, '_glossary_rebuild_worker', None)
+        if worker is not None and worker.isRunning():
+            return False
         is_running = (self.orchestrator and self.orchestrator._is_running) or (self.engine and self.engine.session_id)
         if is_running:
             self.reject()
@@ -1367,7 +1424,6 @@ class GenerationSessionPage(ShellPage):
                 user_defined=self._pending_new_terms_limit_user_defined,
             )
 
-        self._update_dependent_widgets()
         self._update_sequential_mode_widgets(self.sequential_mode_checkbox.isChecked())
         self._update_start_button_state()
 
@@ -1827,7 +1883,6 @@ class GenerationSessionPage(ShellPage):
             self.html_files = selected_files
             self.reselect_chapters_btn.setText(f"Главы: {len(self.html_files)}")
             self._rebuild_glossary_tasks()
-            self._update_dependent_widgets()
             
 
     def _emit_task_manipulation_signal(self, action: str, task_ids: list):
@@ -1971,60 +2026,110 @@ class GenerationSessionPage(ShellPage):
     def _rebuild_glossary_tasks(self):
         """
         Пересобирает задачи для глоссария, наполняет центральный ChapterQueueManager
-        и инициирует обновление UI.
+        и инициирует обновление UI. Чтение EPUB и запись очереди выполняются в
+        QThread: на больших книгах окно продолжает отвечать во время подготовки.
         """
         self._update_new_terms_limit_from_current_size()
-        from gemini_translator.utils.glossary_tools import TaskPreparer
-        import uuid
-        if not self.task_manager: return
+        if not self.task_manager:
+            return
 
         if not self.html_files or not self.epub_path:
             self.task_manager.clear_all_queues()
             return
 
-        settings = self.translation_options_widget.get_settings()
+        settings = dict(self.translation_options_widget.get_settings())
         settings['use_batching'] = True
         settings['chunking'] = False
         settings['chunk_on_error'] = False
         settings['file_path'] = self.epub_path
-        
-        real_chapter_sizes = {}
-        try:
-            with zipfile.ZipFile(self.epub_path, 'r') as zf:
-                for chapter in self.html_files:
-                    real_chapter_sizes[chapter] = estimate_epub_chapter_input_size(
-                        zf.read(chapter).decode('utf-8', 'ignore'),
-                        settings.get('task_size_unit'),
-                    )
-        except Exception as e:
-            QMessageBox.critical(self, "Ошибка чтения файла", f"Не удалось прочитать главы из EPUB: {e}")
-            return
-    
-        preparer = TaskPreparer(settings, real_chapter_sizes)
-        epub_tasks = preparer.prepare_tasks(self.html_files)
 
-        tasks_for_core_engine = []
-        context_glossary_for_payload = {}
-        for task_payload in epub_tasks:
-            task_type = task_payload[0]
-            if task_type == 'epub':
-                _, epub_path, chapter = task_payload
-                payload_for_glossary = ('glossary_batch_task', epub_path, (chapter,), context_glossary_for_payload)
-            elif task_type == 'epub_batch':
-                _, epub_path, chapters = task_payload
-                payload_for_glossary = ('glossary_batch_task', epub_path, chapters, context_glossary_for_payload)
+        generation = int(getattr(self, '_glossary_rebuild_generation', 0)) + 1
+        self._glossary_rebuild_generation = generation
+        request = {
+            'generation': generation,
+            'epub_path': self.epub_path,
+            'html_files': list(self.html_files),
+            'settings': settings,
+        }
+        self._glossary_rebuild_failed = False
+        self._pending_glossary_rebuild_request = request
+
+        worker = getattr(self, '_glossary_rebuild_worker', None)
+        if worker is not None and worker.isRunning():
+            # A settings change while scanning is coalesced. Once the current
+            # worker finishes only the newest snapshot is rebuilt.
+            self._set_glossary_rebuild_busy(True)
+            return
+
+        self._start_glossary_rebuild_worker(request)
+
+    def _set_glossary_rebuild_busy(self, busy: bool):
+        self._is_glossary_rebuilding = bool(busy)
+        self._is_rebuilding = bool(busy)
+        if hasattr(self, 'rebuild_tasks_btn'):
+            self.rebuild_tasks_btn.setEnabled(not busy and not self.is_session_active)
+        if hasattr(self, 'reselect_chapters_btn'):
+            self.reselect_chapters_btn.setEnabled(not busy and not self.is_session_active)
+        if hasattr(self, 'apply_btn'):
+            self.apply_btn.setEnabled(not busy)
+        if hasattr(self, 'close_btn'):
+            self.close_btn.setEnabled(not busy)
+        if hasattr(self, 'status_bar'):
+            if busy:
+                self.status_bar.set_permanent_message("Подготавливаю главы и задачи глоссария…")
             else:
-                continue
-            
-            tasks_for_core_engine.append(payload_for_glossary)
-        
-        # --- НАЧАЛО ИЗМЕНЕНИЯ: Установка флага ---
-        self._is_rebuilding = True
-        try:
-            self.task_manager.set_pending_tasks(tasks_for_core_engine)
-        finally:
-            self._is_rebuilding = False
-        # --- КОНЕЦ ИЗМЕНЕНИЯ ---
+                self.status_bar.clear_message()
+        self._update_start_button_state()
+
+    def _start_glossary_rebuild_worker(self, request):
+        self._pending_glossary_rebuild_request = None
+        self._set_glossary_rebuild_busy(True)
+        worker = TaskDBWorker(
+            _prepare_glossary_tasks_background,
+            request['epub_path'],
+            request['html_files'],
+            request['settings'],
+            self.task_manager,
+        )
+        worker._glossary_rebuild_generation = request['generation']
+        self._glossary_rebuild_worker = worker
+        worker.finished.connect(
+            lambda worker=worker: self._on_glossary_rebuild_finished(worker)
+        )
+        worker.start()
+
+    def _on_glossary_rebuild_finished(self, worker):
+        result = getattr(worker, 'result', None)
+        generation = getattr(worker, '_glossary_rebuild_generation', 0)
+        if getattr(self, '_glossary_rebuild_worker', None) is worker:
+            self._glossary_rebuild_worker = None
+        worker.deleteLater()
+
+        pending = getattr(self, '_pending_glossary_rebuild_request', None)
+        if isinstance(pending, dict) and pending.get('generation', 0) > generation:
+            self._start_glossary_rebuild_worker(pending)
+            return
+
+        succeeded = isinstance(result, dict) and bool(result.get('ok'))
+        self._glossary_rebuild_failed = not succeeded
+        self._set_glossary_rebuild_busy(False)
+        if not succeeded:
+            error = result.get('error') if isinstance(result, dict) else None
+            error_text = error or 'неизвестная ошибка'
+            self.task_preparation_finished.emit(False, error_text)
+            if self.isVisible():
+                QMessageBox.critical(
+                    self,
+                    "Ошибка чтения файла",
+                    f"Не удалось подготовить главы из EPUB:\n{error_text}",
+                )
+            return
+
+        self.model_settings_widget.update_cjk_options_availability(
+            enabled=True,
+            is_cjk_recommended=bool(result.get('is_any_cjk')),
+        )
+        self.task_preparation_finished.emit(True, '')
 
     
     def _create_settings_tab(self):
@@ -2222,7 +2327,11 @@ class GenerationSessionPage(ShellPage):
         Кнопка 'Применить' видна ВСЕГДА, когда есть данные и не идет сессия.
         """
         # 1. Логика кнопки "Начать"
-        if self.is_session_active:
+        if (
+            self.is_session_active
+            or getattr(self, '_is_glossary_rebuilding', False)
+            or getattr(self, '_glossary_rebuild_failed', False)
+        ):
             self.start_btn.setEnabled(False)
         else:
             pipeline_ready = (not self.pipeline_enabled_checkbox.isChecked()) or bool(self.pipeline_steps)
@@ -2553,6 +2662,9 @@ class GenerationSessionPage(ShellPage):
     
     def _start_session(self):
         """Запускает сессию генерации, предварительно очистив старые результаты в БД."""
+        worker = getattr(self, '_glossary_rebuild_worker', None)
+        if getattr(self, '_is_glossary_rebuilding', False) or (worker is not None and worker.isRunning()):
+            return
         if self.engine and self.engine.session_id:
             QMessageBox.warning(self, "Движок занят", "Другая операция уже выполняется. Пожалуйста, дождитесь ее завершения.")
             return
@@ -2995,6 +3107,10 @@ class GenerationSessionPage(ShellPage):
         Обрабатывает кнопку 'Закрыть' и крестик.
         """
         print("[DEBUG] GenerationSessionDialog.reject() called.")
+
+        worker = getattr(self, '_glossary_rebuild_worker', None)
+        if worker is not None and worker.isRunning():
+            return
         
         is_running = (self.orchestrator and self.orchestrator._is_running) or (self.engine and self.engine.session_id)
         if is_running:
@@ -3056,10 +3172,8 @@ class GenerationSessionPage(ShellPage):
             )
             self._pending_new_terms_limit = None
             self._pending_new_terms_limit_user_defined = True
-        # 2. И только теперь строим задачи
+        # 2. И только теперь строим задачи. Фоновый результат также обновит CJK.
         self._rebuild_glossary_tasks()
-        # 3. Обновляем визуальные CJK опции
-        self._update_dependent_widgets()
         
     def closeEvent(self, event):
         """Перехватываем событие закрытия (крестик) и направляем его в нашу логику reject."""

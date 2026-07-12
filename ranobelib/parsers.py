@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from docx import Document
 
 from models import ChapterData, auto_fill_missing_chapter_numbers
-from utils import natural_sort_key, parse_vol_and_chapter
+from utils import parse_vol_and_chapter
 
 class FileParser:
     """Статические методы для разбора файлов разных форматов."""
@@ -116,18 +116,14 @@ class FileParser:
     def parse_zip_docx(zip_path: str, default_vol: str, log_fn=None) -> list[ChapterData]:
         chapters = []
         with zipfile.ZipFile(zip_path, "r") as z:
-            file_list = sorted(
-                [
-                    f
-                    for f in z.namelist()
-                    if f.endswith(".docx") and not os.path.basename(f).startswith("~")
-                ],
-                key=natural_sort_key,
-            )
+            file_list = [
+                f
+                for f in z.namelist()
+                if f.endswith(".docx") and not os.path.basename(f).startswith("~")
+            ]
             if log_fn:
                 log_fn("INFO", f"ZIP: найдено DOCX-файлов: {len(file_list)}")
             cnt = 1
-            all_nums_found = True
             for filename in file_list:
                 try:
                     name_no_ext = os.path.splitext(os.path.basename(filename))[0]
@@ -149,22 +145,12 @@ class FileParser:
                     content = "\n".join(paragraphs)
                     chapters.append(ChapterData(vol, chap_num, title, content,
                                                 _parse_index=cnt, _num_found=num_found))
-                    all_nums_found = all_nums_found and num_found
                     cnt += 1
                 except Exception as e:
                     if log_fn:
                         log_fn("ERROR", f"Файл {filename}: {e}")
 
-        # Сортировка по номеру главы (а не по имени файла),
-        # т.к. имена файлов с Rulate могут иметь разный формат
-        # и при алфавитной сортировке идут вперемешку.
-        # Но сортируем ТОЛЬКО если у всех глав номер был реально найден
-        # в имени файла. Если у какой-то главы номер не найден
-        # (например, "Пролог", "�?нтерлюдия"), сохраняем исходный
-        # порядок файлов, чтобы не сломать последовательность.
         auto_fill_missing_chapter_numbers(chapters)
-        if all_nums_found and chapters:
-            chapters.sort(key=lambda c: (c.volume, c.number, c._parse_index))
         return chapters
 
     @staticmethod

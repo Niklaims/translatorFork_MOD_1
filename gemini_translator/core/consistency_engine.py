@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
@@ -517,6 +518,9 @@ class ConsistencyEngine(QObject):
             "analysis": set(),
         }
         self.session_signature = ""
+        self._active_keys_lock = threading.RLock()
+        self._handler_cache_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         
         # Индекс текущего ключа для ротации
         self._current_key_index = 0
@@ -883,10 +887,227 @@ class ConsistencyEngine(QObject):
                 cleaned_metadata[key] = str(value)
         if cleaned_metadata:
             trace_entry['metadata'] = cleaned_metadata
-        self.request_response_trace.append(trace_entry)
+        with self._state_lock:
+            self.request_response_trace.append(trace_entry)
 
     def get_request_response_trace(self) -> List[Dict[str, Any]]:
-        return [dict(entry) for entry in self.request_response_trace]
+        with self._state_lock:
+            return [dict(entry) for entry in self.request_response_trace]
+
+    @staticmethod
+    def _unique_non_empty_keys(active_keys: List[str]) -> List[str]:
+        return list(dict.fromkeys(
+            str(key).strip()
+            for key in (active_keys or [])
+            if str(key).strip()
+        ))
+
+    @staticmethod
+    def _positive_int_or_none(value: Any) -> Optional[int]:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _parallel_worker_count_for_fast_mode(
+        self,
+        config: Dict[str, Any],
+        active_keys: List[str],
+        task_count: int,
+    ) -> int:
+        if task_count <= 1 or config.get("consistency_mode") != FAST_PROOFREAD_MODE:
+            return 1
+
+        requested = (
+            self._positive_int_or_none(config.get("consistency_parallel_workers"))
+            or self._positive_int_or_none(config.get("num_instances"))
+            or len(self._unique_non_empty_keys(active_keys))
+            or 1
+        )
+        key_capacity = max(1, len(self._unique_non_empty_keys(active_keys)))
+        return max(1, min(int(task_count), int(requested), key_capacity))
+
+    def _store_analysis_result(
+        self,
+        analysis_result: Dict[str, Any] | None,
+        chunk: List[Dict[str, Any]],
+        chunk_index: int,
+    ) -> None:
+        if not analysis_result:
+            return
+
+        chunk_problems = analysis_result.get('problems', [])
+        for prob in chunk_problems:
+            prob['chunk_index'] = chunk_index
+            chapter_name = prob.get('chapter', '')
+            if chapter_name not in self.chapter_problems_map:
+                self.chapter_problems_map[chapter_name] = []
+            self.chapter_problems_map[chapter_name].append(prob)
+
+        self.all_problems.extend(chunk_problems)
+        self.glossary_session.update_from_response(
+            analysis_result.get('glossary_update', {}),
+            analysis_result.get('context_summary', {})
+        )
+
+        self._mark_chunk_completed("analysis", chunk)
+        self.chunk_analyzed.emit(analysis_result)
+
+    def _analyze_chunk_request(
+        self,
+        chunk: List[Dict[str, Any]],
+        config: Dict[str, Any],
+        active_keys: List[str],
+        *,
+        chunk_index: int,
+        total_chunks: int,
+    ) -> tuple[str, str]:
+        prompt = self._build_analysis_prompt(chunk, config)
+        self._emit_log_message(
+            f"[Analysis] Чанк {chunk_index + 1}/{total_chunks}: {self._format_chunk_label(chunk)}"
+        )
+        response_text = self._call_api_with_transient_chunk_retry(
+            prompt,
+            config,
+            active_keys,
+            retry_label=f"анализа (чанк {chunk_index + 1}/{total_chunks})",
+        )
+        return prompt, response_text
+
+    def _analyze_chunk_request_parallel(
+        self,
+        chunk: List[Dict[str, Any]],
+        config: Dict[str, Any],
+        active_keys: List[str],
+        *,
+        chunk_index: int,
+        total_chunks: int,
+    ) -> tuple[str, str]:
+        try:
+            return self._analyze_chunk_request(
+                chunk,
+                config,
+                active_keys,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+            )
+        finally:
+            self.close_session_resources()
+
+    def _handle_analysis_response(
+        self,
+        *,
+        chunk: List[Dict[str, Any]],
+        chunk_index: int,
+        total_chunks: int,
+        mode: str,
+        config: Dict[str, Any],
+        prompt: str,
+        response_text: str,
+    ) -> None:
+        self._record_request_response_trace(
+            phase='analysis',
+            prompt=prompt,
+            response=response_text,
+            chapter_names=[ch.get('name', '') for ch in chunk if isinstance(ch, dict)],
+            metadata={
+                'chunk_index': chunk_index + 1,
+                'total_chunks': total_chunks,
+                'mode': mode,
+                'consistency_mode': config.get("consistency_mode"),
+            },
+        )
+
+        analysis_result = self._parse_ai_response(response_text)
+        if analysis_result and config.get("consistency_mode") == FAST_PROOFREAD_MODE:
+            analysis_result = self._filter_fast_proofread_result(analysis_result)
+        self._store_analysis_result(analysis_result, chunk, chunk_index)
+
+    def _analyze_fast_chunks_parallel(
+        self,
+        chunks: List[List[Dict[str, Any]]],
+        config: Dict[str, Any],
+        active_keys: List[str],
+        mode: str,
+    ) -> bool:
+        total_chunks = len(chunks)
+        pending: list[tuple[int, List[Dict[str, Any]]]] = []
+        skipped: list[tuple[int, List[Dict[str, Any]]]] = []
+        completed_count = 0
+
+        for i, chunk in enumerate(chunks):
+            if self.is_cancelled:
+                break
+            if self._is_chunk_completed("analysis", chunk):
+                skipped.append((i, chunk))
+                continue
+            pending.append((i, chunk))
+
+        worker_count = self._parallel_worker_count_for_fast_mode(config, active_keys, len(pending))
+        if worker_count <= 1:
+            return False
+
+        for i, chunk in skipped:
+            completed_count += 1
+            self.progress_updated.emit(completed_count, total_chunks)
+            self._emit_log_message(
+                f"↷ [Analysis] Чанк {i + 1}/{total_chunks} уже есть в сохраненной сессии, пропускаю."
+            )
+
+        self._emit_log_message(
+            f"AI-consistency 3.1: параллельный анализ {len(pending)} чанков, потоков: {worker_count}."
+        )
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ai-consistency-3-1") as executor:
+            future_map = {
+                executor.submit(
+                    self._analyze_chunk_request_parallel,
+                    chunk,
+                    config,
+                    active_keys,
+                    chunk_index=i,
+                    total_chunks=total_chunks,
+                ): (i, chunk)
+                for i, chunk in pending
+                if not self.is_cancelled
+            }
+
+            for future in as_completed(future_map):
+                i, chunk = future_map[future]
+                try:
+                    prompt, response_text = future.result()
+                    self._handle_analysis_response(
+                        chunk=chunk,
+                        chunk_index=i,
+                        total_chunks=total_chunks,
+                        mode=mode,
+                        config=config,
+                        prompt=prompt,
+                        response_text=response_text,
+                    )
+                except Exception as e:
+                    error_text = self._sanitize_exception_message(e)
+                    if self._is_expected_user_cancel_error(error_text):
+                        logger.info("Analysis chunk %s stopped by cancellation", i + 1)
+                    else:
+                        logger.error(f"Error analyzing chunk {i + 1}: {error_text}")
+                        self.error_occurred.emit(f"Ошибка анализа чанка {i + 1}: {error_text}")
+                    with self._active_keys_lock:
+                        no_active_keys = not active_keys
+                    if self.is_cancelled or no_active_keys:
+                        self.is_cancelled = True
+                        for other_future in future_map:
+                            if other_future is not future:
+                                other_future.cancel()
+                finally:
+                    completed_count += 1
+                    if not self.is_cancelled:
+                        self.progress_updated.emit(min(completed_count, total_chunks), total_chunks)
+
+                if self.is_cancelled:
+                    break
+
+        return True
 
     def analyze_chapters(self, chapters: List[Dict[str, Any]], config: Dict[str, Any], 
                         active_keys: List[str], 
@@ -993,8 +1214,11 @@ class ConsistencyEngine(QObject):
                         
                 except Exception as e:
                     error_text = self._sanitize_exception_message(e)
-                    logger.error(f"Error collecting glossary for chunk {i + 1}: {error_text}")
-                    self.error_occurred.emit(f"Ошибка сбора глоссария (чанк {i + 1}): {error_text}")
+                    if self._is_expected_user_cancel_error(error_text):
+                        logger.info("Glossary collection chunk %s stopped by cancellation", i + 1)
+                    else:
+                        logger.error(f"Error collecting glossary for chunk {i + 1}: {error_text}")
+                        self.error_occurred.emit(f"Ошибка сбора глоссария (чанк {i + 1}): {error_text}")
                     if self.is_cancelled or not active_keys:
                         self.is_cancelled = True
                         break
@@ -1002,6 +1226,13 @@ class ConsistencyEngine(QObject):
             logger.info("Двухпроходный режим: проход 2 - поиск проблем с глоссарием")
 
         # Основной проход: поиск проблем
+        if (
+            config.get("consistency_mode") == FAST_PROOFREAD_MODE
+            and self._analyze_fast_chunks_parallel(chunks, config, active_keys, mode)
+        ):
+            self.finished.emit(self.all_problems)
+            return
+
         for i, chunk in enumerate(chunks):
             if self.is_cancelled:
                 break
@@ -1073,8 +1304,11 @@ class ConsistencyEngine(QObject):
 
             except Exception as e:
                 error_text = self._sanitize_exception_message(e)
-                logger.error(f"Error analyzing chunk {i + 1}: {error_text}")
-                self.error_occurred.emit(f"Ошибка анализа чанка {i + 1}: {error_text}")
+                if self._is_expected_user_cancel_error(error_text):
+                    logger.info("Analysis chunk %s stopped by cancellation", i + 1)
+                else:
+                    logger.error(f"Error analyzing chunk {i + 1}: {error_text}")
+                    self.error_occurred.emit(f"Ошибка анализа чанка {i + 1}: {error_text}")
                 if self.is_cancelled or not active_keys:
                     self.is_cancelled = True
                     break
@@ -1086,12 +1320,28 @@ class ConsistencyEngine(QObject):
         if not active_keys:
             raise ValueError("Нет доступных ключей")
         
-        key = active_keys[self._current_key_index % len(active_keys)]
-        self._current_key_index += 1
-        return key
+        with self._active_keys_lock:
+            if not active_keys:
+                raise ValueError("No available API keys")
+            key = active_keys[self._current_key_index % len(active_keys)]
+            self._current_key_index += 1
+            return key
 
     def _sanitize_exception_message(self, exc: Exception | str) -> str:
         return _sanitize_api_keys(str(exc))
+
+    def _is_expected_user_cancel_error(self, error_text: Any) -> bool:
+        if not self.is_cancelled:
+            return False
+        normalized = str(error_text or "").strip()
+        return normalized in {
+            "Анализ остановлен",
+            "Cancelled by user",
+            "Operation cancelled",
+            "Operation canceled",
+            "Cancelled",
+            "Canceled",
+        }
 
     def _is_key_retryable_error(self, exc: Exception) -> bool:
         text = str(exc or "")
@@ -1239,13 +1489,15 @@ class ConsistencyEngine(QObject):
         config: Dict[str, Any],
         exc: Exception,
     ) -> bool:
-        before = len(active_keys)
-        active_keys[:] = [key for key in active_keys if key != api_key]
-        removed = len(active_keys) != before
+        with self._active_keys_lock:
+            before = len(active_keys)
+            active_keys[:] = [key for key in active_keys if key != api_key]
+            removed = len(active_keys) != before
         if not removed:
             return False
 
-        self._discarded_keys.add(api_key)
+        with self._state_lock:
+            self._discarded_keys.add(api_key)
         reason = self._sanitize_exception_message(exc)
         masked_key = _redact_api_key(api_key)
         if self._should_persist_key_unavailable_status(exc):
@@ -1266,7 +1518,12 @@ class ConsistencyEngine(QObject):
     ) -> str:
         last_error: Exception | None = None
 
-        while active_keys and not self.is_cancelled:
+        while not self.is_cancelled:
+            with self._active_keys_lock:
+                has_active_keys = bool(active_keys)
+            if not has_active_keys:
+                break
+
             api_key = self._get_next_key(active_keys)
             try:
                 return self._call_api(prompt, config, api_key)
@@ -1278,7 +1535,9 @@ class ConsistencyEngine(QObject):
                 if not self._discard_key_for_retry(active_keys, api_key, config, exc):
                     raise
 
-                if active_keys:
+                with self._active_keys_lock:
+                    has_active_keys = bool(active_keys)
+                if has_active_keys:
                     self._emit_log_message(
                         f"↻ Повтор {retry_label} с другим ключом. Осталось ключей: {len(active_keys)}"
                     )
@@ -1790,7 +2049,8 @@ class ConsistencyEngine(QObject):
     def fix_chapter(self, chapter_content: str, problems: List[Dict[str, Any]], 
                     config: Dict[str, Any], active_keys: List[str],
                     batch_mode: bool = False,
-                    chapter_name: str | None = None) -> str:
+                    chapter_name: str | None = None,
+                    reset_cancel_state: bool = True) -> str:
         """
         Исправляет конкретную главу на основе списка проблем.
         
@@ -1804,6 +2064,9 @@ class ConsistencyEngine(QObject):
         Returns:
             Исправленный текст главы
         """
+        if reset_cancel_state:
+            self.is_cancelled = False
+
         from ..api.config import get_resource_path
         prompts_file = get_resource_path("config/consistency_prompts.json")
         
@@ -1889,6 +2152,81 @@ class ConsistencyEngine(QObject):
         )
         return self._sanitize_fixed_chapter_response(response_text, chapter_content)
 
+    def _fix_chapter_parallel(
+        self,
+        chapter: Dict[str, Any],
+        problems: List[Dict[str, Any]],
+        config: Dict[str, Any],
+        active_keys: List[str],
+    ) -> str:
+        try:
+            return self.fix_chapter(
+                chapter['content'],
+                problems,
+                config,
+                active_keys,
+                batch_mode=len(problems) > 1,
+                chapter_name=chapter['name'],
+                reset_cancel_state=False,
+            )
+        finally:
+            self.close_session_resources()
+
+    def _fix_all_chapters_parallel(
+        self,
+        chapters_with_problems: List[tuple[Dict[str, Any], List[Dict[str, Any]]]],
+        config: Dict[str, Any],
+        active_keys: List[str],
+    ) -> Dict[str, str]:
+        results: Dict[str, str] = {}
+        total = len(chapters_with_problems)
+        worker_count = self._parallel_worker_count_for_fast_mode(config, active_keys, total)
+        if worker_count <= 1:
+            return results
+
+        self._emit_log_message(
+            f"AI-consistency 3.1: параллельное исправление {total} глав, потоков: {worker_count}."
+        )
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="ai-consistency-fix-3-1") as executor:
+            future_map = {
+                executor.submit(
+                    self._fix_chapter_parallel,
+                    chapter,
+                    problems,
+                    config,
+                    active_keys,
+                ): (chapter, problems)
+                for chapter, problems in chapters_with_problems
+                if not self.is_cancelled
+            }
+
+            completed_count = 0
+            for future in as_completed(future_map):
+                chapter, _problems = future_map[future]
+                chapter_name = chapter['name']
+                completed_count += 1
+                self.fix_progress.emit(completed_count, total, chapter_name)
+
+                try:
+                    fixed_content = future.result()
+                    results[chapter['path']] = fixed_content
+                    self.fix_completed.emit(chapter['path'], fixed_content)
+                except Exception as e:
+                    logger.error(f"Error fixing chapter {chapter_name}: {e}")
+                    self.error_occurred.emit(f"Ошибка при исправлении {chapter_name}: {e}")
+                    with self._active_keys_lock:
+                        no_active_keys = not active_keys
+                    if self.is_cancelled or no_active_keys:
+                        self.is_cancelled = True
+                        for other_future in future_map:
+                            if other_future is not future:
+                                other_future.cancel()
+
+                if self.is_cancelled:
+                    break
+
+        return results
+
     def fix_all_chapters(self, chapters: List[Dict[str, Any]], config: Dict[str, Any],
                          active_keys: List[str]) -> Dict[str, str]:
         """
@@ -1902,6 +2240,7 @@ class ConsistencyEngine(QObject):
         Returns:
             Словарь {path: new_content} с исправленными главами
         """
+        self.is_cancelled = False
         results = {}
         allowed_confidences = normalize_consistency_confidences(
             config.get('consistency_fix_confidences'),
@@ -1922,6 +2261,15 @@ class ConsistencyEngine(QObject):
                 chapters_with_problems.append((chapter, problems))
 
         total = len(chapters_with_problems)
+        if (
+            config.get("consistency_mode") == FAST_PROOFREAD_MODE
+            and self._parallel_worker_count_for_fast_mode(config, active_keys, total) > 1
+        ):
+            return self._fix_all_chapters_parallel(
+                chapters_with_problems,
+                config,
+                active_keys,
+            )
 
         for i, (chapter, problems) in enumerate(chapters_with_problems):
             if self.is_cancelled:
@@ -1939,6 +2287,7 @@ class ConsistencyEngine(QObject):
                     active_keys,
                     batch_mode=len(problems) > 1,
                     chapter_name=chapter_name,
+                    reset_cancel_state=False,
                 )
                 results[chapter['path']] = fixed_content
                 self.fix_completed.emit(chapter['path'], fixed_content)
@@ -1983,15 +2332,17 @@ class ConsistencyEngine(QObject):
 
     def _get_current_thread_handler_cache(self) -> Dict[tuple, Dict[str, Any]]:
         thread_id = threading.get_ident()
-        cache = self._thread_handler_cache.get(thread_id)
-        if cache is None:
-            cache = {}
-            self._thread_handler_cache[thread_id] = cache
+        with self._handler_cache_lock:
+            cache = self._thread_handler_cache.get(thread_id)
+            if cache is None:
+                cache = {}
+                self._thread_handler_cache[thread_id] = cache
         return cache
 
     def close_session_resources(self) -> None:
         thread_id = threading.get_ident()
-        cache = self._thread_handler_cache.pop(thread_id, {})
+        with self._handler_cache_lock:
+            cache = self._thread_handler_cache.pop(thread_id, {})
         for entry in cache.values():
             handler = entry.get("handler")
             if handler is not None:

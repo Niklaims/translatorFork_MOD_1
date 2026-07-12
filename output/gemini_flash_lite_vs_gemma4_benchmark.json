@@ -1,0 +1,108 @@
+{
+  "name": "gemini-flash-lite-vs-gemma4",
+  "output_dir": "output/gemini_flash_lite_vs_gemma4",
+  "defaults": {
+    "use_system_instruction": true,
+    "system_instruction": "You are a professional literary translator into Russian. Preserve markup, placeholders, links, comments, and glossary terms exactly where required.",
+    "prompt_mode": "project"
+  },
+  "prompts": [
+    {
+      "id": "project-default",
+      "mode": "project",
+      "builtin": "default",
+      "use_system_instruction": true
+    }
+  ],
+  "models": [
+    {
+      "id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model_id": "gemini-3.1-flash-lite",
+      "use_stream": true,
+      "max_output_tokens": 8192
+    },
+    {
+      "id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "use_stream": true,
+      "max_output_tokens": 8192
+    }
+  ],
+  "cases": [
+    {
+      "id": "zh-dialogue-glossary",
+      "source_html": "<p>青云宗的弟子低声说：“师尊来了。”</p><!-- MEDIA_0 -->",
+      "reference": "<p>Ученик Секты Лазурного Облака тихо сказал: «Наставник пришёл».</p><!-- MEDIA_0 -->",
+      "glossary": [
+        {
+          "original": "青云宗",
+          "rus": "Секта Лазурного Облака"
+        },
+        {
+          "original": "师尊",
+          "rus": "наставник"
+        }
+      ],
+      "checks": {
+        "preserve_html_tags": true,
+        "allow_cjk": false,
+        "glossary_required": true,
+        "required": [
+          "Секта Лазурного Облака"
+        ],
+        "forbidden": [
+          "青云宗"
+        ],
+        "placeholders": [
+          "<!-- MEDIA_0 -->"
+        ],
+        "min_similarity": 0.2
+      }
+    },
+    {
+      "id": "html-link-preservation",
+      "source_html": "<p><a href=\"notes.xhtml#n1\">Note</a>: The tower opened, and the old oath burned blue.</p>",
+      "reference": "<p><a href=\"notes.xhtml#n1\">Примечание</a>: башня открылась, и древняя клятва вспыхнула синим.</p>",
+      "checks": {
+        "preserve_html_tags": true,
+        "allow_cjk": false,
+        "required": [
+          "башня",
+          "клятва"
+        ],
+        "min_similarity": 0.2
+      }
+    },
+    {
+      "id": "zh-style-and-term",
+      "source_html": "<p>黑潮压过城墙时，林澈仍把破损的玉符藏进袖中，像藏住最后一盏灯。</p>",
+      "reference": "<p>Когда чёрная волна перехлестнула городскую стену, Линь Чэ всё ещё прятал треснувший нефритовый талисман в рукаве, будто укрывал последний огонь.</p>",
+      "glossary": [
+        {
+          "original": "林澈",
+          "rus": "Линь Чэ"
+        },
+        {
+          "original": "玉符",
+          "rus": "нефритовый талисман"
+        }
+      ],
+      "checks": {
+        "preserve_html_tags": true,
+        "allow_cjk": false,
+        "glossary_required": true,
+        "required": [
+          "Линь Чэ",
+          "нефритовый талисман"
+        ],
+        "forbidden": [
+          "林澈",
+          "玉符"
+        ],
+        "min_similarity": 0.2
+      }
+    }
+  ]
+}

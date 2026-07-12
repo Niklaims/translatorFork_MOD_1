@@ -4,24 +4,29 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import glob
 import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import traceback
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtGui import QImage
 
 from gemini_translator.api import config as api_config
-from gemini_translator.api.errors import NetworkError, TemporaryRateLimitError
+from gemini_translator.api.errors import NetworkError, OperationCancelledError, TemporaryRateLimitError
 from gemini_translator.api.factory import get_api_handler_class
 
 from .models import PreparedRulateMetadata, QidianBookMetadata, RulateBookDraft
@@ -579,33 +584,160 @@ def _normalize_url(value: str | None, base_url: str) -> str:
     return urljoin(base_url, value)
 
 
+@dataclass(frozen=True)
+class CoverImageDownload:
+    url: str
+    content: bytes
+    width: int = 0
+    height: int = 0
+
+    @property
+    def area(self) -> int:
+        return self.width * self.height
+
+
+QIDIAN_COVER_SIZE_CANDIDATES = (600, 480, 300, 180)
+
+
+def _image_dimensions(image_data: bytes) -> tuple[int, int]:
+    if not image_data:
+        return 0, 0
+    image = QImage()
+    if not image.loadFromData(image_data):
+        return 0, 0
+    return image.width(), image.height()
+
+
+def _format_image_size(image_data: bytes) -> str:
+    width, height = _image_dimensions(image_data)
+    dimensions = f"{width}x{height}" if width and height else "unknown size"
+    return f"{dimensions}, {len(image_data) / 1024:.1f} KB"
+
+
+def _dedupe_urls(urls: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        url = (url or "").strip()
+        key = url.lower()
+        if not url or key in seen:
+            continue
+        seen.add(key)
+        result.append(url)
+    return result
+
+
+def _qidian_cover_url_candidates(cover_url: str) -> list[str]:
+    parsed = urlparse(cover_url)
+    host = parsed.netloc.lower()
+    path = parsed.path or ""
+    candidates: list[str] = []
+
+    if "bookcover.yuewen.com" in host or "qidian" in host:
+        parts = path.rstrip("/").split("/")
+        if parts and parts[-1].isdigit():
+            for size in QIDIAN_COVER_SIZE_CANDIDATES:
+                next_parts = list(parts)
+                next_parts[-1] = str(size)
+                candidates.append(urlunparse(parsed._replace(path="/".join(next_parts))))
+
+        for size in QIDIAN_COVER_SIZE_CANDIDATES:
+            next_path = re.sub(r"(?<!\d)(?:180|300|480|600)(?!\d)", str(size), path)
+            if next_path != path:
+                candidates.append(urlunparse(parsed._replace(path=next_path)))
+
+    return candidates
+
+
+def _query_cover_url_candidates(cover_url: str) -> list[str]:
+    parsed = urlparse(cover_url)
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    if not params:
+        return []
+
+    candidates: list[str] = []
+    for size in QIDIAN_COVER_SIZE_CANDIDATES:
+        changed = False
+        next_params: list[tuple[str, str]] = []
+        for key, value in params:
+            low_key = key.lower()
+            if low_key in {"w", "width", "size"} and value.isdigit():
+                next_params.append((key, str(size)))
+                changed = True
+            elif low_key in {"h", "height"} and value.isdigit():
+                next_params.append((key, str(round(size * 4 / 3))))
+                changed = True
+            else:
+                next_value = re.sub(r"(?<!\d)(?:180x240|300x400|480x640|600x800)(?!\d)", f"{size}x{round(size * 4 / 3)}", value)
+                changed = changed or next_value != value
+                next_params.append((key, next_value))
+        if changed:
+            candidates.append(urlunparse(parsed._replace(query=urlencode(next_params))))
+    return candidates
+
+
+def _cover_url_candidates(cover_url: str) -> list[str]:
+    cover_url = (cover_url or "").strip()
+    if not cover_url:
+        return []
+    return _dedupe_urls(
+        _qidian_cover_url_candidates(cover_url)
+        + _query_cover_url_candidates(cover_url)
+        + [cover_url]
+    )
+
+
+def _download_cover_image_once(cover_url: str, *, referer: str) -> CoverImageDownload | None:
+    response = requests.get(
+        cover_url,
+        timeout=20,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            ),
+            "Referer": referer,
+        },
+    )
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    image_signatures = (b"\xff\xd8", b"\x89PNG", b"GIF", b"RIFF")
+    if not response.content:
+        return None
+    if "image" not in content_type.lower() and not response.content.startswith(image_signatures):
+        return None
+    width, height = _image_dimensions(response.content)
+    if not width or not height:
+        return None
+    return CoverImageDownload(
+        url=response.url or cover_url,
+        content=response.content,
+        width=width,
+        height=height,
+    )
+
+
+def _download_best_cover_image(cover_url: str, *, referer: str) -> CoverImageDownload | None:
+    best: CoverImageDownload | None = None
+    for candidate_url in _cover_url_candidates(cover_url):
+        try:
+            current = _download_cover_image_once(candidate_url, referer=referer)
+        except Exception:
+            continue
+        if not current:
+            continue
+        if not best or (current.area, len(current.content)) > (best.area, len(best.content)):
+            best = current
+    return best
+
+
 def _download_cover_image(cover_url: str, *, referer: str) -> bytes:
     cover_url = (cover_url or "").strip()
     if not cover_url:
         return b""
-    try:
-        response = requests.get(
-            cover_url,
-            timeout=20,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "Referer": referer,
-            },
-        )
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        image_signatures = (b"\xff\xd8", b"\x89PNG", b"GIF", b"RIFF")
-        if not response.content:
-            return b""
-        if "image" not in content_type.lower() and not response.content.startswith(image_signatures):
-            return b""
-        return response.content
-    except Exception:
-        return b""
+    best = _download_best_cover_image(cover_url, referer=referer)
+    return best.content if best else b""
 
 
 def google_translate_title_to_english(title: str, timeout: int = 20) -> str:
@@ -880,8 +1012,8 @@ def build_catalog_prompt(
 Верни только JSON без markdown.
 
 Поля JSON:
-- genres: от 3 до 5 жанров строго из списка допустимых жанров.
-- tags: от 3 до 8 существующих тегов Rulate по смыслу описания. Не придумывай новые теги и не используй заготовленный список.
+- genres: от 3 до 7 жанров строго из списка допустимых жанров.
+- tags: до 15-ти существующих тегов Rulate по смыслу описания. Не придумывай новые теги и не используй заготовленный список.
 - cover_prompt: единый промпт на английском для генерации обложки в DALL-E 3 / Ideogram. Используй русское название "{prepared.translated_title}" внутри блока Typography в кавычках. Формат значения строго такой: [Subject & Action], [Background & Atmosphere], [Typography: The text "{prepared.translated_title}" written in [Font Style Description], placed at the [bottom/top], professional book cover typography, legible, high contrast], [Visual Style: Manhwa style, Riot Games Splash Art, 8k, masterpiece], --ar 2:3
 
 Допустимые жанры Rulate:
@@ -1434,6 +1566,7 @@ def _run_ai_request(
     log_callback,
     log_prefix: str,
     max_output_tokens: int = 4096,
+    cancel_event: Event | None = None,
 ) -> str:
     provider_config = deepcopy(api_config.api_providers().get(provider_id) or {})
     if not provider_config:
@@ -1458,6 +1591,7 @@ def _run_ai_request(
         api_key=api_key,
         model_settings=model_settings,
         log_callback=log_callback,
+        cancel_event=cancel_event,
     )
 
     handler_class_name = provider_config.get("handler_class")
@@ -1467,6 +1601,9 @@ def _run_ai_request(
     handler_class = get_api_handler_class(handler_class_name)
     retryable_errors = (TemporaryRateLimitError, NetworkError)
     for attempt in range(1, AI_REQUEST_RETRY_ATTEMPTS + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise OperationCancelledError("Генерация отменена пользователем.")
+
         handler = handler_class(worker)
         client = SimpleNamespace(api_key=api_key)
         proxy_settings = settings_manager.load_proxy_settings() if settings_manager else None
@@ -1495,7 +1632,10 @@ def _run_ai_request(
                 f"AI: временная ошибка провайдера, повтор {attempt + 1}/{AI_REQUEST_RETRY_ATTEMPTS} через {delay}с: {error}",
             )
             if delay:
-                time.sleep(delay)
+                if cancel_event is not None and cancel_event.wait(delay):
+                    raise OperationCancelledError("Генерация отменена пользователем.") from error
+                if cancel_event is None:
+                    time.sleep(delay)
         finally:
             close_coro = getattr(handler, "_close_thread_session_internal", None)
             if callable(close_coro):
@@ -1577,6 +1717,15 @@ class QidianFetchWorker(QThread):
             title_original = _clean_text(payload.get("title"))
             author_name = _clean_text(payload.get("author"))
             cover_url = _normalize_url(payload.get("cover_url"), self.qidian_url)
+            cover_image = _download_best_cover_image(cover_url, referer=self.qidian_url) if cover_url else None
+            if cover_image:
+                if cover_image.url != cover_url:
+                    self.log("INFO", f"{source}: выбрана более крупная обложка: {cover_image.url}")
+                self.log(
+                    "INFO",
+                    f"{source}: обложка {cover_image.width}x{cover_image.height}, {len(cover_image.content) / 1024:.1f} KB.",
+                )
+                cover_url = cover_image.url
             description = _clean_multiline(payload.get("description"))
             if not validate_fanqie_url(self.qidian_url):
                 description = _select_qidian_description(
@@ -1590,7 +1739,7 @@ class QidianFetchWorker(QThread):
                 author_name=author_name,
                 description=description,
                 cover_url=cover_url,
-                cover_image_data=_download_cover_image(cover_url, referer=self.qidian_url),
+                cover_image_data=cover_image.content if cover_image else b"",
             )
             if not metadata.title_original:
                 raise ValueError(f"{source}: не удалось определить название книги.")
@@ -1869,12 +2018,25 @@ class AiPrepareWorker(QThread):
         self.active_keys = active_keys or []
         self.settings_manager = settings_manager
         self.visible_browser = visible_browser
+        self._cancel_event = Event()
 
     def log(self, level: str, message: str) -> None:
         self.log_signal.emit(level, message)
 
+    def cancel(self) -> None:
+        self._cancel_event.set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancel_event.is_set()
+
+    def _raise_if_cancelled(self) -> None:
+        if self.is_cancelled:
+            raise OperationCancelledError("Генерация отменена пользователем.")
+
     def run(self) -> None:
         try:
+            self._raise_if_cancelled()
             english_title = ""
             try:
                 self.log("INFO", "Google Translate: перевожу название на английский...")
@@ -1888,6 +2050,7 @@ class AiPrepareWorker(QThread):
             if not self.active_keys:
                 raise ValueError("Не выбран активный ключ или сессия для AI-сервиса.")
 
+            self._raise_if_cancelled()
             self.log("INFO", "AI: перевожу название и описание...")
             translation_prompt = build_ai_prompt(self.metadata, english_title)
             translation_response = self._run_ai_request(
@@ -1895,6 +2058,7 @@ class AiPrepareWorker(QThread):
                 log_prefix="Qidian -> Rulate translation",
                 max_output_tokens=2048,
             )
+            self._raise_if_cancelled()
             prepared = parse_translation_metadata(translation_response)
             if english_title and not prepared.english_title:
                 prepared.english_title = english_title
@@ -1920,6 +2084,7 @@ class AiPrepareWorker(QThread):
             else:
                 self.log("WARNING", "Источник: ссылка на оригинал не задана, промпт обложки будет без текста глав.")
 
+            self._raise_if_cancelled()
             self.log("INFO", "AI: подбираю жанры, теги и промпт обложки...")
             catalog_prompt = build_catalog_prompt(self.metadata, prepared, chapters_text)
             catalog_response = self._run_ai_request(
@@ -1927,6 +2092,7 @@ class AiPrepareWorker(QThread):
                 log_prefix="Qidian -> Rulate catalog",
                 max_output_tokens=4096,
             )
+            self._raise_if_cancelled()
             catalog = parse_catalog_metadata(catalog_response)
             prepared.genres = catalog.genres
             prepared.tags = catalog.tags
@@ -1936,6 +2102,8 @@ class AiPrepareWorker(QThread):
 
             self.prepared_ready.emit(prepared)
             self.log("SUCCESS", "AI: данные для Rulate подготовлены.")
+        except OperationCancelledError:
+            self.log("INFO", "AI: генерация отменена пользователем.")
         except Exception as error:
             self.log("ERROR", f"AI: {error}")
             self.log("DEBUG", traceback.format_exc())
@@ -1958,6 +2126,7 @@ class AiPrepareWorker(QThread):
             log_callback=self.log,
             log_prefix=log_prefix,
             max_output_tokens=max_output_tokens,
+            cancel_event=self._cancel_event,
         )
 
 
@@ -2047,6 +2216,517 @@ class CoverPromptWorker(QThread):
         return chapters_text
 
 
+CODEX_COVER_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+CODEX_COVER_MODEL = "gpt-5.5"
+CODEX_GENERATED_IMAGE_RE = re.compile(
+    r"(?P<path>[A-Za-z]:\\[^\r\n`<>|?\"]*?\\.codex\\generated_images\\[^\r\n`<>|?\"]+\.(?:png|jpe?g|webp))",
+    re.IGNORECASE,
+)
+CODEX_GENERATED_IMAGE_DIR_RE = re.compile(
+    r"(?P<path>[A-Za-z]:\\[^\r\n`<>|?*\"]*?\\.codex\\generated_images\\[0-9a-f-]{8,})(?=\\|[`'\"\s\r\n]|$)",
+    re.IGNORECASE,
+)
+RULATE_COVER_UPLOAD_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif"}
+RULATE_COVER_UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+RULATE_COVER_UPLOAD_SELECTORS = (
+    'input[type="file"][name="Book[new_img]"]',
+    'input[type="file"][id^="Book[new_img]"]',
+    '.image-cropper input[type="file"][name="Book[new_img]"]',
+    '.image-cropper input[type="file"]',
+)
+RULATE_COVER_CROPPER_OK_SELECTORS = (
+    ('dialog[open] button[data-action="ok"]', 10000),
+    ('.image-cropper dialog[open] button[data-action="ok"]', 10000),
+    ('.image-cropper-actions button[data-action="ok"]', 1500),
+    ('dialog button[data-action="ok"]', 1500),
+)
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _normalize_codex_candidate(path_value: str | os.PathLike[str]) -> Path:
+    candidate = Path(path_value)
+    if candidate.is_dir():
+        executable_name = "codex.exe" if sys.platform == "win32" else "codex"
+        return candidate / executable_name
+    return candidate
+
+
+def _find_codex_executable() -> str:
+    candidates: list[Path] = []
+    for env_name in ("CODEX_BIN", "CODEX_EXE"):
+        env_value = os.environ.get(env_name)
+        if env_value:
+            candidates.append(_normalize_codex_candidate(env_value))
+
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "OpenAI" / "Codex" / "bin" / "codex.exe")
+        candidates.append(Path.home() / ".codex" / ".sandbox-bin" / "codex.exe")
+
+    for executable_name in ("codex.exe", "codex"):
+        resolved = shutil.which(executable_name)
+        if resolved:
+            candidates.append(_normalize_codex_candidate(resolved))
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return str(candidate)
+    return "codex"
+
+
+def _safe_cover_filename_stem(title: str) -> str:
+    cleaned = re.sub(r"[^\w.-]+", "_", (title or "").strip(), flags=re.UNICODE).strip("._-")
+    return (cleaned[:48] or "cover").strip("._-") or "cover"
+
+
+def _tail_text(text: str, limit: int = 4000) -> str:
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def _build_codex_cover_exec_command(target_path: Path, output_dir: Path, extra_args: list[str] | None = None) -> list[str]:
+    project_root = _project_root()
+    command = [
+        _find_codex_executable(),
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--model",
+        CODEX_COVER_MODEL,
+        "--sandbox",
+        "workspace-write",
+        "--cd",
+        str(project_root),
+        "--ignore-user-config",
+        "--skip-git-repo-check",
+        "--ephemeral",
+    ]
+    if extra_args:
+        command.extend(extra_args)
+    try:
+        target_path.relative_to(project_root.resolve())
+    except ValueError:
+        command.extend(["--add-dir", str(output_dir.resolve())])
+    return command
+
+
+def _append_codex_prompt(command: list[str], prompt: str) -> list[str]:
+    command.extend(["--", prompt])
+    return command
+
+
+def _copy_cover_image_file(source_path: Path, target_path: Path) -> Path | None:
+    if not source_path.is_file() or source_path.stat().st_size <= 0:
+        return None
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, target_path)
+    if target_path.is_file() and target_path.stat().st_size > 0:
+        return target_path.resolve()
+    return None
+
+
+def _copy_latest_cover_image_from_directory(directory_path: Path, target_path: Path) -> Path | None:
+    if not directory_path.is_dir():
+        return None
+    candidates = [
+        path
+        for path in directory_path.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in CODEX_COVER_IMAGE_EXTENSIONS
+        and path.stat().st_size > 0
+    ]
+    if not candidates:
+        return None
+    return _copy_cover_image_file(max(candidates, key=lambda item: item.stat().st_mtime), target_path)
+
+
+def _copy_codex_generated_image_path(path_value: str, target_path: Path) -> Path | None:
+    path_text = (path_value or "").strip().strip("`'\"")
+    if not path_text:
+        return None
+
+    try:
+        if "*" in path_text:
+            candidates = [
+                Path(match)
+                for match in glob.glob(path_text)
+                if Path(match).is_file()
+                and Path(match).suffix.lower() in CODEX_COVER_IMAGE_EXTENSIONS
+                and Path(match).stat().st_size > 0
+            ]
+            if candidates:
+                return _copy_cover_image_file(max(candidates, key=lambda item: item.stat().st_mtime), target_path)
+            source_parent = Path(path_text).parent
+            copied_path = _copy_latest_cover_image_from_directory(source_parent, target_path)
+            if copied_path:
+                return copied_path
+
+        source_path = Path(path_text)
+        copied_path = _copy_cover_image_file(source_path, target_path)
+        if copied_path:
+            return copied_path
+        copied_path = _copy_latest_cover_image_from_directory(source_path, target_path)
+        if copied_path:
+            return copied_path
+        return _copy_latest_cover_image_from_directory(source_path.parent, target_path)
+    except OSError:
+        return None
+
+
+def _copy_recent_codex_generated_image(target_path: Path, started_at: float) -> Path | None:
+    generated_root = Path.home() / ".codex" / "generated_images"
+    if not generated_root.exists():
+        return None
+    candidates: list[Path] = []
+    for path in generated_root.rglob("*"):
+        try:
+            if (
+                path.is_file()
+                and path.suffix.lower() in CODEX_COVER_IMAGE_EXTENSIONS
+                and path.stat().st_size > 0
+                and path.stat().st_mtime >= started_at - 5
+            ):
+                candidates.append(path)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return _copy_cover_image_file(max(candidates, key=lambda item: item.stat().st_mtime), target_path)
+
+
+def _copy_codex_generated_image_from_output(output_text: str, target_path: Path) -> Path | None:
+    seen: set[str] = set()
+    for pattern in (CODEX_GENERATED_IMAGE_RE, CODEX_GENERATED_IMAGE_DIR_RE):
+        for match in pattern.finditer(output_text or ""):
+            path_value = match.group("path").strip()
+            key = path_value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            copied_path = _copy_codex_generated_image_path(path_value, target_path)
+            if copied_path:
+                return copied_path
+    return None
+
+
+def _find_generated_cover(
+    output_dir: Path,
+    target_path: Path,
+    started_at: float,
+    *,
+    codex_output: str = "",
+) -> Path | None:
+    if target_path.is_file() and target_path.stat().st_size > 0:
+        return target_path
+    copied_path = _copy_codex_generated_image_from_output(codex_output, target_path)
+    if copied_path:
+        return copied_path
+    if "generated_images" in (codex_output or "").lower():
+        copied_path = _copy_recent_codex_generated_image(target_path, started_at)
+        if copied_path:
+            return copied_path
+    if not output_dir.exists():
+        return None
+    candidates: list[Path] = []
+    for path in output_dir.rglob("*"):
+        try:
+            if (
+                path.is_file()
+                and path.suffix.lower() in CODEX_COVER_IMAGE_EXTENSIONS
+                and "_source_" not in path.name.lower()
+                and path.stat().st_size > 0
+                and path.stat().st_mtime >= started_at - 2
+            ):
+                candidates.append(path)
+        except OSError:
+            continue
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item.stat().st_mtime)
+
+
+def _build_codex_cover_generation_prompt(cover_prompt: str, target_path: Path) -> str:
+    return f"""Use the imagegen skill/tool to generate a finished raster book cover.
+
+Do not edit source code. Do not create an SVG or placeholder. Generate an actual bitmap cover image.
+Save the final image at this exact absolute path:
+{target_path}
+
+If imagegen saves the image under CODEX_HOME/generated_images and shell copy/write commands are blocked, do not run shell copy commands. Reply with the exact generated image file path, wildcard path, or generated image directory; the outer app will copy it to the target path.
+The output should be a portrait book cover, PNG preferred, suitable for visual preview in a desktop app.
+After saving or generating, reply only with the absolute saved path or generated image path.
+
+Cover prompt:
+{cover_prompt.strip()}
+"""
+
+
+def _build_codex_cover_translation_prompt(title_ru: str, target_path: Path) -> str:
+    quoted_title = json.dumps(title_ru.strip(), ensure_ascii=False)
+    return f"""Use the imagegen skill/tool to edit the attached original book cover image.
+
+Task:
+- Remove every existing visible text element from the cover: original title, subtitles, author text, logos, ad banners, promo stickers, QR codes, watermarks, labels, and any other text-like marks.
+- Reconstruct the covered artwork naturally where text was removed. Preserve the original characters, background, composition, lighting, palette, rendering style, and mood.
+- Put this exact Russian title on the cover: {quoted_title}
+- Match the original cover's typography placement, scale, color logic, paint texture, effects, decorative details, and visual hierarchy. The new title must look native to the original art, not pasted on.
+- Add small ornamental/details around the title only when they support the original cover style and make the typography integrate better.
+- Final output must be a polished portrait book cover, 2:3 aspect ratio, high-detail 4K-quality look, PNG preferred.
+
+Save the final edited/upscaled image at this exact absolute path:
+{target_path}
+
+If imagegen saves the edited image under CODEX_HOME/generated_images and shell copy/write commands are blocked, do not run shell copy commands. Reply with the exact generated image file path, wildcard path, or generated image directory; the outer app will copy it to the target path.
+After saving or generating, reply only with the absolute saved path or generated image path.
+"""
+
+
+def _cover_source_extension(image_data: bytes) -> str:
+    if image_data.startswith(b"\x89PNG"):
+        return ".png"
+    if image_data.startswith(b"\xff\xd8"):
+        return ".jpg"
+    if image_data.startswith(b"GIF"):
+        return ".gif"
+    if image_data.startswith(b"RIFF") and b"WEBP" in image_data[:16]:
+        return ".webp"
+    return ".jpg"
+
+
+def _load_cover_image_from_file(image_path: str | Path) -> CoverImageDownload | None:
+    path = Path(image_path).expanduser()
+    if not path.is_file():
+        return None
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return None
+    width, height = _image_dimensions(content)
+    if not width or not height:
+        return None
+    return CoverImageDownload(
+        url=str(path.resolve()),
+        content=content,
+        width=width,
+        height=height,
+    )
+
+
+def _save_cover_source_image(image_data: bytes, output_dir: Path, title: str) -> Path:
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    source_path = output_dir / f"{_safe_cover_filename_stem(title)}_source_{timestamp}{_cover_source_extension(image_data)}"
+    source_path.write_bytes(image_data)
+    return source_path.resolve()
+
+
+class CodexCoverGenerateWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    cover_ready = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, cover_prompt: str, *, title_ru: str = "", output_dir: str | Path | None = None):
+        super().__init__()
+        self.cover_prompt = (cover_prompt or "").strip()
+        self.title_ru = (title_ru or "").strip()
+        self.output_dir = Path(output_dir) if output_dir else _project_root() / "output" / "codex_covers"
+
+    def log(self, level: str, message: str) -> None:
+        self.log_signal.emit(level, message)
+
+    def _target_path(self) -> Path:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return self.output_dir / f"{_safe_cover_filename_stem(self.title_ru)}_{timestamp}.png"
+
+    def run(self) -> None:
+        try:
+            if not self.cover_prompt:
+                raise ValueError("Сначала заполните промпт обложки.")
+
+            project_root = _project_root()
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            target_path = self._target_path().resolve()
+            prompt = _build_codex_cover_generation_prompt(self.cover_prompt, target_path)
+            command = _build_codex_cover_exec_command(target_path, self.output_dir)
+            _append_codex_prompt(command, prompt)
+
+            self.log("INFO", f"Codex: запускаю генерацию обложки в {target_path}")
+            started_at = time.time()
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            completed = subprocess.run(
+                command,
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1200,
+                creationflags=creationflags,
+                check=False,
+            )
+
+            if completed.stdout.strip():
+                self.log("DEBUG", "Codex stdout:\n" + _tail_text(completed.stdout))
+            if completed.stderr.strip():
+                self.log("DEBUG", "Codex stderr:\n" + _tail_text(completed.stderr))
+            if completed.returncode != 0:
+                details = _tail_text(completed.stderr or completed.stdout)
+                raise RuntimeError(f"Codex завершился с кодом {completed.returncode}. {details}".strip())
+
+            generated_path = _find_generated_cover(
+                self.output_dir,
+                target_path,
+                started_at,
+                codex_output="\n".join([completed.stdout, completed.stderr]),
+            )
+            if not generated_path:
+                details = _tail_text(completed.stdout or completed.stderr)
+                raise RuntimeError(
+                    "Codex завершился без найденного файла обложки в output/codex_covers. "
+                    + details
+                )
+
+            self.cover_ready.emit(str(generated_path.resolve()))
+            self.log("SUCCESS", f"Codex: обложка создана: {generated_path.resolve()}")
+        except subprocess.TimeoutExpired:
+            self.log("ERROR", "Codex: генерация обложки превысила лимит 20 минут.")
+        except FileNotFoundError:
+            self.log("ERROR", "Codex CLI не найден. Установите Codex или добавьте codex.exe в PATH.")
+        except Exception as error:
+            self.log("ERROR", f"Codex cover: {error}")
+            self.log("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+
+class CodexCoverTranslateWorker(QThread):
+    log_signal = pyqtSignal(str, str)
+    cover_ready = pyqtSignal(str)
+    finished_signal = pyqtSignal()
+
+    def __init__(
+        self,
+        cover_url: str,
+        title_ru: str,
+        *,
+        referer: str = "",
+        source_image_path: str | Path = "",
+        output_dir: str | Path | None = None,
+    ):
+        super().__init__()
+        self.cover_url = (cover_url or "").strip()
+        self.title_ru = (title_ru or "").strip()
+        self.referer = (referer or "").strip()
+        self.source_image_path = str(source_image_path or "").strip()
+        self.output_dir = Path(output_dir) if output_dir else _project_root() / "output" / "codex_covers"
+
+    def log(self, level: str, message: str) -> None:
+        self.log_signal.emit(level, message)
+
+    def _target_path(self) -> Path:
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        return self.output_dir / f"{_safe_cover_filename_stem(self.title_ru)}_translated_{timestamp}.png"
+
+    def run(self) -> None:
+        try:
+            if not self.cover_url and not self.source_image_path:
+                raise ValueError("Сначала загрузите или укажите URL исходной обложки.")
+            if not self.title_ru:
+                raise ValueError("Сначала заполните русское название.")
+
+            project_root = _project_root()
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            cover_image = None
+            if self.source_image_path:
+                self.log("INFO", f"Codex: использую локальную исходную обложку: {self.source_image_path}")
+                cover_image = _load_cover_image_from_file(self.source_image_path)
+                if not cover_image and not self.cover_url:
+                    raise RuntimeError("Не удалось прочитать локальную исходную обложку.")
+                if not cover_image:
+                    self.log("WARNING", "Codex: локальная исходная обложка не прочитана, пробую скачать по URL.")
+
+            if not cover_image:
+                self.log("INFO", "Codex: скачиваю исходную обложку для редактирования...")
+                cover_image = _download_best_cover_image(self.cover_url, referer=self.referer)
+            if not cover_image:
+                raise RuntimeError("Не удалось скачать исходную обложку.")
+            if self.cover_url and cover_image.url != self.cover_url:
+                self.log("INFO", f"Codex: выбран более крупный URL обложки: {cover_image.url}")
+            self.log(
+                "INFO",
+                f"Codex: в работу передана обложка {cover_image.width}x{cover_image.height}, "
+                f"{len(cover_image.content) / 1024:.1f} KB.",
+            )
+
+            source_path = _save_cover_source_image(cover_image.content, self.output_dir, self.title_ru)
+            target_path = self._target_path().resolve()
+            prompt = _build_codex_cover_translation_prompt(self.title_ru, target_path)
+            command = _build_codex_cover_exec_command(
+                target_path,
+                self.output_dir,
+                extra_args=["--image", str(source_path)],
+            )
+            _append_codex_prompt(command, prompt)
+
+            self.log("INFO", f"Codex: редактирую обложку и сохраняю результат в {target_path}")
+            started_at = time.time()
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            completed = subprocess.run(
+                command,
+                cwd=str(project_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1200,
+                creationflags=creationflags,
+                check=False,
+            )
+
+            if completed.stdout.strip():
+                self.log("DEBUG", "Codex stdout:\n" + _tail_text(completed.stdout))
+            if completed.stderr.strip():
+                self.log("DEBUG", "Codex stderr:\n" + _tail_text(completed.stderr))
+            if completed.returncode != 0:
+                details = _tail_text(completed.stderr or completed.stdout)
+                raise RuntimeError(f"Codex завершился с кодом {completed.returncode}. {details}".strip())
+
+            generated_path = _find_generated_cover(
+                self.output_dir,
+                target_path,
+                started_at,
+                codex_output="\n".join([completed.stdout, completed.stderr]),
+            )
+            if not generated_path:
+                details = _tail_text(completed.stdout or completed.stderr)
+                raise RuntimeError(
+                    "Codex завершился без найденного файла переведённой обложки в output/codex_covers. "
+                    + details
+                )
+
+            self.cover_ready.emit(str(generated_path.resolve()))
+            self.log("SUCCESS", f"Codex: переведённая обложка создана: {generated_path.resolve()}")
+        except subprocess.TimeoutExpired:
+            self.log("ERROR", "Codex: перевод обложки превысил лимит 20 минут.")
+        except FileNotFoundError:
+            self.log("ERROR", "Codex CLI не найден. Установите Codex или добавьте codex.exe в PATH.")
+        except Exception as error:
+            self.log("ERROR", f"Codex cover translation: {error}")
+            self.log("DEBUG", traceback.format_exc())
+        finally:
+            self.finished_signal.emit()
+
+
 class RulateFillWorker(QThread):
     log_signal = pyqtSignal(str, str)
     finished_signal = pyqtSignal()
@@ -2087,6 +2767,7 @@ class RulateFillWorker(QThread):
                     return
 
                 self._fill_general(page)
+                self._upload_generated_cover(page)
                 self._fill_description(page)
                 self.log(
                     "SUCCESS",
@@ -2231,6 +2912,77 @@ class RulateFillWorker(QThread):
         elif translator_team_mode == "first_suggestion":
             self.log("SUCCESS", "Rulate: выбрана первая подсказка команды переводчиков.")
 
+    def _upload_generated_cover(self, page) -> None:
+        cover_path_value = (getattr(self.draft.prepared, "generated_cover_path", "") or "").strip()
+        if not cover_path_value:
+            return
+
+        cover_path = Path(cover_path_value).expanduser()
+        if not cover_path.is_file():
+            self.log("WARNING", f"Rulate: файл Codex-обложки не найден: {cover_path}")
+            return
+
+        suffix = cover_path.suffix.lower()
+        if suffix not in RULATE_COVER_UPLOAD_EXTENSIONS:
+            self.log(
+                "WARNING",
+                f"Rulate: формат Codex-обложки {suffix or '<none>'} не подходит для загрузчика Rulate. Нужен PNG, JPG или GIF.",
+            )
+            return
+
+        try:
+            size = cover_path.stat().st_size
+        except OSError:
+            size = 0
+        if size > RULATE_COVER_UPLOAD_MAX_BYTES:
+            self.log(
+                "WARNING",
+                f"Rulate: Codex-обложка больше 10 МБ ({size / 1024 / 1024:.1f} МБ), загрузчик Rulate может ее отклонить.",
+            )
+
+        _show_rulate_tab(page, "general")
+        file_input = None
+        for selector in RULATE_COVER_UPLOAD_SELECTORS:
+            try:
+                locator = page.locator(selector)
+                if locator.count() > 0:
+                    file_input = locator.first
+                    break
+            except Exception:
+                continue
+
+        if file_input is None:
+            self.log("WARNING", "Rulate: поле загрузки основной картинки Book[new_img] не найдено.")
+            return
+
+        try:
+            file_input.set_input_files(str(cover_path))
+            page.wait_for_timeout(700)
+        except Exception as error:
+            self.log("WARNING", f"Rulate: не удалось выбрать файл Codex-обложки: {error}")
+            return
+
+        if self._confirm_cover_cropper(page):
+            self.log("SUCCESS", f"Rulate: Codex-обложка загружена в основную картинку: {cover_path}")
+        else:
+            self.log(
+                "SUCCESS",
+                f"Rulate: файл Codex-обложки выбран: {cover_path}. Если cropper остался открыт, нажмите Ок вручную.",
+            )
+
+    def _confirm_cover_cropper(self, page) -> bool:
+        for selector, timeout in RULATE_COVER_CROPPER_OK_SELECTORS:
+            try:
+                button = page.locator(selector)
+                if button.count() == 0:
+                    continue
+                button.last.click(timeout=timeout)
+                page.wait_for_timeout(700)
+                return True
+            except Exception:
+                continue
+        return False
+
     def _fill_description(self, page) -> None:
         prepared = self.draft.prepared
         _show_rulate_tab(page, "description")
@@ -2249,10 +3001,10 @@ class RulateFillWorker(QThread):
             }""",
             prepared.translated_description,
         )
-        for genre in prepared.genres[:5]:
+        for genre in prepared.genres[:7]:
             if not _select_magic_value(page, "#Book_genres", genre, allow_free=False):
                 self.log("WARNING", f"Rulate: жанр '{genre}' не найден в форме и пропущен.")
-        for tag in prepared.tags[:8]:
+        for tag in prepared.tags[:15]:
             if not _select_magic_value(page, "#Book_tags", tag, allow_free=False):
                 self.log("WARNING", f"Rulate: тег '{tag}' не найден в форме и пропущен.")
 
@@ -2271,6 +3023,7 @@ class _SingleRequestWorker:
         api_key: str,
         model_settings: dict,
         log_callback,
+        cancel_event: Event | None = None,
     ):
         self.settings_manager = settings_manager
         self.provider_config = provider_config
@@ -2279,7 +3032,8 @@ class _SingleRequestWorker:
         self.model_id = model_config.get("id")
         self.prompt_builder = _PromptBuilder()
         self.system_instruction = None
-        self.is_cancelled = False
+        self._is_cancelled = False
+        self._cancel_event = cancel_event
         self.sync_executor = None
         self.temperature = model_settings.get("temperature")
         self.temperature_override_enabled = model_settings.get("temperature_override_enabled", False)
@@ -2297,6 +3051,14 @@ class _SingleRequestWorker:
         self.debug_operation_filters = model_settings.get("debug_operation_filters", "")
         self.debug_max_log_mb = model_settings.get("debug_max_log_mb", 128)
         self._log_callback = log_callback
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._is_cancelled or bool(self._cancel_event is not None and self._cancel_event.is_set())
+
+    @is_cancelled.setter
+    def is_cancelled(self, value: bool) -> None:
+        self._is_cancelled = bool(value)
 
     def _post_event(self, event: str, data: dict | None = None) -> None:
         message = (data or {}).get("message") if isinstance(data, dict) else None

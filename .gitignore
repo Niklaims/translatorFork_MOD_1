@@ -43,6 +43,7 @@ settings.json
 .epub_translator_openrouter.json
 
 # Generated output and archives
+output/codex_covers/
 *_translated.html
 *_translated_openrouter.html
 *_openrouter_failed.html

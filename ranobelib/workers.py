@@ -1162,11 +1162,6 @@ class RulateDownloadWorker(QThread):
         self.skip_after = skip_after
         self.chapter_ids = chapter_ids
         self.chapter_infos = chapter_infos or []
-        self._chapter_info_by_id = {
-            str(ch.get("id")): ch
-            for ch in self.chapter_infos
-            if ch and ch.get("id") is not None
-        }
         self.is_running = True
         self._mode = "download" if chapter_ids else "list"
 
@@ -1265,10 +1260,6 @@ class RulateDownloadWorker(QThread):
             logging.error(traceback.format_exc())
 
     @staticmethod
-    def _chapter_has_part(title: str) -> bool:
-        return bool(re.search(r"(?:Часть|Part)\s*\d+\s*$", title or "", re.IGNORECASE))
-
-    @staticmethod
     def _number_key(number) -> str:
         try:
             return format_num(float(number))
@@ -1342,24 +1333,6 @@ class RulateDownloadWorker(QThread):
 
         return annotated
 
-    def _should_download_individually(self) -> bool:
-        if not self.chapter_infos or len(self.chapter_ids or []) <= 1:
-            return False
-
-        seen_numbers = set()
-        for info in self.chapter_infos:
-            title = info.get("title", "")
-            number = info.get("number", 0)
-            if self._chapter_has_part(title):
-                return True
-
-            number_key = self._number_key(number)
-            if number_key and number_key in seen_numbers:
-                return True
-            if number_key:
-                seen_numbers.add(number_key)
-        return False
-
     def _apply_chapter_info(self, chapter: ChapterData, info: dict | None):
         if not info:
             return
@@ -1388,92 +1361,37 @@ class RulateDownloadWorker(QThread):
         if not chapters or not infos:
             return
 
-        unused_infos = list(infos)
+        unused_infos = list(enumerate(infos))
+        ordered_matches = []
+        unmatched_chapters = []
         for chapter in chapters:
             matched = None
-            for info in unused_infos:
+            matched_order = None
+            for info_order, info in unused_infos:
                 try:
                     info_number = float(info.get("number") or 0)
                 except (TypeError, ValueError):
                     info_number = 0.0
                 if info_number and abs(float(chapter.number) - info_number) < 0.0001:
                     matched = info
+                    matched_order = info_order
                     break
 
             if matched is None and len(chapters) == len(infos):
-                matched = unused_infos[0]
+                matched_order, matched = unused_infos[0]
 
             if matched:
                 self._apply_chapter_info(chapter, matched)
-                unused_infos.remove(matched)
+                ordered_matches.append((matched_order, chapter))
+                unused_infos.remove((matched_order, matched))
+            else:
+                unmatched_chapters.append(chapter)
 
-    def _parse_downloaded_file(self, file_path: str, chapter_info: dict | None = None) -> list[ChapterData]:
-        if file_path.lower().endswith(".zip"):
-            chapters = FileParser.parse_zip_docx(file_path, self.default_vol, self.log)
-        elif file_path.lower().endswith(".docx"):
-            doc = Document(file_path)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            content = "\n".join(paragraphs)
-            chapters = [ChapterData(self.default_vol, 1, "", content)]
-        else:
-            self.log("ERROR", f"Rulate: unknown downloaded file format: {file_path}")
-            return []
-
-        if chapter_info and len(chapters) == 1:
-            self._apply_chapter_info(chapters[0], chapter_info)
-        return chapters
-
-    def _select_download_checkboxes(self, page, chapter_ids: list[str]) -> int:
-        page.evaluate("""() => {
-            document.querySelectorAll('input.download_chapter').forEach(cb => {
-                cb.checked = false;
-            });
-        }""")
-
-        return page.evaluate("""(ids) => {
-            let count = 0;
-            for (const id of ids) {
-                const row = document.querySelector(`tr[data-id="${id}"]`);
-                if (row) {
-                    const cb = row.querySelector('input.download_chapter');
-                    if (cb) {
-                        cb.checked = true;
-                        count++;
-                    }
-                }
-            }
-            return count;
-        }""", [str(cid) for cid in chapter_ids])
-
-    def _download_selected_file(self, page, chapter_ids: list[str], chapter_info: dict | None = None) -> list[ChapterData]:
-        checked_count = self._select_download_checkboxes(page, chapter_ids)
-        self.log("INFO", f"Rulate: отмечено {checked_count} из {len(chapter_ids)} глав")
-
-        if checked_count == 0:
-            self.log("ERROR", "Rulate: ни одна глава не была отмечена для скачивания.")
-            return []
-
-        self.log("INFO", "Rulate: запускаю скачивание .docx…")
-        with page.expect_download(timeout=120000) as download_info:
-            page.click('input[name="download_d"]')
-
-        download = download_info.value
-        self.log("INFO", f"Rulate: файл скачивается: {download.suggested_filename}")
-
-        tmp_dir = tempfile.mkdtemp(prefix="rulate_")
-        try:
-            zip_path = os.path.join(tmp_dir, download.suggested_filename or "rulate_chapters.zip")
-            download.save_as(zip_path)
-            self.log("SUCCESS", f"Rulate: файл сохранён ({os.path.getsize(zip_path):,} байт)")
-            self.log("INFO", "Rulate: разбираю скачанный архив…")
-            return self._parse_downloaded_file(zip_path, chapter_info)
-        finally:
-            try:
-                for name in os.listdir(tmp_dir):
-                    os.remove(os.path.join(tmp_dir, name))
-                os.rmdir(tmp_dir)
-            except OSError:
-                pass
+        if ordered_matches:
+            chapters[:] = [
+                chapter
+                for _order, chapter in sorted(ordered_matches, key=lambda item: item[0])
+            ] + unmatched_chapters
 
     def _download_chapters(self):
         """Скачать выбранные главы через форму «Скачать .docx»."""
@@ -1500,43 +1418,6 @@ class RulateDownloadWorker(QThread):
 
                 self.log("INFO", "Rulate: выбираю главы…")
                 self.progress_signal.emit(10)
-
-                if self._should_download_individually():
-                    total = len(self.chapter_ids)
-                    chapters = []
-                    self.log(
-                        "INFO",
-                        "Rulate: обнаружены главы с частями; скачиваю по одной, чтобы архив не потерял одноимённые части",
-                    )
-                    for index, chapter_id in enumerate(self.chapter_ids, start=1):
-                        if not self.is_running:
-                            break
-                        chapter_info = self._chapter_info_by_id.get(str(chapter_id))
-                        title = (chapter_info or {}).get("title") or str(chapter_id)
-                        self.log("INFO", f"Rulate: [{index}/{total}] {title}")
-                        try:
-                            chapters.extend(
-                                self._download_selected_file(
-                                    page, [str(chapter_id)], chapter_info
-                                )
-                            )
-                        except Exception as item_error:
-                            self.log(
-                                "ERROR",
-                                f"Rulate: ошибка скачивания главы {title}: {item_error}",
-                            )
-                            logging.error(traceback.format_exc())
-                        self.progress_signal.emit(10 + int(index * 90 / max(1, total)))
-
-                    browser.close()
-                    self.progress_signal.emit(100)
-
-                    if chapters:
-                        self.log("SUCCESS", f"Rulate: получено {len(chapters)} глав")
-                        self.chapters_ready.emit(chapters)
-                    else:
-                        self.log("WARNING", "Rulate: из выбранных глав не удалось извлечь ни одной главы")
-                    return
 
                 # Снимаем все чекбоксы, затем ставим нужные
                 page.evaluate("""() => {

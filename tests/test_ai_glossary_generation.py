@@ -1,4 +1,7 @@
 import unittest
+import tempfile
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -10,9 +13,50 @@ from gemini_translator.ui.dialogs.glossary_dialogs.ai_generation import (
     GenerationSessionDialog,
     GenerationSessionPage,
     SequentialTaskProvider,
+    _prepare_glossary_tasks_background,
 )
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.widgets.overlay_tab_widget import OverlayTabWidget
+
+
+class GlossaryBackgroundPreparationTests(unittest.TestCase):
+    def test_reads_epub_and_stores_glossary_batches(self):
+        class _TaskManager:
+            def __init__(self):
+                self.tasks = None
+
+            def set_pending_tasks(self, tasks):
+                self.tasks = list(tasks)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            with zipfile.ZipFile(epub_path, "w") as archive:
+                archive.writestr("Text/one.xhtml", "<html><body><p>中文章节</p></body></html>")
+                archive.writestr("Text/two.xhtml", "<html><body><p>Second chapter</p></body></html>")
+
+            manager = _TaskManager()
+            result = _prepare_glossary_tasks_background(
+                str(epub_path),
+                ["Text/one.xhtml", "Text/two.xhtml"],
+                {
+                    "use_batching": True,
+                    "chunking": False,
+                    "sequential_translation": False,
+                    "task_size_limit": 100000,
+                    "task_size_unit": "chars",
+                    "file_path": str(epub_path),
+                },
+                manager,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["is_any_cjk"])
+        self.assertEqual(result["task_count"], 1)
+        self.assertEqual(manager.tasks[0][0], "glossary_batch_task")
+        self.assertEqual(
+            tuple(manager.tasks[0][2]),
+            ("Text/one.xhtml", "Text/two.xhtml"),
+        )
 
 
 class _LineEditStub:

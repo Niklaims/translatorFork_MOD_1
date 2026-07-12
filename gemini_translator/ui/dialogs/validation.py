@@ -427,6 +427,14 @@ LINE_REVIEW_BLOCK_TAGS = (
     'tr', 'td', 'th',
 )
 LINE_REVIEW_BLOCK_TAG_RE = '|'.join(LINE_REVIEW_BLOCK_TAGS)
+LINE_REVIEW_ESCAPED_TAG_FRAGMENT_RE = re.compile(
+    r'&lt;\s*(?:/|[A-Za-z][A-Za-z0-9:_-]*(?:\s|/|&gt;))',
+    re.IGNORECASE,
+)
+LINE_REVIEW_SHELL_RE = re.compile(
+    r'^\s*(?:<\?xml\b|<!DOCTYPE\b|</?(?:html|head|title|body)\b)',
+    re.IGNORECASE,
+)
 
 
 def _split_line_review_text(text: str) -> list[str]:
@@ -469,10 +477,11 @@ def _line_review_visible_text(value) -> str:
 
 
 def ai_repair_candidate_warning(original_html: str, repaired_html: str) -> str:
+    warnings = []
     old_text = _line_review_visible_text(original_html)
     new_text = _line_review_visible_text(repaired_html)
     if len(old_text) >= 120 and len(new_text) < len(old_text) * 0.75:
-        return "после автоправки заметно меньше видимого текста"
+        warnings.append("после автоправки заметно меньше видимого текста")
 
     try:
         old_soup = BeautifulSoup(original_html or "", 'html.parser')
@@ -480,13 +489,36 @@ def ai_repair_candidate_warning(original_html: str, repaired_html: str) -> str:
         block_tags = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']
         old_blocks = len(old_soup.find_all(block_tags))
         new_blocks = len(new_soup.find_all(block_tags))
+        media_tags = ['img', 'svg', 'image', 'audio', 'video', 'source']
+        old_media = len(old_soup.find_all(media_tags))
+        new_media = len(new_soup.find_all(media_tags))
     except Exception:
         old_blocks = 0
         new_blocks = 0
+        old_media = 0
+        new_media = 0
 
     if old_blocks >= 4 and new_blocks < max(1, int(old_blocks * 0.65)):
-        return "после автоправки заметно меньше текстовых блоков"
-    return ""
+        warnings.append("после автоправки заметно меньше текстовых блоков")
+    if new_media < old_media:
+        warnings.append("после автоправки исчезли медиаэлементы")
+
+    for tag in ('html', 'head', 'body'):
+        old_has_tag = bool(re.search(fr'<{tag}\b', original_html or '', re.IGNORECASE))
+        new_has_tag = bool(re.search(fr'<{tag}\b', repaired_html or '', re.IGNORECASE))
+        if old_has_tag and not new_has_tag:
+            warnings.append(f"автоправка удаляет <{tag}> из XHTML-обвязки")
+
+    old_escaped_tags = len(LINE_REVIEW_ESCAPED_TAG_FRAGMENT_RE.findall(original_html or ''))
+    new_escaped_tags = len(LINE_REVIEW_ESCAPED_TAG_FRAGMENT_RE.findall(repaired_html or ''))
+    if new_escaped_tags > old_escaped_tags:
+        warnings.append("часть HTML-тега превращена в видимый текст")
+
+    has_document_root = bool(re.search(r'<(?:html|body)\b', repaired_html or '', re.IGNORECASE))
+    if has_document_root and not is_well_formed_xml(repaired_html or ''):
+        warnings.append("результат автоправки всё ещё содержит некорректный XHTML")
+
+    return "; ".join(dict.fromkeys(warnings))
 
 
 def line_review_change_risk(change) -> str:
@@ -497,7 +529,13 @@ def line_review_change_risk(change) -> str:
     new_visible = _line_review_visible_text(new_text)
 
     if kind == "delete":
+        if LINE_REVIEW_SHELL_RE.search(str(old_text or '')):
+            return "удаление служебной XHTML-обвязки"
         return "удаление строки"
+    old_escaped_tags = len(LINE_REVIEW_ESCAPED_TAG_FRAGMENT_RE.findall(str(old_text or '')))
+    new_escaped_tags = len(LINE_REVIEW_ESCAPED_TAG_FRAGMENT_RE.findall(str(new_text or '')))
+    if new_escaped_tags > old_escaped_tags:
+        return "часть HTML-тега превращена в видимый текст"
     if old_visible and not new_visible:
         return "новая строка пустая"
     if len(old_visible) >= 40 and len(new_visible) < len(old_visible) * 0.45:
@@ -738,7 +776,8 @@ class AIRepairReviewPage(ShellPage):
         layout = QVBoxLayout(self)
         intro = QLabel(
             "Выберите строки, которые нужно применить. Удаления и сильные сокращения сняты по умолчанию; "
-            "неподтверждённые строки останутся как были. Ячейки «Стало» можно редактировать вручную."
+            "неподтверждённые строки останутся как были. Служебная XHTML-обвязка сохраняется автоматически. "
+            "Ячейки «Стало» можно редактировать вручную."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -835,12 +874,17 @@ class AIRepairReviewPage(ShellPage):
         select_layout.addWidget(self.btn_select_all)
         select_layout.addWidget(self.btn_select_none)
         select_layout.addStretch()
+        self.selection_summary_label = QLabel()
+        select_layout.addWidget(self.selection_summary_label)
         layout.addLayout(select_layout)
 
         button_box = QDialogButtonBox()
-        apply_button = button_box.addButton("Применить выбранное", QDialogButtonBox.ButtonRole.AcceptRole)
+        self.apply_button = button_box.addButton(
+            "Применить выбранное",
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
         cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
-        apply_button.clicked.connect(self._accept_with_risk_check)
+        self.apply_button.clicked.connect(self._accept_with_risk_check)
         cancel_button.clicked.connect(self.reject)
         layout.addWidget(button_box)
 
@@ -898,6 +942,7 @@ class AIRepairReviewPage(ShellPage):
         self._populating_table = False
         if self.table.rowCount() > 0:
             self.table.selectRow(0)
+        self._update_selection_summary()
 
     def _format_line_label(self, change):
         kind = change.get("kind")
@@ -1033,9 +1078,13 @@ class AIRepairReviewPage(ShellPage):
                 check_item.setCheckState(Qt.CheckState.Checked)
         finally:
             self._populating_table = False
+        self._refresh_row_risk(row)
 
     def _on_table_item_changed(self, item):
         if self._populating_table or not item:
+            return
+        if item.column() == 0:
+            self._update_selection_summary()
             return
         if item.column() != 5:
             return
@@ -1043,23 +1092,116 @@ class AIRepairReviewPage(ShellPage):
         check_item = self.table.item(row, 0)
         if check_item:
             check_item.setCheckState(Qt.CheckState.Checked)
+        self._refresh_row_risk(row)
         if row == self._selected_row():
             self._sync_detail_editor_from_selection()
 
-    def _set_all_checked(self, checked: bool):
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item:
-                item.setCheckState(state)
+    def _refresh_row_risk(self, row):
+        _candidate_index, candidate, change = self._change_for_row(row)
+        check_item = self.table.item(row, 0)
+        new_item = self.table.item(row, 5)
+        if not candidate or not change or not check_item or not new_item:
+            self._update_selection_summary()
+            return
 
-    def _set_recommended_checked(self):
-        for row in range(self.table.rowCount()):
+        effective_change = dict(change)
+        display_text = new_item.text()
+        original_display = _review_line_text(change.get("new_text"))
+        if display_text != original_display:
+            effective_change["new_text"] = _line_review_display_to_line_text(
+                display_text,
+                change.get("new_text"),
+            )
+            if change.get("kind") == "delete" and display_text:
+                effective_change["kind"] = "replace"
+
+        risk_reason = line_review_change_risk(effective_change)
+        candidate_warning = candidate.get("warning") or ""
+        combined_reason = risk_reason or candidate_warning
+
+        self._populating_table = True
+        try:
+            check_item.setData(LINE_REVIEW_RISK_ROLE, combined_reason)
+            kind_item = self.table.item(row, 1)
+            if kind_item:
+                kind_item.setText(
+                    self._format_kind_label(
+                        effective_change,
+                        risk_reason,
+                        candidate_warning,
+                    )
+                )
+                kind_item.setToolTip(combined_reason or kind_item.text())
+            line_item = self.table.item(row, 3)
+            if line_item:
+                line_item.setText(self._format_line_label(effective_change))
+                line_item.setToolTip(line_item.text())
+
+            background = (
+                QBrush(QColor(255, 193, 7, 38))
+                if combined_reason
+                else QBrush()
+            )
+            for column in range(1, self.table.columnCount()):
+                cell = self.table.item(row, column)
+                if cell:
+                    cell.setBackground(background)
+        finally:
+            self._populating_table = False
+        self._update_selection_summary()
+
+    def _update_selection_summary(self):
+        total = self.table.rowCount()
+        selected = 0
+        recommended = 0
+        risky_selected = 0
+        selected_candidates = set()
+
+        for row in range(total):
             item = self.table.item(row, 0)
             if not item:
                 continue
-            default_checked = bool(item.data(LINE_REVIEW_DEFAULT_ROLE))
-            item.setCheckState(Qt.CheckState.Checked if default_checked else Qt.CheckState.Unchecked)
+            if bool(item.data(LINE_REVIEW_DEFAULT_ROLE)):
+                recommended += 1
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            selected += 1
+            if item.data(LINE_REVIEW_RISK_ROLE):
+                risky_selected += 1
+            payload = item.data(Qt.ItemDataRole.UserRole)
+            if payload:
+                selected_candidates.add(payload[0])
+
+        self.selection_summary_label.setText(
+            f"Выбрано: {selected}/{total} · Рекомендуемых: {recommended} · "
+            f"Рискованных: {risky_selected} · Глав: {len(selected_candidates)}"
+        )
+        self.apply_button.setEnabled(selected > 0)
+
+    def _set_all_checked(self, checked: bool):
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        self._populating_table = True
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if item:
+                    item.setCheckState(state)
+        finally:
+            self._populating_table = False
+        self._update_selection_summary()
+
+    def _set_recommended_checked(self):
+        self._populating_table = True
+        try:
+            for row in range(self.table.rowCount()):
+                item = self.table.item(row, 0)
+                if not item:
+                    continue
+                default_checked = bool(item.data(LINE_REVIEW_DEFAULT_ROLE))
+                item.setCheckState(Qt.CheckState.Checked if default_checked else Qt.CheckState.Unchecked)
+        finally:
+            self._populating_table = False
+        self._update_selection_summary()
 
     def _selected_risky_rows(self):
         rows = []
@@ -1073,6 +1215,17 @@ class AIRepairReviewPage(ShellPage):
         return rows
 
     def _accept_with_risk_check(self):
+        if not any(
+            self.table.item(row, 0)
+            and self.table.item(row, 0).checkState() == Qt.CheckState.Checked
+            for row in range(self.table.rowCount())
+        ):
+            QMessageBox.information(
+                self,
+                "Автоправка",
+                "Сначала выберите хотя бы одно изменение.",
+            )
+            return
         risky_rows = self._selected_risky_rows()
         if risky_rows:
             preview = "\n".join(
@@ -1084,7 +1237,7 @@ class AIRepairReviewPage(ShellPage):
             result = QMessageBox.question(
                 self,
                 "Есть рискованные изменения",
-                "Вы выбрали удаления или сильные сокращения.\n\n"
+                "Вы выбрали изменения, которые требуют ручной проверки.\n\n"
                 f"{preview}\n\n"
                 "Применить их всё равно?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2696,8 +2849,9 @@ class TranslationValidatorPage(ShellPage):
         structure_tooltip = "Проверяет соответствие ключевых тегов (<html>, <body>), заголовков (<h1>-<h6>), изображений и списков.\nТакже проверяет баланс тегов <p>."
         self.check_structure.setToolTip(structure_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
         ai_repair_tooltip = (
-            "Исправляет типовые ошибки ИИ в HTML: лишние символы < или > вне тегов, "
-            "текст напрямую внутри body без p, потерянную обёртку body и баланс p."
+            "Исправляет типовые ошибки ИИ в HTML: дублированные части тегов, лишние символы < или >, "
+            "текст напрямую внутри body без p, потерянную обёртку body и баланс p. "
+            "XHTML-обвязка сохраняется, а каждое изменение показывается перед применением."
         )
         self.btn_fix_ai_artifacts.setToolTip(ai_repair_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
         
