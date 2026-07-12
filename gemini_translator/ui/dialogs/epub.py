@@ -2001,10 +2001,22 @@ class TranslatedChaptersManagerDialog(QDialog):
             # Добавляем индикатор OPDS
             version_combo = self.table.cellWidget(i, self.COL_FILE)
             if version_combo:
-                filepath = version_combo.currentData()
-                if filepath in opds_filepaths:
+                current_filepath = version_combo.currentData()
+                
+                if current_filepath in opds_filepaths:
                     item.setText(f"{i + 1} 📡")
-                    item.setToolTip("Глава сейчас доступна на OPDS-сервере")
+                    item.setToolTip("Эта версия главы сейчас доступна на OPDS-сервере")
+                else:
+                    # Ищем, загружена ли другая (предыдущая) версия этой же главы
+                    is_other_version_on_opds = False
+                    for combo_idx in range(version_combo.count()):
+                        if version_combo.itemData(combo_idx) in opds_filepaths:
+                            is_other_version_on_opds = True
+                            break
+                    
+                    if is_other_version_on_opds:
+                        item.setText(f"{i + 1} 📡")
+                        item.setToolTip("Внимание: на OPDS загружена ДРУГАЯ (предыдущая) версия этой главы.\nНажмите 'Загрузить на OPDS', чтобы обновить её до текущей.")
                     
             self.table.setItem(i, self.COL_NUMBER, item)
 
