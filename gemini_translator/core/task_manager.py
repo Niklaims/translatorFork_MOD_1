@@ -1139,6 +1139,8 @@ class ChapterQueueManager(QObject):
         rowcount = 0
         # 2. Атомарное удаление (внутри транзакции)
         with self._get_write_conn() as conn:
+            conn.execute(f"DELETE FROM chunk_results WHERE task_id IN ({placeholders})", task_id_strs)
+            conn.execute(f"DELETE FROM task_errors WHERE task_id IN ({placeholders})", task_id_strs)
             cursor = conn.execute(f"DELETE FROM tasks WHERE task_id IN ({placeholders})", task_id_strs)
             rowcount = cursor.rowcount
         
@@ -1296,6 +1298,10 @@ class ChapterQueueManager(QObject):
             if deleted_task_ids:
                 delete_placeholders = ','.join('?' for _ in deleted_task_ids)
                 conn.execute(
+                    f"DELETE FROM chunk_results WHERE task_id IN ({delete_placeholders})",
+                    deleted_task_ids
+                )
+                conn.execute(
                     f"DELETE FROM task_errors WHERE task_id IN ({delete_placeholders})",
                     deleted_task_ids
                 )
@@ -1347,6 +1353,8 @@ class ChapterQueueManager(QObject):
 
     def clear_all_queues(self):
         with self._get_write_conn() as conn:
+            conn.execute("DELETE FROM chunk_results")
+            conn.execute("DELETE FROM task_errors")
             conn.execute("DELETE FROM tasks")
         self._safe_request_ui_update()
     
@@ -2063,6 +2071,7 @@ class ChapterQueueManager(QObject):
         # --- ЭТАП 2: Атомарная запись в БД (внутри транзакции) ---
         with self._get_write_conn() as conn:
             # Сначала всегда полная очистка задач и их ошибок (каскадно, но для надежности чистим всё)
+            conn.execute("DELETE FROM chunk_results")
             conn.execute("DELETE FROM tasks")
             conn.execute("DELETE FROM task_errors") # Явная очистка ошибок при сбросе очереди
             
@@ -2131,6 +2140,7 @@ class ChapterQueueManager(QObject):
                             errors_to_insert.append((task_id_str, error_type, timestamp))
 
         with self._get_write_conn() as conn:
+            conn.execute("DELETE FROM chunk_results")
             conn.execute("DELETE FROM tasks")
             conn.execute("DELETE FROM task_errors")
 

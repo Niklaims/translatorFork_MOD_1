@@ -1,0 +1,145 @@
+{
+  "name": "battle-real-epub-gemini-flash-lite-vs-gemma4",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\battle_real_epub_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\battle_real_epub_gemini_flash_lite_vs_gemma4\\battle-real-epub-gemini-flash-lite-vs-gemma4_20260706_174312",
+  "created_at": "2026-07-06T17:43:12.638287+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "project-default-real",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 10897,
+      "prompt_tokens_estimate": 4726,
+      "output_tokens_estimate": 3064,
+      "score": 95.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -1
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.406,
+        "reference_similarity": null,
+        "source_visible_chars": 2143,
+        "output_visible_chars": 7299,
+        "output_tokens_estimate": 3064
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -1}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__project-default-real__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\real-epub-chapter-00001-2143chars__project-default-real__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 4686,
+            "output_tokens": 3182,
+            "total_tokens": 7868,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "project-default-real",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "ok",
+      "latency_ms": 112353,
+      "prompt_tokens_estimate": 4726,
+      "output_tokens_estimate": 4527,
+      "score": 50.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "h1": 3,
+          "p": 2
+        },
+        "cjk_residue_chars": 43,
+        "length_ratio": 5.682,
+        "reference_similarity": null,
+        "source_visible_chars": 2143,
+        "output_visible_chars": 12177,
+        "output_tokens_estimate": 4527
+      },
+      "issues": [
+        "html tag count changed: {\"h1\": 3, \"p\": 2}",
+        "CJK residue chars: 43"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__project-default-real__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\real-epub-chapter-00001-2143chars__project-default-real__gemma-4-31b.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 4686,
+            "output_tokens": 4657,
+            "total_tokens": 9343,
+            "estimated": true,
+            "model_id": "gemma-4-31b-it",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "project-default-real",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 95.0,
+      "avg_latency_ms": 10897.0,
+      "avg_prompt_tokens": 4726.0,
+      "avg_output_tokens": 3064.0
+    },
+    {
+      "prompt_id": "project-default-real",
+      "model_id": "gemma-4-31b",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 50.0,
+      "avg_latency_ms": 112353.0,
+      "avg_prompt_tokens": 4726.0,
+      "avg_output_tokens": 4527.0
+    }
+  ]
+}

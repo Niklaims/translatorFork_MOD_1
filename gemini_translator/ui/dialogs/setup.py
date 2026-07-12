@@ -14,6 +14,7 @@ import json
 import sqlite3
 import uuid
 import zipfile
+import shutil
 from bs4 import BeautifulSoup
 from collections import Counter
 import math  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
@@ -108,6 +109,71 @@ TASK_LIST_MIN_HEIGHT = 420
 TASK_OPTIONS_MIN_HEIGHT = 400
 TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
 # --- КОНЕЦ НОВЫХ КОНСТАНТ ---
+
+
+def _prepare_project_location(folder_path, file_path, choice, move_original):
+    """Create/move project files without touching Qt widgets.
+
+    This function is intentionally module-level so it can safely run in a
+    ``TaskDBWorker``.  Moving an EPUB to another disk may actually copy the
+    whole archive and used to block the GUI thread for seconds or minutes.
+    """
+    effective_folder = folder_path.replace('\\', '/')
+    effective_file_path = file_path.replace('\\', '/')
+
+    try:
+        if choice == 'subfolder':
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            effective_folder = os.path.join(folder_path, base_name)
+            os.makedirs(effective_folder, exist_ok=True)
+
+        if move_original:
+            destination_path = os.path.join(effective_folder, os.path.basename(file_path))
+            if os.path.abspath(file_path) != os.path.abspath(destination_path):
+                backup_path = file_path + ".backup"
+                shutil.move(file_path, destination_path)
+                if os.path.exists(backup_path):
+                    os.remove(backup_path)
+                effective_file_path = destination_path
+
+        return {
+            'ok': True,
+            'effective_folder': effective_folder,
+            'effective_file_path': effective_file_path,
+        }
+    except (shutil.Error, OSError) as exc:
+        return {
+            'ok': False,
+            'error': str(exc),
+            'operation': 'move' if move_original else 'create',
+        }
+
+
+def _prepare_project_location_and_analysis(
+    folder_path,
+    file_path,
+    choice,
+    move_original,
+    html_files,
+):
+    result = _prepare_project_location(folder_path, file_path, choice, move_original)
+    if not result.get('ok') or not html_files:
+        return result
+
+    try:
+        from ..widgets.translation_options_widget import analyze_chapter_compositions
+
+        project_manager = TranslationProjectManager(result['effective_folder'])
+        result['chapter_analysis'] = analyze_chapter_compositions(
+            list(html_files),
+            result['effective_file_path'],
+            project_manager,
+        )
+    except Exception as exc:
+        # The directory/move already succeeded and must not be reported as a
+        # failed move. The normal project path will surface a corrupt EPUB.
+        result['analysis_error'] = str(exc)
+    return result
 
 
 def _instance_attr(obj, name: str, default=None):
@@ -400,6 +466,7 @@ class InitialSetupPage(ShellPage):
         self._base_glossary_prompt_seen_projects = set()
         self._pending_old_project_cleanup_offer = False
         self._returning_to_main_menu = False
+        self._leave_prepared_once = False
         self._auto_workflow_enabled_for_session = False
         self._auto_workflow_round = 0
         self._auto_followup_running = False
@@ -421,6 +488,13 @@ class InitialSetupPage(ShellPage):
         self._auto_glossary_poll_timer = QtCore.QTimer(self)
         self._auto_glossary_poll_timer.setInterval(400)
         self._auto_glossary_poll_timer.timeout.connect(self._poll_auto_glossary_dialog)
+
+        # A cancellable timer is required here. QTimer.singleShot callbacks used
+        # to survive disabling the auto workflow (or leaving the page) and could
+        # unexpectedly start a normal translation several minutes later.
+        self._auto_restart_timer = QtCore.QTimer(self)
+        self._auto_restart_timer.setSingleShot(True)
+        self._auto_restart_timer.timeout.connect(self._run_scheduled_auto_translation_restart)
 
         self._snapshot_save_timer = QtCore.QTimer(self)
         self._snapshot_save_timer.setSingleShot(True)
@@ -710,6 +784,7 @@ class InitialSetupPage(ShellPage):
         self.preset_widget.text_changed.connect(self._mark_promt_as_dirty)
         self.glossary_widget.glossary_changed.connect(self._on_glossary_changed)
         self.auto_translate_widget.settings_changed.connect(self._mark_settings_as_dirty)
+        self.auto_translate_widget.settings_changed.connect(self._on_auto_translation_settings_changed)
         self.prevent_sleep_checkbox.toggled.connect(self._mark_settings_as_dirty)
         self.prevent_sleep_checkbox.toggled.connect(
             lambda checked: save_prevent_sleep_setting(self.settings_manager, checked)
@@ -871,14 +946,24 @@ class InitialSetupPage(ShellPage):
         """Просто возвращает уже созданный PresetWidget."""
         return self.preset_widget
 
-    def _prepare_for_close(self):
+    def _prepare_for_close(self, autosave_glossary: bool = False):
         """Обрабатывает несохраненные изменения перед закрытием окна."""
+        location_worker = getattr(self, '_project_location_worker', None)
+        if location_worker is not None and location_worker.isRunning():
+            return False
+
         has_unsaved_settings = self.is_settings_dirty
 
         has_unsaved_glossary = (
             self.output_folder
             and (self.is_glossary_dirty or self.glossary_widget.get_glossary() != self.initial_glossary_state)
         )
+        if autosave_glossary and has_unsaved_glossary:
+            self._save_project_glossary_only()
+            has_unsaved_glossary = (
+                self.output_folder
+                and (self.is_glossary_dirty or self.glossary_widget.get_glossary() != self.initial_glossary_state)
+            )
 
         should_show_dialog = has_unsaved_settings or has_unsaved_glossary
         user_choice_to_exit = True
@@ -936,8 +1021,9 @@ class InitialSetupPage(ShellPage):
 
     def _return_to_main_menu_from_button(self):
         """Возвращает пользователя в главное меню по кнопке 'Выход'."""
-        if not self._prepare_for_close():
+        if not self._prepare_for_close(autosave_glossary=True):
             return
+        self._leave_prepared_once = True
         self.request_back.emit()
 
     def _set_stop_button_mode(self, hard_stop: bool):
@@ -2068,10 +2154,8 @@ class InitialSetupPage(ShellPage):
     def _handle_project_initialization(self, select_mode=True):
         """
         Главный оркестратор. Вызывается, когда и файл, и папка, и главы заданы.
-        Версия 2.0: Корректно обрабатывает создание подпапки и перемещает оригинал.
+        Файловые операции запускаются в фоне, чтобы главное окно не зависало.
         """
-        import shutil
-
         file_path = self.selected_file
         folder_path = self.output_folder
         pending_cleanup_offer = self._pending_old_project_cleanup_offer
@@ -2093,9 +2177,8 @@ class InitialSetupPage(ShellPage):
         )
         is_folder_reused = False
 
-        # Изначально считаем, что будем работать с выбранными путями
-        effective_folder = folder_path.replace('\\', '/')
-        effective_file_path = file_path.replace('\\', '/')
+        choice = 'current'
+        move_original = False
 
         if not is_known_project:
             is_folder_reused = any(
@@ -2116,32 +2199,115 @@ class InitialSetupPage(ShellPage):
                 return
 
             choice = dialog.choice
-            copy_original = dialog.copy_file_checked # Теперь это флаг "переместить"
+            move_original = dialog.copy_file_checked
 
-            if choice == 'subfolder':
-                subfolder_path = os.path.join(folder_path, base_name)
-                try:
-                    os.makedirs(subfolder_path, exist_ok=True)
-                    # Переназначаем effective_folder на новую подпапку
-                    effective_folder = subfolder_path
-                except OSError as e:
-                    QMessageBox.critical(self, "Ошибка", f"Не удалось создать подпапку:\n{e}")
-                    return
+        context = {
+            'pending_cleanup_offer': pending_cleanup_offer,
+            'is_known_project': is_known_project,
+        }
+        needs_file_work = not is_known_project and (choice == 'subfolder' or move_original)
+        needs_background_setup = needs_file_work or bool(self.html_files)
 
-            if copy_original: # Теперь это "переместить"
-                try:
-                    # os.path.join сам все нормализует
-                    destination_path = os.path.join(effective_folder, os.path.basename(file_path))
+        # Real pages use a worker. Lightweight test harnesses and legacy callers
+        # without Qt-owned controls retain deterministic synchronous behaviour.
+        if needs_background_setup and isinstance(self, QtCore.QObject) and hasattr(self, 'status_bar'):
+            self._start_project_location_worker(
+                folder_path,
+                file_path,
+                choice,
+                move_original,
+                context,
+            )
+            return
 
-                    if os.path.abspath(file_path) != os.path.abspath(destination_path):
-                        shutil.move(file_path, destination_path)
-                        # Обновляем путь к файлу, с которым будет работать сессия
-                        effective_file_path = destination_path
-                        print(f"[INFO] Оригинальный файл перемещен в папку проекта: {destination_path}")
-                except (shutil.Error, OSError) as e:
-                    QMessageBox.critical(self, "Ошибка перемещения", f"Не удалось переместить исходный файл:\n{e}")
-                    return
+        result = _prepare_project_location(
+            folder_path,
+            file_path,
+            choice,
+            move_original,
+        )
+        if not result.get('ok'):
+            title = "Ошибка перемещения" if result.get('operation') == 'move' else "Ошибка"
+            QMessageBox.critical(self, title, result.get('error') or "Неизвестная ошибка файловой системы")
+            return
 
+        InitialSetupPage._finish_project_initialization(
+            self,
+            result['effective_folder'],
+            result['effective_file_path'],
+            context,
+        )
+
+    def _start_project_location_worker(
+        self,
+        folder_path,
+        file_path,
+        choice,
+        move_original,
+        context,
+    ):
+        worker = getattr(self, '_project_location_worker', None)
+        if worker is not None and worker.isRunning():
+            return
+
+        self.paths_widget.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        if choice == 'subfolder' or move_original:
+            status_message = "Создаю папку проекта, переношу и анализирую EPUB…"
+        else:
+            status_message = "Анализирую EPUB в фоне…"
+        self.status_bar.set_permanent_message(status_message)
+        worker = TaskDBWorker(
+            _prepare_project_location_and_analysis,
+            folder_path,
+            file_path,
+            choice,
+            move_original,
+            list(self.html_files),
+        )
+        self._project_location_worker = worker
+        worker.finished.connect(
+            lambda worker=worker, context=dict(context):
+                self._on_project_location_worker_finished(worker, context)
+        )
+        worker.start()
+
+    def _on_project_location_worker_finished(self, worker, context):
+        self.status_bar.clear_message()
+        self.paths_widget.setEnabled(True)
+        if getattr(self, '_project_location_worker', None) is worker:
+            self._project_location_worker = None
+
+        result = getattr(worker, 'result', None)
+        worker.deleteLater()
+        if not isinstance(result, dict) or not result.get('ok'):
+            operation = result.get('operation') if isinstance(result, dict) else None
+            title = "Ошибка перемещения" if operation == 'move' else "Ошибка создания проекта"
+            error = result.get('error') if isinstance(result, dict) else None
+            QMessageBox.critical(self, title, error or "Фоновая файловая операция завершилась с ошибкой.")
+            self.check_ready()
+            return
+
+        if os.path.abspath(result['effective_file_path']) != os.path.abspath(self.selected_file):
+            print(f"[INFO] Оригинальный файл перемещен в папку проекта: {result['effective_file_path']}")
+
+        analysis = result.get('chapter_analysis')
+        if isinstance(analysis, dict):
+            self.translation_options_widget.html_files = list(self.html_files)
+            self.translation_options_widget._analysis_signature = analysis.get('signature')
+            self.translation_options_widget.chapter_compositions = dict(
+                analysis.get('compositions') or {}
+            )
+
+        self._finish_project_initialization(
+            result['effective_folder'],
+            result['effective_file_path'],
+            context,
+        )
+
+    def _finish_project_initialization(self, effective_folder, effective_file_path, context):
+        pending_cleanup_offer = bool(context.get('pending_cleanup_offer'))
+        is_known_project = bool(context.get('is_known_project'))
         old_project_cleanup_confirmed = False
         if pending_cleanup_offer or not is_known_project:
             old_project_cleanup_confirmed = self._maybe_offer_old_project_chapter_cleanup(
@@ -3641,7 +3807,8 @@ class InitialSetupPage(ShellPage):
 
     def _save_project_glossary_only(self):
         """Сохраняет только глоссарий в файл проекта и обновляет 'чистое' состояние."""
-        if not self.output_folder: return
+        if not self.output_folder:
+            return False
 
         project_glossary_path = os.path.join(self.output_folder, "project_glossary.json")
         current_glossary = self.glossary_widget.get_glossary()
@@ -3652,8 +3819,10 @@ class InitialSetupPage(ShellPage):
             self.mark_project_glossary_as_saved(current_glossary)
 
             print("[SETTINGS] Глоссарий проекта сохранен.")
+            return True
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить глоссарий проекта: {e}")
+            return False
 
     def _save_project_data(self):
         """
@@ -3828,6 +3997,10 @@ class InitialSetupPage(ShellPage):
         """
         Собирает настройки и отправляет команду на запуск сессии.
         """
+
+        location_worker = getattr(self, '_project_location_worker', None)
+        if location_worker is not None and location_worker.isRunning():
+            return
 
         if self._check_and_sync_active_session():
             # Если метод вернул True, значит сессия УЖЕ шла.
@@ -5173,6 +5346,11 @@ class InitialSetupPage(ShellPage):
         dialog.hide()
         dialog.generation_finished.connect(self._on_auto_glossary_generation_finished)
         dialog.finished.connect(self._on_auto_glossary_dialog_closed)
+        preparation_source = getattr(dialog, 'page', dialog)
+        preparation_source.task_preparation_finished.connect(
+            lambda success, error, dialog=dialog:
+                self._on_auto_glossary_tasks_ready(dialog, success, error)
+        )
 
         self._auto_glossary_dialog = dialog
         self._auto_glossary_running = True
@@ -5186,6 +5364,25 @@ class InitialSetupPage(ShellPage):
 
         dialog._initial_load_done = True
         dialog._deferred_initial_load()
+
+    def _on_auto_glossary_tasks_ready(self, dialog, success: bool, error: str):
+        if dialog is not self._auto_glossary_dialog or not self._auto_glossary_running:
+            return
+
+        if not success:
+            self._auto_glossary_pending_translation = False
+            self._auto_log(
+                f"Не удалось подготовить задачи автоглоссария: {error or 'неизвестная ошибка'}.",
+                force=True,
+            )
+            try:
+                dialog._cleanup(keep_recovery_file=True)
+            finally:
+                QtWidgets.QDialog.reject(dialog)
+            return
+
+        dialog._auto_glossary_start_requested_at = time.monotonic()
+        dialog._auto_glossary_seen_active = False
         dialog._start_session()
         self._auto_glossary_poll_timer.start()
 
@@ -5196,6 +5393,7 @@ class InitialSetupPage(ShellPage):
             return
 
         if dialog.is_session_active:
+            dialog._auto_glossary_seen_active = True
             return
 
         if getattr(dialog, '_session_finished_successfully', False):
@@ -5206,6 +5404,14 @@ class InitialSetupPage(ShellPage):
                 self._auto_log(f"Не удалось подготовить результаты автоглоссария к применению: {e}", force=True)
             self._auto_glossary_poll_timer.stop()
             dialog.accept()
+            return
+
+        start_requested_at = getattr(dialog, '_auto_glossary_start_requested_at', None)
+        if (
+            start_requested_at is not None
+            and not getattr(dialog, '_auto_glossary_seen_active', False)
+            and time.monotonic() - start_requested_at < 10.0
+        ):
             return
 
         self._auto_glossary_poll_timer.stop()
@@ -5641,6 +5847,9 @@ class InitialSetupPage(ShellPage):
         return chapters_to_retry
 
     def _reset_auto_workflow_state(self):
+        restart_timer = getattr(self, '_auto_restart_timer', None)
+        if restart_timer is not None:
+            restart_timer.stop()
         self._auto_workflow_enabled_for_session = False
         self._auto_workflow_round = 0
         self._auto_followup_running = False
@@ -5653,6 +5862,66 @@ class InitialSetupPage(ShellPage):
         self._auto_restart_session_override = None
         self._auto_validator_dialog = None
         self._auto_consistency_worker = None
+
+    def _auto_retry_round_available(self, auto_settings: dict | None = None) -> tuple[bool, int]:
+        if not isinstance(auto_settings, dict):
+            auto_settings = {}
+        try:
+            max_rounds = max(1, int(auto_settings.get('max_rounds', 3)))
+        except (TypeError, ValueError):
+            max_rounds = 3
+        try:
+            current_round = max(0, int(getattr(self, '_auto_workflow_round', 0)))
+        except (TypeError, ValueError):
+            current_round = 0
+        return current_round < max_rounds, max_rounds
+
+    def _schedule_auto_translation_restart(self, delay_ms: int = 250):
+        delay_ms = max(0, int(delay_ms or 0))
+        restart_timer = getattr(self, '_auto_restart_timer', None)
+        if restart_timer is not None:
+            restart_timer.start(delay_ms)
+            return
+
+        # Lightweight non-QObject test harnesses do not own the real timer.
+        QtCore.QTimer.singleShot(delay_ms, self._run_scheduled_auto_translation_restart)
+
+    def _run_scheduled_auto_translation_restart(self):
+        auto_widget = getattr(self, 'auto_translate_widget', None)
+        auto_settings = auto_widget.get_settings() if auto_widget is not None else {}
+        if (
+            not getattr(self, '_auto_workflow_enabled_for_session', False)
+            or not auto_settings.get('enabled')
+        ):
+            self._reset_auto_workflow_state()
+            self.check_ready()
+            return
+
+        if getattr(self, 'is_session_active', False):
+            self._auto_log(
+                "Автоперезапуск отменён: уже запущена другая сессия перевода.",
+                force=True,
+            )
+            self._reset_auto_workflow_state()
+            self.check_ready()
+            return
+
+        self._start_translation(is_auto_restart=True)
+
+    def _on_auto_translation_settings_changed(self):
+        restart_timer = getattr(self, '_auto_restart_timer', None)
+        if restart_timer is None or not restart_timer.isActive():
+            return
+
+        auto_widget = getattr(self, 'auto_translate_widget', None)
+        auto_settings = auto_widget.get_settings() if auto_widget is not None else {}
+        if auto_settings.get('enabled'):
+            return
+
+        self._auto_log("Ожидающий автоперезапуск отменён: автопайплайн выключен.", force=True)
+        self._reset_auto_workflow_state()
+        if not self.is_session_active:
+            self.check_ready()
 
     def _schedule_auto_workflow_followup(self, reason: str):
         if reason != "Сессия успешно завершена":
@@ -5675,12 +5944,12 @@ class InitialSetupPage(ShellPage):
             self._reset_auto_workflow_state()
             return
 
-        max_rounds = int(auto_settings.get('max_rounds', 3))
-        if self._auto_workflow_round >= max_rounds:
-            self._auto_log(f"Достигнут лимит автоциклов ({max_rounds}). Дальше только вручную.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
+        retry_round_available, max_rounds = self._auto_retry_round_available(auto_settings)
+        if not retry_round_available:
+            self._auto_log(
+                f"Достигнут лимит автоциклов ({max_rounds}). Повторы отключены; выполняю финальные проверки.",
+                force=True,
+            )
 
         network_retry_chapters = set()
         if auto_settings.get('retry_network_failed_enabled'):
@@ -5689,19 +5958,19 @@ class InitialSetupPage(ShellPage):
         else:
             self._auto_pending_network_retry_chapters = set()
 
-        if auto_settings.get('filter_repack_enabled') and self._try_auto_filter_recovery(
+        if retry_round_available and auto_settings.get('filter_repack_enabled') and self._try_auto_filter_recovery(
             auto_settings,
             deferred_retry_chapters=network_retry_chapters,
         ):
             return
 
-        if auto_settings.get('filter_redirect_enabled') and self._try_auto_filter_redirect_followup(
+        if retry_round_available and auto_settings.get('filter_redirect_enabled') and self._try_auto_filter_redirect_followup(
             auto_settings,
             deferred_retry_chapters=network_retry_chapters,
         ):
             return
 
-        if network_retry_chapters:
+        if retry_round_available and network_retry_chapters:
             self._run_auto_network_retry_followup(auto_settings, network_retry_chapters)
             return
 
@@ -5818,7 +6087,7 @@ class InitialSetupPage(ShellPage):
             self._auto_workflow_round += 1
             self._auto_followup_running = True
             self.start_btn.setEnabled(False)
-            QtCore.QTimer.singleShot(250, lambda: self._start_translation(is_auto_restart=True))
+            self._schedule_auto_translation_restart(250)
         else:
             self._auto_restart_session_override = None
             self._auto_log("Пакеты собраны, но автоперезапуск отключён. Можно запускать вручную.", force=True)
@@ -5906,7 +6175,7 @@ class InitialSetupPage(ShellPage):
             self._auto_workflow_round += 1
             self._auto_followup_running = True
             self.start_btn.setEnabled(False)
-            QtCore.QTimer.singleShot(250, lambda: self._start_translation(is_auto_restart=True))
+            self._schedule_auto_translation_restart(250)
         else:
             self._auto_restart_session_override = None
             self._auto_log("Redirect подготовлен, но автоперезапуск отключён. Можно запускать вручную.", force=True)
@@ -5948,7 +6217,7 @@ class InitialSetupPage(ShellPage):
             self._auto_followup_running = True
             self.start_btn.setEnabled(False)
             self._auto_log(f"Ожидаю {delay_seconds} сек. перед повторным запуском сетевых задач.", force=True)
-            QtCore.QTimer.singleShot(delay_seconds * 1000, lambda: self._start_translation(is_auto_restart=True))
+            self._schedule_auto_translation_restart(delay_seconds * 1000)
         else:
             self._auto_log("Сетевые задачи подготовлены к повтору, но автоперезапуск выключен.", force=True)
             self._reset_auto_workflow_state()
@@ -6181,6 +6450,24 @@ class InitialSetupPage(ShellPage):
 
         if chapters_to_retry:
             signature = tuple(sorted(chapters_to_retry))
+            retry_round_available, max_rounds = self._auto_retry_round_available(auto_settings)
+            if not retry_round_available:
+                self._auto_log(
+                    f"Автовалидатор нашёл {len(signature)} глав для повтора, но лимит автоциклов "
+                    f"({max_rounds}) уже достигнут. Главы не возвращены в очередь.",
+                    force=True,
+                    details_title="[AUTO] Финальная проверка ratio",
+                    details_text=self._compose_auto_details([
+                        ("Главы", list(signature)),
+                    ]),
+                )
+                if auto_settings.get('ai_consistency_enabled'):
+                    self._run_auto_consistency_followup(auto_settings)
+                else:
+                    self._reset_auto_workflow_state()
+                    self.check_ready()
+                return
+
             self._auto_last_retry_signatures.add(signature)
             self.add_files_for_retry(self.selected_file, list(signature))
             cjk_retries = sum(1 for _, _, profile in ratio_profiles.values() if profile == "CJK")
@@ -6215,7 +6502,7 @@ class InitialSetupPage(ShellPage):
                 self._auto_workflow_round += 1
                 self._auto_followup_running = True
                 self.start_btn.setEnabled(False)
-                QtCore.QTimer.singleShot(250, lambda: self._start_translation(is_auto_restart=True))
+                self._schedule_auto_translation_restart(250)
             else:
                 self._auto_log("Главы подготовлены к повтору, но автоперезапуск выключен.", force=True)
                 self._reset_auto_workflow_state()
@@ -6292,6 +6579,8 @@ class InitialSetupPage(ShellPage):
             'consistency_fix_confidences': list(selected_confidences),
             'consistency_include_original': include_original,
             'consistency_original_chapter_limit': original_chapter_limit,
+            'consistency_parallel_workers': self.instances_spin.value(),
+            'num_instances': self.instances_spin.value(),
             PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
         })
 
@@ -6609,9 +6898,10 @@ class InitialSetupPage(ShellPage):
         Перехватывает событие закрытия. Корректно проверяет наличие ИЗМЕНЕНИЙ
         и предлагает сохранить их только в этом случае.
         """
-        if not self._prepare_for_close():
+        if not self._prepare_for_close(autosave_glossary=True):
             return
 
+        self._leave_prepared_once = True
         self.request_back.emit()
 
 
@@ -6990,9 +7280,16 @@ class InitialSetupPage(ShellPage):
         self._check_and_sync_active_session()
 
     def can_leave(self) -> bool:
-        return self._prepare_for_close()
+        if getattr(self, "_leave_prepared_once", False):
+            self._leave_prepared_once = False
+            return True
+        return self._prepare_for_close(autosave_glossary=True)
 
     def on_leave(self) -> None:
+        restart_timer = getattr(self, '_auto_restart_timer', None)
+        if restart_timer is not None and restart_timer.isActive():
+            self._auto_log("Ожидающий автоперезапуск отменён при выходе со страницы перевода.", force=True)
+            self._reset_auto_workflow_state()
         self._disconnect_event_bus()
 
 

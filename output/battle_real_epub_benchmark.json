@@ -1,0 +1,46 @@
+{
+  "name": "battle-real-epub-gemini-flash-lite-vs-gemma4",
+  "output_dir": "output/battle_real_epub_gemini_flash_lite_vs_gemma4",
+  "defaults": {
+    "use_system_instruction": true,
+    "system_instruction": "You are a professional literary translator into Russian. Preserve markup, placeholders, links, comments, and glossary terms exactly where required.",
+    "prompt_mode": "project"
+  },
+  "prompts": [
+    {
+      "id": "project-default-real",
+      "mode": "project",
+      "builtin": "default",
+      "use_system_instruction": true
+    }
+  ],
+  "models": [
+    {
+      "id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model_id": "gemini-3.1-flash-lite",
+      "use_stream": true,
+      "max_output_tokens": 8192
+    },
+    {
+      "id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "use_stream": true,
+      "max_output_tokens": 8192
+    }
+  ],
+  "cases": [
+    {
+      "id": "real-epub-chapter-00001-2143chars",
+      "source_path": "output/benchmark_sources/tomato_weird_apocalypse_chapter_00001_chunk_2143.xhtml",
+      "checks": {
+        "preserve_html_tags": true,
+        "allow_cjk": false,
+        "glossary_required": true,
+        "min_length_ratio": 0.25,
+        "max_length_ratio": 6.0
+      }
+    }
+  ]
+}

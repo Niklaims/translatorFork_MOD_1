@@ -11,6 +11,7 @@ import atexit
 import base64
 import importlib
 import subprocess
+from collections import deque
 from pathlib import Path
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
@@ -878,14 +879,30 @@ class EventBus(QtCore.QObject):
     import threading
     event_posted = QtCore.pyqtSignal(dict)
     data_changed = QtCore.pyqtSignal(str)
+    _queued_log_events_ready = QtCore.pyqtSignal()
     _data_store = {}
     _lock = threading.Lock()
+
+    # Worker pools can produce log messages much faster than the GUI event loop
+    # can consume individual queued Qt signals.  Keep that traffic bounded and
+    # drain it in frame-sized chunks so input and paint events always get a turn.
+    LOG_EVENT_BATCH_SIZE = 100
+    LOG_EVENT_DRAIN_INTERVAL_MS = 16
+    MAX_PENDING_LOG_EVENTS = 5000
 
     def __init__(self):
         super().__init__()
         self._topic_subscribers = {}
         self._topic_lock = self.threading.Lock()
+        self._pending_log_events = deque()
+        self._pending_log_lock = self.threading.Lock()
+        self._log_drain_scheduled = False
+        self._dropped_log_events = 0
         self.event_posted.connect(self._dispatch_to_topics)
+        self._queued_log_events_ready.connect(
+            self._drain_pending_log_events,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
 
     def subscribe(self, event_name: str, callback):
         """Подписывает callback только на конкретный тип события."""
@@ -962,7 +979,65 @@ class EventBus(QtCore.QObject):
 
     def emit_event(self, event: dict):
         """Совместимый способ отправки: topics + старый event_posted сигнал."""
+        if (
+            isinstance(event, dict)
+            and event.get('event') == 'log_message'
+            and QtCore.QThread.currentThread() is not self.thread()
+        ):
+            self._queue_log_event(event)
+            return
         self.event_posted.emit(event)
+
+    def _queue_log_event(self, event: dict):
+        """Queue a worker log without adding one Qt event per log line."""
+        should_schedule = False
+        with self._pending_log_lock:
+            if len(self._pending_log_events) >= self.MAX_PENDING_LOG_EVENTS:
+                self._pending_log_events.popleft()
+                self._dropped_log_events += 1
+            self._pending_log_events.append(event)
+            if not self._log_drain_scheduled:
+                self._log_drain_scheduled = True
+                should_schedule = True
+
+        if should_schedule:
+            self._queued_log_events_ready.emit()
+
+    @QtCore.pyqtSlot()
+    def _drain_pending_log_events(self):
+        """Deliver one bounded log batch, then yield back to Qt's event loop."""
+        batch = []
+        dropped_count = 0
+        has_more = False
+        with self._pending_log_lock:
+            dropped_count = self._dropped_log_events
+            self._dropped_log_events = 0
+            while self._pending_log_events and len(batch) < self.LOG_EVENT_BATCH_SIZE:
+                batch.append(self._pending_log_events.popleft())
+            has_more = bool(self._pending_log_events)
+            if not has_more:
+                self._log_drain_scheduled = False
+
+        if dropped_count:
+            self.event_posted.emit({
+                'event': 'log_message',
+                'source': 'EventBus',
+                'data': {
+                    'message': (
+                        f'[WARN] Пропущено {dropped_count} сообщений лога: '
+                        'интерфейс не успевал обрабатывать поток событий.'
+                    )
+                },
+            })
+
+        for pending_event in batch:
+            self.event_posted.emit(pending_event)
+
+        if has_more:
+            QtCore.QTimer.singleShot(
+                self.LOG_EVENT_DRAIN_INTERVAL_MS,
+                self._drain_pending_log_events,
+            )
 
     def set_data(self, key: str, value):
         """Потокобезопасно сохраняет данные и испускает сигнал."""

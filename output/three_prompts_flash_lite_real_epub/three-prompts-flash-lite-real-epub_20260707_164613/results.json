@@ -1,0 +1,173 @@
+{
+  "name": "three-prompts-flash-lite-real-epub",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_real_epub_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_real_epub\\three-prompts-flash-lite-real-epub_20260707_164613",
+  "created_at": "2026-07-07T16:46:13.627341+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 21906,
+      "prompt_tokens_estimate": 4726,
+      "output_tokens_estimate": 2979,
+      "score": 95.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -1
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.303,
+        "reference_similarity": null,
+        "source_visible_chars": 2143,
+        "output_visible_chars": 7078,
+        "output_tokens_estimate": 2979
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -1}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__legacy-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\real-epub-chapter-00001-2143chars__legacy-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 4686,
+            "output_tokens": 3094,
+            "total_tokens": 7780,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "error",
+      "latency_ms": 13622,
+      "prompt_tokens_estimate": 5761,
+      "output_tokens_estimate": 0,
+      "score": null,
+      "metrics": {},
+      "issues": [
+        "run failed: PartialGenerationError"
+      ],
+      "error": "PartialGenerationError: Gemini Stream Error: This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__basic-translation__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт"
+    },
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 18802,
+      "prompt_tokens_estimate": 10987,
+      "output_tokens_estimate": 2881,
+      "score": 90.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -2
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.194,
+        "reference_similarity": null,
+        "source_visible_chars": 2143,
+        "output_visible_chars": 6844,
+        "output_tokens_estimate": 2881
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -2}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__basic-translation-short__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\real-epub-chapter-00001-2143chars__basic-translation-short__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 11273,
+            "output_tokens": 2993,
+            "total_tokens": 14266,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 95.0,
+      "avg_latency_ms": 21906.0,
+      "avg_prompt_tokens": 4726.0,
+      "avg_output_tokens": 2979.0
+    },
+    {
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 90.0,
+      "avg_latency_ms": 18802.0,
+      "avg_prompt_tokens": 10987.0,
+      "avg_output_tokens": 2881.0
+    },
+    {
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 0,
+      "errors": 1,
+      "avg_score": null,
+      "avg_latency_ms": 13622.0,
+      "avg_prompt_tokens": 5761.0,
+      "avg_output_tokens": 0.0
+    }
+  ]
+}

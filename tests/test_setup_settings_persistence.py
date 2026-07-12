@@ -1,5 +1,8 @@
+import json
 import os
+import tempfile
 import unittest
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -53,13 +56,21 @@ class _SettingsManagerStub:
 
 class _DictWidgetStub:
     def __init__(self, settings):
-        self._settings = dict(settings)
+        self._settings = dict(settings) if isinstance(settings, dict) else list(settings)
+        self.marked_saved = False
 
     def get_settings(self):
-        return dict(self._settings)
+        if isinstance(self._settings, dict):
+            return dict(self._settings)
+        return {}
 
     def get_glossary(self):
+        if isinstance(self._settings, list):
+            return [item.copy() if isinstance(item, dict) else item for item in self._settings]
         return list(self._settings)
+
+    def mark_current_state_as_saved(self):
+        self.marked_saved = True
 
 
 class _PromptWidgetStub:
@@ -118,6 +129,9 @@ class _SetupSettingsHarness:
     _refresh_dirty_window_title = InitialSetupDialog._refresh_dirty_window_title
     _prepare_for_close = InitialSetupDialog._prepare_for_close
     _return_to_main_menu_from_button = InitialSetupDialog._return_to_main_menu_from_button
+    _save_project_glossary_only = InitialSetupDialog._save_project_glossary_only
+    mark_project_glossary_as_saved = InitialSetupDialog.mark_project_glossary_as_saved
+    can_leave = InitialSetupDialog.can_leave
     _is_queue_autosave_enabled = InitialSetupDialog._is_queue_autosave_enabled
     _is_show_chapter_char_count_enabled = InitialSetupDialog._is_show_chapter_char_count_enabled
     _save_prompt_session_state = InitialSetupDialog._save_prompt_session_state
@@ -283,6 +297,28 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertEqual(settings_manager.saved_last_prompt_preset_name, "preset")
         self.assertEqual(settings_manager.saved_full_session["task_size_limit"], 15000)
 
+    def test_navigation_autosaves_glossary_without_unsaved_prompt(self):
+        from PyQt6.QtWidgets import QMessageBox
+
+        glossary = [{"original": "alpha", "rus": "альфа", "note": ""}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings_manager = _SettingsManagerStub()
+            harness = _SetupSettingsHarness(settings_manager=settings_manager)
+            harness.is_settings_dirty = False
+            harness.output_folder = tmpdir
+            harness.initial_glossary_state = []
+            harness.glossary_widget = _DictWidgetStub(glossary)
+            harness.is_glossary_dirty = True
+
+            with patch.object(QMessageBox, "exec", side_effect=AssertionError("unexpected prompt")):
+                self.assertTrue(harness.can_leave())
+
+            with open(os.path.join(tmpdir, "project_glossary.json"), "r", encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), glossary)
+            self.assertFalse(harness.is_glossary_dirty)
+            self.assertEqual(harness.initial_glossary_state, glossary)
+            self.assertTrue(harness.glossary_widget.marked_saved)
+
     def test_return_to_main_menu_button_runs_pre_close_flow_before_closing(self):
         settings_manager = _SettingsManagerStub()
         harness = _SetupSettingsHarness(settings_manager=settings_manager)
@@ -295,6 +331,10 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         # and close(); here we verify the signal was emitted and pre-close ran.
         self.assertTrue(harness.request_back.emitted)
         self.assertEqual(settings_manager.saved_full_session["task_size_limit"], 15000)
+
+        with patch.object(harness, "_prepare_for_close", side_effect=AssertionError("already prepared")):
+            self.assertTrue(harness.can_leave())
+        self.assertFalse(harness._leave_prepared_once)
 
 
 if __name__ == "__main__":

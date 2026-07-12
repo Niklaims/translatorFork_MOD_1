@@ -85,6 +85,14 @@ class ChunkAssemblerTests(unittest.TestCase):
             row = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         return row["status"] if row else None
 
+    def _task_error_count(self, task_id, error_type):
+        with self.task_manager._get_read_only_conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task_errors WHERE task_id = ? AND error_type = ?",
+                (task_id, error_type),
+            ).fetchone()
+        return row[0]
+
     def _virtual_path_for_real_file(self, real_path):
         normalized_path = os.path.abspath(real_path).replace(":", "_drive").replace("\\", "/")
         if normalized_path.startswith("/"):
@@ -211,6 +219,68 @@ class ChunkAssemblerTests(unittest.TestCase):
             assembler._assemble_chapter_from_db(["00000000-0000-0000-0000-000000000001"], chapter_path)
 
             self.assertEqual(self._task_status("00000000-0000-0000-0000-000000000001"), "pending")
+
+    def test_set_pending_tasks_clears_stale_chunk_results(self):
+        chapter_path = "Text/ch.xhtml"
+        self._insert_completed_chunk(
+            "00000000-0000-0000-0000-000000000001",
+            ("epub_chunk", "book.epub", chapter_path, "<p>source</p>", 0, 1, "<body>", "</body>"),
+            "<body><p>translated</p></body>",
+        )
+
+        self.task_manager.set_pending_tasks([("epub", "book.epub", "Text/next.xhtml")])
+
+        self.assertEqual(self._chunk_result_count(), 0)
+
+    def test_invalid_full_assembly_requeues_chunks_without_writing_output(self):
+        with tempfile.TemporaryDirectory() as output_folder:
+            assembler = ChunkAssembler(
+                output_folder,
+                _ProjectManagerStub(output_folder),
+                settings={"use_prettify": False},
+            )
+            chapter_path = "Text/ch.xhtml"
+            prefix = "<body>"
+            suffix = "</body>"
+            source_a = "".join(
+                f"<p>Source paragraph {index}. " + ("source text " * 12) + "</p>"
+                for index in range(20)
+            )
+            source_b = "".join(
+                f"<p>Source paragraph {index}. " + ("source text " * 12) + "</p>"
+                for index in range(20, 40)
+            )
+
+            self._insert_completed_chunk(
+                "00000000-0000-0000-0000-000000000001",
+                ("epub_chunk", "mem://missing.epub", chapter_path, source_a, 0, 2, prefix, suffix),
+                "<body><p>\u041f\u0435\u0440\u0435\u0432\u043e\u0434.</p></body>",
+            )
+            self._insert_completed_chunk(
+                "00000000-0000-0000-0000-000000000002",
+                ("epub_chunk", "mem://missing.epub", chapter_path, source_b, 1, 2, prefix, suffix),
+                "<body><p>\u0424\u0438\u043d\u0430\u043b.</p></body>",
+            )
+
+            assembler._assemble_chapter_from_db(
+                [
+                    "00000000-0000-0000-0000-000000000001",
+                    "00000000-0000-0000-0000-000000000002",
+                ],
+                chapter_path,
+            )
+
+            output_path = os.path.join(output_folder, "Text", "ch_translated.html")
+            self.assertFalse(os.path.exists(output_path))
+            self.assertEqual(self._task_status("00000000-0000-0000-0000-000000000001"), "pending")
+            self.assertEqual(self._task_status("00000000-0000-0000-0000-000000000002"), "pending")
+            self.assertEqual(
+                self._task_error_count(
+                    "00000000-0000-0000-0000-000000000001",
+                    "ASSEMBLY_VALIDATION",
+                ),
+                1,
+            )
 
     def test_repeated_scans_do_not_queue_duplicate_assemblies(self):
         with tempfile.TemporaryDirectory() as output_folder:

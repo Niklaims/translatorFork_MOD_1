@@ -1,5 +1,8 @@
 import os
+import tempfile
 import unittest
+import zipfile
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -8,7 +11,10 @@ from PyQt6 import QtWidgets
 
 from gemini_translator.api import config as api_config
 from gemini_translator.utils.epub_tools import TASK_SIZE_UNIT_CHARS
-from gemini_translator.ui.widgets.translation_options_widget import TranslationOptionsWidget
+from gemini_translator.ui.widgets.translation_options_widget import (
+    TranslationOptionsWidget,
+    analyze_chapter_compositions,
+)
 
 
 class TranslationOptionsWidgetTaskSizeTests(unittest.TestCase):
@@ -29,6 +35,25 @@ class TranslationOptionsWidgetTaskSizeTests(unittest.TestCase):
             }
         }
         return widget
+
+    def test_chapter_analysis_can_run_without_widget(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            with zipfile.ZipFile(epub_path, "w") as archive:
+                archive.writestr(
+                    "Text/ch1.xhtml",
+                    "<html><body><p>中文 text</p></body></html>",
+                )
+
+            result = analyze_chapter_compositions(
+                ["Text/ch1.xhtml"],
+                str(epub_path),
+            )
+
+        composition = result["compositions"]["Text/ch1.xhtml"]
+        self.assertTrue(composition["is_cjk"])
+        self.assertGreater(composition["total_chars"], 0)
+        self.assertIsNotNone(result["signature"])
 
     def test_model_recommendation_updates_task_size_until_user_sets_it(self):
         widget = self._create_widget()

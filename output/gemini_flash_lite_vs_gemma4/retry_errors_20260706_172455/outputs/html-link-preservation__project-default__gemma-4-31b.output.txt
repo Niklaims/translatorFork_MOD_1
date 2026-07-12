@@ -1,0 +1,32 @@
+Professional literary translator into Russian.
+Translate a small HTML fragment into Russian.
+Lossless semantic transfer, natural Russian literary syntax, strict HTML preservation, specific punctuation rules (Operator `─` for sound/silence, En-dash `–` for internal pauses).
+
+        *   `─` (U+2500) separates speech [SOUND] from narration [SILENCE].
+        *   No quotation marks for direct speech.
+        *   En-dash `–` for everything else.
+        *   No em-dash `—`.
+        *   Preserve HTML tags (`<p>`, `<a>`, `id="..."`).
+
+        *   `<p><a id="link_0">Note</a>: The tower opened, and the old oath burned blue.</p>`
+
+    *   "Note" -> "Примечание" or "Заметка". In a literary context, "Примечание" is standard.
+    *   "The tower opened" -> "Башня открылась".
+    *   "the old oath burned blue" -> "старая клятва вспыхнула синим" or "загорелась синим пламенем". "Вспыхнула синим" sounds more literary.
+
+    *   The text is purely narrative/authorial. There is no [SOUND] (speech), so no operator `─` is needed.
+    *   There is a colon. In Russian, a colon is appropriate after "Примечание".
+    *   The punctuation "opened, and" (comma before 'and') is standard in English. In Russian, "Башня открылась, и старая клятва вспыхнула синим" is correct.
+
+    *   Keep the `<p>` tag.
+    *   Keep the `<a>` tag with `id="link_0"`.
+    *   Text: `<p><a id="link_0">Примечание</a>: Башня открылась, и старая клятва вспыхнула синим.</p>`
+
+    *   Volume Equivalence? Yes.
+    *   Plot Factuality? Yes.
+    *   Sensory Detail? Yes (blue burn).
+    *   HTML Architecture? Preserved exactly.
+    *   Typography? No speech, so no `─`. No em-dashes used. No quotes for speech.
+    *   Glossary? None provided.
+
+    `<p><a id="link_0">Примечание</a>: Башня открылась, и старая клятва вспыхнула синим.</p>`<p><a id="link_0">Примечание</a>: Башня открылась, и старая клятва вспыхнула синим.</p>

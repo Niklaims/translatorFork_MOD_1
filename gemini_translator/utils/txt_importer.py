@@ -22,6 +22,12 @@ except ImportError:
     HAS_RECOGNIZERS = False
 
 
+CJK_CHAPTER_NUMBER_REGEX = r'[0-9零一二三四五六七八九十百千万两]+'
+# Matches both Markdown headings ("# 第1章 ...") and plain headings
+# ("第181章 ...") so a mixed TXT can be split with one expression.
+BASIC_CJK_CHAPTER_REGEX = rf'^(?:#\s*)?第\s*{CJK_CHAPTER_NUMBER_REGEX}\s*章'
+
+
 def smart_replace_number_in_title(title, new_number_int):
     """
     Умная замена числа в заголовке.
@@ -87,10 +93,14 @@ class RegexExamplesDialog(QDialog):
         # ИСПРАВЛЕНО: Убраны знаки вопроса в конце. Суффикс ОБЯЗАТЕЛЕН.
         # Иначе "第一条" (Первое правило/сообщение) станет главой.
         examples = [
+            {
+                "name": "Китайский: # (необязательно) + 第 + Число + 章",
+                "regex": BASIC_CJK_CHAPTER_REGEX,
+            },
             # 第 + пробелы(опц) + цифры + пробелы(опц) + Иероглиф(Глава/Секция/Раунд)
-            {"name": "Китайский: 第 + Число + Иероглиф (Строго)", "regex": r"^第\s*[0-90-9零一二三四五六七八九十百千万两]+\s*[章节回]"},
+            {"name": "Китайский: 第 + Число + Иероглиф (Строго)", "regex": rf"^第\s*{CJK_CHAPTER_NUMBER_REGEX}\s*[章节回]"},
             # Для редких случаев, когда иероглифа нет, но есть точка (第1. )
-            {"name": "Китайский: 第 + Число + Точка", "regex": r"^第\s*[0-90-9零一二三四五六七八九十百千万两]+\."},
+            {"name": "Китайский: 第 + Число + Точка", "regex": rf"^第\s*{CJK_CHAPTER_NUMBER_REGEX}\."},
             {"name": "Английский: Chapter + Число", "regex": r"^Chapter\s*\d+"},
             {"name": "Русский: Глава + Число", "regex": r"^Глава\s*\d+"},
             {"name": "Просто число (1, 2, 3...)", "regex": r"^\d+\s*$"},
@@ -146,8 +156,8 @@ class TxtChapterAnalyzer:
         numeric_counter = Counter()
         text_starts = Counter()
         indent_pattern = re.compile(r'^\s*[\u3000\s]{1,2}')
-        cjk_num_regex = r'[0-9零一二三四五六七八九十百千万两]+'
-        cjk_idea_pat = re.compile(rf'^(第)\s*({cjk_num_regex})\s*([章节回]?)')
+        cjk_num_regex = CJK_CHAPTER_NUMBER_REGEX
+        cjk_idea_pat = re.compile(rf'^(?:#\s*)?(第)\s*({cjk_num_regex})\s*([章节回]?)')
 
         indent_hits = 0
         potential_headers_in_sample = 0
@@ -178,7 +188,10 @@ class TxtChapterAnalyzer:
         for p, _ in numeric_counter.most_common(5):
             if "第" in p:
                 sfx = p.split("...")[-1]
-                candidates.add(rf'^第\s*{cjk_num_regex}\s*{re.escape(sfx)}' if sfx else rf'^第\s*{cjk_num_regex}')
+                candidates.add(
+                    rf'^(?:#\s*)?第\s*{cjk_num_regex}\s*{re.escape(sfx)}'
+                    if sfx else rf'^(?:#\s*)?第\s*{cjk_num_regex}'
+                )
             else:
                 candidates.add(rf'^{re.escape(p)}\s*\d+')
         for word, count in text_starts.most_common(5):

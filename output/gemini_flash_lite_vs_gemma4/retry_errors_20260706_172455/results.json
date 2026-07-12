@@ -1,0 +1,142 @@
+{
+  "name": "gemini-flash-lite-vs-gemma4",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\gemini_flash_lite_vs_gemma4_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\gemini_flash_lite_vs_gemma4\\retry_errors_20260706_172455",
+  "created_at": "2026-07-06T17:41:03.719332+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "html-link-preservation",
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "ok",
+      "latency_ms": 21823,
+      "prompt_tokens_estimate": 3285,
+      "output_tokens_estimate": 530,
+      "score": 48.57480780603193,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "a": 5,
+          "p": 5
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 30.148,
+        "reference_similarity": 0.0686,
+        "source_visible_chars": 54,
+        "output_visible_chars": 1628,
+        "output_tokens_estimate": 530
+      },
+      "issues": [
+        "html tag count changed: {\"a\": 5, \"p\": 5}",
+        "length ratio out of range: 30.148",
+        "reference similarity below 0.20: 0.069"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\html-link-preservation__project-default__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\html-link-preservation__project-default__gemma-4-31b.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3255,
+            "output_tokens": 537,
+            "total_tokens": 3792,
+            "estimated": true,
+            "model_id": "gemma-4-31b-it",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "zh-style-and-term",
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "ok",
+      "latency_ms": 31609,
+      "prompt_tokens_estimate": 3312,
+      "output_tokens_estimate": 1080,
+      "score": 14.478313618441007,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 2,
+          "found": [
+            "林澈",
+            "玉符"
+          ]
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": 3
+        },
+        "cjk_residue_chars": 67,
+        "length_ratio": 101.71,
+        "reference_similarity": 0.0758,
+        "source_visible_chars": 31,
+        "output_visible_chars": 3153,
+        "output_tokens_estimate": 1080
+      },
+      "issues": [
+        "found forbidden terms: 林澈, 玉符",
+        "html tag count changed: {\"p\": 3}",
+        "CJK residue chars: 67",
+        "length ratio out of range: 101.710",
+        "reference similarity below 0.20: 0.076"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\zh-style-and-term__project-default__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\zh-style-and-term__project-default__gemma-4-31b.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3281,
+            "output_tokens": 1103,
+            "total_tokens": 4384,
+            "estimated": true,
+            "model_id": "gemma-4-31b-it",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "runs": 2,
+      "ok": 2,
+      "errors": 0,
+      "avg_score": 31.53,
+      "avg_latency_ms": 26716.0,
+      "avg_prompt_tokens": 3298.5,
+      "avg_output_tokens": 805.0
+    }
+  ]
+}

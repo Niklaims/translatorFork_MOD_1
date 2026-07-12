@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -381,6 +383,171 @@ class ConsistencyResponseNormalizationTests(unittest.TestCase):
         self.assertIn("--- CHAPTER: chapter_01.xhtml ---", prompt)
         self.assertIn("<p>Translated only.</p>", prompt)
         self.assertNotIn("SOURCE ORIGINAL", prompt)
+
+
+class ConsistencyFastProofreadParallelTests(unittest.TestCase):
+    def test_fast_proofread_analyzes_chunks_in_parallel(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        active_calls = 0
+        max_active_calls = 0
+        calls = []
+        lock = threading.Lock()
+
+        def fake_call_api(prompt, config, api_key):
+            nonlocal active_calls, max_active_calls
+            with lock:
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+                calls.append(api_key)
+            try:
+                time.sleep(0.1)
+                chapter = "chapter_01.xhtml" if "chapter_01.xhtml" in prompt else "chapter_02.xhtml"
+                return json.dumps(
+                    {
+                        "problems": [
+                            {
+                                "id": 1,
+                                "type": "typo",
+                                "chapter": chapter,
+                                "quote": "Text",
+                                "description": "typo",
+                                "suggestion": "Text",
+                            }
+                        ],
+                        "glossary_update": {"characters": [], "terms": []},
+                        "context_summary": {"processed_chapters": [chapter]},
+                    }
+                )
+            finally:
+                with lock:
+                    active_calls -= 1
+
+        engine._call_api = fake_call_api
+        engine.analyze_chapters(
+            [
+                {"name": "chapter_01.xhtml", "content": "Text 1", "path": "chapter_01.xhtml"},
+                {"name": "chapter_02.xhtml", "content": "Text 2", "path": "chapter_02.xhtml"},
+            ],
+            {
+                "chunk_size": 1,
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+                "consistency_mode": FAST_PROOFREAD_MODE,
+                "consistency_parallel_workers": 2,
+            },
+            ["key-1", "key-2"],
+            mode=FAST_PROOFREAD_MODE,
+        )
+
+        self.assertGreaterEqual(max_active_calls, 2)
+        self.assertCountEqual(calls, ["key-1", "key-2"])
+        self.assertEqual(len(engine.all_problems), 2)
+        self.assertEqual(sorted(problem["chunk_index"] for problem in engine.all_problems), [0, 1])
+
+    def test_fast_proofread_fixes_chapters_in_parallel(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        active_calls = 0
+        max_active_calls = 0
+        calls = []
+        lock = threading.Lock()
+        chapters = [
+            {"name": "chapter_01.xhtml", "content": "<p>chapter one</p>", "path": "chapter_01.xhtml"},
+            {"name": "chapter_02.xhtml", "content": "<p>chapter two</p>", "path": "chapter_02.xhtml"},
+        ]
+        engine.chapter_problems_map = {
+            "chapter_01.xhtml": [{"type": "typo", "quote": "chapter", "description": "typo", "suggestion": "chapter"}],
+            "chapter_02.xhtml": [{"type": "typo", "quote": "chapter", "description": "typo", "suggestion": "chapter"}],
+        }
+
+        def fake_call_api(prompt, config, api_key):
+            nonlocal active_calls, max_active_calls
+            with lock:
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+                calls.append(api_key)
+            try:
+                time.sleep(0.1)
+                return "<p>chapter one</p>" if "chapter one" in prompt else "<p>chapter two</p>"
+            finally:
+                with lock:
+                    active_calls -= 1
+
+        engine._call_api = fake_call_api
+        fixed = engine.fix_all_chapters(
+            chapters,
+            {
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+                "consistency_mode": FAST_PROOFREAD_MODE,
+                "consistency_parallel_workers": 2,
+            },
+            ["key-1", "key-2"],
+        )
+
+        self.assertGreaterEqual(max_active_calls, 2)
+        self.assertCountEqual(calls, ["key-1", "key-2"])
+        self.assertEqual(set(fixed), {"chapter_01.xhtml", "chapter_02.xhtml"})
+
+    def test_fix_chapter_starts_after_previous_cancel(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(api_key)
+            return "<p>текст</p>"
+
+        engine._call_api = fake_call_api
+        engine.cancel()
+
+        fixed = engine.fix_chapter(
+            "<p>текст</p>",
+            [{"type": "typo", "quote": "текст", "description": "typo", "suggestion": "текст"}],
+            {"provider": "gemini", "model": "gemini-2.0-flash-exp"},
+            ["key-1"],
+            chapter_name="chapter_01.xhtml",
+        )
+
+        self.assertEqual(fixed, "<p>текст</p>")
+        self.assertEqual(calls, ["key-1"])
+        self.assertFalse(engine.is_cancelled)
+
+    def test_fix_all_chapters_starts_after_previous_cancel(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        calls = []
+        chapters = [
+            {"name": "chapter_01.xhtml", "content": "<p>текст 1</p>", "path": "chapter_01.xhtml"},
+            {"name": "chapter_02.xhtml", "content": "<p>текст 2</p>", "path": "chapter_02.xhtml"},
+        ]
+        engine.chapter_problems_map = {
+            "chapter_01.xhtml": [{"type": "typo", "quote": "текст", "description": "typo", "suggestion": "текст"}],
+            "chapter_02.xhtml": [{"type": "typo", "quote": "текст", "description": "typo", "suggestion": "текст"}],
+        }
+
+        def fake_call_api(prompt, config, api_key):
+            calls.append(api_key)
+            return "<p>текст 1</p>" if "текст 1" in prompt else "<p>текст 2</p>"
+
+        engine._call_api = fake_call_api
+        engine.cancel()
+
+        fixed = engine.fix_all_chapters(
+            chapters,
+            {
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+                "consistency_mode": FAST_PROOFREAD_MODE,
+                "consistency_parallel_workers": 2,
+            },
+            ["key-1", "key-2"],
+        )
+
+        self.assertEqual(set(fixed), {"chapter_01.xhtml", "chapter_02.xhtml"})
+        self.assertCountEqual(calls, ["key-1", "key-2"])
+        self.assertFalse(engine.is_cancelled)
 
 
 class ConsistencyKeyRetryTests(unittest.TestCase):
@@ -801,6 +968,31 @@ class ConsistencyKeyRetryTests(unittest.TestCase):
         self.assertTrue(engine.is_cancelled)
         self.assertEqual(engine.glossary_session.processed_chapters, [])
         self.assertTrue(any("Чанк не будет пропущен" in entry for entry in errors))
+
+    def test_user_cancelled_analysis_does_not_emit_chunk_error(self):
+        settings = _RetrySettingsStub()
+        engine = ConsistencyEngine(settings)
+        errors = []
+
+        def fake_call_api(prompt, config, api_key):
+            engine.cancel()
+            raise ValueError("Анализ остановлен")
+
+        engine._call_api = fake_call_api
+        engine.error_occurred.connect(errors.append)
+
+        engine.analyze_chapters(
+            [{"name": "chapter_01.xhtml", "content": "Text", "path": "chapter_01.xhtml"}],
+            {
+                "chunk_size": 1,
+                "provider": "gemini",
+                "model": "gemini-2.0-flash-exp",
+            },
+            ["good-key-123456"],
+        )
+
+        self.assertEqual(errors, [])
+        self.assertTrue(engine.is_cancelled)
 
 
 class ConsistencyDialogErrorHandlingTests(unittest.TestCase):

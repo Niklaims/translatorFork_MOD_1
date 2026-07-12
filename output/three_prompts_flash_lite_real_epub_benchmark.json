@@ -1,0 +1,51 @@
+{
+  "name": "three-prompts-flash-lite-real-epub",
+  "output_dir": "output/three_prompts_flash_lite_real_epub",
+  "defaults": {
+    "use_system_instruction": true,
+    "system_instruction": "You are a professional literary translator into Russian. Preserve markup, placeholders, links, comments, and glossary terms exactly where required.",
+    "prompt_mode": "project"
+  },
+  "prompts": [
+    {
+      "id": "legacy-default",
+      "mode": "project",
+      "path": "config/default_prompt.txt",
+      "use_system_instruction": true
+    },
+    {
+      "id": "basic-translation",
+      "mode": "project",
+      "path": "config/default_basic_translation_prompt.txt",
+      "use_system_instruction": true
+    },
+    {
+      "id": "basic-translation-short",
+      "mode": "project",
+      "path": "config/default_basic_translation_prompt_short.txt",
+      "use_system_instruction": true
+    }
+  ],
+  "models": [
+    {
+      "id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model_id": "gemini-3.1-flash-lite",
+      "use_stream": true,
+      "max_output_tokens": 8192
+    }
+  ],
+  "cases": [
+    {
+      "id": "real-epub-chapter-00001-2143chars",
+      "source_path": "output/benchmark_sources/tomato_weird_apocalypse_chapter_00001_chunk_2143.xhtml",
+      "checks": {
+        "preserve_html_tags": true,
+        "allow_cjk": false,
+        "glossary_required": true,
+        "min_length_ratio": 0.25,
+        "max_length_ratio": 6.0
+      }
+    }
+  ]
+}

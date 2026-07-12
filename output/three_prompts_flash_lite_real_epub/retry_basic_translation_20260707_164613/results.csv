@@ -1,0 +1,2 @@
+case_id,prompt_id,model_id,provider,model,status,score,latency_ms,prompt_tokens_estimate,output_tokens_estimate,error,prompt_path,output_path
+real-epub-chapter-00001-2143chars,basic-translation,gemini-3.1-flash-lite,gemini,gemini-3.1-flash-lite,ok,60.0,9421,5761,2705,,prompts\real-epub-chapter-00001-2143chars__basic-translation__gemini-3.1-flash-lite.txt,outputs\real-epub-chapter-00001-2143chars__basic-translation__gemini-3.1-flash-lite.output.txt

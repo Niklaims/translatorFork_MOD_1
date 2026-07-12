@@ -4,7 +4,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtWidgets
 
-from gemini_translator.ui.dialogs.setup import InitialSetupDialog
+from gemini_translator.ui.dialogs import setup as setup_dialog
+from gemini_translator.ui.dialogs.setup import InitialSetupDialog, _prepare_project_location
 
 
 class _PathsWidget:
@@ -214,6 +215,64 @@ def test_pending_cleanup_offer_runs_even_when_new_source_is_already_in_history(t
     assert harness.settings_manager.added_projects
     assert harness.filter_calls == 1
     assert harness.data_changed_calls == [False]
+
+
+def test_moving_source_into_project_removes_its_backup(tmp_path, monkeypatch):
+    source_file = tmp_path / "book.epub"
+    source_file.write_bytes(b"epub")
+    backup_file = tmp_path / "book.epub.backup"
+    backup_file.write_bytes(b"backup")
+    project_folder = tmp_path / "translation"
+    project_folder.mkdir()
+
+    class _MoveDialog:
+        choice = "current"
+        copy_file_checked = True
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec(self):
+            return True
+
+    monkeypatch.setattr(setup_dialog, "ProjectFolderDialog", _MoveDialog)
+    harness = _InitializationHarness(
+        selected_file=str(source_file),
+        output_folder=str(project_folder),
+        history=[],
+    )
+
+    harness._handle_project_initialization()
+
+    destination = project_folder / source_file.name
+    assert destination.read_bytes() == b"epub"
+    assert not source_file.exists()
+    assert not backup_file.exists()
+    assert os.path.normpath(harness.selected_file) == os.path.normpath(str(destination))
+
+
+def test_background_project_location_creates_subfolder_and_moves_source(tmp_path):
+    source_file = tmp_path / "book.epub"
+    source_file.write_bytes(b"epub-data")
+    backup_file = tmp_path / "book.epub.backup"
+    backup_file.write_bytes(b"old-backup")
+    project_root = tmp_path / "projects"
+    project_root.mkdir()
+
+    result = _prepare_project_location(
+        str(project_root),
+        str(source_file),
+        "subfolder",
+        True,
+    )
+
+    destination = project_root / "book" / "book.epub"
+    assert result["ok"] is True
+    assert destination.read_bytes() == b"epub-data"
+    assert os.path.normpath(result["effective_folder"]) == os.path.normpath(str(project_root / "book"))
+    assert os.path.normpath(result["effective_file_path"]) == os.path.normpath(str(destination))
+    assert not source_file.exists()
+    assert not backup_file.exists()
 
 
 def test_snapshot_restore_is_not_offered_for_different_epub_signature(tmp_path, monkeypatch):

@@ -1,6 +1,7 @@
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
+import time
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -102,6 +103,14 @@ class _CheckStateStub:
         return self.checked
 
 
+class _ValueStub:
+    def __init__(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
 class _ConnectOnlySignal:
     def __init__(self):
         self.callbacks = []
@@ -114,6 +123,7 @@ class _AutoWorkflowHarness:
     _on_auto_validator_finished = InitialSetupDialog._on_auto_validator_finished
     _on_auto_consistency_finished = InitialSetupDialog._on_auto_consistency_finished
     _finish_auto_validator_followup = InitialSetupDialog._finish_auto_validator_followup
+    _auto_retry_round_available = InitialSetupDialog._auto_retry_round_available
     _compose_auto_details = InitialSetupDialog._compose_auto_details
     _compose_auto_trace_details = InitialSetupDialog._compose_auto_trace_details
 
@@ -123,6 +133,7 @@ class _AutoWorkflowHarness:
         self.key_management_widget = _KeyManagementWidgetStub()
         self.selected_file = "C:/project/book.epub"
         self._auto_followup_running = True
+        self._auto_workflow_round = 0
         self._auto_last_retry_signatures = set()
         self._auto_last_untranslated_fix_signatures = set(repeated_signatures or set())
         self.logs = []
@@ -169,6 +180,84 @@ class _AutoWorkflowHarness:
 
     def check_ready(self):
         self.ready_calls += 1
+
+
+class _AutoFollowupLimitHarness:
+    _run_auto_workflow_followup = InitialSetupDialog._run_auto_workflow_followup
+    _auto_retry_round_available = InitialSetupDialog._auto_retry_round_available
+
+    def __init__(self):
+        self.is_session_active = False
+        self._auto_followup_running = False
+        self._auto_workflow_round = 1
+        self._auto_pending_network_retry_chapters = set()
+        self.auto_translate_widget = _AutoTranslateWidgetStub({
+            "enabled": True,
+            "max_rounds": 1,
+            "retry_network_failed_enabled": False,
+            "filter_repack_enabled": True,
+            "filter_redirect_enabled": True,
+            "retry_short_enabled": False,
+            "retry_untranslated_enabled": False,
+            "ai_consistency_enabled": True,
+        })
+        self.logs = []
+        self.consistency_calls = []
+        self.reset_calls = 0
+        self.ready_calls = 0
+
+    def _auto_log(self, message, force=False, **kwargs):
+        self.logs.append({"message": message, "force": force, **kwargs})
+
+    def _run_auto_consistency_followup(self, auto_settings):
+        self.consistency_calls.append(dict(auto_settings))
+
+    def _reset_auto_workflow_state(self):
+        self.reset_calls += 1
+
+    def check_ready(self):
+        self.ready_calls += 1
+
+
+class _ScheduledAutoRestartHarness:
+    _run_scheduled_auto_translation_restart = InitialSetupDialog._run_scheduled_auto_translation_restart
+    _on_auto_translation_settings_changed = InitialSetupDialog._on_auto_translation_settings_changed
+
+    def __init__(self, *, enabled, workflow_enabled=True, session_active=False):
+        self.auto_translate_widget = _AutoTranslateWidgetStub({"enabled": enabled})
+        self._auto_workflow_enabled_for_session = workflow_enabled
+        self.is_session_active = session_active
+        self.start_calls = 0
+        self.reset_calls = 0
+        self.ready_calls = 0
+        self.logs = []
+        self._auto_restart_timer = _ActiveTimerStub()
+
+    def _start_translation(self, is_auto_restart=False):
+        self.start_calls += int(bool(is_auto_restart))
+
+    def _reset_auto_workflow_state(self):
+        self.reset_calls += 1
+        self._auto_restart_timer.stop()
+
+    def check_ready(self):
+        self.ready_calls += 1
+
+    def _auto_log(self, message, force=False, **kwargs):
+        self.logs.append({"message": message, "force": force, **kwargs})
+
+
+class _ActiveTimerStub:
+    def __init__(self):
+        self.active = True
+        self.stop_calls = 0
+
+    def isActive(self):
+        return self.active
+
+    def stop(self):
+        self.active = False
+        self.stop_calls += 1
 
 
 class _AutoRatioHarness:
@@ -382,6 +471,43 @@ class _ConsistencyProjectManagerStub:
 
 
 class AutoWorkflowFollowupTests(unittest.TestCase):
+    def test_retry_limit_runs_final_consistency_instead_of_aborting_pipeline(self):
+        harness = _AutoFollowupLimitHarness()
+
+        harness._run_auto_workflow_followup()
+
+        self.assertEqual(len(harness.consistency_calls), 1)
+        self.assertEqual(harness.reset_calls, 0)
+        self.assertTrue(any("выполняю финальные проверки" in entry["message"] for entry in harness.logs))
+
+    def test_disabled_auto_mode_cancels_delayed_restart(self):
+        harness = _ScheduledAutoRestartHarness(enabled=False)
+
+        harness._run_scheduled_auto_translation_restart()
+
+        self.assertEqual(harness.start_calls, 0)
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertEqual(harness.ready_calls, 1)
+
+    def test_disabling_auto_mode_stops_waiting_timer_immediately(self):
+        harness = _ScheduledAutoRestartHarness(enabled=False)
+
+        harness._on_auto_translation_settings_changed()
+
+        self.assertFalse(harness._auto_restart_timer.isActive())
+        self.assertEqual(harness._auto_restart_timer.stop_calls, 1)
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertTrue(any("автопайплайн выключен" in entry["message"] for entry in harness.logs))
+
+    def test_delayed_restart_does_not_collide_with_another_session(self):
+        harness = _ScheduledAutoRestartHarness(enabled=True, session_active=True)
+
+        harness._run_scheduled_auto_translation_restart()
+
+        self.assertEqual(harness.start_calls, 0)
+        self.assertEqual(harness.reset_calls, 1)
+        self.assertTrue(any("уже запущена другая сессия" in entry["message"] for entry in harness.logs))
+
     def test_auto_translation_options_include_chapter_limit(self):
         harness = _AutoTranslationOptionsHarness()
 
@@ -543,6 +669,35 @@ class AutoWorkflowFollowupTests(unittest.TestCase):
         self.assertEqual(harness.retry_requests, [(harness.selected_file, [short_chapter])])
         self.assertEqual(harness.reset_calls, 1)
         self.assertEqual(harness.ready_calls, 1)
+
+    def test_retry_limit_still_runs_final_consistency_without_requeue(self):
+        settings = {
+            "retry_short_enabled": True,
+            "retry_untranslated_enabled": False,
+            "auto_restart_after_retry": True,
+            "max_rounds": 1,
+            "ai_consistency_enabled": True,
+        }
+        short_chapter = "Text/ch-final.xhtml"
+        dialog = _ValidatorDialogStub(
+            {
+                0: {
+                    "internal_html_path": short_chapter,
+                    "len_orig": 500,
+                    "ratio_value": 0.20,
+                }
+            },
+            allow_auto_fix=False,
+        )
+        harness = _AutoWorkflowHarness(dialog, settings)
+        harness._auto_workflow_round = 1
+
+        harness._on_auto_validator_finished(total_scanned=1, suspicious_found=1)
+
+        self.assertEqual(harness.retry_requests, [])
+        self.assertEqual(len(harness.consistency_calls), 1)
+        self.assertEqual(harness.reset_calls, 0)
+        self.assertTrue(any("лимит автоциклов" in entry["message"] for entry in harness.logs))
 
     def test_repeated_untranslated_signature_advances_to_consistency(self):
         settings = {
@@ -846,6 +1001,7 @@ class _AutoConsistencyFollowupHarness:
         self.key_management_widget = _KeyManagementWidgetStub()
         self.start_btn = _ButtonStub()
         self.prevent_sleep_checkbox = _CheckStateStub()
+        self.instances_spin = _ValueStub(3)
         self.logs = []
         self._auto_followup_running = False
         self._auto_consistency_worker = None
@@ -1016,6 +1172,8 @@ class AutoConsistencyFollowupTests(unittest.TestCase):
 
         worker = _AutoConsistencyWorkerStub.instances[0]
         self.assertEqual(worker.config["consistency_mode"], FAST_PROOFREAD_MODE)
+        self.assertEqual(worker.config["consistency_parallel_workers"], 3)
+        self.assertEqual(worker.config["num_instances"], 3)
         self.assertEqual(worker.mode, FAST_PROOFREAD_MODE)
 
     def test_run_auto_consistency_followup_passes_original_flag_to_loader(self):
@@ -1213,6 +1371,67 @@ class AutoConsistencyWorkerTests(unittest.TestCase):
             self.assertEqual(result["request_response_trace"][0]["response"], "stub analysis response")
             with open(chapter_path, "r", encoding="utf-8") as handle:
                 self.assertEqual(handle.read(), original_content)
+
+
+class _AutoGlossaryPollTimerStub:
+    def __init__(self):
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+
+    def stop(self):
+        self.stop_calls += 1
+
+
+class _AutoGlossaryDialogStub:
+    def __init__(self):
+        self.start_calls = 0
+        self.is_session_active = False
+        self._session_finished_successfully = False
+
+    def _start_session(self):
+        self.start_calls += 1
+
+
+class _AutoGlossarySequencingHarness:
+    _on_auto_glossary_tasks_ready = InitialSetupDialog._on_auto_glossary_tasks_ready
+    _poll_auto_glossary_dialog = InitialSetupDialog._poll_auto_glossary_dialog
+
+    def __init__(self):
+        self._auto_glossary_dialog = _AutoGlossaryDialogStub()
+        self._auto_glossary_running = True
+        self._auto_glossary_pending_translation = True
+        self._auto_glossary_poll_timer = _AutoGlossaryPollTimerStub()
+        self.logs = []
+
+    def _auto_log(self, message, force=False, **_kwargs):
+        self.logs.append((message, force))
+
+
+class AutoGlossarySequencingTests(unittest.TestCase):
+    def test_auto_glossary_starts_only_after_task_preparation_signal(self):
+        harness = _AutoGlossarySequencingHarness()
+        dialog = harness._auto_glossary_dialog
+
+        harness._on_auto_glossary_tasks_ready(dialog, True, "")
+
+        self.assertEqual(dialog.start_calls, 1)
+        self.assertEqual(harness._auto_glossary_poll_timer.start_calls, 1)
+        self.assertFalse(dialog._auto_glossary_seen_active)
+        self.assertIsInstance(dialog._auto_glossary_start_requested_at, float)
+
+    def test_poll_does_not_fail_while_engine_start_is_in_flight(self):
+        harness = _AutoGlossarySequencingHarness()
+        dialog = harness._auto_glossary_dialog
+        dialog._auto_glossary_start_requested_at = time.monotonic()
+        dialog._auto_glossary_seen_active = False
+
+        harness._poll_auto_glossary_dialog()
+
+        self.assertEqual(harness.logs, [])
+        self.assertEqual(harness._auto_glossary_poll_timer.stop_calls, 0)
 
 
 if __name__ == "__main__":

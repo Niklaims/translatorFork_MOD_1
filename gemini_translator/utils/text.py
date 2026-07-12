@@ -1694,6 +1694,32 @@ HTML_TAG_TOKEN_RE = re.compile(
     re.DOTALL,
 )
 
+DUPLICATED_ANGLE_TAG_PREFIX_RE = re.compile(
+    r'<\s*/?\s*(?=</?\s*[A-Za-z][A-Za-z0-9:_-]*(?:\s|/?>))',
+    re.IGNORECASE,
+)
+DUPLICATED_CLOSING_TAG_FRAGMENT_RE = re.compile(
+    r'</\s*(?P<tag>p|h[1-6]|li|blockquote|div|section|article)\s*[.,:;/]*\s*'
+    r'(?=</\s*(?P=tag)\s*>)',
+    re.IGNORECASE,
+)
+ORPHAN_CLOSING_PREFIX_BEFORE_DASH_RE = re.compile(r'</\s*(?=[—–−─-])')
+
+
+def _remove_duplicated_angle_tag_prefixes(html_content: str) -> str:
+    """Repair broken prefixes such as ``</</p>``, ``</p.</p>`` and ``</—``.
+
+    These are markup artifacts, not visible less-than signs. Escaping the first
+    angle bracket would turn the broken prefix into reader-visible ``</`` text.
+    """
+    if not isinstance(html_content, str) or '<' not in html_content:
+        return html_content
+    repaired = DUPLICATED_ANGLE_TAG_PREFIX_RE.sub('', html_content)
+    repaired = DUPLICATED_CLOSING_TAG_FRAGMENT_RE.sub('', repaired)
+    # In dialogue prose an orphan ``</`` before a dash is garbage between two
+    # valid sentence parts. Keep a single separator so words do not stick.
+    return ORPHAN_CLOSING_PREFIX_BEFORE_DASH_RE.sub(' ', repaired)
+
 
 def _consume_valid_angle_token(text: str, start: int) -> int | None:
     if text.startswith('<!--', start):
@@ -1789,15 +1815,31 @@ def find_stray_angle_bracket_snippets(html_content: str, limit: int = 3) -> list
 def repair_ai_html_artifacts(original_html: str, translated_html: str) -> str:
     """
     Repairs common AI HTML artifacts without changing translation wording:
-    missing body wrapper, stray angle brackets, unbalanced <p>, and direct
-    visible text inside <body> that should be wrapped in paragraphs.
+    missing body wrapper, duplicated tag prefixes, stray angle brackets,
+    unbalanced <p>, and direct visible text inside <body> that should be
+    wrapped in paragraphs. A complete translated XHTML shell is preserved
+    byte-for-byte around the repaired body.
     """
     if not isinstance(translated_html, str) or not translated_html.strip():
         return translated_html
 
     original_html = original_html if isinstance(original_html, str) else ""
+    preserved_shell = None
+    if (
+        re.search(r'<body\b', translated_html, re.IGNORECASE)
+        and re.search(r'</body>', translated_html, re.IGNORECASE)
+    ):
+        prefix, _body, suffix = process_body_tag(
+            translated_html,
+            return_parts=True,
+            body_content_only=False,
+        )
+        if prefix or suffix:
+            preserved_shell = (prefix, suffix)
+
     repaired = normalize_translated_body_wrapper(original_html, translated_html)
     repaired = normalize_xhtml_tag_case(repaired)
+    repaired = _remove_duplicated_angle_tag_prefixes(repaired)
     repaired = escape_stray_angle_brackets(repaired)
     repaired = optimize_headings(repaired)
     repaired = repair_unbalanced_paragraphs(repaired)
@@ -1805,6 +1847,14 @@ def repair_ai_html_artifacts(original_html: str, translated_html: str) -> str:
     repaired = _coerce_first_heading_level(original_html, repaired)
     repaired = coerce_translated_body_block(original_html, repaired)
     repaired = RAW_AMPERSAND_PATTERN.sub('&amp;', repaired)
+
+    if preserved_shell and re.search(r'<body\b', repaired, re.IGNORECASE):
+        repaired_body = process_body_tag(
+            repaired,
+            return_parts=False,
+            body_content_only=False,
+        )
+        return preserved_shell[0] + repaired_body + preserved_shell[1]
     return repaired
 
 
@@ -2713,6 +2763,12 @@ def _paragraph_tag_count(html_content: str) -> int:
     return len(re.findall(r'<p(?:\s|>)', html_content, flags=re.IGNORECASE))
 
 
+def _large_translation_min_ratio(source_text: str) -> float:
+    if CJK_UNSPACED_RE.search(source_text or ""):
+        return 0.70
+    return 0.45
+
+
 def find_unwrapped_body_text_snippets(html_content: str, limit: int = 3) -> list[str]:
     """Return visible direct text/inline content in <body> that is not inside a block tag."""
     if not isinstance(html_content, str) or not html_content.strip():
@@ -3179,6 +3235,27 @@ def validate_html_structure(original_html, translated_html):
         return False, f"Ошибка при анализе HTML-структуры: {e}", final_translated_html
 
     # --- ПРОВЕРКА 3: Эвристика ---
+    text_orig = soup_orig.get_text() if 'soup_orig' in locals() else normalized_orig
+    text_trans = soup_trans.get_text() if 'soup_trans' in locals() else final_translated_html
+
+    if len(text_orig) > 3000:
+        text_ratio = len(text_trans) / max(len(text_orig), 1)
+        min_ratio = _large_translation_min_ratio(text_orig)
+        if text_ratio < min_ratio:
+            return False, (
+                "Translation is too short for a large source "
+                f"(ratio {text_ratio:.2f} < {min_ratio:.2f})."
+            ), final_translated_html
+
+        orig_p_count = _paragraph_tag_count(original_html)
+        trans_p_count = _paragraph_tag_count(final_translated_html)
+        min_p_count = max(3, int(orig_p_count * 0.30))
+        if orig_p_count >= 12 and trans_p_count < min_p_count:
+            return False, (
+                "Too many source paragraphs collapsed or disappeared "
+                f"({trans_p_count}/{orig_p_count} < {min_p_count})."
+            ), final_translated_html
+
     try:
         compressed_size = len(zlib.compress(final_translated_html.encode('utf-8')))
         original_size = len(final_translated_html.encode('utf-8'))
@@ -3189,9 +3266,6 @@ def validate_html_structure(original_html, translated_html):
     except Exception as e:
         print(f"[WARN] Ошибка при проверке сжатия: {e}")
     
-    text_orig = soup_orig.get_text() if 'soup_orig' in locals() else normalized_orig
-    text_trans = soup_trans.get_text() if 'soup_trans' in locals() else final_translated_html
-
     if len(text_orig) > 500 and len(text_trans) < len(text_orig) / 8:
         return False, f"Ответ слишком короткий.", final_translated_html
         
