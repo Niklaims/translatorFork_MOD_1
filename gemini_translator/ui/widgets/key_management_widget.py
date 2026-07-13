@@ -33,28 +33,21 @@ class AdaptiveControlsWidget(QWidget):
         self._applied_style_key = None
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
 
-        layout.addStretch(10)
+        layout.addStretch(1)
         for btn in self.arrow_buttons:
             layout.addWidget(btn)
-            layout.addStretch(1)
 
-        if layout.itemAt(layout.count() - 1).spacerItem():
-            layout.takeAt(layout.count() - 1)
-
-        layout.addStretch(5)
+        layout.addSpacing(4)
         layout.addWidget(separator)
-        layout.addStretch(5)
+        layout.addSpacing(4)
 
         for btn in self.action_buttons:
             layout.addWidget(btn)
-            layout.addStretch(1)
 
-        if layout.itemAt(layout.count() - 1).spacerItem():
-            layout.takeAt(layout.count() - 1)
-
-        layout.addStretch(10)
+        layout.addStretch(1)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -195,11 +188,12 @@ class KeyManagementWidget(QWidget):
         left_panel_widget.setObjectName("keyPanelSurface")
         left_panel_layout = QVBoxLayout(left_panel_widget)
         left_panel_layout.setContentsMargins(0, 0, 0, 0)
-        left_panel_layout.setSpacing(10)
+        left_panel_layout.setSpacing(4)
 
         provider_group = QGroupBox("1. Выбор сервиса")
         provider_layout = QHBoxLayout(provider_group)
-        provider_layout.setSpacing(10)
+        provider_layout.setContentsMargins(4, 4, 4, 4)
+        provider_layout.setSpacing(4)
 
         self.provider_combo = NoScrollComboBox()
         self.provider_combo.clear()
@@ -218,7 +212,7 @@ class KeyManagementWidget(QWidget):
 
         self.server_button = QPushButton("Запустить сервер")
         self.server_button.setStyleSheet(f"""
-            QPushButton {{ background-color: {theme_manager.color('success')}; color: {theme_manager.color('accent_text')}; font-weight: bold; padding: 10px; border-radius: 4px; }}
+            QPushButton {{ background-color: {theme_manager.color('success')}; color: {theme_manager.color('accent_text')}; font-weight: bold; padding: 4px 10px; border-radius: 4px; }}
             QPushButton:hover {{ background-color: {theme_manager.color('success')}; }}
             QPushButton:disabled {{ background-color: {theme_manager.color('success')}; color: {theme_manager.color('text_muted')}; }}
         """)
@@ -238,10 +232,12 @@ class KeyManagementWidget(QWidget):
 
         self.available_keys_group = QGroupBox("2. Доступные ключи (общий пул)")
         available_layout = QVBoxLayout(self.available_keys_group)
+        available_layout.setContentsMargins(4, 4, 4, 4)
+        available_layout.setSpacing(4)
 
         legend_layout = QHBoxLayout()
         legend_layout.setContentsMargins(0, 0, 0, 0)
-        legend_layout.setSpacing(6)
+        legend_layout.setSpacing(4)
         for text, state in (
             ("Активный", "active"),
             ("Пауза", "paused"),
@@ -256,7 +252,7 @@ class KeyManagementWidget(QWidget):
 
         search_row = QHBoxLayout()
         search_row.setContentsMargins(0, 0, 0, 0)
-        search_row.setSpacing(8)
+        search_row.setSpacing(4)
         search_label = QLabel("Фильтр")
         search_label.setObjectName("mutedCaptionLabel")
         self.available_search_edit = QLineEdit()
@@ -285,14 +281,12 @@ class KeyManagementWidget(QWidget):
 
         # Центральная панель с кнопками
         self.add_selected_btn = QPushButton(" > ")
-        self.add_selected_btn.setToolTip(
-            "Переместить выделенные ключи в активные")
+        self.add_selected_btn.setToolTip("Переместить выделенные ключи в активные")
         self.add_selected_btn.clicked.connect(self._add_selected_to_active)
 
         self.remove_selected_btn = QPushButton(" < ")
         self.remove_selected_btn.setToolTip("Вернуть выделенные ключи в пул")
-        self.remove_selected_btn.clicked.connect(
-            self._remove_selected_from_active)
+        self.remove_selected_btn.clicked.connect(self._remove_selected_from_active)
 
         self.add_all_btn = QPushButton(" >> ")
         self.add_all_btn.setToolTip("Добавить все рабочие ('зеленые') ключи")
@@ -307,33 +301,25 @@ class KeyManagementWidget(QWidget):
         separator.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
 
         self.add_from_text_btn = QPushButton("Добавить…")
-        self.add_from_text_btn.setToolTip(
-            "Добавить новые ключи из текста или файла")
+        self.add_from_text_btn.setToolTip("Добавить новые ключи из текста или файла")
         self.add_from_text_btn.clicked.connect(self._add_keys_from_text)
 
         self.reset_selected_btn = QPushButton("'Отбелить'…")
-        self.reset_selected_btn.setToolTip(
-            "Сбросить статус ('отбелить') для выделенных ключей")
+        self.reset_selected_btn.setToolTip("Сбросить статус ('отбелить') для выделенных ключей")
         self.reset_selected_btn.clicked.connect(self._reset_selected_statuses)
 
         self.force_exhaust_btn = QPushButton("'Покраснить'…")
-        self.force_exhaust_btn.setToolTip(
-            "Принудительно пометить выделенные ключи как исчерпанные")
+        self.force_exhaust_btn.setToolTip("Принудительно пометить выделенные ключи как исчерпанные")
         self.force_exhaust_btn.clicked.connect(self._force_exhaust_selected)
 
         self.remove_from_pool_btn = QPushButton("Удалить…")
-        self.remove_from_pool_btn.setToolTip(
-            "Удалить выделенные ключи из пула навсегда")
-        self.remove_from_pool_btn.clicked.connect(
-            self._handle_delete_from_pool)
+        self.remove_from_pool_btn.setToolTip("Удалить выделенные ключи из пула навсегда")
+        self.remove_from_pool_btn.clicked.connect(self._handle_delete_from_pool)
 
-        arrow_buttons = [self.add_selected_btn, self.remove_selected_btn,
-                         self.add_all_btn, self.remove_all_btn]
-        action_buttons = [self.add_from_text_btn,
-                          self.reset_selected_btn, self.force_exhaust_btn, self.remove_from_pool_btn]
+        arrow_buttons = [self.add_selected_btn, self.remove_selected_btn, self.add_all_btn, self.remove_all_btn]
+        action_buttons = [self.add_from_text_btn, self.reset_selected_btn, self.force_exhaust_btn, self.remove_from_pool_btn]
 
-        controls_widget = AdaptiveControlsWidget(
-            arrow_buttons, action_buttons, separator, self)
+        controls_widget = AdaptiveControlsWidget(arrow_buttons, action_buttons, separator, self)
         controls_widget.setObjectName("keyTransferColumn")
         key_splitter.addWidget(controls_widget)
 
@@ -342,14 +328,18 @@ class KeyManagementWidget(QWidget):
         right_panel_container.setObjectName("keyPanelSurface")
         right_panel_layout = QVBoxLayout(right_panel_container)
         right_panel_layout.setContentsMargins(0, 0, 0, 0)
-        right_panel_layout.setSpacing(10)
+        right_panel_layout.setSpacing(4)
 
         if self.distribution_group_widget:
             self.distribution_group_widget.setObjectName("distribution_group")
+            if self.distribution_group_widget.layout():
+                self.distribution_group_widget.layout().setContentsMargins(4, 4, 4, 4)
             right_panel_layout.addWidget(self.distribution_group_widget)
 
         self.active_keys_group = QGroupBox("3. Активные ключи для сессии")
         active_layout = QVBoxLayout(self.active_keys_group)
+        active_layout.setContentsMargins(4, 4, 4, 4)
+        active_layout.setSpacing(4)
 
         active_header_widget = QWidget()
         active_header_layout = QHBoxLayout(active_header_widget)
@@ -362,9 +352,7 @@ class KeyManagementWidget(QWidget):
         active_header_layout.addWidget(self.active_key_count_label)
         active_layout.addWidget(active_header_widget)
 
-        self.active_empty_label = QLabel(
-            "Активные ключи пока не выбраны. Перенесите их из общего пула."
-        )
+        self.active_empty_label = QLabel("Активные ключи пока не выбраны. Перенесите их из общего пула.")
         self._active_empty_default_text = self.active_empty_label.text()
         self.active_empty_label.setObjectName("helperLabel")
         self.active_empty_label.setWordWrap(True)
@@ -373,23 +361,19 @@ class KeyManagementWidget(QWidget):
         self.active_keys_list = CustomListWidget()
         self.active_keys_list.setObjectName("keyListWidget")
         self.active_keys_list.setAlternatingRowColors(True)
-        self.active_keys_list.setSelectionMode(
-            QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.active_keys_list.doubleClicked.connect(
-            self._remove_selected_from_active)
-        self.active_keys_list.setToolTip(
-            "Нажмите Delete или двойной клик для возврата в пул.")
-        self.active_keys_list.delete_pressed.connect(
-            self._remove_selected_from_active)
-
+        self.active_keys_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.active_keys_list.doubleClicked.connect(self._remove_selected_from_active)
+        self.active_keys_list.setToolTip("Нажмите Delete или двойной клик для возврата в пул.")
+        self.active_keys_list.delete_pressed.connect(self._remove_selected_from_active)
         active_layout.addWidget(self.active_keys_list)
+
         right_panel_layout.addWidget(self.active_keys_group, 1)
 
         key_splitter.addWidget(right_panel_container)
-        
+
         left_panel_widget.setMinimumWidth(300)
         right_panel_container.setMinimumWidth(250)
-        
+
         key_splitter.setStretchFactor(0, 1)
         key_splitter.setStretchFactor(1, 0)
         key_splitter.setStretchFactor(2, 1)
@@ -412,18 +396,18 @@ class KeyManagementWidget(QWidget):
         card.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Minimum)
 
         layout = QHBoxLayout(card)
-        layout.setContentsMargins(8, 6, 8, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(4, 2, 4, 2)
+        layout.setSpacing(4)
 
         icon_label = QLabel("🔑")
         icon_label.setObjectName("keyStatusIcon")
         icon_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        icon_label.setFixedSize(34, 34)
+        icon_label.setFixedSize(24, 24)
         layout.addWidget(icon_label, 0, QtCore.Qt.AlignmentFlag.AlignTop)
 
         text_layout = QVBoxLayout()
         text_layout.setContentsMargins(0, 0, 0, 0)
-        text_layout.setSpacing(2)
+        text_layout.setSpacing(0)
 
         title_label = QLabel("Ключи")
         title_label.setObjectName("keyStatusTitle")

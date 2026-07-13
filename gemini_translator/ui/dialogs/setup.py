@@ -544,7 +544,8 @@ class InitialSetupPage(ShellPage):
         # Оборачиваем в группу для визуальной целостности
         keys_container_group = QGroupBox("Сервисы, сессии и распределение нагрузки")
         keys_container_layout = QVBoxLayout(keys_container_group)
-        keys_container_layout.setContentsMargins(2, 8, 2, 2)
+        keys_container_layout.setContentsMargins(2, 4, 2, 2)
+        keys_container_layout.setSpacing(2)
         keys_container_layout.addWidget(self.key_management_widget)
 
         # Добавляем группу ключей наверх (stretch=1, чтобы она занимала все свободное место)
@@ -1092,8 +1093,144 @@ class InitialSetupPage(ShellPage):
             lambda: self.model_settings_widget._refresh_current_provider_models() if hasattr(self, 'model_settings_widget') else None
         )
         tabs.addTab(self.provider_models_widget, "Провайдер")
-        
+
+        # --- Tab 3: "OPDS Сервер" ---
+        opds_tab = QWidget()
+        opds_layout = QVBoxLayout(opds_tab)
+        opds_layout.setContentsMargins(4, 4, 4, 4)
+        opds_layout.setSpacing(8)
+
+        # Группа управления сервером
+        server_group = QGroupBox("Управление OPDS-сервером")
+        server_layout = QVBoxLayout(server_group)
+        server_layout.setSpacing(8)
+
+        # Строка: Тумблер + Статус
+        toggle_row = QHBoxLayout()
+        from ..widgets.toggle_switch_widget import ToggleSwitchWidget
+        self.opds_toggle = ToggleSwitchWidget(checked=False, parent=opds_tab)
+        self.opds_toggle.toggled.connect(self._on_opds_toggle_changed)
+        toggle_row.addWidget(QLabel("Сервер OPDS:"))
+        toggle_row.addWidget(self.opds_toggle)
+        toggle_row.addSpacing(12)
+
+        self.opds_status_label = QLabel("🔴 Остановлен")
+        self.opds_status_label.setObjectName("helperLabel")
+        toggle_row.addWidget(self.opds_status_label, 1)
+        server_layout.addLayout(toggle_row)
+
+        # Адрес подключения (показывается при запуске)
+        self.opds_url_label = QLabel("")
+        self.opds_url_label.setObjectName("helperLabel")
+        self.opds_url_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.opds_url_label.setStyleSheet(f"color: {theme_manager.color('success')}; font-weight: bold;")
+        self.opds_url_label.setVisible(False)
+        server_layout.addWidget(self.opds_url_label)
+
+        opds_layout.addWidget(server_group)
+
+        # Группа настроек сети
+        network_group = QGroupBox("Настройки сети")
+        network_layout = QFormLayout(network_group)
+        network_layout.setSpacing(8)
+
+        self.opds_ip_combo = QComboBox()
+        self.opds_ip_combo.addItem("127.0.0.1 (только этот ПК)", "127.0.0.1")
+        self.opds_ip_combo.addItem("0.0.0.0 (раздача по Wi-Fi)", "0.0.0.0")
+        network_layout.addRow("IP-адрес:", self.opds_ip_combo)
+
+        self.opds_port_spin = QSpinBox()
+        self.opds_port_spin.setRange(1024, 65535)
+        self.opds_port_spin.setValue(8080)
+        self.opds_port_spin.setToolTip("Порт для OPDS-сервера. По умолчанию 8080.")
+        network_layout.addRow("Порт:", self.opds_port_spin)
+
+        opds_layout.addWidget(network_group)
+
+        # Группа автоматики
+        auto_group = QGroupBox("Автоматизация")
+        auto_layout = QVBoxLayout(auto_group)
+        auto_layout.setSpacing(8)
+
+        self.opds_auto_publish_checkbox = QCheckBox("Автоматическая загрузка готовых глав")
+        self.opds_auto_publish_checkbox.setToolTip(
+            "При включении, как только глава помечается как «готова» (перевод завершён),\n"
+            "она автоматически становится доступна на OPDS-сервере."
+        )
+        self.opds_auto_publish_checkbox.toggled.connect(self._on_opds_auto_publish_toggled)
+        auto_layout.addWidget(self.opds_auto_publish_checkbox)
+
+        opds_layout.addWidget(auto_group)
+
+        # Информация о количестве глав в раздаче
+        self.opds_chapters_label = QLabel("Глав в раздаче: 0")
+        self.opds_chapters_label.setObjectName("helperLabel")
+        opds_layout.addWidget(self.opds_chapters_label)
+
+        opds_layout.addStretch(1)
+        tabs.addTab(opds_tab, "OPDS Сервер")
+
         return tabs
+
+    # ─── OPDS-сервер — обработчики UI ───────────────────────────────────
+
+    def _get_opds_manager(self):
+        """Возвращает глобальный OPDSManager из QApplication или None."""
+        app = QtWidgets.QApplication.instance()
+        return getattr(app, "opds_manager", None)
+
+    def _on_opds_toggle_changed(self, checked: bool):
+        """Обработчик тумблера OPDS — запуск/остановка сервера."""
+        manager = self._get_opds_manager()
+        if manager is None:
+            self.opds_status_label.setText("⚠️ OPDS-менеджер не инициализирован")
+            return
+
+        if checked:
+            host = self.opds_ip_combo.currentData()
+            port = self.opds_port_spin.value()
+            try:
+                url = manager.start(host=host, port=port)
+                self._update_opds_ui(running=True, url=url)
+            except Exception as e:
+                self._update_opds_ui(running=False)
+                QMessageBox.warning(self, "Ошибка OPDS", f"Не удалось запустить OPDS-сервер:\n{e}")
+                # Возвращаем тумблер в исходное положение
+                self.opds_toggle.blockSignals(True)
+                self.opds_toggle.setChecked(False)
+                self.opds_toggle.blockSignals(False)
+        else:
+            manager.stop()
+            self._update_opds_ui(running=False)
+
+    def _on_opds_auto_publish_toggled(self, checked: bool):
+        """Обработчик галочки автоматической публикации готовых глав."""
+        manager = self._get_opds_manager()
+        if manager is not None:
+            manager.auto_publish = checked
+
+    def _update_opds_ui(self, running: bool, url: str = ""):
+        """Обновляет визуальное состояние элементов OPDS-вкладки."""
+        if running:
+            self.opds_status_label.setText("🟢 Запущен")
+            self.opds_url_label.setText(f"📡 Адрес: {url}")
+            self.opds_url_label.setVisible(True)
+            # Блокируем настройки сети при работающем сервере
+            self.opds_ip_combo.setEnabled(False)
+            self.opds_port_spin.setEnabled(False)
+        else:
+            self.opds_status_label.setText("🔴 Остановлен")
+            self.opds_url_label.setVisible(False)
+            self.opds_ip_combo.setEnabled(True)
+            self.opds_port_spin.setEnabled(True)
+
+        # Обновляем счётчик глав
+        manager = self._get_opds_manager()
+        if manager:
+            count = manager.chapter_count()
+            self.opds_chapters_label.setText(f"Глав в раздаче: {count}")
 
     def _load_show_chapter_char_count_enabled(self) -> bool:
         for loader_name in ("load_full_session_settings", "load_settings"):

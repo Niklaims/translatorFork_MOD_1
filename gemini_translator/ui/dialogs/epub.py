@@ -1590,11 +1590,25 @@ class TranslatedChaptersManagerDialog(QDialog):
         meta_main_layout.addLayout(cover_layout)
         main_layout.addWidget(self.metadata_group)
 
-        # Кнопка запуска
+        # Кнопки запуска
+        build_buttons_layout = QHBoxLayout()
+
         self.create_epub_btn = QPushButton("🚀 Собрать EPUB")
         self.create_epub_btn.setStyleSheet(f"background-color: {theme_manager.color('success')}; color: {theme_manager.color('accent_text')}; font-weight: bold; padding: 5px;")
         self.create_epub_btn.clicked.connect(self.create_epub)
-        main_layout.addWidget(self.create_epub_btn)
+        build_buttons_layout.addWidget(self.create_epub_btn)
+
+        self.upload_opds_btn = QPushButton("📡 Загрузить на OPDS")
+        self.upload_opds_btn.setToolTip(
+            "Отправляет выбранные (галочкой) главы на локальный OPDS-сервер.\n"
+            "Главы станут доступны для скачивания на читалках."
+        )
+        self.upload_opds_btn.setStyleSheet(f"background-color: {theme_manager.color('accent')}; color: {theme_manager.color('accent_text')}; font-weight: bold; padding: 5px;")
+        self.upload_opds_btn.clicked.connect(self._upload_to_opds)
+        build_buttons_layout.addWidget(self.upload_opds_btn)
+
+        build_buttons_layout.addStretch()
+        main_layout.addLayout(build_buttons_layout)
 
         # --- Логика переключений режимов ---
         self.create_new_radio.toggled.connect(self._on_mode_toggled)
@@ -1973,8 +1987,38 @@ class TranslatedChaptersManagerDialog(QDialog):
         self.table.setCellWidget(row, self.COL_FILE, combo)
             
     def _renumber_rows(self):
+        app = QtWidgets.QApplication.instance()
+        opds_manager = getattr(app, "opds_manager", None)
+        opds_filepaths = set()
+        if opds_manager:
+            book = opds_manager.get_book(self.translated_folder)
+            if book:
+                opds_filepaths = {ch.get("filepath") for ch in book["chapters"]}
+
         for i in range(self.table.rowCount()):
-            self.table.setItem(i, self.COL_NUMBER, QTableWidgetItem(str(i + 1)))
+            item = QTableWidgetItem(str(i + 1))
+            
+            # Добавляем индикатор OPDS
+            version_combo = self.table.cellWidget(i, self.COL_FILE)
+            if version_combo:
+                current_filepath = version_combo.currentData()
+                
+                if current_filepath in opds_filepaths:
+                    item.setText(f"{i + 1} 📡")
+                    item.setToolTip("Эта версия главы сейчас доступна на OPDS-сервере")
+                else:
+                    # Ищем, загружена ли другая (предыдущая) версия этой же главы
+                    is_other_version_on_opds = False
+                    for combo_idx in range(version_combo.count()):
+                        if version_combo.itemData(combo_idx) in opds_filepaths:
+                            is_other_version_on_opds = True
+                            break
+                    
+                    if is_other_version_on_opds:
+                        item.setText(f"{i + 1} 📡")
+                        item.setToolTip("Внимание: на OPDS загружена ДРУГАЯ (предыдущая) версия этой главы.\nНажмите 'Загрузить на OPDS', чтобы обновить её до текущей.")
+                    
+            self.table.setItem(i, self.COL_NUMBER, item)
 
     def _move_row(self, offset):
         """Перемещение выделенной строки на offset."""
@@ -2494,6 +2538,96 @@ class TranslatedChaptersManagerDialog(QDialog):
             self._create_new_epub_with_creator(build_rows)
         elif self.update_original_radio.isChecked():
             self._update_original_epub_with_updater(build_rows)
+
+    def _upload_to_opds(self):
+        """Загружает выбранные (отмеченные галочкой) главы на OPDS-сервер."""
+        app = QtWidgets.QApplication.instance()
+        opds_manager = getattr(app, "opds_manager", None)
+        if opds_manager is None:
+            QMessageBox.warning(
+                self,
+                "OPDS-сервер недоступен",
+                "OPDS-менеджер не инициализирован.\n"
+                "Убедитесь, что сервер включён в настройках «Приложение → OPDS Сервер»."
+            )
+            return
+
+        build_rows = self._get_build_row_indices()
+        if not build_rows:
+            QMessageBox.warning(
+                self,
+                "Нет выбранных глав",
+                "Отметьте хотя бы одну главу (галочкой) для загрузки на OPDS."
+            )
+            return
+
+        chapters = []
+        for row_idx in build_rows:
+            version_combo = self.table.cellWidget(row_idx, self.COL_FILE)
+            if not version_combo:
+                continue
+            filepath = version_combo.currentData()
+            if not filepath or not os.path.exists(filepath):
+                continue
+
+            # Пытаемся извлечь заголовок из файла
+            title = self._extract_chapter_title(filepath, row_idx)
+            chapters.append({"title": title, "filepath": filepath})
+
+        if not chapters:
+            QMessageBox.warning(
+                self,
+                "Нет доступных файлов",
+                "Ни один из выбранных файлов не найден на диске."
+            )
+            return
+
+        # Устанавливаем метаданные книги
+        book_title_str = "Unknown Book"
+        book_title = getattr(self, "title_edit", None)
+        if book_title and book_title.text().strip():
+            book_title_str = book_title.text().strip()
+            
+        book_author_str = "Gemini EPUB Translator"
+        book_author = getattr(self, "author_edit", None)
+        if book_author and book_author.text().strip():
+            book_author_str = book_author.text().strip()
+
+        # Используем путь к папке проекта как уникальный ID книги
+        book_id = self.translated_folder
+
+        # Передаём главы в менеджер OPDS как отдельную книгу
+        opds_manager.add_or_update_book(book_id, book_title_str, book_author_str, chapters)
+
+        # Обновляем интерфейс, чтобы показать индикаторы загрузки (📡)
+        self._renumber_rows()
+
+        status = f"✅ Загружено {len(chapters)} глав на OPDS-сервер."
+        if opds_manager.is_running():
+            status += f"\n📡 Доступно по адресу: {opds_manager.get_url()}"
+        else:
+            status += "\n⚠️ Сервер сейчас остановлен. Включите его в настройках «Приложение → OPDS Сервер»."
+
+        QMessageBox.information(self, "OPDS", status)
+
+    def _extract_chapter_title(self, filepath: str, row_idx: int) -> str:
+        """Извлекает заголовок главы из HTML-файла или использует имя файла."""
+        try:
+            from bs4 import BeautifulSoup
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read(4096)  # Читаем только начало для скорости
+            soup = BeautifulSoup(content, "html.parser")
+            h1 = soup.find("h1")
+            if h1 and h1.get_text(strip=True):
+                return h1.get_text(strip=True)
+            h2 = soup.find("h2")
+            if h2 and h2.get_text(strip=True):
+                return h2.get_text(strip=True)
+        except Exception:
+            pass
+
+        # Если не удалось — используем имя файла
+        return os.path.splitext(os.path.basename(filepath))[0]
 
     def _create_new_epub_with_creator(self, build_rows):
         title = self.title_edit.text() or "Переведенная книга"

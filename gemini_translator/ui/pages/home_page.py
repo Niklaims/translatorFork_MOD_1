@@ -145,6 +145,12 @@ class HomePage(ShellPage):
         top_row.addWidget(self.lbl_version)
         
         top_row.addStretch()
+
+        self.btn_proxy = QtWidgets.QPushButton("Прокси")
+        self.btn_proxy.setFixedSize(100, 30)
+        self.btn_proxy.clicked.connect(self._open_proxy_settings)
+        top_row.addWidget(self.btn_proxy)
+        
         outer.addLayout(top_row)
 
         heading = QtWidgets.QLabel("Выберите основной инструмент для запуска")
@@ -171,6 +177,16 @@ class HomePage(ShellPage):
                 grid.addWidget(card, row, col)
         outer.addLayout(grid)
         outer.addStretch(1)
+
+    def _open_proxy_settings(self):
+        from gemini_translator.ui.dialogs.proxy import ProxySettingsDialog
+        app = QtWidgets.QApplication.instance()
+        settings_manager = getattr(app, 'settings_manager', None)
+        if not settings_manager:
+            QtWidgets.QMessageBox.warning(self, "Ошибка", "Менеджер настроек недоступен.")
+            return
+        dialog = ProxySettingsDialog(self, settings_manager)
+        dialog.exec()
 
     def check_for_updates(self, silent=False):
         self.btn_check_update.setEnabled(False)
