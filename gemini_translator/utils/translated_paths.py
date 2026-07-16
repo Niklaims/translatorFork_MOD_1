@@ -5,6 +5,7 @@ import os
 WINDOWS_SAFE_MAX_PATH = 240
 SAFE_FILENAME_MAX = 240
 HASH_LEN = 10
+ROOT_CHAPTER_OUTPUT_DIR = os.path.join("OEBPS", "Text")
 
 
 def _path_len(path: str) -> int:
@@ -55,10 +56,9 @@ def build_translated_output_path(
     normalized_internal_path = str(original_internal_path).replace("\\", "/")
     internal_dir = os.path.dirname(normalized_internal_path)
     chapter_stem = os.path.splitext(os.path.basename(normalized_internal_path))[0]
-    destination_dir = (
-        os.path.join(output_folder, internal_dir.replace("/", os.sep))
-        if internal_dir
-        else output_folder
+    destination_dir = os.path.join(
+        output_folder,
+        internal_dir.replace("/", os.sep) if internal_dir else ROOT_CHAPTER_OUTPUT_DIR,
     )
 
     filename = f"{chapter_stem}{file_suffix}"
