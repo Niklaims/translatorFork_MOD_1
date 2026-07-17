@@ -1,0 +1,78 @@
+{
+  "name": "three-prompts-flash-lite-real-epub",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_real_epub_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_real_epub\\retry_basic_translation_20260707_164613",
+  "created_at": "2026-07-07T16:47:29.612998+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "real-epub-chapter-00001-2143chars",
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 9421,
+      "prompt_tokens_estimate": 5761,
+      "output_tokens_estimate": 2705,
+      "score": 60.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -3
+        },
+        "cjk_residue_chars": 18,
+        "length_ratio": 2.995,
+        "reference_similarity": null,
+        "source_visible_chars": 2143,
+        "output_visible_chars": 6418,
+        "output_tokens_estimate": 2705
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -3}",
+        "CJK residue chars: 18"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\real-epub-chapter-00001-2143chars__basic-translation__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\real-epub-chapter-00001-2143chars__basic-translation__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 5856,
+            "output_tokens": 2808,
+            "total_tokens": 8664,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 60.0,
+      "avg_latency_ms": 9421.0,
+      "avg_prompt_tokens": 5761.0,
+      "avg_output_tokens": 2705.0
+    }
+  ]
+}

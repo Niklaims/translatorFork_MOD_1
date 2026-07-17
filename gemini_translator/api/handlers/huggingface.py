@@ -210,7 +210,7 @@ class HuggingFaceApiHandler(BaseApiHandler):
                 raise NetworkError("Таймаут соединения с Hugging Face")
             except (aiohttp.ClientError, OSError) as e:
                 # Это подавит трейсбек в консоли и отправит ошибку в штатный обработчик ретраев
-                error_msg = f"Сбой сети/SSL ({type(e).__name__}): {e}"
+                error_msg = self._format_transport_error(e, "Hugging Face")
                 raise NetworkError(error_msg, delay_seconds=self.NETWORK_RETRY_DELAY) from e
             except Exception as e:
                 traceback.print_exc()

@@ -1,0 +1,209 @@
+{
+  "name": "three-prompts-flash-lite-ghost-city-ch2",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_ghost_city_ch2_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_ghost_city_ch2\\three-prompts-flash-lite-ghost-city-ch2_20260707_165835",
+  "created_at": "2026-07-07T16:58:35.369026+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "ghost-city-chapter-00002-2218chars",
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 11194,
+      "prompt_tokens_estimate": 4792,
+      "output_tokens_estimate": 2814,
+      "score": 75.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -8
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.012,
+        "reference_similarity": null,
+        "source_visible_chars": 2218,
+        "output_visible_chars": 6681,
+        "output_tokens_estimate": 2814
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -8}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00002-2218chars__legacy-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00002-2218chars__legacy-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 4752,
+            "output_tokens": 2919,
+            "total_tokens": 7671,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "ghost-city-chapter-00002-2218chars",
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 10634,
+      "prompt_tokens_estimate": 5827,
+      "output_tokens_estimate": 2905,
+      "score": 90.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -2
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.102,
+        "reference_similarity": null,
+        "source_visible_chars": 2218,
+        "output_visible_chars": 6880,
+        "output_tokens_estimate": 2905
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -2}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00002-2218chars__basic-translation__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00002-2218chars__basic-translation__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 5922,
+            "output_tokens": 3015,
+            "total_tokens": 8937,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "ghost-city-chapter-00002-2218chars",
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 9955,
+      "prompt_tokens_estimate": 11053,
+      "output_tokens_estimate": 2871,
+      "score": 75.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -10
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.076,
+        "reference_similarity": null,
+        "source_visible_chars": 2218,
+        "output_visible_chars": 6823,
+        "output_tokens_estimate": 2871
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -10}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00002-2218chars__basic-translation-short__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00002-2218chars__basic-translation-short__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 11339,
+            "output_tokens": 2980,
+            "total_tokens": 14319,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 90.0,
+      "avg_latency_ms": 10634.0,
+      "avg_prompt_tokens": 5827.0,
+      "avg_output_tokens": 2905.0
+    },
+    {
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 75.0,
+      "avg_latency_ms": 9955.0,
+      "avg_prompt_tokens": 11053.0,
+      "avg_output_tokens": 2871.0
+    },
+    {
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 1,
+      "ok": 1,
+      "errors": 0,
+      "avg_score": 75.0,
+      "avg_latency_ms": 11194.0,
+      "avg_prompt_tokens": 4792.0,
+      "avg_output_tokens": 2814.0
+    }
+  ]
+}

@@ -266,9 +266,6 @@ class AutoTranslateWidget(QWidget):
         )
         self.translation_profile_hint.setWordWrap(True)
         self.translation_profile_hint.setStyleSheet(f"color: {theme_manager.color('text_muted')};")
-        self.translation_profile_hint.setText(
-            "0 in batch limit inherits the common task size. Non-zero values are Gemini input tokens and are used directly."
-        )
         profile_layout.addWidget(self.translation_profile_hint, 5, 0, 1, 2)
 
         self.translation_summary_frame = QFrame()
@@ -369,7 +366,7 @@ class AutoTranslateWidget(QWidget):
         filter_layout.addWidget(filter_hint, 6, 0, 1, 2)
         content_layout.addWidget(filter_group)
 
-        consistency_group = QGroupBox("5. Согласованность AI")
+        consistency_group = QGroupBox("6. Согласованность AI")
         network_group = QGroupBox("5. Повтор сбоев сети")
         network_layout = QGridLayout(network_group)
         self.retry_network_checkbox = QCheckBox("Автоматически возвращать в очередь главы с сетевыми ошибками")

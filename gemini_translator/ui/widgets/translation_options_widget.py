@@ -32,6 +32,136 @@ from .common_widgets import NoScrollSpinBox
 from gemini_translator.ui import theme_manager
 
 
+def build_chapter_analysis_signature(html_files, epub_path):
+    if not epub_path or not os.path.exists(epub_path):
+        return None
+    try:
+        stat = os.stat(epub_path)
+    except OSError:
+        return None
+    return (
+        os.path.abspath(epub_path),
+        stat.st_mtime_ns,
+        stat.st_size,
+        tuple(html_files or []),
+    )
+
+
+def _build_epub_analysis_metadata(epub_path):
+    try:
+        epub_stat = os.stat(epub_path)
+        with open(epub_path, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
+            chapter_info_list = [
+                (info.filename, info.file_size)
+                for info in epub_zip.infolist()
+                if info.filename.lower().endswith((".html", ".xhtml", ".htm"))
+            ]
+    except (OSError, zipfile.BadZipFile, FileNotFoundError):
+        return None
+
+    return {
+        "epub_name": os.path.basename(epub_path),
+        "epub_size": epub_stat.st_size,
+        "content_checksum": sum(size for _, size in chapter_info_list),
+        "metric": CHAPTER_SIZE_CACHE_METRIC,
+        "version": CHAPTER_SIZE_CACHE_VERSION,
+    }
+
+
+def analyze_chapter_compositions(html_files, epub_path, project_manager=None):
+    """Return chapter metrics without touching a QWidget; safe for QThread use."""
+    from bs4 import BeautifulSoup
+
+    html_files = list(html_files or [])
+    signature = build_chapter_analysis_signature(html_files, epub_path)
+    if not html_files or not epub_path:
+        return {'signature': signature, 'compositions': {}}
+
+    chapter_sizes = (
+        get_epub_chapter_sizes_with_cache(project_manager, epub_path)
+        if project_manager
+        else {}
+    )
+    cache_metadata = _build_epub_analysis_metadata(epub_path) or {}
+    cached_chapters = {}
+    if project_manager:
+        cache_data = project_manager.load_chapter_analysis_cache()
+        if isinstance(cache_data, dict) and cache_data.get("metadata") == cache_metadata:
+            cached_chapters = cache_data.get("chapters", {})
+            if not isinstance(cached_chapters, dict):
+                cached_chapters = {}
+
+    compositions = {}
+    merged_cached_chapters = dict(cached_chapters)
+    missing_files = []
+    for file_name in html_files:
+        cached_entry = cached_chapters.get(file_name)
+        if (
+            isinstance(cached_entry, dict)
+            and "total_chars" in cached_entry
+            and "text_chars" in cached_entry
+        ):
+            total_size = int(
+                cached_entry.get(
+                    "input_tokens",
+                    cached_entry.get("total_size", chapter_sizes.get(file_name, 0)),
+                )
+                or 0
+            )
+            code_size = int(cached_entry.get("code_tokens", cached_entry.get("code_size", 0)) or 0)
+            text_size = int(cached_entry.get("text_tokens", cached_entry.get("text_size", 0)) or 0)
+            compositions[file_name] = {
+                "code_size": code_size,
+                "text_size": text_size,
+                "is_cjk": bool(cached_entry.get("is_cjk", False)),
+                "total_size": total_size,
+                "code_tokens": code_size,
+                "text_tokens": text_size,
+                "input_tokens": total_size,
+                "code_chars": int(cached_entry.get("code_chars", 0) or 0),
+                "text_chars": int(cached_entry.get("text_chars", 0) or 0),
+                "total_chars": int(cached_entry.get("total_chars", 0) or 0),
+            }
+        else:
+            missing_files.append(file_name)
+
+    if missing_files:
+        with open(epub_path, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
+            for file_name in missing_files:
+                content_str = epub_zip.read(file_name).decode("utf-8", errors="ignore")
+                visible_text = BeautifulSoup(content_str, "html.parser").get_text()
+                text_tokens = estimate_gemini_tokens(visible_text)
+                total_tokens = int(
+                    chapter_sizes.get(file_name, 0)
+                    or estimate_epub_chapter_input_tokens(content_str)
+                )
+                code_tokens = max(0, total_tokens - text_tokens)
+                total_chars = len(content_str)
+                text_chars = len(visible_text)
+                chapter_data = {
+                    "code_size": code_tokens,
+                    "text_size": text_tokens,
+                    "is_cjk": LanguageDetector.is_cjk_text(visible_text),
+                    "total_size": total_tokens,
+                    "code_tokens": code_tokens,
+                    "text_tokens": text_tokens,
+                    "input_tokens": total_tokens,
+                    "code_chars": max(0, total_chars - text_chars),
+                    "text_chars": text_chars,
+                    "total_chars": total_chars,
+                }
+                compositions[file_name] = chapter_data
+                merged_cached_chapters[file_name] = chapter_data
+
+        if project_manager and cache_metadata:
+            project_manager.save_chapter_analysis_cache({
+                "metadata": cache_metadata,
+                "chapters": merged_cached_chapters,
+            })
+
+    return {'signature': signature, 'compositions': compositions}
+
+
 class TranslationOptionsWidget(QGroupBox):
     """Widget for task batching/chunking settings and recommendations."""
 
@@ -502,89 +632,13 @@ class TranslationOptionsWidget(QGroupBox):
             return
 
         try:
-            from bs4 import BeautifulSoup
-
-            chapter_sizes = (
-                get_epub_chapter_sizes_with_cache(project_manager, epub_path)
-                if project_manager
-                else {}
+            result = analyze_chapter_compositions(
+                self.html_files,
+                epub_path,
+                project_manager,
             )
-            cached_chapters, cache_metadata = self._load_cached_chapter_analysis(
-                project_manager, epub_path
-            )
-            merged_cached_chapters = dict(cached_chapters)
-            missing_files = []
-
-            for file_name in self.html_files:
-                cached_entry = cached_chapters.get(file_name)
-                if (
-                    isinstance(cached_entry, dict)
-                    and "total_chars" in cached_entry
-                    and "text_chars" in cached_entry
-                ):
-                    total_size = int(
-                        cached_entry.get(
-                            "input_tokens",
-                            cached_entry.get("total_size", chapter_sizes.get(file_name, 0)),
-                        )
-                        or 0
-                    )
-                    code_size = int(
-                        cached_entry.get("code_tokens", cached_entry.get("code_size", 0)) or 0
-                    )
-                    text_size = int(
-                        cached_entry.get("text_tokens", cached_entry.get("text_size", 0)) or 0
-                    )
-                    self.chapter_compositions[file_name] = {
-                        "code_size": code_size,
-                        "text_size": text_size,
-                        "is_cjk": bool(cached_entry.get("is_cjk", False)),
-                        "total_size": total_size,
-                        "code_tokens": code_size,
-                        "text_tokens": text_size,
-                        "input_tokens": total_size,
-                        "code_chars": int(cached_entry.get("code_chars", 0) or 0),
-                        "text_chars": int(cached_entry.get("text_chars", 0) or 0),
-                        "total_chars": int(cached_entry.get("total_chars", 0) or 0),
-                    }
-                else:
-                    missing_files.append(file_name)
-
-            if missing_files:
-                with open(epub_path, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
-                    for file_name in missing_files:
-                        content_str = epub_zip.read(file_name).decode("utf-8", errors="ignore")
-                        soup = BeautifulSoup(content_str, "html.parser")
-                        visible_text = soup.get_text()
-
-                        text_tokens = estimate_gemini_tokens(visible_text)
-                        total_tokens = int(
-                            chapter_sizes.get(file_name, 0)
-                            or estimate_epub_chapter_input_tokens(content_str)
-                        )
-                        code_tokens = max(0, total_tokens - text_tokens)
-                        total_chars = len(content_str)
-                        text_chars = len(visible_text)
-                        code_chars = max(0, total_chars - text_chars)
-                        chapter_data = {
-                            "code_size": code_tokens,
-                            "text_size": text_tokens,
-                            "is_cjk": LanguageDetector.is_cjk_text(visible_text),
-                            "total_size": total_tokens,
-                            "code_tokens": code_tokens,
-                            "text_tokens": text_tokens,
-                            "input_tokens": total_tokens,
-                            "code_chars": code_chars,
-                            "text_chars": text_chars,
-                            "total_chars": total_chars,
-                        }
-                        self.chapter_compositions[file_name] = chapter_data
-                        merged_cached_chapters[file_name] = chapter_data
-
-            if missing_files and cache_metadata:
-                self._save_cached_chapter_analysis(
-                    project_manager, cache_metadata, merged_cached_chapters
-                )
+            self._analysis_signature = result['signature']
+            self.chapter_compositions = result['compositions']
         except Exception as exc:
             print(f"[WIDGET ERROR] chapter analysis failed for '{epub_path}': {exc}")
             self.chapter_compositions = {}

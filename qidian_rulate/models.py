@@ -24,6 +24,7 @@ class PreparedRulateMetadata:
     genres: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     cover_prompt: str = ""
+    generated_cover_path: str = ""
 
 
 @dataclass(slots=True)

@@ -1,3 +1,4 @@
+import ssl
 import unittest
 
 import aiohttp
@@ -65,6 +66,21 @@ class _PayloadErrorOnceHandler(_DisconnectOnceHandler):
 
 
 class TransientDisconnectRetryTests(unittest.IsolatedAsyncioTestCase):
+    def test_server_disconnect_is_not_mislabelled_as_ssl(self):
+        handler = _DisconnectOnceHandler(_WorkerStub())
+
+        message = handler._format_transport_error(aiohttp.ServerDisconnectedError())
+
+        self.assertIn("Сервер разорвал соединение", message)
+        self.assertNotIn("SSL", message)
+
+    def test_real_ssl_error_is_labelled_as_ssl(self):
+        handler = _DisconnectOnceHandler(_WorkerStub())
+
+        message = handler._format_transport_error(ssl.SSLError("certificate verify failed"))
+
+        self.assertIn("Ошибка SSL/TLS", message)
+
     async def test_server_disconnected_is_retried_inside_api_call(self):
         worker = _WorkerStub()
         handler = _DisconnectOnceHandler(worker)
@@ -83,9 +99,21 @@ class TransientDisconnectRetryTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(NetworkError):
             await handler.execute_api_call("prompt", "[test]")
 
+        # One fast retry absorbs a stale pooled connection without repeatedly
+        # resending a request while the upstream service is unavailable.
         self.assertEqual(handler.calls, 2)
         self.assertEqual(worker.settings_manager.increment_calls, 1)
         self.assertEqual(worker.settings_manager.decrement_calls, 1)
+
+    async def test_disconnect_retry_budget_can_be_overridden(self):
+        worker = _WorkerStub()
+        worker.provider_config["transient_disconnect_retries"] = 1
+        handler = _AlwaysDisconnectHandler(worker)
+
+        with self.assertRaises(NetworkError):
+            await handler.execute_api_call("prompt", "[test]")
+
+        self.assertEqual(handler.calls, 2)
 
     async def test_client_payload_error_is_retried_inside_api_call(self):
         worker = _WorkerStub()

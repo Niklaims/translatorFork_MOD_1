@@ -12,9 +12,10 @@ RANOBELIB_DIR = os.path.join(PROJECT_ROOT, "ranobelib")
 if RANOBELIB_DIR not in sys.path:
     sys.path.insert(0, RANOBELIB_DIR)
 
-from parsers import FileParser
-from models import ChapterData
-from workers import (
+from parsers import FileParser  # noqa: E402
+from models import ChapterData  # noqa: E402
+from utils import parse_vol_and_chapter  # noqa: E402
+from workers import (  # noqa: E402
     QIDIAN_RULATE_PROFILE_DIR,
     RANOBELIB_GENRES,
     RANOBELIB_TAGS,
@@ -121,6 +122,57 @@ def test_parse_zip_docx_keeps_russian_chapter_parts(tmp_path):
     assert chapters[0].title == "Король Валид становится королём зубрёжки"
 
 
+def test_parse_zip_docx_preserves_archive_order(tmp_path):
+    zip_path = tmp_path / "rulate.zip"
+    titles = [
+        "z Глава 31 Кредитор",
+        "a Глава 24 Глава XXIV Золотой и пурпурный летящий генерал",
+        "m Глава 25 Глава XXV Благородство мужа и письмо ценою в золото",
+    ]
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for index, title in enumerate(titles, start=1):
+            docx_path = tmp_path / f"chapter_{index}.docx"
+            doc = Document()
+            doc.add_paragraph(f"Text for {title}")
+            doc.save(docx_path)
+            archive.write(docx_path, f"{title}.docx")
+
+    chapters = FileParser.parse_zip_docx(str(zip_path), "1")
+
+    assert [chapter.number for chapter in chapters] == [31.0, 24.0, 25.0]
+    assert [chapter.title for chapter in chapters] == [
+        "Кредитор",
+        "Золотой и пурпурный летящий генерал",
+        "Благородство мужа и письмо ценою в золото",
+    ]
+
+
+def test_parse_vol_and_chapter_cleans_nested_roman_heading_with_char_count():
+    vol, number, title, num_found = parse_vol_and_chapter(
+        "Т.1 Гл.24: Глава XXIV: «Золотой и пурпурный летящий генерал!» [11,886 зн.]",
+        "1",
+        1,
+    )
+
+    assert vol == "1"
+    assert number == 24.0
+    assert title == "Золотой и пурпурный летящий генерал!"
+    assert num_found is True
+
+
+def test_parse_vol_and_chapter_accepts_roman_and_russian_word_numbers():
+    roman = parse_vol_and_chapter("Глава XXXVIII: «Башня Чэнфэн»", "1", 1)
+    words = parse_vol_and_chapter(
+        "Глава тридцать пятая: «Схватка с великим полководцем»",
+        "1",
+        1,
+    )
+
+    assert roman == ("1", 38.0, "Башня Чэнфэн", True)
+    assert words == ("1", 35.0, "Схватка с великим полководцем", True)
+
+
 def test_rulate_worker_applies_full_site_titles_to_downloaded_chapters():
     infos = [
         {
@@ -151,32 +203,65 @@ def test_rulate_worker_applies_full_site_titles_to_downloaded_chapters():
     assert chapters[1].title == "Второе длинное необрезанное название главы с сайта Rulate"
 
 
-def test_rulate_worker_bulk_downloads_plain_fractional_chapters():
+def test_rulate_worker_applies_roman_site_title_cleanly():
+    chapter = ChapterData("1", 24.0, "Глава XXIV", "text")
     worker = RulateDownloadWorker(
         "https://tl.rulate.ru/book/1",
         "1",
-        chapter_ids=["101", "102"],
+        chapter_ids=["101"],
         chapter_infos=[
-            {"id": "101", "title": "Chapter 12.1 Side Story", "number": 12.1},
-            {"id": "102", "title": "Chapter 12.2 Side Story", "number": 12.2},
+            {
+                "id": "101",
+                "title": "Глава XXIV: «Золотой и пурпурный летящий генерал!»",
+                "number": 24.0,
+                "volume": "1",
+            },
         ],
     )
 
-    assert not worker._should_download_individually()
+    worker._apply_chapter_info(chapter, worker.chapter_infos[0])
+
+    assert chapter.volume == "1"
+    assert chapter.number == 24.0
+    assert chapter.title == "Золотой и пурпурный летящий генерал!"
 
 
-def test_rulate_worker_downloads_explicit_parts_individually():
+def test_rulate_worker_keeps_selected_chapter_order_after_matching():
+    infos = [
+        {"id": "131", "title": "Глава 31 Кредитор", "number": 31.0, "volume": "1"},
+        {
+            "id": "124",
+            "title": "Глава XXIV: «Золотой и пурпурный летящий генерал!»",
+            "number": 24.0,
+            "volume": "1",
+        },
+        {
+            "id": "125",
+            "title": "Глава XXV: «Благородство мужа и письмо ценою в золото»",
+            "number": 25.0,
+            "volume": "1",
+        },
+    ]
+    chapters = [
+        ChapterData("1", 24.0, "old 24", "text 24"),
+        ChapterData("1", 25.0, "old 25", "text 25"),
+        ChapterData("1", 31.0, "old 31", "text 31"),
+    ]
     worker = RulateDownloadWorker(
         "https://tl.rulate.ru/book/1",
         "1",
-        chapter_ids=["101", "102"],
-        chapter_infos=[
-            {"id": "101", "title": "Chapter 12 Side Story Part 1", "number": 12.1},
-            {"id": "102", "title": "Chapter 12 Side Story Part 2", "number": 12.2},
-        ],
+        chapter_ids=["131", "124", "125"],
+        chapter_infos=infos,
     )
 
-    assert worker._should_download_individually()
+    worker._apply_chapter_infos(chapters, infos)
+
+    assert [chapter.number for chapter in chapters] == [31.0, 24.0, 25.0]
+    assert [chapter.title for chapter in chapters] == [
+        "Кредитор",
+        "Золотой и пурпурный летящий генерал!",
+        "Благородство мужа и письмо ценою в золото",
+    ]
 
 
 def test_rulate_worker_infers_next_volume_when_numbers_restart():
@@ -192,6 +277,19 @@ def test_rulate_worker_infers_next_volume_when_numbers_restart():
 
     assert [chapter["volume"] for chapter in annotated] == ["1", "1", "2", "2"]
     assert [chapter["number"] for chapter in annotated] == [1.0, 2.0, 1.0, 2.0]
+
+
+def test_rulate_worker_annotates_roman_and_russian_word_numbers():
+    worker = RulateDownloadWorker("https://tl.rulate.ru/book/1", "1")
+    infos = [
+        {"id": "124", "title": "Глава XXIV: «Золотой и пурпурный летящий генерал!»", "number": 0},
+        {"id": "135", "title": "Глава тридцать пятая: «Схватка с великим полководцем»", "number": 0},
+    ]
+
+    annotated = worker._annotate_chapter_infos(infos)
+
+    assert [chapter["volume"] for chapter in annotated] == ["1", "1"]
+    assert [chapter["number"] for chapter in annotated] == [24.0, 35.0]
 
 
 def test_rulate_worker_applies_inferred_volume_to_downloaded_chapter():

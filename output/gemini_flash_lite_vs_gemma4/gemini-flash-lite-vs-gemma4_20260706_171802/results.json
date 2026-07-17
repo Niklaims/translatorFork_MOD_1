@@ -1,0 +1,334 @@
+{
+  "name": "gemini-flash-lite-vs-gemma4",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\gemini_flash_lite_vs_gemma4_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\gemini_flash_lite_vs_gemma4\\gemini-flash-lite-vs-gemma4_20260706_171802",
+  "created_at": "2026-07-06T17:18:02.134792+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "zh-dialogue-glossary",
+      "prompt_id": "project-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 2180,
+      "prompt_tokens_estimate": 3311,
+      "output_tokens_estimate": 31,
+      "score": 80.0,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": [
+            "Секта Лазурного Облака"
+          ]
+        },
+        "forbidden_terms": {
+          "total": 1,
+          "found": []
+        },
+        "placeholders": {
+          "total": 1,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": 1
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.529,
+        "reference_similarity": 0.4918,
+        "source_visible_chars": 17,
+        "output_visible_chars": 60,
+        "output_tokens_estimate": 31
+      },
+      "issues": [
+        "missing required terms: Секта Лазурного Облака",
+        "html tag count changed: {\"p\": 1}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\zh-dialogue-glossary__project-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\zh-dialogue-glossary__project-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3280,
+            "output_tokens": 33,
+            "total_tokens": 3313,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "zh-dialogue-glossary",
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "error",
+      "latency_ms": 817,
+      "prompt_tokens_estimate": 3311,
+      "output_tokens_estimate": 0,
+      "score": null,
+      "metrics": {},
+      "issues": [
+        "run failed: NetworkError"
+      ],
+      "error": "NetworkError: Ошибка сервера (500): Internal error encountered.",
+      "prompt_path": "prompts\\zh-dialogue-glossary__project-default__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт"
+    },
+    {
+      "case_id": "html-link-preservation",
+      "prompt_id": "project-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 730,
+      "prompt_tokens_estimate": 3285,
+      "output_tokens_estimate": 35,
+      "score": 100.0,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {},
+        "cjk_residue_chars": 0,
+        "length_ratio": 1.333,
+        "reference_similarity": 0.9333,
+        "source_visible_chars": 54,
+        "output_visible_chars": 72,
+        "output_tokens_estimate": 35
+      },
+      "issues": [],
+      "error": "",
+      "prompt_path": "prompts\\html-link-preservation__project-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\html-link-preservation__project-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3255,
+            "output_tokens": 37,
+            "total_tokens": 3292,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "html-link-preservation",
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "ok",
+      "latency_ms": 12516,
+      "prompt_tokens_estimate": 3285,
+      "output_tokens_estimate": 361,
+      "score": 53.10316139767055,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "a": 3,
+          "p": 3
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 21.093,
+        "reference_similarity": 0.1048,
+        "source_visible_chars": 54,
+        "output_visible_chars": 1139,
+        "output_tokens_estimate": 361
+      },
+      "issues": [
+        "html tag count changed: {\"a\": 3, \"p\": 3}",
+        "length ratio out of range: 21.093",
+        "reference similarity below 0.20: 0.105"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\html-link-preservation__project-default__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\html-link-preservation__project-default__gemma-4-31b.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3255,
+            "output_tokens": 365,
+            "total_tokens": 3620,
+            "estimated": true,
+            "model_id": "gemma-4-31b-it",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "zh-style-and-term",
+      "prompt_id": "project-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 1617,
+      "prompt_tokens_estimate": 3312,
+      "output_tokens_estimate": 69,
+      "score": 90.0,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 2,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {},
+        "cjk_residue_chars": 0,
+        "length_ratio": 5.355,
+        "reference_similarity": 0.7032,
+        "source_visible_chars": 31,
+        "output_visible_chars": 166,
+        "output_tokens_estimate": 69
+      },
+      "issues": [
+        "length ratio out of range: 5.355"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\zh-style-and-term__project-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\zh-style-and-term__project-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3281,
+            "output_tokens": 73,
+            "total_tokens": 3354,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "zh-style-and-term",
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "provider": "gemini",
+      "model": "Gemma 4 31B",
+      "status": "ok",
+      "latency_ms": 25526,
+      "prompt_tokens_estimate": 3312,
+      "output_tokens_estimate": 892,
+      "score": 10.787992495309567,
+      "metrics": {
+        "required_terms": {
+          "total": 2,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 2,
+          "found": [
+            "林澈",
+            "玉符"
+          ]
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": 4
+        },
+        "cjk_residue_chars": 72,
+        "length_ratio": 81.323,
+        "reference_similarity": 0.0863,
+        "source_visible_chars": 31,
+        "output_visible_chars": 2521,
+        "output_tokens_estimate": 892
+      },
+      "issues": [
+        "found forbidden terms: 林澈, 玉符",
+        "html tag count changed: {\"p\": 4}",
+        "CJK residue chars: 72",
+        "length ratio out of range: 81.323",
+        "reference similarity below 0.20: 0.086"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\zh-style-and-term__project-default__gemma-4-31b.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\zh-style-and-term__project-default__gemma-4-31b.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 3281,
+            "output_tokens": 911,
+            "total_tokens": 4192,
+            "estimated": true,
+            "model_id": "gemma-4-31b-it",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "project-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 3,
+      "ok": 3,
+      "errors": 0,
+      "avg_score": 90.0,
+      "avg_latency_ms": 1509.0,
+      "avg_prompt_tokens": 3302.7,
+      "avg_output_tokens": 45.0
+    },
+    {
+      "prompt_id": "project-default",
+      "model_id": "gemma-4-31b",
+      "runs": 3,
+      "ok": 2,
+      "errors": 1,
+      "avg_score": 31.95,
+      "avg_latency_ms": 12953.0,
+      "avg_prompt_tokens": 3302.7,
+      "avg_output_tokens": 417.7
+    }
+  ]
+}

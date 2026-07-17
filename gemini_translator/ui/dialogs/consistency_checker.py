@@ -1804,7 +1804,11 @@ class ConsistencyValidatorPage(ShellPage):
         self._update_glossary_button_state()
         self._update_batch_fix_button_state()
         
-        self._log(f"✅ Анализ завершён. Найдено проблем: {len(all_problems)}")
+        analysis_cancelled = bool(getattr(self.engine, 'is_cancelled', False))
+        if analysis_cancelled:
+            self._log(f"⏹ Анализ остановлен. Найдено проблем до остановки: {len(all_problems)}")
+        else:
+            self._log(f"✅ Анализ завершён. Найдено проблем: {len(all_problems)}")
         self._log(f"   Персонажей в глоссарии: {len(self.engine.glossary_session.characters)}")
         self._log(f"   Терминов в глоссарии: {len(self.engine.glossary_session.terms)}")
         
@@ -1814,7 +1818,10 @@ class ConsistencyValidatorPage(ShellPage):
         self._save_session()
         
         from gemini_translator.ui.notifications import NotificationManager
-        NotificationManager.show("Согласованность", f"Анализ завершен. Найдено проблем: {len(all_problems)}")
+        if analysis_cancelled:
+            NotificationManager.show("Согласованность", f"Анализ остановлен. Найдено проблем до остановки: {len(all_problems)}")
+        else:
+            NotificationManager.show("Согласованность", f"Анализ завершен. Найдено проблем: {len(all_problems)}")
 
     @pyqtSlot(str)
     def on_engine_error(self, error_msg):

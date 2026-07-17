@@ -20,6 +20,9 @@ from .errors import (
 _thread_local = threading.local()
 _current_debug_trace = contextvars.ContextVar("current_debug_trace", default=None)
 
+_DEFAULT_TRANSIENT_DISCONNECT_RETRIES = 1
+_DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS = 1.0
+
 
 def _get_ssl_context_signature():
     ssl_cert_file = os.environ.get("SSL_CERT_FILE") or None
@@ -286,18 +289,24 @@ class BaseApiHandler:
         return default
 
     def _transient_disconnect_retry_attempts(self) -> int:
-        raw_value = self._config_value("transient_disconnect_retries", 3)
+        raw_value = self._config_value(
+            "transient_disconnect_retries",
+            _DEFAULT_TRANSIENT_DISCONNECT_RETRIES,
+        )
         try:
             return max(0, int(raw_value))
         except (TypeError, ValueError):
-            return 3
+            return _DEFAULT_TRANSIENT_DISCONNECT_RETRIES
 
     def _transient_disconnect_retry_delay(self, attempt: int) -> float:
-        raw_value = self._config_value("transient_disconnect_retry_delay_seconds", 1.0)
+        raw_value = self._config_value(
+            "transient_disconnect_retry_delay_seconds",
+            _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS,
+        )
         try:
             base_delay = max(0.0, float(raw_value))
         except (TypeError, ValueError):
-            base_delay = 1.0
+            base_delay = _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS
         return base_delay * max(1, attempt)
 
     def _exception_chain(self, error: Exception):
@@ -345,6 +354,17 @@ class BaseApiHandler:
 
     def _should_retry_transient_disconnect(self, error: Exception, attempt: int, max_retries: int) -> bool:
         return attempt <= max_retries and self._is_transient_disconnect_error(error)
+
+    def _format_transport_error(self, error: Exception, service_name: str | None = None) -> str:
+        """Describe transport failures without labelling every disconnect as SSL."""
+        context = f" при запросе к {service_name}" if service_name else ""
+        if isinstance(error, aiohttp.ServerDisconnectedError):
+            category = "Сервер разорвал соединение"
+        elif isinstance(error, (aiohttp.ClientSSLError, ssl.SSLError)):
+            category = "Ошибка SSL/TLS"
+        else:
+            category = "Сетевой сбой"
+        return f"{category}{context} ({type(error).__name__}): {error}"
 
     def _temperature_payload_value(self):
         if not getattr(self.worker, "temperature_override_enabled", True):

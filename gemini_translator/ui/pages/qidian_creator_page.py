@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PyQt6 import QtWidgets, sip
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +30,8 @@ from PyQt6.QtWidgets import (
 from qidian_rulate.models import PreparedRulateMetadata, QidianBookMetadata, RulateBookDraft
 from qidian_rulate.workers import (
     AiPrepareWorker,
+    CodexCoverGenerateWorker,
+    CodexCoverTranslateWorker,
     CoverPromptWorker,
     QidianFetchWorker,
     RulateFillWorker,
@@ -44,6 +48,10 @@ from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
 
 
 QIDIAN_CREATOR_UI_STATE_KEY = "qidian_creator_ui"
+CODEX_COVER_DROP_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif"}
+SOURCE_COVER_DROP_EXTENSIONS = CODEX_COVER_DROP_EXTENSIONS | {".webp"}
+CODEX_COVER_DROP_TOOLTIP = "Перетащите PNG, JPG или GIF сюда, чтобы выбрать обложку для Rulate."
+SOURCE_COVER_DROP_TOOLTIP = "Перетащите PNG, JPG, GIF или WEBP сюда, если обложка источника не загрузилась."
 
 
 def _qt_object_is_alive(obj) -> bool:
@@ -53,6 +61,55 @@ def _qt_object_is_alive(obj) -> bool:
         return not sip.isdeleted(obj)
     except TypeError:
         return True
+
+
+class _CoverDropLabel(QLabel):
+    file_dropped = pyqtSignal(str)
+
+    def __init__(
+        self,
+        text: str = "",
+        parent=None,
+        *,
+        tooltip: str = CODEX_COVER_DROP_TOOLTIP,
+        extensions: set[str] | None = None,
+    ):
+        super().__init__(text, parent)
+        self._drop_extensions = extensions or CODEX_COVER_DROP_EXTENSIONS
+        self.setAcceptDrops(True)
+        self.setToolTip(tooltip)
+
+    def _local_image_path_from_event(self, event) -> str:
+        mime_data = event.mimeData()
+        if not mime_data or not mime_data.hasUrls():
+            return ""
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                continue
+            image_path = Path(url.toLocalFile())
+            if image_path.is_file() and image_path.suffix.lower() in self._drop_extensions:
+                return str(image_path)
+        return ""
+
+    def dragEnterEvent(self, event) -> None:
+        if self._local_image_path_from_event(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if self._local_image_path_from_event(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        image_path = self._local_image_path_from_event(event)
+        if not image_path:
+            event.ignore()
+            return
+        self.file_dropped.emit(image_path)
+        event.acceptProposedAction()
 
 
 class QidianCreatorPage(ShellPage):
@@ -69,6 +126,10 @@ class QidianCreatorPage(ShellPage):
         self.server_manager = getattr(app, "server_manager", None)
         self._qidian_metadata: QidianBookMetadata | None = None
         self._prepared_metadata: PreparedRulateMetadata | None = None
+        self._prepare_ai_worker: AiPrepareWorker | None = None
+        self._prepare_ai_cancel_requested = False
+        self._local_source_cover_path = ""
+        self._generated_cover_path = ""
         self._workers = []
 
         self._build_ui()
@@ -150,6 +211,11 @@ class QidianCreatorPage(ShellPage):
         self.prepare_ai_btn.clicked.connect(self._prepare_ai)
         action_row.addWidget(self.prepare_ai_btn)
 
+        self.cancel_prepare_ai_btn = QPushButton("Отменить генерацию")
+        self.cancel_prepare_ai_btn.clicked.connect(self._cancel_prepare_ai)
+        self.cancel_prepare_ai_btn.setVisible(False)
+        action_row.addWidget(self.cancel_prepare_ai_btn)
+
         self.cover_prompt_btn = QPushButton("Сгенерировать промпт для обложки")
         self.cover_prompt_btn.clicked.connect(self._generate_cover_prompt)
         action_row.addWidget(self.cover_prompt_btn)
@@ -197,7 +263,12 @@ class QidianCreatorPage(ShellPage):
         cover_url_layout.addWidget(self.cover_url_edit, 1)
         cover_url_layout.addWidget(self.reload_cover_btn)
 
-        self.cover_preview_label = QLabel("Обложка не загружена")
+        self.cover_preview_label = _CoverDropLabel(
+            "Обложка не загружена",
+            tooltip=SOURCE_COVER_DROP_TOOLTIP,
+            extensions=SOURCE_COVER_DROP_EXTENSIONS,
+        )
+        self.cover_preview_label.file_dropped.connect(self._apply_dropped_source_cover)
         self.cover_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_preview_label.setFixedSize(150, 210)
         self.cover_preview_label.setStyleSheet(
@@ -239,6 +310,50 @@ class QidianCreatorPage(ShellPage):
         self.cover_prompt_edit.setAcceptRichText(False)
         self.cover_prompt_edit.setMinimumHeight(130)
         self.cover_prompt_edit.setPlaceholderText("Здесь появится английский промпт для генерации обложки")
+        self.codex_cover_btn = QPushButton("Сгенерировать в Codex")
+        self.codex_cover_btn.setToolTip("Запустить Codex с текущим промптом обложки и показать результат здесь.")
+        self.codex_cover_btn.clicked.connect(self._generate_cover_in_codex)
+        self.translate_cover_btn = QPushButton("Перевести обложку")
+        self.translate_cover_btn.setToolTip(
+            "Удалить текст и рекламу с исходной обложки, поставить русское название и запросить 2:3/4K-качество."
+        )
+        self.translate_cover_btn.clicked.connect(self._translate_cover_in_codex)
+        self.open_codex_cover_folder_btn = QPushButton("Открыть папку")
+        self.open_codex_cover_folder_btn.setToolTip("Открыть папку с Codex-обложкой.")
+        self.open_codex_cover_folder_btn.clicked.connect(self._open_codex_cover_folder)
+        self.open_codex_cover_folder_btn.setEnabled(False)
+        self.codex_cover_preview_label = _CoverDropLabel("Обложка\nне создана")
+        self.codex_cover_preview_label.file_dropped.connect(self._apply_dropped_codex_cover)
+        self.codex_cover_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.codex_cover_preview_label.setFixedSize(150, 210)
+        self.codex_cover_preview_label.setStyleSheet(
+            "QLabel { border: 1px solid #444; background: #15191d; color: #888; }"
+        )
+        self.codex_cover_path_label = QLabel("")
+        self.codex_cover_path_label.setMaximumHeight(34)
+        self.codex_cover_path_label.setWordWrap(True)
+        self.codex_cover_path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        cover_generation_widget = QWidget()
+        cover_generation_layout = QHBoxLayout(cover_generation_widget)
+        cover_generation_layout.setContentsMargins(0, 0, 0, 0)
+        cover_generation_layout.setSpacing(8)
+        cover_generation_controls = QWidget()
+        cover_generation_controls.setFixedWidth(170)
+        cover_generation_controls_layout = QVBoxLayout(cover_generation_controls)
+        cover_generation_controls_layout.setContentsMargins(0, 0, 0, 0)
+        cover_generation_controls_layout.setSpacing(6)
+        cover_generation_controls_layout.addWidget(self.codex_cover_btn)
+        cover_generation_controls_layout.addWidget(self.translate_cover_btn)
+        cover_generation_controls_layout.addWidget(self.open_codex_cover_folder_btn)
+        cover_generation_controls_layout.addWidget(
+            self.codex_cover_preview_label,
+            alignment=Qt.AlignmentFlag.AlignHCenter,
+        )
+        cover_generation_controls_layout.addWidget(self.codex_cover_path_label)
+        cover_generation_controls_layout.addStretch()
+        cover_generation_layout.addWidget(cover_generation_controls)
+        cover_generation_layout.addWidget(self.cover_prompt_edit, 1)
 
         layout.addRow("Название EN:", self.english_title_edit)
         layout.addRow("Название RU:", self.translated_title_edit)
@@ -246,7 +361,7 @@ class QidianCreatorPage(ShellPage):
         layout.addRow("Команда переводчиков:", self.translator_team_combo)
         layout.addRow("Жанры:", self.genres_edit)
         layout.addRow("Теги:", self.tags_edit)
-        layout.addRow("Промпт обложки:", self.cover_prompt_edit)
+        layout.addRow("Промпт обложки:", cover_generation_widget)
 
         return group
 
@@ -297,7 +412,6 @@ class QidianCreatorPage(ShellPage):
         provider_id = self.key_widget.get_selected_provider()
         active_keys = self.key_widget.get_active_keys()
         model_settings = self.model_settings_widget.get_settings()
-        self.prepare_ai_btn.setEnabled(False)
         worker = AiPrepareWorker(
             metadata,
             provider_id,
@@ -308,9 +422,23 @@ class QidianCreatorPage(ShellPage):
         )
         worker.log_signal.connect(self._log)
         worker.prepared_ready.connect(self._apply_prepared_metadata)
-        worker.finished_signal.connect(lambda: self._worker_finished(worker, self.prepare_ai_btn))
+        worker.finished_signal.connect(lambda: self._prepare_ai_worker_finished(worker))
+        self._prepare_ai_worker = worker
+        self._prepare_ai_cancel_requested = False
+        self._set_prepare_ai_running(True)
         self._workers.append(worker)
         worker.start()
+
+    def _cancel_prepare_ai(self) -> None:
+        worker = getattr(self, "_prepare_ai_worker", None)
+        if worker is None:
+            return
+        cancel_method = getattr(worker, "cancel", None)
+        if callable(cancel_method):
+            cancel_method()
+        self._prepare_ai_cancel_requested = True
+        self._set_prepare_ai_running(True)
+        self._log("INFO", "AI: запрошена отмена генерации.")
 
     def _generate_cover_prompt(self) -> None:
         url = self.source_url_edit.text().strip() or self.qidian_url_edit.text().strip()
@@ -345,6 +473,58 @@ class QidianCreatorPage(ShellPage):
         worker.log_signal.connect(self._log)
         worker.prompt_ready.connect(self._apply_cover_prompt)
         worker.finished_signal.connect(lambda: self._worker_finished(worker, self.cover_prompt_btn))
+        self._workers.append(worker)
+        worker.start()
+
+    def _generate_cover_in_codex(self) -> None:
+        cover_prompt = self.cover_prompt_edit.toPlainText().strip()
+        if not cover_prompt:
+            QMessageBox.warning(self, "Codex", "Сначала заполните промпт обложки.")
+            return
+
+        self._set_codex_cover_buttons_enabled(False)
+        self._generated_cover_path = ""
+        self._set_codex_cover_folder_button_enabled(False)
+        self._set_codex_cover_preview(None, "Генерация...")
+        worker = CodexCoverGenerateWorker(
+            cover_prompt,
+            title_ru=self.translated_title_edit.text().strip(),
+        )
+        worker.log_signal.connect(self._log)
+        worker.cover_ready.connect(self._apply_codex_cover)
+        worker.finished_signal.connect(lambda: self._codex_cover_worker_finished(worker))
+        self._workers.append(worker)
+        worker.start()
+
+    def _translate_cover_in_codex(self) -> None:
+        cover_url = self.cover_url_edit.text().strip()
+        source_image_path = getattr(self, "_local_source_cover_path", "")
+        if not cover_url and not source_image_path:
+            QMessageBox.warning(
+                self,
+                "Codex",
+                "Сначала загрузите/укажите URL исходной обложки или перетащите локальную обложку в левое превью.",
+            )
+            return
+
+        title_ru = self.translated_title_edit.text().strip()
+        if not title_ru:
+            QMessageBox.warning(self, "Codex", "Сначала заполните русское название.")
+            return
+
+        self._set_codex_cover_buttons_enabled(False)
+        self._generated_cover_path = ""
+        self._set_codex_cover_folder_button_enabled(False)
+        self._set_codex_cover_preview(None, "Перевод...")
+        worker = CodexCoverTranslateWorker(
+            cover_url,
+            title_ru,
+            referer=self.source_url_edit.text().strip() or self.qidian_url_edit.text().strip(),
+            source_image_path=source_image_path,
+        )
+        worker.log_signal.connect(self._log)
+        worker.cover_ready.connect(self._apply_codex_cover)
+        worker.finished_signal.connect(lambda: self._codex_cover_worker_finished(worker))
         self._workers.append(worker)
         worker.start()
 
@@ -399,6 +579,7 @@ class QidianCreatorPage(ShellPage):
         if not _qt_object_is_alive(self):
             return
         self._qidian_metadata = metadata
+        self._local_source_cover_path = ""
         self.original_title_edit.setText(metadata.title_original)
         self.author_edit.setText(metadata.author_name)
         self.source_url_edit.setText(metadata.source_url)
@@ -425,6 +606,10 @@ class QidianCreatorPage(ShellPage):
                 self.translator_team_combo.setCurrentIndex(index)
         if prepared.cover_prompt:
             self.cover_prompt_edit.setPlainText(prepared.cover_prompt)
+        generated_cover_path = getattr(prepared, "generated_cover_path", "") or ""
+        if generated_cover_path:
+            self._generated_cover_path = generated_cover_path
+            self._set_codex_cover_preview(generated_cover_path)
         self._update_action_state()
 
     def _apply_cover_prompt(self, prompt: str) -> None:
@@ -432,6 +617,74 @@ class QidianCreatorPage(ShellPage):
             return
         self.cover_prompt_edit.setPlainText(prompt)
         self._update_action_state()
+
+    def _apply_codex_cover(self, image_path: str) -> None:
+        if not _qt_object_is_alive(self):
+            return
+        self._generated_cover_path = image_path
+        self._set_codex_cover_preview(image_path)
+        self._update_action_state()
+
+    def _apply_dropped_source_cover(self, image_path: str) -> None:
+        if not _qt_object_is_alive(self):
+            return
+        cover_path = Path(image_path).expanduser()
+        if not cover_path.is_file():
+            QMessageBox.warning(self, "Источник", "Файл обложки не найден.")
+            return
+        if cover_path.suffix.lower() not in SOURCE_COVER_DROP_EXTENSIONS:
+            QMessageBox.warning(self, "Источник", "Для исходной обложки выберите PNG, JPG, GIF или WEBP.")
+            return
+
+        try:
+            image_data = cover_path.read_bytes()
+        except OSError as error:
+            QMessageBox.warning(self, "Источник", f"Не удалось открыть файл обложки: {error}")
+            return
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(image_data):
+            QMessageBox.warning(self, "Источник", "Не удалось прочитать изображение.")
+            return
+
+        self._local_source_cover_path = str(cover_path.resolve())
+        self._set_cover_preview(image_data)
+        if _qt_object_is_alive(getattr(self, "cover_preview_label", None)):
+            self.cover_preview_label.setToolTip(self._local_source_cover_path)
+        self._log("INFO", f"Источник: выбрана локальная обложка для Codex: {self._local_source_cover_path}")
+
+    def _apply_dropped_codex_cover(self, image_path: str) -> None:
+        if not _qt_object_is_alive(self):
+            return
+        cover_path = Path(image_path).expanduser()
+        if not cover_path.is_file():
+            QMessageBox.warning(self, "Codex", "Файл обложки не найден.")
+            return
+        if cover_path.suffix.lower() not in CODEX_COVER_DROP_EXTENSIONS:
+            QMessageBox.warning(self, "Codex", "Для загрузки в Rulate выберите PNG, JPG или GIF.")
+            return
+
+        pixmap = QPixmap()
+        if not pixmap.load(str(cover_path)):
+            QMessageBox.warning(self, "Codex", "Не удалось прочитать изображение.")
+            return
+
+        self._generated_cover_path = str(cover_path.resolve())
+        self._set_codex_cover_preview(self._generated_cover_path)
+        self._update_action_state()
+        self._log("INFO", f"Codex: выбрана локальная обложка для Rulate: {self._generated_cover_path}")
+
+    def _open_codex_cover_folder(self) -> None:
+        if not _qt_object_is_alive(self):
+            return
+        cover_path = Path(getattr(self, "_generated_cover_path", "") or "").expanduser()
+        if not cover_path.is_file():
+            self._set_codex_cover_folder_button_enabled(False)
+            QMessageBox.warning(self, "Codex", "Сначала создайте или переведите обложку в Codex.")
+            return
+
+        folder_path = cover_path.parent
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder_path))):
+            QMessageBox.warning(self, "Codex", f"Не удалось открыть папку:\n{folder_path}")
 
     def _load_ui_state(self) -> None:
         saved = {}
@@ -483,14 +736,31 @@ class QidianCreatorPage(ShellPage):
             genres=_split_csv(self.genres_edit.text()),
             tags=_split_csv(self.tags_edit.text()),
             cover_prompt=self.cover_prompt_edit.toPlainText().strip(),
+            generated_cover_path=getattr(self, "_generated_cover_path", ""),
         )
 
     def _update_action_state(self) -> None:
         if not _qt_object_is_alive(self):
             return
-        self._set_button_enabled(self.prepare_ai_btn, True)
+        self._set_prepare_ai_running(getattr(self, "_prepare_ai_worker", None) is not None)
         self._set_button_enabled(self.login_rulate_btn, True)
         self._set_button_enabled(self.fill_rulate_btn, True)
+        folder_button_updater = getattr(self, "_set_codex_cover_folder_button_enabled", None)
+        if callable(folder_button_updater):
+            folder_button_updater()
+
+    def _set_prepare_ai_running(self, running: bool) -> None:
+        prepare_btn = getattr(self, "prepare_ai_btn", None)
+        if _qt_object_is_alive(prepare_btn):
+            prepare_btn.setVisible(not running)
+            prepare_btn.setEnabled(not running)
+
+        cancel_btn = getattr(self, "cancel_prepare_ai_btn", None)
+        if _qt_object_is_alive(cancel_btn):
+            cancel_requested = bool(getattr(self, "_prepare_ai_cancel_requested", False))
+            cancel_btn.setText("Отмена..." if running and cancel_requested else "Отменить генерацию")
+            cancel_btn.setVisible(running)
+            cancel_btn.setEnabled(running and not cancel_requested)
 
     def _set_button_enabled(self, button: QPushButton | None, enabled: bool) -> None:
         if _qt_object_is_alive(button):
@@ -503,6 +773,35 @@ class QidianCreatorPage(ShellPage):
             return
         self._set_button_enabled(button, True)
         self._update_action_state()
+
+    def _prepare_ai_worker_finished(self, worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+        if getattr(self, "_prepare_ai_worker", None) is worker:
+            self._prepare_ai_worker = None
+        self._prepare_ai_cancel_requested = False
+        if not _qt_object_is_alive(self):
+            return
+        self._set_prepare_ai_running(False)
+        self._update_action_state()
+
+    def _codex_cover_worker_finished(self, worker) -> None:
+        if worker in self._workers:
+            self._workers.remove(worker)
+        if not _qt_object_is_alive(self):
+            return
+        self._set_codex_cover_buttons_enabled(True)
+        self._update_action_state()
+
+    def _set_codex_cover_buttons_enabled(self, enabled: bool) -> None:
+        self._set_button_enabled(getattr(self, "codex_cover_btn", None), enabled)
+        self._set_button_enabled(getattr(self, "translate_cover_btn", None), enabled)
+
+    def _set_codex_cover_folder_button_enabled(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            cover_path = Path(getattr(self, "_generated_cover_path", "") or "")
+            enabled = bool(getattr(self, "_generated_cover_path", "")) and cover_path.is_file()
+        self._set_button_enabled(getattr(self, "open_codex_cover_folder_btn", None), enabled)
 
     def _log(self, level: str, message: str) -> None:
         if level == "DEBUG" and not message:
@@ -524,9 +823,11 @@ class QidianCreatorPage(ShellPage):
                 Qt.TransformationMode.SmoothTransformation,
             )
             self.cover_preview_label.setPixmap(scaled)
+            self.cover_preview_label.setToolTip(SOURCE_COVER_DROP_TOOLTIP)
             return
         self.cover_preview_label.clear()
         self.cover_preview_label.setText("Обложка не загружена")
+        self.cover_preview_label.setToolTip(SOURCE_COVER_DROP_TOOLTIP)
 
     def _load_cover_preview_from_current_url(self) -> None:
         cover_url = self.cover_url_edit.text().strip()
@@ -537,4 +838,34 @@ class QidianCreatorPage(ShellPage):
             cover_url,
             referer=self.source_url_edit.text().strip() or self.qidian_url_edit.text().strip(),
         )
+        if image_data:
+            self._local_source_cover_path = ""
         self._set_cover_preview(image_data)
+
+    def _set_codex_cover_preview(self, image_path: str | None, placeholder: str = "Обложка\nне создана") -> None:
+        if not _qt_object_is_alive(self):
+            return
+        label = getattr(self, "codex_cover_preview_label", None)
+        if not _qt_object_is_alive(label):
+            return
+
+        pixmap = QPixmap()
+        if image_path and pixmap.load(image_path):
+            scaled = pixmap.scaled(
+                label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
+            label.setToolTip(image_path)
+            if _qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
+                self.codex_cover_path_label.setText(Path(image_path).name)
+                self.codex_cover_path_label.setToolTip(image_path)
+            return
+
+        label.clear()
+        label.setText(placeholder)
+        label.setToolTip(CODEX_COVER_DROP_TOOLTIP)
+        if _qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
+            self.codex_cover_path_label.setText("")
+            self.codex_cover_path_label.setToolTip("")

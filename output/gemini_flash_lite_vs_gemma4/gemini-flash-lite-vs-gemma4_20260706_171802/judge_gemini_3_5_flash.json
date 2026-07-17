@@ -1,0 +1,73 @@
+{
+  "winner": "gemini-3.1-flash-lite",
+  "overall": {
+    "gemini-3.1-flash-lite": 8,
+    "gemma-4-31b": 3
+  },
+  "cases": [
+    {
+      "case_id": "zh-dialogue-glossary",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 8,
+          "russian_style": 8,
+          "constraints": 8,
+          "concision": 10,
+          "overall": 8.5
+        },
+        "gemma-4-31b": {
+          "adequacy": 0,
+          "russian_style": 0,
+          "constraints": 0,
+          "concision": 0,
+          "overall": 0
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "Модель gemma выдала ошибку сервера. Модель gemini перевела хорошо, хотя разбила HTML на два абзаца и изменила оформление диалога на тире."
+    },
+    {
+      "case_id": "html-link-preservation",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 10,
+          "russian_style": 9,
+          "constraints": 8,
+          "concision": 10,
+          "overall": 9.2
+        },
+        "gemma-4-31b": {
+          "adequacy": 10,
+          "russian_style": 10,
+          "constraints": 10,
+          "concision": 2,
+          "overall": 6.5
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "Модель gemma выдала огромное количество рассуждений вопреки правилу concision, хотя сам перевод в конце идеален. Gemini заменила href на id в теге ссылки (что является нарушением разметки), но выдала только чистый перевод."
+    },
+    {
+      "case_id": "zh-style-and-term",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 9,
+          "russian_style": 9,
+          "constraints": 10,
+          "concision": 10,
+          "overall": 9.5
+        },
+        "gemma-4-31b": {
+          "adequacy": 10,
+          "russian_style": 10,
+          "constraints": 10,
+          "concision": 2,
+          "overall": 7.0
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "У gemma прекрасный литературный перевод, но модель тотально проигнорировала требование лаконичности (concision), выдав гору рассуждений и черновиков. Gemini перевела сразу и качественно."
+    }
+  ],
+  "summary_ru": "Gemma-4-31b страдает от фатального несоблюдения ограничений: в первом кейсе выдала ошибку 500, в остальных — огромные простыни рассуждений (Chain of Thought) наружу вместо чистого перевода. Gemini-3.1-flash-lite работает стабильно, лаконично и выдает качественный русский текст, хоть и допустила небольшую ошибку с заменой атрибута в HTML во втором кейсе."
+}

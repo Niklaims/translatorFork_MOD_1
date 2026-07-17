@@ -124,7 +124,14 @@ class HomePage(ShellPage):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.tool_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self.proxy_status_label = QtWidgets.QLabel("Прокси: выключен")
+        self.proxy_status_label.setObjectName("helperLabel")
+        self.proxy_status_label.setToolTip("Сетевые запросы идут без прокси.")
+        self.proxy_button = QtWidgets.QPushButton("Прокси")
+        self.proxy_button.setObjectName("compactActionButton")
+        self.proxy_button.clicked.connect(self._open_proxy_settings)
         self._build_ui()
+        self._refresh_proxy_status()
         import os
         if os.environ.get("QT_QPA_PLATFORM") != "offscreen":
             QtCore.QTimer.singleShot(1000, lambda: self.check_for_updates(silent=True))
@@ -178,15 +185,54 @@ class HomePage(ShellPage):
         outer.addLayout(grid)
         outer.addStretch(1)
 
-    def _open_proxy_settings(self):
-        from gemini_translator.ui.dialogs.proxy import ProxySettingsDialog
+        proxy_row = QtWidgets.QHBoxLayout()
+        proxy_row.addWidget(self.proxy_status_label, 1)
+        proxy_row.addWidget(self.proxy_button, 0, QtCore.Qt.AlignmentFlag.AlignRight)
+        outer.addLayout(proxy_row)
+
+    @staticmethod
+    def _settings_manager():
         app = QtWidgets.QApplication.instance()
-        settings_manager = getattr(app, 'settings_manager', None)
-        if not settings_manager:
-            QtWidgets.QMessageBox.warning(self, "Ошибка", "Менеджер настроек недоступен.")
+        if app is None:
+            return None
+        get_manager = getattr(app, "get_settings_manager", None)
+        if callable(get_manager):
+            return get_manager()
+        return getattr(app, "settings_manager", None)
+
+    def _open_proxy_settings(self) -> None:
+        settings_manager = self._settings_manager()
+        if settings_manager is None:
             return
+
+        from gemini_translator.ui.dialogs.proxy import ProxySettingsDialog
+
         dialog = ProxySettingsDialog(self, settings_manager)
         dialog.exec()
+        self._refresh_proxy_status()
+
+    def _refresh_proxy_status(self) -> None:
+        settings_manager = self._settings_manager()
+        self.proxy_button.setEnabled(settings_manager is not None)
+        settings = settings_manager.load_proxy_settings() if settings_manager is not None else {}
+        self._update_proxy_display(settings)
+
+    def _update_proxy_display(self, settings: dict) -> None:
+        enabled = bool(settings.get("enabled", False))
+        proxy_type = str(settings.get("type") or "SOCKS5")
+        host = str(settings.get("host") or "")
+        port = str(settings.get("port") or "")
+        user = str(settings.get("user") or "")
+
+        if enabled and host and port:
+            self.proxy_status_label.setText(f"Прокси: {proxy_type}://{host}:{port}")
+            tooltip_lines = [f"Тип: {proxy_type}", f"Хост: {host}", f"Порт: {port}"]
+            if user:
+                tooltip_lines.append(f"Пользователь: {user}")
+            self.proxy_status_label.setToolTip("\n".join(tooltip_lines))
+        else:
+            self.proxy_status_label.setText("Прокси: выключен")
+            self.proxy_status_label.setToolTip("Сетевые запросы идут без прокси.")
 
     def check_for_updates(self, silent=False):
         self.btn_check_update.setEnabled(False)

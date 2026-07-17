@@ -102,6 +102,8 @@ class _AutoFilterPipelineHarness:
     _get_filter_retry_translation_options = InitialSetupDialog._get_filter_retry_translation_options
     _try_auto_filter_recovery = InitialSetupDialog._try_auto_filter_recovery
     _try_auto_filter_redirect_followup = InitialSetupDialog._try_auto_filter_redirect_followup
+    _schedule_auto_translation_restart = InitialSetupDialog._schedule_auto_translation_restart
+    _run_scheduled_auto_translation_restart = InitialSetupDialog._run_scheduled_auto_translation_restart
 
     def __init__(self, ui_state, key_widget):
         self.engine = _EngineStub(ui_state)

@@ -678,7 +678,7 @@ def _patched_sqlite3_connect(*args, **kwargs):
 
     return conn
 
-def copy_to_mem(real_path: str) -> str | None:
+def copy_to_mem(real_path: str, *, unique: bool = False) -> str | None:
     # Используем _patched_exists, который теперь тоже защищен, так как использует _patched_open опосредованно
     if not real_path or not _patched_exists(real_path): return None
     
@@ -687,6 +687,8 @@ def copy_to_mem(real_path: str) -> str | None:
     normalized_path = _original["os_path"].abspath(real_path).replace(":", "_drive").replace("\\", "/")
     if normalized_path.startswith('/'):
         normalized_path = normalized_path[1:]
+    if unique:
+        normalized_path = f"isolated/{uuid.uuid4().hex}/{normalized_path}"
     virtual_path_internal_for_pyfs = "/" + normalized_path
     virtual_path_for_return = VIRTUAL_PREFIX + normalized_path
     

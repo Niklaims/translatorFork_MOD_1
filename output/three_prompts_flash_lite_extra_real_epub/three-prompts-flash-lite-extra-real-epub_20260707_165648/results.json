@@ -1,0 +1,266 @@
+{
+  "name": "three-prompts-flash-lite-extra-real-epub",
+  "config_path": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_extra_real_epub_benchmark.json",
+  "output_dir": "C:\\Users\\shest\\Downloads\\rulate\\translatorFork 1.1\\output\\three_prompts_flash_lite_extra_real_epub\\three-prompts-flash-lite-extra-real-epub_20260707_165648",
+  "created_at": "2026-07-07T16:56:48.752722+00:00",
+  "prompt_only": false,
+  "results": [
+    {
+      "case_id": "weird-apocalypse-chapter-00003-2152chars",
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "error",
+      "latency_ms": 1389,
+      "prompt_tokens_estimate": 4728,
+      "output_tokens_estimate": 0,
+      "score": null,
+      "metrics": {},
+      "issues": [
+        "run failed: ContentFilterError"
+      ],
+      "error": "ContentFilterError: Блокировка на уровне промпта: PROHIBITED_CONTENT",
+      "prompt_path": "prompts\\weird-apocalypse-chapter-00003-2152chars__legacy-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт"
+    },
+    {
+      "case_id": "weird-apocalypse-chapter-00003-2152chars",
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "error",
+      "latency_ms": 504,
+      "prompt_tokens_estimate": 5762,
+      "output_tokens_estimate": 0,
+      "score": null,
+      "metrics": {},
+      "issues": [
+        "run failed: ContentFilterError"
+      ],
+      "error": "ContentFilterError: Блокировка на уровне промпта: PROHIBITED_CONTENT",
+      "prompt_path": "prompts\\weird-apocalypse-chapter-00003-2152chars__basic-translation__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт"
+    },
+    {
+      "case_id": "weird-apocalypse-chapter-00003-2152chars",
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "error",
+      "latency_ms": 9260,
+      "prompt_tokens_estimate": 10989,
+      "output_tokens_estimate": 0,
+      "score": null,
+      "metrics": {},
+      "issues": [
+        "run failed: PartialGenerationError"
+      ],
+      "error": "PartialGenerationError: Генерация прервана (причина: PROHIBITED_CONTENT)",
+      "prompt_path": "prompts\\weird-apocalypse-chapter-00003-2152chars__basic-translation-short__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт"
+    },
+    {
+      "case_id": "ghost-city-chapter-00001-3611chars",
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 16528,
+      "prompt_tokens_estimate": 5711,
+      "output_tokens_estimate": 4437,
+      "score": 75.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -34
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 2.945,
+        "reference_similarity": null,
+        "source_visible_chars": 3611,
+        "output_visible_chars": 10636,
+        "output_tokens_estimate": 4437
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -34}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00001-3611chars__legacy-default__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00001-3611chars__legacy-default__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 5662,
+            "output_tokens": 4601,
+            "total_tokens": 10263,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "ghost-city-chapter-00001-3611chars",
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 13590,
+      "prompt_tokens_estimate": 6745,
+      "output_tokens_estimate": 4419,
+      "score": 75.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -16
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 2.914,
+        "reference_similarity": null,
+        "source_visible_chars": 3611,
+        "output_visible_chars": 10522,
+        "output_tokens_estimate": 4419
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -16}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00001-3611chars__basic-translation__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00001-3611chars__basic-translation__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 6832,
+            "output_tokens": 4580,
+            "total_tokens": 11412,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    },
+    {
+      "case_id": "ghost-city-chapter-00001-3611chars",
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "provider": "gemini",
+      "model": "gemini-3.1-flash-lite",
+      "status": "ok",
+      "latency_ms": 15050,
+      "prompt_tokens_estimate": 11972,
+      "output_tokens_estimate": 4618,
+      "score": 75.0,
+      "metrics": {
+        "required_terms": {
+          "total": 0,
+          "missing": []
+        },
+        "forbidden_terms": {
+          "total": 0,
+          "found": []
+        },
+        "placeholders": {
+          "total": 0,
+          "missing": []
+        },
+        "html_tag_diff": {
+          "p": -18
+        },
+        "cjk_residue_chars": 0,
+        "length_ratio": 3.053,
+        "reference_similarity": null,
+        "source_visible_chars": 3611,
+        "output_visible_chars": 11023,
+        "output_tokens_estimate": 4618
+      },
+      "issues": [
+        "html tag count changed: {\"p\": -18}"
+      ],
+      "error": "",
+      "prompt_path": "prompts\\ghost-city-chapter-00001-3611chars__basic-translation-short__gemini-3.1-flash-lite.txt",
+      "debug_report": "Стандартный промпт",
+      "output_path": "outputs\\ghost-city-chapter-00001-3611chars__basic-translation-short__gemini-3.1-flash-lite.output.txt",
+      "events": [
+        {
+          "event": "token_usage_updated",
+          "data": {
+            "input_tokens": 12249,
+            "output_tokens": 4788,
+            "total_tokens": 17037,
+            "estimated": true,
+            "model_id": "gemini-3.1-flash-lite",
+            "provider": null
+          }
+        }
+      ]
+    }
+  ],
+  "summary": [
+    {
+      "prompt_id": "basic-translation",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 2,
+      "ok": 1,
+      "errors": 1,
+      "avg_score": 75.0,
+      "avg_latency_ms": 7047.0,
+      "avg_prompt_tokens": 6253.5,
+      "avg_output_tokens": 2209.5
+    },
+    {
+      "prompt_id": "legacy-default",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 2,
+      "ok": 1,
+      "errors": 1,
+      "avg_score": 75.0,
+      "avg_latency_ms": 8958.5,
+      "avg_prompt_tokens": 5219.5,
+      "avg_output_tokens": 2218.5
+    },
+    {
+      "prompt_id": "basic-translation-short",
+      "model_id": "gemini-3.1-flash-lite",
+      "runs": 2,
+      "ok": 1,
+      "errors": 1,
+      "avg_score": 75.0,
+      "avg_latency_ms": 12155.0,
+      "avg_prompt_tokens": 11480.5,
+      "avg_output_tokens": 2309.0
+    }
+  ]
+}

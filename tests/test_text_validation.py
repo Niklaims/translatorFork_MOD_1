@@ -117,6 +117,39 @@ def test_validate_html_structure_accepts_multi_h2_heading_after_media_placeholde
     assert '<h2>Chapter 45: End of Trial</h2>' not in repaired
 
 
+def test_validate_html_structure_rejects_large_translation_missing_middle():
+    source_paragraphs = [
+        f"<p>Source paragraph {index}. " + ("source text " * 12) + "</p>"
+        for index in range(40)
+    ]
+    translated_paragraphs = [
+        "<p>" + ("\u041f\u0435\u0440\u0435\u0432\u043e\u0434 " * 10) + "</p>"
+        for _ in range(5)
+    ]
+    original = "<body>" + "".join(source_paragraphs) + "</body>"
+    translated = "<body>" + "".join(translated_paragraphs) + "</body>"
+
+    is_valid, reason, _ = validate_html_structure(original, translated)
+
+    assert not is_valid
+    assert "too short" in reason
+
+
+def test_validate_html_structure_rejects_large_paragraph_collapse():
+    source_paragraphs = [
+        f"<p>Source paragraph {index}. " + ("source text " * 12) + "</p>"
+        for index in range(40)
+    ]
+    translated_text = "\u041f\u0435\u0440\u0435\u0432\u043e\u0434 " * 700
+    original = "<body>" + "".join(source_paragraphs) + "</body>"
+    translated = f"<body><p>{translated_text}</p></body>"
+
+    is_valid, reason, _ = validate_html_structure(original, translated)
+
+    assert not is_valid
+    assert "collapsed or disappeared" in reason
+
+
 def test_normalize_translated_body_wrapper_repairs_inner_html_response():
     original = '<body id="main"><p>Source text.</p></body>'
     translated = '<p>Переведенный текст.</p>'

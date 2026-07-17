@@ -280,7 +280,7 @@ class GeminiApiHandler(BaseApiHandler):
             raise NetworkError(f"Таймаут запроса к Gemini.", delay_seconds=30)
         except (aiohttp.ClientError, OSError) as e:
             # Это подавит трейсбек в консоли и отправит ошибку в штатный обработчик ретраев
-            error_msg = f"Сбой сети/SSL ({type(e).__name__}): {e}"
+            error_msg = self._format_transport_error(e)
             raise NetworkError(error_msg, delay_seconds=30) from e
         
         except (RateLimitExceededError, ContentFilterError, NetworkError, 

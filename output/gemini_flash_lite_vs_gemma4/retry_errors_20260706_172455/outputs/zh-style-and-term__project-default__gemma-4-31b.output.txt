@@ -1,0 +1,38 @@
+*   Task: Translate a specific HTML fragment from Chinese to Russian.
+    *   Role: Professional literary translator.
+    *   Key constraints:
+        *   Strict HTML preservation.
+        *   Literary Russian (native-sounding, not a calque).
+        *   Specific dash logic: `─` (U+2500) for [SOUND] $\leftrightarrow$ [SILENCE] transitions, `–` (en-dash) for internal pauses.
+        *   No quotation marks for direct speech (though this fragment has no speech).
+        *   Glossary: 林澈 $\rightarrow$ Линь Чэ, 玉符 $\rightarrow$ нефритовый талисман.
+        *   Volume equivalence, sensory detail, psychological depth.
+
+    *   `<p>黑潮压过城墙时，林澈仍把破损的玉符藏进袖中，像藏住最后一盏灯。</p>`
+    *   Meaning: When the black tide pressed over the city walls, Lin Che still hid the damaged jade talisman in his sleeve, as if hiding the last lamp.
+
+    *   *Black tide* (黑潮): "Черный прилив" or "черная волна". "Прилив" fits "tide" and feels more ominous/massive.
+    *   *Pressed over city walls* (压过城墙): "накрывал стены города", "перехлестывал через стены". "Накрывал" (covered/overwhelmed) or "переливался через" (overflowed). "Накрыл" sounds more sudden and overwhelming.
+    *   *Lin Che* (林澈): Линь Чэ (from glossary).
+    *   *Damaged jade talisman* (破损的玉符): "поврежденный нефритовый талисман" (from glossary).
+    *   *Hid in sleeve* (藏进袖中): "спрятал в рукав".
+    *   *Like hiding the last lamp* (像藏住最后一盏灯): "словно укрывая последний огонек" or "будто пряча последнюю лампу". "Огонек" (little light/flame) is more poetic in Russian for a "lamp" when used metaphorically as a symbol of hope.
+
+    *   *Draft 1 (Literal):* Когда черный прилив перехлестнул через городские стены, Линь Чэ все еще прятал поврежденный нефритовый талисман в рукаве, словно прятал последнюю лампу.
+    *   *Draft 2 (More literary):* В тот миг, когда черный прилив накрыл городские стены, Линь Чэ всё так же прятал в рукаве надломленный нефритовый талисман – будто укрывал последний в мире огонек.
+    *   *Draft 3 (Refining syntax):* Когда черный прилив захлестнул городские стены, Линь Чэ всё так же прижимал к себе, пряча в рукаве, поврежденный нефритовый талисман – словно укрывал последний угасающий огонек.
+
+    *   Wait, let's check "压过". It suggests pressure/weight. "Сдавил", "передавил". But with "tide" (潮), "захлестнул" (overwhelmed/washed over) is better.
+    *   "破损" (broken/damaged). "Поврежденный" is standard. "Надломленный" (cracked/broken) is more evocative.
+    *   "最后一盏灯" (last lamp). "Последний огонек" captures the sensory/psychological feeling of hope/light in the dark.
+
+    *   Text: `<p>Когда черный прилив захлестнул городские стены, Линь Чэ всё так же прятал в рукаве поврежденный нефритовый талисман – словно укрывал последний огонек.</p>`
+
+    *   HTML preserved? Yes.
+    *   Glossary used? Линь Чэ, нефритовый талисман. Yes.
+    *   Dash logic? The dash here is within narration ([SILENCE] $\rightarrow$ [SILENCE]), so it must be an en-dash `–`. Yes.
+    *   No quotation marks for speech? (No speech here).
+    *   No meta-leakage? Yes.
+    *   Volume equivalence? Yes.
+
+    `<p>Когда черный прилив захлестнул городские стены, Линь Чэ всё так же прятал в рукаве поврежденный нефритовый талисман – словно укрывал последний огонек.</p>`<p>Когда черный прилив захлестнул городские стены, Линь Чэ всё так же прятал в рукаве поврежденный нефритовый талисман – словно укрывал последний огонек.</p>

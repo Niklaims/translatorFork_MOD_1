@@ -22,6 +22,21 @@ def test_build_translated_output_path_keeps_short_name(tmp_path):
     )
 
 
+def test_build_translated_output_path_uses_epub_text_folder_for_root_chapter(tmp_path):
+    path = build_translated_output_path(
+        str(tmp_path),
+        "chapter_01.xhtml",
+        "_translated_gemini.html",
+    )
+
+    assert path == os.path.join(
+        str(tmp_path),
+        "OEBPS",
+        "Text",
+        "chapter_01_translated_gemini.html",
+    )
+
+
 def test_build_translated_output_path_shortens_overlong_filename(tmp_path):
     long_stem = "0000_" + ("very_long_chapter_title_" * 20)
     path = build_translated_output_path(

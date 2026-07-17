@@ -73,6 +73,29 @@ from workers import (
     publisher_from_source_url,
 )
 
+SCHEDULE_LIMIT_DAYS = 60
+
+
+def calculate_fit_interval_minutes(
+    start_time: datetime,
+    chapter_count: int,
+    deadline: datetime,
+) -> int:
+    """Return an integer interval that keeps all chapters within ``deadline``."""
+    if chapter_count < 2:
+        raise ValueError("Для расчёта нужны как минимум две главы.")
+
+    available_minutes = int((deadline - start_time).total_seconds() // 60)
+    intervals_count = chapter_count - 1
+    if available_minutes < intervals_count:
+        raise ValueError(
+            "Между первой датой и пределом недостаточно времени: "
+            "нужен хотя бы один минутный интервал на каждую главу."
+        )
+
+    return available_minutes // intervals_count
+
+
 try:
     from gemini_translator.ui.widgets.key_management_widget import KeyManagementWidget
     from gemini_translator.ui.widgets.model_settings_widget import ModelSettingsWidget
@@ -430,6 +453,13 @@ class RanobeUploaderApp(QMainWindow):
         self.interval_spin.setRange(1, 99999)
         self.interval_spin.setValue(1440)
         sw_layout.addWidget(self.interval_spin)
+        self.btn_fit_schedule = QPushButton("Вписать в 60 дней")
+        self.btn_fit_schedule.setToolTip(
+            "Равномерно распределить выбранные главы от первой даты "
+            "до предела: текущий момент + 60 дней"
+        )
+        self.btn_fit_schedule.clicked.connect(self._fit_schedule_in_60_days)
+        sw_layout.addWidget(self.btn_fit_schedule)
         self.schedule_widget.setEnabled(False)
         sched_layout.addWidget(self.schedule_widget)
         schedule_group.setLayout(sched_layout)
@@ -1221,6 +1251,47 @@ class RanobeUploaderApp(QMainWindow):
 
     def _toggle_schedule(self, state):
         self.schedule_widget.setEnabled(state == 2)
+
+    def _fit_schedule_in_60_days(self):
+        chapter_count = sum(
+            self.chapters_list_widget.item(index).checkState() == Qt.CheckState.Checked
+            for index in range(self.chapters_list_widget.count())
+        )
+        start_time = self.date_edit.dateTime().toPyDateTime()
+        deadline = datetime.now() + timedelta(days=SCHEDULE_LIMIT_DAYS)
+
+        try:
+            interval_minutes = calculate_fit_interval_minutes(
+                start_time,
+                chapter_count,
+                deadline,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Не удалось рассчитать расписание", str(error))
+            return
+
+        if interval_minutes > self.interval_spin.maximum():
+            QMessageBox.warning(
+                self,
+                "Не удалось рассчитать расписание",
+                "Полученный интервал превышает допустимое значение поля. "
+                "Выберите более позднюю первую дату.",
+            )
+            return
+
+        self.interval_spin.setValue(interval_minutes)
+        last_publish_time = start_time + timedelta(
+            minutes=interval_minutes * (chapter_count - 1)
+        )
+        QMessageBox.information(
+            self,
+            "Расписание рассчитано",
+            f"Глав: {chapter_count}\n"
+            f"Интервал: {interval_minutes} мин.\n"
+            f"Первая глава: {start_time:%d.%m.%Y %H:%M}\n"
+            f"Последняя глава: {last_publish_time:%d.%m.%Y %H:%M}\n"
+            f"Предел 60 дней: {deadline:%d.%m.%Y %H:%M}",
+        )
 
     def _toggle_paid(self, state):
         self.spin_price.setEnabled(state == 2 and self._current_upload_mode() != "api")

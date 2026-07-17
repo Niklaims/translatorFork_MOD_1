@@ -1,0 +1,71 @@
+Professional literary translator into Russian.
+Translate a specific HTML fragment from Chinese to Russian.
+Strict HTML preservation, specific dialogue formatting (operator `─`), literary style, glossary usage.
+
+        *   `青云宗` $\rightarrow$ `Секта Лазурного Облака`
+        *   `师尊` $\rightarrow$ `наставник`
+
+        *   `<p>青云宗的弟子低声说：“师尊来了。”</p>`
+        *   `<p><!-- MEDIA_0 --></p>`
+
+    *   *Literal:* "A disciple of the Qingyun Sect whispered: 'The master has come.'"
+    *   *Glossary application:* "Ученик Секты Лазурного Облака тихо сказал: «Наставник пришел»." (Wait, applying dialogue rules).
+
+    *   State 1: [SILENCE] (Author narrates) $\rightarrow$ State 2: [SOUND] (Disciple speaks) $\rightarrow$ State 3: [SILENCE] (Author says "whispered").
+    *   Actually, the source is: "Disciple [Author] whispered [Author]: 'Master has come' [Sound]."
+    *   Following Anchor D (Dialogue rules):
+        *   Speech must start with `─`.
+        *   Speaker tags are separated by `─`.
+        *   No quotation marks for spoken speech.
+    *   Draft 1: `<p>─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.</p>`
+    *   Draft 2 (Alternative order for flow): `<p>Ученик Секты Лазурного Облака тихо прошептал: ─ Наставник пришел.</p>`
+
+    *Let's check the "Naturalness and Inversion" rule.*
+    Source: `青云宗的弟子低声说：“师尊来了。”`
+    Translation: `─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.`
+    Or: `Ученик Секты Лазурного Облака тихо произнес: ─ Наставник пришел.`
+
+    Wait, the prompt says: "Place speaker tags (author's words)... after or inside a break in the direct speech, if it improves the rhythm."
+    Let's go with: `<p>─ Наставник пришел, ─ тихо прошептал ученик Секты Лазурного Облака.</p>`
+
+    *Wait, let's re-evaluate the trigger operator `─`.*
+    [SILENCE] $\leftrightarrow$ [SOUND] = `─`.
+    If the sentence starts with "Ученик... сказал", it's [SILENCE]. Then "Наставник пришел" is [SOUND].
+    So: `Ученик Секты Лазурного Облака тихо сказал: ─ Наставник пришел.`
+    Or: `─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.`
+
+    Looking at the provided examples in the prompt:
+    `Src: <p>“你好，”他说。“今天天气不错。”</p>` $\rightarrow$ `Tgt: <p>─ Привет, ─ сказал он. ─ Сегодня хорошая погода.</p>`
+    This shows the pattern: `─ [Speech], ─ [Author]. ─ [Speech].`
+
+    Applying this to the source:
+    `─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.`
+
+    *   `青云宗` $\rightarrow$ `Секта Лазурного Облака` (Correct).
+    *   `师尊` $\rightarrow$ `наставник` (Correct).
+    *   `低声说` $\rightarrow$ `тихо сказал` or `прошептал`. Let's use `тихо сказал` to be precise, or `прошептал` for a more literary feel. `тихо произнес` is also good. Let's stick to `тихо сказал`.
+
+    *   HTML tags preserved? Yes.
+    *   `<!-- MEDIA_0 -->` preserved? Yes.
+    *   No quotation marks for speech? Yes.
+    *   Operator `─` used for sound/silence boundary? Yes.
+    *   No em-dash `—` used? Yes.
+    *   No meta-leakage? Yes.
+
+    `<p>─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.</p>`
+    `<p><!-- MEDIA_0 --></p>`
+
+    Wait, "low voice" (低声) in a sect setting usually implies a whisper or a hushed tone. "Тихо сказал" is fine.
+
+    Double-check the dialogue start:
+    Example: `Src: <p>他说：“你好。”</p>` $\rightarrow$ `Tgt: <p>─ Привет, ─ сказал он.</p>`
+    Our source: `<p>青云宗的弟子低声说：“师尊来了。”</p>`
+    Following the example exactly: `<p>─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.</p>`
+
+    Wait, "Наставник пришел" (The master has come/arrived).
+    Let's ensure "наставник" is the correct gender (usually masculine in this context). Correct.
+
+    Final Polish:
+    `<p>─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.</p>`
+    `<p><!-- MEDIA_0 --></p>`<p>─ Наставник пришел, ─ тихо сказал ученик Секты Лазурного Облака.</p>
+<p><!-- MEDIA_0 --></p>

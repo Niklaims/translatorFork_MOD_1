@@ -1,0 +1,22 @@
+*   Task: Translate a short HTML fragment from English to Russian.
+    *   Source: `<p><a id="link_0">Note</a>: The tower opened, and the old oath burned blue.</p>`
+    *   Constraints: Professional literary translation, strict HTML preservation, specific punctuation/formatting rules (Operator `─` for speech, En-dash `–` for pauses, Guillemets `«...»` for quotes/thoughts).
+    *   State: The text is purely narration [SILENCE].
+
+    *   "Note": This looks like a label or a header for a note. In Russian, "Примечание" or "Заметка".
+    *   "The tower opened": "Башня открылась".
+    *   "and the old oath burned blue": "и древняя клятва вспыхнула синим".
+
+    *   The text is authorial narration.
+    *   No dialogue is present, so the Operator `─` is not used.
+    *   No internal pauses that require an En-dash `–`.
+    *   HTML preservation: `<p>`, `<a>`, `id="link_0"` must be kept exactly.
+
+    *   `<p><a id="link_0">Примечание</a>: Башня открылась, и древняя клятва вспыхнула синим.</p>`
+
+    *   Volume equivalence? Yes.
+    *   Plot factuality? Yes.
+    *   HTML preservation? Yes.
+    *   Correct dash usage? No dashes needed here.
+    *   No quotation marks for speech? No speech here.
+    *   No metadata leakage? Yes.<p><a id="link_0">Примечание</a>: Башня открылась, и древняя клятва вспыхнула синим.</p>

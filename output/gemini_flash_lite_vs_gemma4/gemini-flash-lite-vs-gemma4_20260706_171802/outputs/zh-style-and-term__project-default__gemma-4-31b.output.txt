@@ -1,0 +1,38 @@
+*   Source text: `<p>黑潮压过城墙时，林澈仍把破损的玉符藏进袖中，像藏住最后一盏灯。</p>`
+    *   Glossary: 林澈 -> Линь Чэ, 玉符 -> нефритовый талисман.
+    *   Meaning: When the black tide pressed over the city walls, Lin Che still hid the broken jade talisman in his sleeve, as if hiding the last lamp.
+
+    *   State: [SILENCE] (Narration only).
+    *   Key elements:
+        *   "Black tide" (黑潮)
+        *   "Pressed over city walls" (压过城墙时)
+        *   "Lin Che" (林澈)
+        *   "Broken jade talisman" (破损的玉符)
+        *   "Hid in sleeve" (藏进袖中)
+        *   "Like hiding the last lamp" (像藏住最后一盏灯)
+
+    *   *Draft 1 (Literal):* Когда черный прилив перехлестнул через городские стены, Линь Чэ все еще прятал сломанный нефритовый талисман в рукаве, словно прятал последний фонарь.
+    *   *Draft 2 (More literary):* Когда черный прилив захлестнул городские стены, Линь Чэ по-прежнему сжимал в рукаве поврежденный нефритовый талисман, точно оберегая последний огонек лампы.
+    *   *Draft 3 (Refining for flow and sensory impact):* Когда черный прилив обрушился на городские стены, Линь Чэ все так же прятал в рукаве надломленный нефритовый талисман, словно оберегал последний в мире огонек.
+
+    *   Volume equivalence: 1:1.
+    *   Plot factuality: Lin Che, broken talisman, sleeve, black tide, city walls.
+    *   Sensory detail: "Black tide" implies weight and darkness. "Sleeve" implies concealment. "Lamp" implies hope/last light.
+    *   Stylistic Vector: Natural Russian literary syntax.
+    *   HTML Architecture: Maintain `<p>` tags.
+    *   Binary Text Physics: This is pure [SILENCE]. No `─` operator needed. Use `–` (en-dash) if needed, but the sentence is simple.
+
+    *   "黑潮" (Black Tide) -> Черный прилив.
+    *   "压过" (Press/overwhelm) -> захлестнул / обрушился.
+    *   "破损的" (Damaged/Broken) -> поврежденный / надломленный.
+    *   "玉符" (Jade talisman) -> нефритовый талисман (as per glossary).
+    *   "最后一盏灯" (Last lamp) -> последний огонек / последняя лампа. In Russian, "last lamp" sounds slightly mechanical; "last light/lamp-light" (последний огонек) is more literary.
+
+    *   `<p>Когда черный прилив захлестнул городские стены, Линь Чэ по-прежнему прятал в рукаве надломленный нефритовый талисман, точно оберегая последний огонек лампы.</p>`
+
+    *   No metadata leakage? Yes.
+    *   No parentheses/footnotes? Yes.
+    *   Typography: No quotation marks for speech (none here). No em-dashes.
+    *   Glossary followed? Yes.
+
+    `<p>Когда черный прилив захлестнул городские стены, Линь Чэ по-прежнему прятал в рукаве надломленный нефритовый талисман, словно оберегая последний огонек лампы.</p>`<p>Когда черный прилив захлестнул городские стены, Линь Чэ по-прежнему прятал в рукаве надломленный нефритовый талисман, словно оберегая последний огонек лампы.</p>

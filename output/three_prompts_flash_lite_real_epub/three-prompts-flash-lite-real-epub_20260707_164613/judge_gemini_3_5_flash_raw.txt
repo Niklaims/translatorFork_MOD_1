@@ -1,0 +1,41 @@
+{
+  "winner": "legacy-default",
+  "ranking": ["legacy-default", "basic-translation-short", "basic-translation"],
+  "overall": {
+    "legacy-default": 9,
+    "basic-translation-short": 8,
+    "basic-translation": 5
+  },
+  "scores": {
+    "legacy-default": {
+      "adequacy": 10,
+      "russian_style": 9,
+      "html_integrity": 10,
+      "production_readiness": 10,
+      "consistency": 10,
+      "overall": 9
+    },
+    "basic-translation-short": {
+      "adequacy": 9,
+      "russian_style": 8,
+      "html_integrity": 10,
+      "production_readiness": 10,
+      "consistency": 8,
+      "overall": 8
+    },
+    "basic-translation": {
+      "adequacy": 8,
+      "russian_style": 7,
+      "html_integrity": 10,
+      "production_readiness": 5,
+      "consistency": 5,
+      "overall": 5
+    }
+  },
+  "notes_ru": {
+    "legacy-default": "Отличный литературный слог, точное попадание в терминологию (потусторонние монеты, Банк Преисподней) и безупречная HTML-верстка. Прямая речь оформлена по правилам русской типографики.",
+    "basic-translation-short": "Хороший перевод, но уступает первому варианту из-за менее звучной терминологии («призрачные монеты», «Царство мертвых» вместо Преисподней/Ада в контексте китайского Диюй/冥府).",
+    "basic-translation": "Критическая ошибка: в тексте оставлен непереведенный китайский термин «冥币» (иероглифы в русской транслитерации), что делает текст непригодным для публикации без ручной редактуры."
+  },
+  "summary_ru": "Победителем признан вариант 'legacy-default', который продемонстрировал великолепный литературный слог, точную адаптацию китайских реалий (冥币 как 'потусторонние монеты', а не калькой) и полное сохранение структуры HTML. Вариант 'basic-translation' полностью провалил проверку из-за оставшихся в тексте китайских иероглифов."
+}

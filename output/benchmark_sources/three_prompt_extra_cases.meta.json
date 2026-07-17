@@ -1,0 +1,20 @@
+[
+  {
+    "id": "weird-apocalypse-chapter-00003",
+    "epub_path": "tools/tomato/诡异末世：重生开局拥有万亿冥币.epub",
+    "epub_member": "OEBPS/chapter_00003.xhtml",
+    "source_path": "output/benchmark_sources/tomato_weird_apocalypse_chapter_00003_chunk_2152.xhtml",
+    "visible_chars": 2152,
+    "html_chars": 2593,
+    "chapter_title": "第3章 危险的客人"
+  },
+  {
+    "id": "ghost-city-chapter-00001",
+    "epub_path": "tools/tomato/全班跳转死光光我在鬼城百万撤离.epub",
+    "epub_member": "OEBPS/chapter_00001.xhtml",
+    "source_path": "output/benchmark_sources/tomato_ghost_city_chapter_00001_chunk_3611.xhtml",
+    "visible_chars": 3611,
+    "html_chars": 4442,
+    "chapter_title": "第1章 坠入黑暗"
+  }
+]

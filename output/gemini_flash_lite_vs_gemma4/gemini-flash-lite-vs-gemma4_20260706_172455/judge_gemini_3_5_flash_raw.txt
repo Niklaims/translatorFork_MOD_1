@@ -1,0 +1,73 @@
+{
+  "winner": "gemini-3.1-flash-lite",
+  "overall": {
+    "gemini-3.1-flash-lite": 9,
+    "gemma-4-31b": 2
+  },
+  "cases": [
+    {
+      "case_id": "zh-dialogue-glossary",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 10,
+          "russian_style": 9,
+          "constraints": 10,
+          "concision": 10,
+          "overall": 9.5
+        },
+        "gemma-4-31b": {
+          "adequacy": 10,
+          "russian_style": 9,
+          "constraints": 10,
+          "concision": 1,
+          "overall": 5.0
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "Gemma-4-31b выдала огромный объем размышлений (CoT) вместо чистого перевода, грубо нарушив правила лаконичности. Gemini перевела отлично и без лишнего текста."
+    },
+    {
+      "case_id": "html-link-preservation",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 10,
+          "russian_style": 9,
+          "constraints": 8,
+          "concision": 10,
+          "overall": 9.0
+        },
+        "gemma-4-31b": {
+          "adequacy": 0,
+          "russian_style": 0,
+          "constraints": 0,
+          "concision": 0,
+          "overall": 0
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "Gemma выдала ошибку генерации. Gemini изменила href ссылку на id=\"link_0\", что немного нарушает ограничения исходного HTML, но перевод качественный."
+    },
+    {
+      "case_id": "zh-style-and-term",
+      "scores": {
+        "gemini-3.1-flash-lite": {
+          "adequacy": 10,
+          "russian_style": 10,
+          "constraints": 10,
+          "concision": 10,
+          "overall": 10
+        },
+        "gemma-4-31b": {
+          "adequacy": 0,
+          "russian_style": 0,
+          "constraints": 0,
+          "concision": 0,
+          "overall": 0
+        }
+      },
+      "winner": "gemini-3.1-flash-lite",
+      "notes": "Gemma выдала системную ошибку 500. Gemini перевела великолепно, с отличным литературным слогом."
+    }
+  ],
+  "summary_ru": "Модель gemma-4-31b полностью провалила тест, выдав системные ошибки на двух кейсах и огромный лог рассуждений вместо чистого перевода в первом кейсе. Gemini-3.1-flash-lite справилась отлично, продемонстрировав прекрасный литературный русский язык."
+}
