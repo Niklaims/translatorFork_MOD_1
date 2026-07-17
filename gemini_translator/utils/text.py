@@ -902,7 +902,12 @@ def initial_cleanup(html_content: str) -> str:
         for part in parts:
             p_strip = part.strip()
             if p_strip:
-                if p_strip.startswith('<'):
+                # Only a real block element may stand on its own. Inline
+                # markup such as <em>, <strong>, <span>, or <a> still belongs
+                # to the paragraph; dropping the wrapper here leaves visible
+                # text directly under <body>/<div> while keeping the raw
+                # opening/closing <p> counts deceptively balanced.
+                if BLOCK_TAGS_PATTERN.match(p_strip):
                     new_paragraphs.append(p_strip)
                 else:
                     new_paragraphs.append(f"{attrs}{p_strip}{closing}")
@@ -1673,13 +1678,43 @@ def repair_unbalanced_paragraphs(html_content: str) -> str:
                 last_p = p_matches[-1]
                 if last_p.group(1):
                     new_opening_tag = f"<p{last_p.group(1)}>"
-            
-            replacement = f"{preceding_tag}{new_opening_tag}{orphan_text}</p>"
+
+            # When the orphan run already ends at </p>, that existing tag is
+            # its closing tag. Appending another one used to turn
+            # ``</p>text</p>`` into ``</p><p>text</p></p>`` and left exactly
+            # the extra closing tags that the final checker reports.
+            next_fragment = content[match.end():]
+            closing_tag = "" if re.match(r'</p\s*>', next_fragment, re.IGNORECASE) else "</p>"
+            replacement = f"{preceding_tag}{new_opening_tag}{orphan_text}{closing_tag}"
             content = content[:match.start()] + replacement + content[match.end():]
         
         # Если за проход ничего не изменилось - выходим
         if content == old_content:
             break
+
+    # Remove closing tags that have no preceding unmatched <p>. They commonly
+    # survive at the end of AI output as ``</p></body>`` and cannot be fixed by
+    # wrapping text because there is no orphan text between the tags.
+    paragraph_depth = 0
+
+    def remove_orphan_closing_tag(match):
+        nonlocal paragraph_depth
+        raw_tag = match.group(0)
+        if raw_tag.lstrip().startswith('</'):
+            if paragraph_depth <= 0:
+                return ""
+            paragraph_depth -= 1
+            return raw_tag
+
+        paragraph_depth += 1
+        return raw_tag
+
+    content = re.sub(
+        r'<p(?:\s+[^>]*)?>|</p\s*>',
+        remove_orphan_closing_tag,
+        content,
+        flags=re.IGNORECASE,
+    )
 
     # Финальный штрих: убираем случайные дубликаты пустых абзацев, если они возникли
     content = re.sub(r'<p[^>]*>\s*</p>', '', content, flags=re.IGNORECASE)
