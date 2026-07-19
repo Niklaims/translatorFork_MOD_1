@@ -73,7 +73,7 @@ class BaseTaskProcessor:
         context_payload = operation_context or self._build_operation_context(task_info)
         try:
             if should_orchestrate_api_call(self.worker, context_payload):
-                return await execute_orchestrated_api_call(
+                raw_response = await execute_orchestrated_api_call(
                     self.worker,
                     prompt,
                     log_prefix,
@@ -81,15 +81,16 @@ class BaseTaskProcessor:
                     operation_context=context_payload,
                     call_kwargs=kwargs,
                 )
-            with self.worker.debug_operation_context(context_payload):
-                return await self.worker.api_handler_instance.execute_api_call(
-                    prompt,
-                    log_prefix,
-                    **kwargs,
-                )
+            else:
+                with self.worker.debug_operation_context(context_payload):
+                    raw_response = await self.worker.api_handler_instance.execute_api_call(
+                        prompt,
+                        log_prefix,
+                        **kwargs,
+                    )
         except (ContentFilterError, PartialGenerationError) as exc:
             if fallback_enabled(self.worker) and is_content_block_exception(exc):
-                return await run_content_filter_fallback(
+                raw_response = await run_content_filter_fallback(
                     self.worker,
                     prompt,
                     log_prefix,
@@ -97,7 +98,13 @@ class BaseTaskProcessor:
                     operation_context=context_payload,
                     call_kwargs=kwargs,
                 )
-            raise
+            else:
+                raise
+                
+        if getattr(self.worker, 'response_parser', None) and getattr(self.worker.prompt_builder, 'extract_glossary', False):
+            raw_response = self.worker.response_parser.extract_and_remove_glossary(raw_response)
+            
+        return raw_response
 
     def _raise_validation_error(self, message, raw_package_text=""):
         error = ValidationFailedError(message)

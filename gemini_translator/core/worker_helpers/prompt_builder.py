@@ -54,10 +54,12 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
         sequential_chapter_order=None,
         sequential_chain_starts=None,
         sequential_reference_char_limit=60000,
+        extract_glossary=False,
     ):
         self.custom_prompt = custom_prompt
         self.context_manager = context_manager
         self.use_system_instruction = use_system_instruction
+        self.extract_glossary = extract_glossary
         self.sequential_mode = bool(sequential_mode)
         self.project_manager = project_manager
         self.provider_file_suffix = provider_file_suffix
@@ -631,6 +633,10 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
             format_examples=examples_content, # <-- Вставляем динамические примеры
             previous_chapter_reference=previous_chapter_reference or "",
         )
+        
+        if self.extract_glossary:
+            user_prompt += api_config.internal_prompts().get("extract_glossary_instruction", api_config._DEFAULT_EXTRACT_GLOSSARY_INSTRUCTION)
+        
         
         # 3. Собираем отчет (без изменений)
         

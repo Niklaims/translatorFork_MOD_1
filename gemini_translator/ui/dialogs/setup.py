@@ -402,7 +402,7 @@ class InitialSetupPage(ShellPage):
         self.prefill_data = prefill_data
 
 
-        self.setMinimumSize(1050, 650)
+        self.setMinimumSize(1400, 650)
         self._apply_initial_geometry()
 
         app = QtWidgets.QApplication.instance()
@@ -518,10 +518,8 @@ class InitialSetupPage(ShellPage):
             return
 
         available_geometry = screen.availableGeometry()
-        width = max(1200, int(self.minimumWidth() * 1.2))
-        width = min(width, int(available_geometry.width() * 0.95))
-        height = max(900, int(self.minimumHeight() * 1.2))
-        height = min(height, int(available_geometry.height() * 0.95))
+        width = min(1900, int(available_geometry.width() * 0.95))
+        height = min(1200, int(available_geometry.height() * 0.90))
 
         self.resize(width, height)
         # Принудительно разворачиваем ГЛАВНОЕ окно на весь экран, чтобы точно всё влезло

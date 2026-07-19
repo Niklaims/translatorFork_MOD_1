@@ -27,6 +27,36 @@ class ResponseParser:
         self.task_manager = task_manager
         self.validator_func = validator_func
         self.prompt_builder = prompt_builder # <-- Сохраняем ссылку
+
+    def extract_and_remove_glossary(self, raw_response):
+        import json
+        import re
+        if not isinstance(raw_response, str):
+            return raw_response
+            
+        pattern = re.compile(r"<new_glossary>([\s\S]*?)</new_glossary>", re.IGNORECASE)
+        match = pattern.search(raw_response)
+        
+        if match:
+            json_text = match.group(1).strip()
+            if json_text:
+                try:
+                    json_match = re.search(r"\{[\s\S]*\}", json_text)
+                    if json_match:
+                        json_text = json_match.group(0)
+                        
+                    new_terms = json.loads(json_text)
+                    if isinstance(new_terms, dict) and new_terms and hasattr(self.worker, 'context_manager'):
+                        self.worker.context_manager.add_custom_words(new_terms)
+                        self.log(f"[GLOSSARY] Извлечено новых терминов: {len(new_terms)}")
+                except json.JSONDecodeError as e:
+                    self.log(f"[WARN] Ошибка парсинга JSON глоссария: {e}")
+                except Exception as e:
+                    self.log(f"[WARN] Ошибка добавления терминов: {e}")
+            
+            return pattern.sub("", raw_response)
+            
+        return raw_response
     
     def _get_text_length_before(self, element, soup):
         length = 0
