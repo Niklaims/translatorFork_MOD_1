@@ -2,7 +2,9 @@
 
 import os
 import re
+import unicodedata
 from collections import Counter, defaultdict
+from difflib import SequenceMatcher
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QDialogButtonBox, QLabel,
@@ -26,6 +28,83 @@ CJK_CHAPTER_NUMBER_REGEX = r'[0-9零一二三四五六七八九十百千万两]+
 # Matches both Markdown headings ("# 第1章 ...") and plain headings
 # ("第181章 ...") so a mixed TXT can be split with one expression.
 BASIC_CJK_CHAPTER_REGEX = rf'^(?:#\s*)?第\s*{CJK_CHAPTER_NUMBER_REGEX}\s*章'
+
+_ARABIC_CJK_CHAPTER_NUMBER_RE = re.compile(
+    r'^\s*(?:#\s*)?第\s*(\d+)\s*章'
+)
+_DUPLICATE_CHAPTER_MIN_COMPACT_CHARS = 500
+_DUPLICATE_CHAPTER_SIMILARITY = 0.995
+
+
+def _extract_arabic_cjk_chapter_number(title):
+    match = _ARABIC_CJK_CHAPTER_NUMBER_RE.match(str(title or ""))
+    return int(match.group(1)) if match else None
+
+
+def _duplicate_chapter_comparison_text(content):
+    if isinstance(content, (list, tuple)):
+        content = "".join(str(part) for part in content)
+    normalized = unicodedata.normalize("NFKC", str(content or "")).casefold()
+    return re.sub(r'[\W_]+', '', normalized, flags=re.UNICODE)
+
+
+def collapse_adjacent_duplicate_txt_chapters(chapters):
+    """Drop a repeated full chapter while preserving legitimate numbered parts."""
+    filtered = []
+    removed = []
+
+    for chapter in chapters or []:
+        if not filtered:
+            filtered.append(chapter)
+            continue
+
+        previous = filtered[-1]
+        previous_number = _extract_arabic_cjk_chapter_number(previous[0])
+        current_number = _extract_arabic_cjk_chapter_number(chapter[0])
+        if previous_number is None or previous_number != current_number:
+            filtered.append(chapter)
+            continue
+
+        previous_text = _duplicate_chapter_comparison_text(previous[1])
+        current_text = _duplicate_chapter_comparison_text(chapter[1])
+        if min(len(previous_text), len(current_text)) < _DUPLICATE_CHAPTER_MIN_COMPACT_CHARS:
+            filtered.append(chapter)
+            continue
+
+        length_ratio = min(len(previous_text), len(current_text)) / max(
+            len(previous_text), len(current_text)
+        )
+        is_duplicate = previous_text == current_text
+        if not is_duplicate and length_ratio >= _DUPLICATE_CHAPTER_SIMILARITY:
+            is_duplicate = (
+                SequenceMatcher(None, previous_text, current_text).ratio()
+                >= _DUPLICATE_CHAPTER_SIMILARITY
+            )
+
+        if is_duplicate:
+            removed.append({
+                'title': chapter[0],
+                'duplicate_of': previous[0],
+            })
+            continue
+
+        filtered.append(chapter)
+
+    return filtered, removed
+
+
+def find_cjk_chapter_number_gaps(chapters):
+    """Return adjacent Arabic CJK chapter-number gaps without inventing content."""
+    gaps = []
+    previous_number = None
+    for title, _content in chapters or []:
+        number = _extract_arabic_cjk_chapter_number(title)
+        if number is None:
+            continue
+        if previous_number is not None and number > previous_number + 1:
+            gaps.append((previous_number, number))
+        previous_number = number
+    return gaps
 
 
 def smart_replace_number_in_title(title, new_number_int):
@@ -214,6 +293,8 @@ class TxtChapterAnalyzer:
             try:
                 fast_reg = re.compile(pat.replace('^', r'^\s*'), re.IGNORECASE)
                 indices = [idx for idx, line in enumerate(self.lines) if fast_reg.match(line)]
+                if pat == BASIC_CJK_CHAPTER_REGEX:
+                    indices = self._filter_sandwiched_cjk_outliers(indices)
                 score, info = self._validate_indices(indices)
                 if score > 0:
                     display = self._format_display_name(pat)
@@ -222,6 +303,53 @@ class TxtChapterAnalyzer:
 
         final_results.sort(key=lambda x: (x[2] if len(x)>2 else 0, x[1]), reverse=True)
         return [item[0:2] for item in final_results]
+
+    def _filter_sandwiched_cjk_outliers(self, indices):
+        """Ignore prose lines that resemble headings inside a consecutive run.
+
+        A line such as ``第1963章 年，...`` can be ordinary prose. When one or
+        more such candidates occur between real chapters 287 and 288, keep the
+        consecutive anchors and merge the intervening lines back into chapter
+        287 instead of creating phantom chapters.
+        """
+        filtered = list(indices or [])
+        max_anchor_distance = 6
+
+        while True:
+            removed_any = False
+            for left_pos in range(len(filtered)):
+                left_number = _extract_arabic_cjk_chapter_number(
+                    self.lines[filtered[left_pos]].strip()
+                )
+                if left_number is None:
+                    continue
+
+                right_limit = min(len(filtered), left_pos + max_anchor_distance + 1)
+                for right_pos in range(left_pos + 2, right_limit):
+                    right_number = _extract_arabic_cjk_chapter_number(
+                        self.lines[filtered[right_pos]].strip()
+                    )
+                    if right_number != left_number + 1:
+                        continue
+
+                    middle_numbers = [
+                        _extract_arabic_cjk_chapter_number(
+                            self.lines[line_idx].strip()
+                        )
+                        for line_idx in filtered[left_pos + 1:right_pos]
+                    ]
+                    if any(number in {left_number, right_number} for number in middle_numbers):
+                        continue
+
+                    del filtered[left_pos + 1:right_pos]
+                    removed_any = True
+                    break
+
+                if removed_any:
+                    break
+
+            if not removed_any:
+                return filtered
 
     def _validate_indices(self, indices):
         count = len(indices)
@@ -316,6 +444,16 @@ class TxtChapterAnalyzer:
                     'title': clean_line,
                     'char_idx': char_offsets[i]
                 })
+
+        if custom_regex == BASIC_CJK_CHAPTER_REGEX and len(boundaries) > 2:
+            boundaries_by_line = {
+                boundary['line_idx']: boundary
+                for boundary in boundaries
+            }
+            filtered_indices = self._filter_sandwiched_cjk_outliers(
+                [boundary['line_idx'] for boundary in boundaries]
+            )
+            boundaries = [boundaries_by_line[line_idx] for line_idx in filtered_indices]
                 
         return boundaries
 
@@ -354,7 +492,13 @@ class TxtChapterAnalyzer:
             chunk = self.lines[start_line+1 : end_line]
             chapters_lines.append([l + "\n" for l in chunk])
             titles.append(boundaries[i]['title'])
-            
+
+        chapter_pairs, _removed = collapse_adjacent_duplicate_txt_chapters(
+            list(zip(titles, chapters_lines))
+        )
+        titles = [title for title, _content in chapter_pairs]
+        chapters_lines = [content for _title, content in chapter_pairs]
+
         return chapters_lines, titles
 
     def calculate_stats(self, marker_word=None, context=None, custom_regex=None) -> dict:
@@ -898,6 +1042,37 @@ class TxtImportWizardDialog(QDialog):
                 content = "".join([l + "\n" for l in lines_slice])
                 final_chapters.append((item['title'], content))
 
+            final_chapters, removed_duplicates = collapse_adjacent_duplicate_txt_chapters(
+                final_chapters
+            )
+            chapter_gaps = find_cjk_chapter_number_gaps(final_chapters)
+            if chapter_gaps:
+                gap_labels = []
+                for previous_number, next_number in chapter_gaps[:12]:
+                    first_missing = previous_number + 1
+                    last_missing = next_number - 1
+                    gap_labels.append(
+                        str(first_missing)
+                        if first_missing == last_missing
+                        else f"{first_missing}–{last_missing}"
+                    )
+                if len(chapter_gaps) > 12:
+                    gap_labels.append("…")
+
+                answer = QtWidgets.QMessageBox.question(
+                    self,
+                    "Обнаружены пропуски глав",
+                    "В исходном TXT отсутствуют номера глав: "
+                    + ", ".join(gap_labels)
+                    + ".\n\nИмпортёр не может восстановить отсутствующий текст. "
+                    "Продолжить создание EPUB без этих глав?",
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+
             # --- ИСПРАВЛЕНИЕ 2: УМНАЯ НУМЕРАЦИЯ ---
             if self.chk_force_renumber.isChecked():
                 renumbered = []
@@ -935,6 +1110,19 @@ class TxtImportWizardDialog(QDialog):
             
             creator.create_epub(output_epub_path)
             self.generated_epub_path = output_epub_path
+            if removed_duplicates:
+                duplicate_titles = ", ".join(
+                    str(item['title'])
+                    for item in removed_duplicates[:8]
+                )
+                if len(removed_duplicates) > 8:
+                    duplicate_titles += ", …"
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Удалены дубли глав",
+                    f"Удалено полных соседних дублей: {len(removed_duplicates)}.\n"
+                    f"{duplicate_titles}",
+                )
             super().accept()
             
         except Exception as e:
