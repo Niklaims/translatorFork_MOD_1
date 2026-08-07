@@ -1,6 +1,13 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
+
+# Автоматическое подтягивание библиотек из .venv, если программа запущена системным Python
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_venv_site = os.path.join(_base_dir, ".venv", "Lib", "site-packages")
+if os.path.exists(_venv_site) and _venv_site not in sys.path:
+    sys.path.insert(0, _venv_site)
+
 import os_patch
 import builtins
 import argparse
@@ -67,6 +74,12 @@ RANOBELIB_MODULE_NAMES = (
     "utils",
     "workers",
 )
+
+RESTART_INFO = {
+    "is_restarting": False,
+    "epub_path": None,
+    "chapters": [],
+}
 
 
 def configure_ranobelib_playwright_runtime():
@@ -748,8 +761,8 @@ def restart_with_new_files(epub_path, chapters):
 
     app = QtWidgets.QApplication.instance()
     if app:
-        # Просто выходим из текущего цикла событий, чтобы вернуться в main()
-        app.quit()
+        # Возвращаемся во внешний цикл интерфейса, не завершая общий runtime.
+        app.exit(EXIT_CODE_REBOOT)
 
 
 def global_excepthook(exc_type, exc_value, exc_tb):
@@ -1204,6 +1217,7 @@ if __name__ == "__main__":
     app.global_version = APP_VERSION
     app.proxy_controller = GlobalProxyController(app.event_bus)
     proxy_settings = app.settings_manager.load_proxy_settings()
+    app.proxy_controller.apply_settings(proxy_settings)
 
     temp_folder = os.path.join(
         os.path.expanduser("~"), ".epub_translator_temp")
@@ -1272,6 +1286,8 @@ if __name__ == "__main__":
     # Останавливаем OPDS-сервер
     if hasattr(app, 'opds_manager') and app.opds_manager.is_running():
         app.opds_manager.stop()
+    if hasattr(app, 'proxy_controller'):
+        app.proxy_controller.shutdown()
     if hasattr(app, 'engine_thread') and app.engine_thread.isRunning():
         app.engine_thread.quit()
         app.engine_thread.wait()

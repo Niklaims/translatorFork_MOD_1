@@ -414,6 +414,19 @@ def _build_all_models(providers_config: dict) -> dict:
 def _compose_runtime_providers() -> dict:
     return deepcopy(_API_PROVIDERS)
 
+_COMPOSED_PROVIDERS_CACHE = None
+
+def _invalidate_composed_providers():
+    global _COMPOSED_PROVIDERS_CACHE
+    _COMPOSED_PROVIDERS_CACHE = None
+
+def set_custom_provider_models(custom_provider_models):
+    global _CUSTOM_PROVIDER_MODELS, _ALL_MODELS
+    _CUSTOM_PROVIDER_MODELS = _normalize_custom_provider_models(custom_provider_models)
+    _invalidate_composed_providers()
+    if _API_PROVIDERS:
+        _ALL_MODELS = _build_all_models(_compose_runtime_providers())
+
 def _save_models_to_json(provider_id: str, new_models: dict, clear_unlisted: bool = False) -> bool:
     global _ALL_MODELS
     normalized_provider = str(provider_id or "").strip()
@@ -1302,6 +1315,8 @@ def _refresh_dynamic_provider_models(provider_id: str, force: bool = False, api_
     if is_successful:
         _save_models_to_json(normalized_provider, resolved_models, clear_unlisted=True)
         _DYNAMIC_PROVIDER_MODELS_TS[normalized_provider] = now
+        _invalidate_composed_providers()
+        _ALL_MODELS = _build_all_models(_compose_runtime_providers())
         return resolved_models
     
     return _API_PROVIDERS.get(normalized_provider, {}).get("models", {})
@@ -1333,6 +1348,7 @@ def initialize_configs():
         "models": {"dry-run-model": {"id": "dry-run-model", "rpm": 1000}}
     }
     
+    _invalidate_composed_providers()
     _ALL_MODELS = _build_all_models(_compose_runtime_providers())
     _PROVIDER_DISPLAY_MAP = {
         p_data["display_name"]: p_id for p_id, p_data in _API_PROVIDERS.items()
@@ -1349,7 +1365,17 @@ def _ensure_configs_initialized():
 
 def api_providers():
     _ensure_configs_initialized()
-    return _compose_runtime_providers()
+    return deepcopy(api_providers_view())
+
+def api_providers_view():
+    """Кэшированный реестр провайдеров БЕЗ копирования. Только для чтения:
+    мутация результата повредит глобальный кэш — для изменений берите
+    api_providers()."""
+    global _COMPOSED_PROVIDERS_CACHE
+    _ensure_configs_initialized()
+    if _COMPOSED_PROVIDERS_CACHE is None:
+        _COMPOSED_PROVIDERS_CACHE = _compose_runtime_providers()
+    return _COMPOSED_PROVIDERS_CACHE
 
 def default_prompt():
     _ensure_configs_initialized()
@@ -1762,13 +1788,17 @@ def chunk_html_source(): return True
 
 
 # Subprocess-spawning handler classes (Playwright browser, Node bridge).
-_SUBPROCESS_HANDLER_CLASSES = {"BrowserApiHandler", "WorkAsciiChatGptApiHandler"}
+_SUBPROCESS_HANDLER_CLASSES = {
+    "BrowserApiHandler",
+    "QoderApiHandler",
+    "WorkAsciiChatGptApiHandler",
+}
 
 
 def uses_legacy_worker_thread(provider_config: dict) -> bool:
     """Subprocess-spawning handlers keep the per-thread worker model; everything
     else runs on the shared AsyncWorkerRuntime. The explicit flag is the override;
-    the handler-class set is a safety net so a future Browser/WorkAscii provider
+    the handler-class set is a safety net so a future subprocess-backed provider
     that forgets the flag is still routed to the legacy path."""
     if not provider_config:
         return False

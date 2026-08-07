@@ -18,6 +18,8 @@ import tempfile
 import json
 import html as html_lib
 from xml.etree import ElementTree as ET
+
+from defusedxml import ElementTree as SafeET
 import traceback
 from functools import partial
 from collections import Counter
@@ -57,6 +59,7 @@ except ImportError:
     
 # --- Импорты из нашего проекта ---
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.wait_dialogs import show_when_slow
 from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed, EpubCreator, TASK_SIZE_UNIT_CHARS, get_epub_chapter_sizes_with_cache, extract_epub_heading_text
 from ...utils.text import unify_paragraphs_for_ai
 from ...utils.project_manager import TranslationProjectManager
@@ -694,9 +697,8 @@ class EpubHtmlSelectorDialog(QDialog):
         cleanup_layout.addWidget(self.duplicate_cleanup_btn)
         cleanup_layout.addWidget(self.restore_backup_btn)
         
-        # Сама панель должна быть видима, так как в ней лежит кнопка "Анализ"
-        self.cleanup_panel.setVisible(True) 
-        
+        # Панель видима по умолчанию вместе с родителем; явный setVisible(True)
+        # до прикрепления layout к диалогу на мгновение показывал её отдельным окном.
         bottom_bar_layout.addWidget(self.cleanup_panel, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
         
         
@@ -926,21 +928,17 @@ class EpubHtmlSelectorDialog(QDialog):
 
     @staticmethod
     def _extract_h1_title(html_content):
+        # Заголовок нужен только для подсказки; полный BS4-парсинг каждой
+        # главы стоил секунды на больших книгах, поэтому берём h1 регулярным
+        # выражением (сверено с BS4 на реальных книгах — результат совпадает).
         if not html_content:
             return ""
 
-        if BS4_AVAILABLE and BeautifulSoup:
-            try:
-                soup = BeautifulSoup(html_content, "html.parser")
-                return extract_epub_heading_text(soup.find("h1"))
-            except Exception:
-                return ""
-
-        match = re.search(r"<h1\b[^>]*>(.*?)</h1>", str(html_content), re.IGNORECASE | re.DOTALL)
+        match = re.search(r"<h1\b[^>]*>(.*?)</h1\s*>", str(html_content), re.IGNORECASE | re.DOTALL)
         if not match:
             return ""
         raw_title = re.sub(r"<(?:br|hr)\b[^>]*>", " ", match.group(1), flags=re.IGNORECASE)
-        raw_title = re.sub(r"<[^>]+>", " ", raw_title)
+        raw_title = re.sub(r"<[^>]+>", "", raw_title)
         return re.sub(r"\s+", " ", html_lib.unescape(raw_title)).strip()
 
     def _load_chapter_title_cache(self):
@@ -1041,8 +1039,8 @@ class EpubHtmlSelectorDialog(QDialog):
         self.analysis_thread = EpubAnalysisThread(self.virtual_epub_path, self.all_chapters)
         self.analysis_thread.analysis_finished.connect(self._on_full_analysis_finished)
         self.analysis_thread.start()
-        
-        self.wait_dialog.show()
+
+        show_when_slow(self.wait_dialog)
 
     def _on_full_analysis_finished(self, issues):
         """Анализ завершен. Показываем результаты."""
@@ -1295,7 +1293,7 @@ class EpubHtmlSelectorDialog(QDialog):
             elif len(opf_files) > 1:
                 # 2. Если эвристика не сработала, используем медленный, но надежный метод
                 container_content = epub_zip_file.read('META-INF/container.xml')
-                root = ET.fromstring(container_content)
+                root = SafeET.fromstring(container_content)
                 ns = {'cn': 'urn:oasis:names:tc:opendocument:xmlns:container'}
                 opf_path = root.find('.//cn:rootfile', ns).attrib['full-path']
             
@@ -1304,7 +1302,7 @@ class EpubHtmlSelectorDialog(QDialog):
 
             opf_dir = os.path.dirname(opf_path)
             opf_content = epub_zip_file.read(opf_path)
-            opf_root = ET.fromstring(opf_content)
+            opf_root = SafeET.fromstring(opf_content)
             opf_ns = {'opf': 'http://www.idpf.org/2007/opf'}
 
             manifest_items = {}
@@ -2656,7 +2654,7 @@ class TranslatedChaptersManagerDialog(QDialog):
                              opf_content = zf.read(opf_path)
                         
                         if opf_content:
-                            root = ET.fromstring(opf_content)
+                            root = SafeET.fromstring(opf_content)
                             ns = {'opf': 'http://www.idpf.org/2007/opf'}
                             meta_cover = root.find('.//opf:meta[@name="cover"]', ns)
                             if meta_cover:
