@@ -154,6 +154,28 @@ class ContextManager:
         except json.JSONDecodeError:
             return False
 
+    def add_custom_words(self, new_terms: dict):
+        """Динамически добавляет новые термины в глоссарий и обновляет сервисы."""
+        if not new_terms or not isinstance(new_terms, dict):
+            return
+
+        updated = False
+        for term, data in new_terms.items():
+            if term not in self.global_glossary:
+                self.global_glossary[term] = data
+                updated = True
+
+        if updated:
+            print(f"[ContextManager] Добавлено {len(new_terms)} новых терминов. Перекомпиляция Regex-сервиса…")
+            self.regex_service = GlossaryRegexService(self.global_glossary)
+            
+            if self.similarity_map is not None and getattr(self, 'glossary_logic', None):
+                glossary_list = [{'original': k, **(v if isinstance(v, dict) else {'rus': v})} for k, v in self.global_glossary.items()]
+                self.similarity_map = self.glossary_logic.build_similarity_map(glossary_list, getattr(self, 'fuzzy_threshold', 100), self.use_jieba_for_glossary)
+            
+            if self.chinese_processor:
+                self.chinese_processor.add_custom_words(new_terms)
+
     def prepare_html_for_translation(self, html_content, log_callback=None):
         """
         Подготавливает HTML контент к переводу, выполняя сегментацию, если необходимо.

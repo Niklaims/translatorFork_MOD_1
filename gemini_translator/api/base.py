@@ -360,8 +360,12 @@ class BaseApiHandler:
         context = f" при запросе к {service_name}" if service_name else ""
         if isinstance(error, aiohttp.ServerDisconnectedError):
             category = "Сервер разорвал соединение"
+            return f"{category}{context}"
         elif isinstance(error, (aiohttp.ClientSSLError, ssl.SSLError)):
             category = "Ошибка SSL/TLS"
+        elif isinstance(error, aiohttp.ClientPayloadError):
+            category = "Сервер некорректно прервал передачу данных"
+            return f"{category}{context} (ClientPayloadError)"
         else:
             category = "Сетевой сбой"
         return f"{category}{context} ({type(error).__name__}): {error}"

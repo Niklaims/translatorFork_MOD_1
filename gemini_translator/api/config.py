@@ -624,7 +624,8 @@ def _guess_local_endpoint_label(root_url: str) -> str:
         return "LM Studio"
     if host in {"127.0.0.1", "localhost", "0.0.0.0"} and port:
         return f"Local {port}"
-    return parsed.netloc or "Local"
+        
+    return ""
 
 
 def _iter_local_discovery_sources(provider_config: dict, provider_id: str | None = None) -> list[dict]:
