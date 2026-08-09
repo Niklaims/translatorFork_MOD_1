@@ -256,40 +256,6 @@ def _create_tasks_tab_scroll_area(task_management_widget, translation_options_wi
     return tasks_scroll, tasks_splitter
 
 
-class PreflightEstimateDialog(QDialog):
-    """Compact dialog for previewing the session estimate before launch."""
-
-    def __init__(self, report_text: str, can_start: bool = False, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Предварительная оценка сессии")
-        self.setMinimumSize(760, 540)
-
-        layout = QVBoxLayout(self)
-
-        intro = QLabel(
-            "Ниже показана приблизительная оценка по текущим настройкам проекта. "
-            "Значения по времени и стоимости являются ориентировочными."
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        report_edit = QPlainTextEdit(self)
-        report_edit.setReadOnly(True)
-        report_edit.setPlainText(report_text)
-        report_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        layout.addWidget(report_edit, 1)
-
-        buttons = QDialogButtonBox(self)
-        if can_start:
-            start_button = buttons.addButton("Запустить", QDialogButtonBox.ButtonRole.AcceptRole)
-            start_button.setDefault(True)
-        close_label = "Отмена" if can_start else "Закрыть"
-        buttons.addButton(close_label, QDialogButtonBox.ButtonRole.RejectRole)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-
 class BaseGlossarySelectionDialog(QDialog):
     """Lets the user choose one or more built-in glossaries for an empty project."""
 
@@ -425,6 +391,7 @@ class InitialSetupPage(ShellPage):
             'session_finished',
             'tasks_for_retry_ready',
             'task_state_changed',
+            'task_finished',
             'geoblock_detected',
         )
         self.engine = app.engine
@@ -991,14 +958,6 @@ class InitialSetupPage(ShellPage):
                 self._refresh_dirty_window_title()
             QMessageBox.information(self, "Глоссарий добавлен", f"Добавлено записей: {added_total}.")
 
-    def _create_glossary_tab_content(self) -> QWidget:
-        """Просто возвращает уже созданный GlossaryWidget."""
-        return self.glossary_widget
-
-    def _create_prompt_tab_content(self) -> QWidget:
-        """Просто возвращает уже созданный PresetWidget."""
-        return self.preset_widget
-
     def _prepare_for_close(self, autosave_glossary: bool = False):
         """Обрабатывает несохраненные изменения перед закрытием окна."""
         location_worker = getattr(self, '_project_location_worker', None)
@@ -1364,23 +1323,6 @@ class InitialSetupPage(ShellPage):
             if isinstance(settings, dict) and QUEUE_AUTOSAVE_SETTING_KEY in settings:
                 return bool(settings.get(QUEUE_AUTOSAVE_SETTING_KEY))
         return True
-
-    def _save_queue_autosave_enabled(self, enabled: bool) -> None:
-        loader = getattr(self.settings_manager, "load_full_session_settings", None)
-        saver = getattr(self.settings_manager, "save_full_session_settings", None)
-        if not callable(loader) or not callable(saver):
-            loader = getattr(self.settings_manager, "load_settings", None)
-            saver = getattr(self.settings_manager, "save_settings", None)
-        if not callable(loader) or not callable(saver):
-            return
-
-        try:
-            settings = loader()
-            settings = dict(settings) if isinstance(settings, dict) else {}
-            settings[QUEUE_AUTOSAVE_SETTING_KEY] = bool(enabled)
-            saver(settings)
-        except Exception as exc:
-            print(f"[WARN] Не удалось сохранить настройку автосохранения очереди: {exc}")
 
     def _create_queue_persistence_group(self) -> QGroupBox:
         group = QGroupBox("Очередь задач")
@@ -1954,14 +1896,6 @@ class InitialSetupPage(ShellPage):
         self.distribution_label.setText(text)
 
 
-    # ЗАМЕНИТЕ ЭТОТ МЕТОД
-    def _calculate_potential_output_size(self, html_content, is_cjk):
-        """
-        Вычисляет потенциальный размер ответа модели на основе содержимого HTML.
-        Устаревший метод, используйте глобальную функцию calculate_potential_output_size.
-        """
-        return calculate_potential_output_size(html_content, is_cjk)
-
     def _build_chapter_size_map_for_task_unit(self, chapters, settings_or_unit=None):
         if isinstance(settings_or_unit, dict):
             task_size_unit = normalize_task_size_unit(settings_or_unit.get('task_size_unit'))
@@ -2324,21 +2258,6 @@ class InitialSetupPage(ShellPage):
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.save_settings_status_label.setText(f"✅ Глобальные настройки сохранены · {timestamp}")
             self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('success')};")
-
-    def _save_current_ui_settings(self):
-        """Сохраняет текущее состояние UI в активный файл настроек."""
-        self._save_global_ui_settings()
-
-
-    @QtCore.pyqtSlot()
-    def _continue_loading_project_and_update_all(self):
-        """
-        Запускает полную асинхронную цепочку загрузки проекта.
-        Используется после создания нового проекта или принудительной перезагрузки.
-        """
-        # Этот метод теперь просто "пробрасывает" вызов дальше,
-        # обеспечивая единую точку входа для разных сценариев.
-        self._process_selected_file()
 
     def _ask_and_filter_chapters(self):
         """
@@ -2820,32 +2739,6 @@ class InitialSetupPage(ShellPage):
             f"Старая версия сохранена как: {os.path.basename(old_version_path)}\n\n"
             f"Удалено неактуальных переводов: {files_deleted_count}.")
 
-
-    def _on_folder_sync_finished(self, is_project_ready, message):
-        """
-        Слот, который вызывается после завершения фоновой синхронизации папки.
-        Версия 2.0: Использует новые, централизованные методы для фильтрации и обновления.
-        """
-        if hasattr(self, 'wait_dialog') and self.wait_dialog:
-            self.wait_dialog.accept()
-
-        if not is_project_ready:
-            QMessageBox.warning(self, "Операция прервана", message)
-            self.output_folder = None
-            self.project_manager = None
-            self.paths_widget.set_folder_path(None)
-            self.check_ready()
-            return
-
-        # 1. Загружаем ассеты проекта (например, глоссарий).
-        self._process_project_folder(self.output_folder)
-
-        # 2. Вызываем "умный" диалог, который предложит отфильтровать список глав, если это необходимо.
-        self._ask_and_filter_chapters()
-
-        # 3. Вызываем единый "оркестратор" для обновления всего UI на основе
-        #    (возможно, измененного) списка глав.
-        self._on_project_data_changed()
 
     def _handle_backup_restore(self):
         """
@@ -3652,37 +3545,6 @@ class InitialSetupPage(ShellPage):
 
         return False # Файл не найден, глава не "готова"
 
-    def _ask_and_run_migration(self, migrator, file_count):
-        """Показывает диалог с предложением о миграции и запускает ее."""
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Обнаружен старый проект")
-        msg_box.setIcon(QMessageBox.Icon.Question)
-        msg_box.setText(f"В выбранной папке найдено {file_count} файлов в старом 'плоском' формате.")
-
-        msg_box.setInformativeText(
-            "Программа может попытаться автоматически преобразовать этот проект в новую структурированную систему "
-            "(с вложенными папками и файлом-картой 'translation_map.json').\n\n"
-            "Это позволит использовать новые функции, такие как 'Обновление EPUB'.\n\n"
-            "<b>Рекомендуется сделать резервную копию папки перед миграцией.</b>\n\n"
-            "Выполнить миграцию?"
-        )
-
-        migrate_button = msg_box.addButton("Да, мигрировать", QMessageBox.ButtonRole.YesRole)
-        cancel_button = msg_box.addButton("Нет, пропустить", QMessageBox.ButtonRole.NoRole)
-
-        msg_box.exec()
-
-        if msg_box.clickedButton() == migrate_button:
-            moved, errors = migrator.run_migration()
-
-            summary_message = f"Миграция завершена.\n\n- Успешно перемещено и зарегистрировано: {moved}\n- Ошибок (файлы оставлены на месте): {errors}"
-
-            if errors > 0:
-                QMessageBox.warning(self, "Миграция завершена с ошибками", summary_message)
-            else:
-                QMessageBox.information(self, "Миграция завершена успешно", summary_message)
-
-
     def _copy_original_chapters(self):
         """
         Копирует оригиналы выбранных глав, управляя пакетной обработкой
@@ -4075,15 +3937,6 @@ class InitialSetupPage(ShellPage):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить глоссарий проекта: {e}")
             return False
-
-    def _save_project_data(self):
-        """
-        Сохраняет ВСЕ данные проекта: и настройки UI, и глоссарий.
-        """
-        if not self.output_folder:
-            return
-        self._save_project_settings_only()
-        self._save_project_glossary_only()
 
     def check_ready(self):
         """
@@ -4743,19 +4596,6 @@ class InitialSetupPage(ShellPage):
             self.dry_run_btn.setText("Пробный запуск")
 
 
-    @pyqtSlot(str, object, bool, str, str, str)
-    def _on_chapter_status_update(self, session_id, task_info_result, success, err_type, msg, final_status):
-        """Обновляет статус задачи в UI."""
-        task_info, _ = (task_info_result, None)
-        if isinstance(task_info_result, tuple) and len(task_info_result) == 2:
-            task_info, _ = task_info_result
-
-        self.task_management_widget.update_task_status(task_info, final_status)
-
-        # Обновляем счетчики
-        self.status_bar.increment_status(final_status)
-
-
     # --- НОВЫЙ МЕТОД ДЛЯ ПРИЕМА ДАННЫХ ИЗ ВАЛИДАТОРА ---
     def add_files_for_retry(self, epub_path, chapter_paths):
         """
@@ -4955,13 +4795,20 @@ class InitialSetupPage(ShellPage):
 
         # 3. Добавляем в лог все использованные параметры для полной прозрачности.
         fuzzy_mode_info = f"Fuzzy порог {current_threshold}%" if current_threshold < 100 else "Fuzzy выключен"
+        calibration_message = (
+            f"[INFO] Калибровка ({fuzzy_mode_info}, Jieba: {'Вкл' if use_jieba_for_test else 'Выкл'}) завершена за {time_taken:.4f} сек. "
+            f"Индекс: {self.cpu_performance_index:,.0f} (термин*сим)/сек."
+        )
         if not no_log:
-            print(f"[INFO] Калибровка ({fuzzy_mode_info}, Jieba: {'Вкл' if use_jieba_for_test else 'Выкл'}) завершена за {time_taken:.4f} сек. "
-              f"Индекс: {self.cpu_performance_index:,.0f} (термин*сим)/сек.")
+            print(calibration_message)
 
         self._update_fuzzy_status_display()
         if no_log == True:
-            QtCore.QTimer.singleShot(600, lambda: self._calibrate_cpu(no_log=False))
+            # Раньше здесь весь бенчмарк гонялся ВТОРОЙ раз (ещё один прогон
+            # SmartGlossaryFilter на GUI-потоке) только ради строки лога —
+            # печатаем её по уже посчитанному индексу. Пересчёт при смене
+            # настроек делает recalibrate_requested.
+            QtCore.QTimer.singleShot(600, lambda: print(calibration_message))
 
     @QtCore.pyqtSlot()
     def _update_fuzzy_status_display(self):
@@ -5074,43 +4921,6 @@ class InitialSetupPage(ShellPage):
             dialog.exec()
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть менеджер EPUB: {e}")
-
-    def _validate_translation_map(self, project_manager):
-        """
-        Проверяет карту, спрашивает пользователя и, если нужно, СИНХРОННО выполняет очистку.
-        Возвращает True, если очистка была выполнена.
-        """
-        dead_entries = project_manager.validate_map_with_filesystem()
-        if not dead_entries:
-            return False
-
-        num_dead = len(dead_entries)
-        # --- ИСПРАВЛЕНИЕ: Создаем QMessageBox с родителем (self) для правильного стиля ---
-        msg_box = QMessageBox(self)
-        msg_box.setWindowTitle("Синхронизация проекта")
-        msg_box.setIcon(QMessageBox.Icon.Warning)
-        msg_box.setText(f"Обнаружено {num_dead} записей о переводах, файлы которых отсутствуют.")
-
-        details = "\n".join([f"- {rel_path}" for _, _, rel_path in dead_entries[:5]])
-        if num_dead > 5:
-            details += f"\n… и еще {num_dead - 5}."
-
-        msg_box.setInformativeText(f"Рекомендуется очистить эти 'мертвые' записи из карты проекта.\n\nПримеры:\n{details}")
-
-        cleanup_button = msg_box.addButton("Очистить записи", QMessageBox.ButtonRole.AcceptRole)
-        msg_box.addButton("Оставить как есть", QMessageBox.ButtonRole.RejectRole)
-
-        msg_box.exec()
-
-        if msg_box.clickedButton() == cleanup_button:
-            # Выполняем запись в файл немедленно. Это гарантирует целостность данных.
-            project_manager.cleanup_dead_entries(dead_entries)
-            # --- ИСПРАВЛЕНИЕ: Убираем лишнее и проблемное окно "Выполнено" ---
-            return True
-
-        return False
-
-# gemini_translator/ui/dialogs/setup.py
 
     def _estimate_auto_task_size_limit(self, token_limit: int):
         return auto_workflow_helpers.estimate_auto_task_size_limit(token_limit)
@@ -5977,6 +5787,41 @@ class InitialSetupPage(ShellPage):
         except Exception as exc:
             self._auto_log(f"Не удалось запустить параллельный filter redirect: {exc}", force=True)
             return False
+
+    def _shutdown_parallel_filter_redirect_runs(self):
+        """Гасит фоновые redirect-движки при уходе со страницы: без этого их
+        QThread'ы (дети страницы) уничтожаются работающими."""
+        runs = getattr(self, '_auto_filter_parallel_redirect_runs', None)
+        if not runs:
+            return
+        for run_id in list(runs.keys()):
+            runner = runs.pop(run_id, None)
+            if not runner:
+                continue
+            engine = runner.get('engine')
+            thread = runner.get('thread')
+            try:
+                if engine is not None and thread is not None and thread.isRunning():
+                    QtCore.QMetaObject.invokeMethod(
+                        engine,
+                        'cleanup',
+                        QtCore.Qt.ConnectionType.BlockingQueuedConnection,
+                    )
+            except Exception:
+                pass
+            if thread is not None:
+                thread.quit()
+                thread.wait(3000)
+            db_anchor = runner.get('db_anchor')
+            if db_anchor is not None:
+                try:
+                    db_anchor.close()
+                except Exception:
+                    pass
+            task_manager = runner.get('task_manager')
+            if task_manager is not None:
+                task_manager.deleteLater()
+            self._auto_filter_parallel_redirect_signatures.discard(runner.get('signature'))
 
     def _finish_parallel_filter_redirect_run(self, run_id: str, reason: str | None = None):
         runner = self._auto_filter_parallel_redirect_runs.pop(run_id, None)
@@ -7086,86 +6931,6 @@ class InitialSetupPage(ShellPage):
             self.dry_run_btn.setEnabled(True)
 
 
-    def check_unvalidated_chapters(self):
-        """Проверяет, какие главы уже переведены, и предлагает их исключить."""
-        if not self.output_folder or not self.html_files: return
-
-        # --- НАЧАЛО ИЗМЕНЕНИЯ: Используем новую, правильную логику ---
-        from ...api import config as api_config
-
-        validated_chapters, unvalidated_chapters, untranslated_chapters = set(), set(), []
-        epub_base_name = os.path.splitext(os.path.basename(self.selected_file))[0]
-        validated_folder = os.path.join(self.output_folder, "validated_ok")
-
-        for html_file in self.html_files:
-            safe_html_name = re.sub(r'[\\/*?:"<>|]', "_", os.path.splitext(os.path.basename(html_file))[0])
-            base_filename = f"{epub_base_name}_{safe_html_name}"
-
-            # 1. Приоритетная проверка: ищем готовую версию
-            validated_filepath = os.path.join(validated_folder, f"{base_filename}_validated.html")
-            if os.path.exists(validated_filepath):
-                validated_chapters.add(html_file)
-                continue
-
-            # 2. Вторая проверка: ищем любую переведенную версию
-            is_unvalidated = False
-            for suffix in api_config.all_translated_suffixes():
-                unvalidated_filepath = os.path.join(self.output_folder, f"{base_filename}{suffix}")
-                if os.path.exists(unvalidated_filepath):
-                    is_unvalidated = True
-                    break
-
-            if is_unvalidated:
-                unvalidated_chapters.add(html_file)
-            else:
-                untranslated_chapters.append(html_file)
-
-
-        if not validated_chapters and not unvalidated_chapters:
-            return
-
-        msg = QMessageBox()
-        msg.setWindowTitle("Обнаружены переведенные главы")
-        msg.setIcon(QtWidgets.QMessageBox.Icon.Information)
-
-        msg.setText(
-            f"<b>Анализ выбранных глав ({len(self.html_files)}):</b>\n\n"
-            f"✅ <font color='green'>Проверенные ('готовые'):</font> <b>{len(validated_chapters)}</b>\n"
-            f"🔵 <font color='blue'>Непроверенные ('переведенные'):</font> <b>{len(unvalidated_chapters)}</b>\n"
-            f"⚪ Непереведенные: <b>{len(untranslated_chapters)}</b>"
-        )
-        msg.setInformativeText("Выберите, какие главы вы хотите включить в текущую сессию перевода:")
-
-        btn_skip_all = msg.addButton("Пропустить всё переведенное", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        btn_retranslate_unvalidated = msg.addButton("Перевести непроверенные", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-        btn_retranslate_all = msg.addButton("Перевести всё заново", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
-
-        btn_skip_all.setToolTip("Будут переведены только непереведенные главы.")
-        btn_retranslate_unvalidated.setToolTip("Перезапишет 'непроверенные', но сохранит 'готовые'.")
-        btn_retranslate_all.setToolTip("Полностью перезапишет все существующие переводы.")
-
-        msg.exec()
-
-        clicked_button = msg.clickedButton()
-        original_html_files = self.html_files.copy() # Сохраняем исходный выбор
-
-        if clicked_button == btn_skip_all:
-            self.html_files = untranslated_chapters
-            info = f"Выбрано глав: {len(self.html_files)} (все переведенные пропущены)"
-        elif clicked_button == btn_retranslate_unvalidated:
-            self.html_files = untranslated_chapters + list(unvalidated_chapters)
-            info = f"Выбрано глав: {len(self.html_files)} (пропущены только 'готовые')"
-        elif clicked_button == btn_retranslate_all:
-            self.html_files = original_html_files # Возвращаем исходный выбор
-            info = f"Выбрано глав: {len(self.html_files)} (все главы будут переведены заново)"
-        else:
-            self.html_files, self.selected_file = [], None
-            self.paths_widget.set_file_path(None)
-            info = ""
-
-        self._on_project_data_changed()
-
-
     def reject(self):
         """
         Перехватывает событие закрытия. Корректно проверяет наличие ИЗМЕНЕНИЙ
@@ -7402,30 +7167,6 @@ class InitialSetupPage(ShellPage):
             self.use_project_settings_btn.setText("Режим: Глобальные настройки")
             self.use_project_settings_btn.setToolTip("Используются глобальные настройки из домашней директории.\nНажмите, чтобы переключиться на настройки проекта (будет создан файл, если его нет).")
 
-    def update_keys_count(self):
-        """Обновляет счетчик API ключей"""
-        keys = [k.strip() for k in self.keys_edit.toPlainText().splitlines() if k.strip()]
-        unique_keys = list(set(keys))
-
-
-        num_keys = len(unique_keys)
-        self.instances_spin.setMaximum(num_keys if num_keys > 0 else 1)
-
-
-        if len(keys) != len(unique_keys):
-            self.keys_count_label.setText(f"Ключей: {len(unique_keys)} (уникальных из {len(keys)})")
-            self.keys_count_label.setStyleSheet(f"color: {theme_manager.color('warning')}; font-size: 10px;")
-        else:
-            self.keys_count_label.setText(f"Ключей: {len(keys)}")
-            self.keys_count_label.setStyleSheet(f"color: {theme_manager.color('info')}; font-size: 10px;")
-        self._update_distribution_info() # <--- ДОБАВЬ ЭТУ СТРОКУ
-
-
-    def update_glossary_count(self):
-        """Обновляет счетчик терминов в глоссарии"""
-        self.glossary_count_label.setText(f"Терминов: {self.glossary_table.rowCount()}")
-
-
     def _init_lazy_ui_skeleton(self):
         """Создает минимальный 'скелет' UI для мгновенного отображения."""
         main_layout = QVBoxLayout(self)
@@ -7548,6 +7289,7 @@ class InitialSetupPage(ShellPage):
         if restart_timer is not None and restart_timer.isActive():
             self._auto_log("Ожидающий автоперезапуск отменён при выходе со страницы перевода.", force=True)
             self._reset_auto_workflow_state()
+        self._shutdown_parallel_filter_redirect_runs()
         self._disconnect_event_bus()
 
 

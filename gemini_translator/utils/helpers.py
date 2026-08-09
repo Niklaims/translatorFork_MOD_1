@@ -24,6 +24,16 @@ OPENROUTER_CYRILLIC_CHARS_PER_TOKEN = 1.0
 OPENROUTER_CJK_CHARS_PER_TOKEN = 1.0
 OPENROUTER_OTHER_CHARS_PER_TOKEN = 1.5
 
+_ASCII_RUN_PATTERN = re.compile(r'[\x00-\x7f]+')
+_CYRILLIC_RUN_PATTERN = re.compile(r'[\u0400-\u04ff]+')
+_CJK_RUN_PATTERN = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
+
+
+def _count_chars(pattern, text):
+    # Считаем длины непрерывных серий вместо findall по одному символу:
+    # findall на промпте в сотни КБ аллоцирует сотни тысяч строк-односимволок.
+    return sum(m.end() - m.start() for m in pattern.finditer(text))
+
 
 def estimate_gemini_tokens(text):
     """Estimate Gemini input tokens without an API round trip."""
@@ -31,9 +41,9 @@ def estimate_gemini_tokens(text):
         return 0
 
     text = str(text)
-    ascii_like_chars = len(re.findall(r'[\x00-\x7f]', text))
-    cyrillic_chars = len(re.findall(r'[\u0400-\u04ff]', text))
-    cjk_chars = len(re.findall(r'[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', text))
+    ascii_like_chars = _count_chars(_ASCII_RUN_PATTERN, text)
+    cyrillic_chars = _count_chars(_CYRILLIC_RUN_PATTERN, text)
+    cjk_chars = _count_chars(_CJK_RUN_PATTERN, text)
     other_chars = max(0, len(text) - ascii_like_chars - cyrillic_chars - cjk_chars)
 
     total_tokens = (
