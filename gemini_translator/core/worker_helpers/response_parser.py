@@ -49,6 +49,8 @@ class ResponseParser:
                     if isinstance(new_terms, dict) and new_terms and hasattr(self.worker, 'context_manager'):
                         self.worker.context_manager.add_custom_words(new_terms)
                         self.log(f"[GLOSSARY] Извлечено новых терминов: {len(new_terms)}")
+                        if hasattr(self.worker, '_post_event'):
+                            self.worker._post_event('new_glossary_terms_extracted', {'terms': new_terms})
                 except json.JSONDecodeError as e:
                     self.log(f"[WARN] Ошибка парсинга JSON глоссария: {e}")
                 except Exception as e:

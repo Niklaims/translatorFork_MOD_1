@@ -263,6 +263,22 @@ class SelectionTranslationController(QtCore.QObject):
             | QtCore.Qt.WindowType.FramelessWindowHint
             | QtCore.Qt.WindowType.WindowStaysOnTopHint
         )
+        self._offer_button.setStyleSheet("""
+            QToolButton {
+                background-color: #2563eb;
+                color: white;
+                border: 1px solid #1d4ed8;
+                border-radius: 4px;
+                padding: 5px 10px;
+                font-weight: bold;
+            }
+            QToolButton:hover {
+                background-color: #1d4ed8;
+            }
+            QToolButton:pressed {
+                background-color: #1e3a8a;
+            }
+        """)
         self._offer_button.hide()
         self._offer_button.clicked.connect(self._translate_offered_selection)
 
@@ -492,9 +508,10 @@ class SelectionTranslationController(QtCore.QObject):
         ):
             return
         self._offered_snapshot = snapshot
-        self._position_offer_button(global_pos)
-        self._offer_button.show()
-        self._offer_button.raise_()
+        # Кнопка "Перевести на русский" скрыта по запросу пользователя
+        # self._position_offer_button(global_pos)
+        # self._offer_button.show()
+        # self._offer_button.raise_()
 
     def _translate_offered_selection(self) -> None:
         snapshot = self._offered_snapshot

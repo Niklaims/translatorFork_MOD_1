@@ -2008,6 +2008,16 @@ class InitialSetupPage(ShellPage):
             self._maybe_start_parallel_filter_redirect(event_data)
             return
 
+        if event_name == 'new_glossary_terms_extracted':
+            terms = data.get('terms', {})
+            if terms:
+                QtCore.QMetaObject.invokeMethod(
+                    self, "_handle_new_glossary_terms",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                    QtCore.Q_ARG(dict, terms)
+                )
+            return
+
         # Логика для geoblock остается здесь, так как она показывает модальное окно
         if self.is_session_active and event_name == 'geoblock_detected':
             QtCore.QMetaObject.invokeMethod(
@@ -2095,6 +2105,38 @@ class InitialSetupPage(ShellPage):
         # --- КОНЕЦ НОВОГО БЛОКА ---
         self._process_selected_file()
 
+    @QtCore.pyqtSlot(dict)
+    def _handle_new_glossary_terms(self, new_terms: dict):
+        if not hasattr(self, 'glossary_widget'):
+            return
+            
+        current_glossary = self.glossary_widget.get_glossary()
+        updated = False
+        
+        glossary_map = {str(item.get('original')).strip(): item for item in current_glossary if item.get('original')}
+        
+        for original, trans_data in new_terms.items():
+            original = str(original).strip()
+            if not original:
+                continue
+                
+            if original not in glossary_map:
+                new_entry = {
+                    'original': original,
+                    'rus': str(trans_data.get('rus') if isinstance(trans_data, dict) else trans_data),
+                    'note': str(trans_data.get('note') if isinstance(trans_data, dict) else 'Авто-извлечение')
+                }
+                current_glossary.append(new_entry)
+                glossary_map[original] = new_entry
+                updated = True
+                
+        if updated:
+            self.glossary_widget.set_glossary(current_glossary, emit_signal=True)
+            self.is_glossary_dirty = True
+            self._refresh_dirty_window_title()
+            # Автоматически сохраняем измененный глоссарий в проект
+            if self.output_folder:
+                self.glossary_widget.save_project_glossary(notify=False)
 
     def _process_selected_file(self, pre_selected_chapters=None):
         """

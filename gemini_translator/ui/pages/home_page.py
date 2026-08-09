@@ -153,10 +153,7 @@ class HomePage(ShellPage):
         
         top_row.addStretch()
 
-        self.btn_proxy = QtWidgets.QPushButton("Прокси")
-        self.btn_proxy.setFixedSize(100, 30)
-        self.btn_proxy.clicked.connect(self._open_proxy_settings)
-        top_row.addWidget(self.btn_proxy)
+
         
         outer.addLayout(top_row)
 
