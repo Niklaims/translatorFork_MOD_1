@@ -98,6 +98,7 @@ from .auto_workflow import (
 )
 from datetime import datetime
 import time # <-- НОВЫЙ ИМПОРТ
+from ..overlay_host import exec_dialog
 
 
 # --- НОВЫЕ КОНСТАНТЫ ДЛЯ КАЛИБРОВКИ ---
@@ -937,7 +938,7 @@ class InitialSetupPage(ShellPage):
 
         self._base_glossary_prompt_seen_projects.add(project_key)
         dialog = BaseGlossarySelectionDialog(options, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        if exec_dialog(self, dialog) != QDialog.DialogCode.Accepted:
             return
 
         selected_ids = dialog.selected_ids()
@@ -1788,7 +1789,7 @@ class InitialSetupPage(ShellPage):
         """
         # Просто создаем и запускаем наш новый, умный диалог.
         dialog = GeoBlockDialog(self)
-        dialog.exec()
+        exec_dialog(self, dialog)
 
     def create_glossary_tab(self, tabs_group):
         # 1. Создаем экземпляр нашего виджета, передавая ему settings_manager
@@ -2050,9 +2051,10 @@ class InitialSetupPage(ShellPage):
 
     def _open_proxy_settings(self):
         from .proxy import ProxySettingsDialog
+        from ..overlay_host import present_dialog
 
         dialog = ProxySettingsDialog(self, self.settings_manager)
-        dialog.exec()
+        present_dialog(self, dialog)
 
     def _update_proxy_display(self, settings):
         label = getattr(self, 'proxy_status_label', None)
@@ -2372,7 +2374,7 @@ class InitialSetupPage(ShellPage):
             base_name = os.path.splitext(os.path.basename(file_path))[0]
 
             dialog = ProjectFolderDialog(self, main_text, base_name)
-            if not dialog.exec():
+            if not exec_dialog(self, dialog):
                 self.output_folder = None
                 self.paths_widget.set_folder_path(None)
                 self._on_project_data_changed()
@@ -2927,7 +2929,12 @@ class InitialSetupPage(ShellPage):
             self._snapshot_restore_in_progress = False
 
     def _maybe_offer_snapshot_restore(self):
-        if self._snapshot_restore_in_progress or self.is_session_active:
+        if (
+            self._snapshot_restore_in_progress
+            or self.is_session_active
+            or getattr(self, '_auto_workflow_enabled_for_session', False)
+            or getattr(self, '_auto_followup_running', False)
+        ):
             return
         if not (self.selected_file and self.output_folder and self.engine and self.engine.task_manager):
             return
@@ -3314,7 +3321,7 @@ class InitialSetupPage(ShellPage):
                 f"Глава EPUB:\n{chapter_path}"
             ),
         )
-        dialog.exec()
+        exec_dialog(self, dialog)
 
     def _open_chapter_preview_from_queue(self, epub_path: str, chapter_path: str):
         if not chapter_path:
@@ -3367,7 +3374,7 @@ class InitialSetupPage(ShellPage):
             parent=self,
             path_caption=f"Источник: глава из EPUB\n{chapter_path}",
         )
-        dialog.exec()
+        exec_dialog(self, dialog)
 
     def _filter_validated_chapters(self, silent=False):
         """
@@ -4516,7 +4523,7 @@ class InitialSetupPage(ShellPage):
             parent=self
         )
 
-        if dialog.exec():
+        if exec_dialog(self, dialog):
             result = dialog.get_result()
             if result:
                 self._process_filter_dialog_result(result)
@@ -4656,8 +4663,10 @@ class InitialSetupPage(ShellPage):
         # 2. Логируем действие
         self._post_event('log_message', {'message': f"[INFO] Загружено {len(chapter_paths)} глав для повторного перевода из Валидатора."})
 
-        # 3. Полностью обновляем UI на основе нового списка глав
-        self._on_project_data_changed()
+        # 3. Полностью обновляем UI на основе нового списка глав. Это локальная
+        # операция внутри текущего проекта, поэтому сохраненный снимок очереди
+        # здесь предлагать нельзя: модальный вопрос остановит автодоперевод.
+        self._on_project_data_changed(offer_snapshot_restore=False)
 
         # Перепроверяем готовность к запуску
         self.check_ready()
@@ -4670,7 +4679,7 @@ class InitialSetupPage(ShellPage):
         # Передаем settings_manager в диалог
         dialog = ProjectHistoryDialog(history, self.settings_manager, self)
 
-        if dialog.exec():
+        if exec_dialog(self, dialog):
             # Эта часть кода сработает, только если пользователь выбрал проект
             # и нажал "Загрузить". Удаление уже было сохранено внутри диалога.
             selected_project = dialog.get_selected_project()
@@ -4960,7 +4969,7 @@ class InitialSetupPage(ShellPage):
                 original_epub_path=self.selected_file,
                 project_manager=self.project_manager # <--- ВОТ ОНО
             )
-            dialog.exec()
+            exec_dialog(self, dialog)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть менеджер EPUB: {e}")
 
@@ -7047,7 +7056,7 @@ class InitialSetupPage(ShellPage):
                 close_btn.clicked.connect(dialog.accept)
                 layout.addWidget(text_edit)
                 layout.addWidget(close_btn)
-                dialog.exec()
+                exec_dialog(self, dialog)
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось оценить токены: {e}")
 

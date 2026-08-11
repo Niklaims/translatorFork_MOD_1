@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 from PyQt6 import QtWidgets, QtCore, QtGui
 import time
 import threading
+from ..overlay_host import exec_dialog
 
 
 MCP_PROVIDER_ID = "__mcp_server__"
@@ -1151,7 +1152,7 @@ class KeyManagementWidget(QWidget):
 
     def _add_keys_from_text(self):
         dialog = KeyInputDialog(self)
-        if not dialog.exec():
+        if not exec_dialog(self, dialog):
             return
         text = dialog.get_text()
         if not text.strip():
@@ -1170,7 +1171,7 @@ class KeyManagementWidget(QWidget):
             return
 
         dialog = ProviderChoiceDialog(list(visible_providers.keys()), self)
-        if not dialog.exec():
+        if not exec_dialog(self, dialog):
             return
 
         provider_name = dialog.get_selected_item()
@@ -1269,7 +1270,7 @@ class KeyManagementWidget(QWidget):
             num_total=len(all_statuses)
         )
 
-        if not dialog.exec():
+        if not exec_dialog(self, dialog):
             return
 
         choice = dialog.choice

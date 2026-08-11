@@ -64,6 +64,7 @@ from gemini_translator.ui import theme_manager
 # Словари (~35МБ, ~секунда) больше не строятся при импорте модуля (то есть
 # при старте GUI): PYMORPHY_AVAILABLE — только проверка importability,
 # анализатор строится фоновым прогревом при открытии окна глоссария.
+from ..overlay_host import exec_dialog
 from ...utils.morphology import (
     PYMORPHY_AVAILABLE,
     get_morph_analyzer,
@@ -125,7 +126,7 @@ class GlossaryStartupDialog(QDialog):
         from gemini_translator.ui.dialogs.misc import ProjectHistoryDialog
         dialog = ProjectHistoryDialog(history, self.settings_manager, self)
         
-        if dialog.exec():
+        if exec_dialog(self, dialog):
             project = dialog.get_selected_project()
             if project:
                 path = project.get("output_folder")
@@ -377,11 +378,7 @@ class GlossaryManagerPage(ShellPage):
         height = max(int(available_geometry.height() * 0.75), 650)
         width = max(int(available_geometry.width() * 0.65), 1000)
         
-        self.resize(width, height)
-        self.move(
-            available_geometry.center().x() - self.width() // 2,
-            available_geometry.center().y() - self.height() // 2
-        )
+        self.preferred_window_size = (width, height)
         
         self.launch_mode = mode
         self.associated_project_path = project_path # Сохраняем путь к проекту
@@ -1223,7 +1220,7 @@ class GlossaryManagerPage(ShellPage):
             parent=self
         )
         
-        if dialog.exec():
+        if exec_dialog(self, dialog):
             self.filter_state = dialog.get_filter_state()
             
             # Меняем стиль кнопки
@@ -1346,7 +1343,7 @@ class GlossaryManagerPage(ShellPage):
         # Передаем данные. set_glossary создаст новые ID в изолированной базе ребенка
         child_manager.set_glossary(filtered_entries, run_analysis=True)
         
-        result = child_manager.exec()
+        result = exec_dialog(self, child_manager)
         
         # 3. Если пользователь сохранил изменения (нажал 'Применить')
         if result == QDialog.DialogCode.Accepted:
@@ -1613,7 +1610,7 @@ class GlossaryManagerPage(ShellPage):
         # --- КОНЕЦ ИЗМЕНЕНИЙ ---
         
         layout.addWidget(btn_all); layout.addWidget(btn_empty); layout.addWidget(button_box)
-        dialog.exec()
+        exec_dialog(self, dialog)
         return self.choice
     
     
@@ -2405,6 +2402,19 @@ class GlossaryManagerPage(ShellPage):
             # Обязательно выбираем timestamp для сохранения в файл
             cursor = conn.execute("SELECT original, rus, note, timestamp FROM glossary_editor_state ORDER BY sequence ASC")
             return [dict(row) for row in cursor.fetchall()]
+
+    def _get_glossary_with_db_ids(self) -> list:
+        """Возвращает строки для внутренних редакторов с устойчивым ID из БД."""
+        conn = self._get_db_conn()
+        with conn:
+            cursor = conn.execute(
+                """
+                SELECT id AS _db_id, original, rus, note, timestamp
+                FROM glossary_editor_state
+                ORDER BY sequence ASC
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
     
     def _remove_selected_terms(self):
         selected_indexes = self.table.selectionModel().selectedIndexes()
@@ -2493,7 +2503,7 @@ class GlossaryManagerPage(ShellPage):
         # Добавляем опцию в комбобокс диалога на лету, если его класс позволяет, 
         # но проще обновить сам класс GlossarySortDialog ниже.
         
-        if dialog.exec():
+        if exec_dialog(self, dialog):
             col_idx, order, criterion = dialog.get_state()
             self.sort_column_index = col_idx
             self.sort_order = order
@@ -2757,7 +2767,7 @@ class GlossaryManagerPage(ShellPage):
         actions = {"Проектный файл JSON (все данные, […] )": "full_json_project", "Словарь JSON (для перевода, {…} )": "full_json_dictionary", "Простой JSON (Оригинал -> Перевод)": "simple_json", "Контекст TXT (Перевод - Примечание)": "context_txt", "Простой TXT (Оригинал = Перевод)": "simple_txt"}
         for text, fmt in actions.items():
             btn = QPushButton(text); btn.clicked.connect(lambda ch, f=fmt: set_fmt(f)); layout.addWidget(btn)
-        if not dialog.exec(): return
+        if not exec_dialog(self, dialog): return
         
         filters = {"full_json_project": "JSON Project File (*.json)", "full_json_dictionary": "JSON Dictionary (*.json)", "simple_json": "Simple JSON Glossary (*.json)", "context_txt": "Text File (*.txt)", "simple_txt": "Text File (*.txt)"}
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить глоссарий", f"glossary.{'txt' if 'txt' in self.save_format_choice else 'json'}", filters[self.save_format_choice])
@@ -2790,7 +2800,7 @@ class GlossaryManagerPage(ShellPage):
             
         wizard = ImporterWizardDialog(initial_data=table_data, is_from_table=True, parent=self)
         
-        if wizard.exec() == QDialog.DialogCode.Accepted:
+        if exec_dialog(self, wizard) == QDialog.DialogCode.Accepted:
             new_glossary = wizard.get_glossary()
             if new_glossary:
                 self.add_history('wholesale', {'action_name': "Мастер импорта", 'description': f"Данные пересобраны ({len(new_glossary)} записей).", 'old_state': current_glossary})
@@ -2858,15 +2868,17 @@ class GlossaryManagerPage(ShellPage):
             for original in affected_originals:
                 if not original: continue
                 related = [e for e in current_glossary if e.get('original') == original]
-                if len({(e.get('rus', ''), e.get('note', '')) for e in related}) > 1:
+                if len(related) > 1:
                     self.direct_conflicts[original] = [{'rus': e.get('rus', ''), 'note': e.get('note', '')} for e in related]
 
             affected_translations = translations_before.union(translations_after)
             for trans in affected_translations:
                 if not trans: continue
                 related = [e for e in current_glossary if e.get('rus') == trans]
-                if len([e for e in related if e.get('original')]) > 1 or ([e for e in related if e.get('original')] and [e for e in related if not e.get('original')]):
-                    self.reverse_issues[trans] = {'complete': [e for e in related if e.get('original')], 'orphans': [e for e in related if not e.get('original')]}
+                complete = [e for e in related if e.get('original')]
+                orphans = [e for e in related if not e.get('original')]
+                if len({e.get('original', '').strip() for e in complete}) > 1 or (complete and orphans):
+                    self.reverse_issues[trans] = {'complete': complete, 'orphans': orphans}
                 elif trans in self.reverse_issues:
                     del self.reverse_issues[trans]
 
@@ -3188,7 +3200,7 @@ class GlossaryManagerPage(ShellPage):
             parent=self
         )
         
-        dlg.exec()
+        exec_dialog(self, dlg)
         
         # После закрытия диалога нужно обновить кнопку (вдруг версии появились/исчезли)
         # Для простоты можно перезагрузить текущую страницу таблицы
@@ -3274,7 +3286,7 @@ class GlossaryManagerPage(ShellPage):
                 with open(paths[0], 'r', encoding='utf-8') as f: content = f.read()
                 if content.strip():
                     wizard = ImporterWizardDialog(initial_data=content, parent=self)
-                    if wizard.exec() == QDialog.DialogCode.Accepted and (newly_imported := wizard.get_glossary()):
+                    if exec_dialog(self, wizard) == QDialog.DialogCode.Accepted and (newly_imported := wizard.get_glossary()):
                         imported_entries.extend(newly_imported); files_processed_count = 1
                 else: files_processed_count = 1; QMessageBox.information(self, "Файл пуст", f"Выбранный файл пуст:\n{paths[0]}")
             except Exception as e: QMessageBox.critical(self, "Ошибка чтения файла", f"Не удалось прочитать или обработать файл:\n{paths[0]}\n\nОшибка: {e}")
@@ -3289,7 +3301,7 @@ class GlossaryManagerPage(ShellPage):
                 QMessageBox.information(self, "Автоматический импорт", f"Все {files_processed_count} файлов были в стандартном формате.")
             else:
                 manager = MultiImportManagerDialog(to_configure, pre_processed, self)
-                if manager.exec() == QDialog.DialogCode.Accepted:
+                if exec_dialog(self, manager) == QDialog.DialogCode.Accepted:
                     imported_entries, files_processed_count = manager.get_all_imported_entries()
         # ----------------------------------------------------------------------------------
         
@@ -3337,7 +3349,7 @@ class GlossaryManagerPage(ShellPage):
                 cancel_btn.clicked.connect(dialog.reject)
                 layout.addWidget(cancel_btn)
                 
-                result_code = dialog.exec()
+                result_code = exec_dialog(self, dialog)
                 
                 # Коды возврата: 100=merge, 101=supplement, 102=accumulate, 103=replace
                 if result_code >= 100:
@@ -3363,9 +3375,17 @@ class GlossaryManagerPage(ShellPage):
     def resolve_direct_conflicts(self):
         self.table.setCurrentItem(None)
         if not self.direct_conflicts: return
-        current_glossary = self.get_glossary()
-        dlg = DirectConflictResolverDialog(self.direct_conflicts, self, morph=get_morph_analyzer())
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        current_glossary = (
+            self._get_glossary_with_db_ids()
+            if hasattr(self, '_get_glossary_with_db_ids')
+            else self.get_glossary()
+        )
+        dlg = DirectConflictResolverDialog(
+            self.direct_conflicts,
+            self,
+            morph=get_morph_analyzer(),
+        )
+        if exec_dialog(self, dlg) == QDialog.DialogCode.Accepted:
             resolved = dlg.resolved_glossary
             if not resolved: return
             
@@ -3433,8 +3453,17 @@ class GlossaryManagerPage(ShellPage):
     def resolve_reverse_conflicts(self):
         self.table.setCurrentItem(None)
         if not self.reverse_issues: return
-        current_glossary = self.get_glossary()
-        page = ReverseConflictResolverPage(self.reverse_issues, current_glossary, self, morph=get_morph_analyzer())
+        current_glossary = (
+            self._get_glossary_with_db_ids()
+            if hasattr(self, '_get_glossary_with_db_ids')
+            else self.get_glossary()
+        )
+        page = ReverseConflictResolverPage(
+            self.reverse_issues,
+            current_glossary,
+            self,
+            morph=get_morph_analyzer(),
+        )
 
         def apply_reverse_result(accepted, page=page):
             if accepted:
@@ -3497,8 +3526,26 @@ class GlossaryManagerPage(ShellPage):
                 before, after = change.get('before'), change.get('after')
                 
                 if before and not after: # Удаление
-                    conn.execute("DELETE FROM glossary_editor_state WHERE original=? AND rus=? AND note=?",
-                                 (before['original'], before['rus'], before['note']))
+                    if db_id := before.get('_db_id'):
+                        conn.execute(
+                            "DELETE FROM glossary_editor_state WHERE id=?",
+                            (db_id,),
+                        )
+                    else:
+                        # Один элемент патча представляет одну строку. LIMIT 1 не
+                        # дает одинаковым записям удаляться всем скопом.
+                        conn.execute(
+                            """
+                            DELETE FROM glossary_editor_state
+                            WHERE id = (
+                                SELECT id FROM glossary_editor_state
+                                WHERE original=? AND rus=? AND note=?
+                                ORDER BY sequence ASC
+                                LIMIT 1
+                            )
+                            """,
+                            (before['original'], before['rus'], before['note']),
+                        )
                 
                 elif not before and after: # Добавление новой записи
                     cursor = conn.execute("SELECT MAX(sequence) FROM glossary_editor_state")
@@ -3515,12 +3562,32 @@ class GlossaryManagerPage(ShellPage):
                 
                 elif before and after: # Обновление существующей записи
                     # При обновлении НЕ меняем timestamp в БД, чтобы сохранить дату создания
-                    conn.execute("""
-                        UPDATE glossary_editor_state 
-                        SET original=?, rus=?, note=? 
-                        WHERE original=? AND rus=? AND note=?
-                    """, (after['original'], after['rus'], after['note'], 
-                          before['original'], before['rus'], before['note']))
+                    if db_id := before.get('_db_id'):
+                        conn.execute(
+                            """
+                            UPDATE glossary_editor_state
+                            SET original=?, rus=?, note=?
+                            WHERE id=?
+                            """,
+                            (after['original'], after['rus'], after['note'], db_id),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            UPDATE glossary_editor_state
+                            SET original=?, rus=?, note=?
+                            WHERE id = (
+                                SELECT id FROM glossary_editor_state
+                                WHERE original=? AND rus=? AND note=?
+                                ORDER BY sequence ASC
+                                LIMIT 1
+                            )
+                            """,
+                            (
+                                after['original'], after['rus'], after['note'],
+                                before['original'], before['rus'], before['note'],
+                            ),
+                        )
 
         self._load_current_page()
     

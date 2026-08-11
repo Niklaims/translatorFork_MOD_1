@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""QidianCreatorPage — Qidian/Fanqie → Rulate creator as an embeddable ShellPage."""
+"""QidianCreatorPage — Qidian/Fanqie/Ciweimao → Rulate creator as an embeddable ShellPage."""
 
 from __future__ import annotations
 
@@ -51,6 +51,7 @@ from ..widgets.key_management_widget import KeyManagementWidget
 from ..widgets.model_settings_widget import ModelSettingsWidget
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
+from ..widgets.overlay_tab_widget import install_tab_fade
 
 
 QIDIAN_CREATOR_UI_STATE_KEY = "qidian_creator_ui"
@@ -119,7 +120,7 @@ class _CoverDropLabel(QLabel):
 
 
 class QidianCreatorPage(ShellPage):
-    page_title = "Qidian/Fanqie → Rulate"
+    page_title = "Qidian/Fanqie/Ciweimao → Rulate"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -135,6 +136,7 @@ class QidianCreatorPage(ShellPage):
         self._prepare_ai_worker: AiPrepareWorker | None = None
         self._prepare_ai_cancel_requested = False
         self._local_source_cover_path = ""
+        self._source_cover_image_data = b""
         self._generated_cover_path = ""
         self._workers = []
 
@@ -147,6 +149,7 @@ class QidianCreatorPage(ShellPage):
         root = QVBoxLayout(self)
 
         self.main_tabs = QTabWidget()
+        install_tab_fade(self.main_tabs)
         self.main_tabs.setDocumentMode(False)
         root.addWidget(self.main_tabs, 1)
 
@@ -201,7 +204,7 @@ class QidianCreatorPage(ShellPage):
         url_row.addWidget(QLabel("URL источника:"))
         self.qidian_url_edit = QLineEdit("https://www.qidian.com/book/1041604040/")
         self.qidian_url_edit.setPlaceholderText(
-            "https://www.qidian.com/book/1041604040/ или https://fanqienovel.com/page/7229603492648717324"
+            "Qidian, Fanqie или https://www.ciweimao.com/book/100441110"
         )
         url_row.addWidget(self.qidian_url_edit, 1)
         self.visible_qidian_checkbox = QCheckBox("Открывать источник видимо")
@@ -404,7 +407,8 @@ class QidianCreatorPage(ShellPage):
                 self,
                 "Источник",
                 "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
-                "или https://fanqienovel.com/page/7229603492648717324",
+                "или https://fanqienovel.com/page/7229603492648717324 "
+                "или https://www.ciweimao.com/book/100441110",
             )
             return
         self.fetch_qidian_btn.setEnabled(False)
@@ -418,7 +422,7 @@ class QidianCreatorPage(ShellPage):
     def _prepare_ai(self) -> None:
         metadata = self._collect_qidian_metadata()
         if not metadata.title_original or not metadata.description:
-            QMessageBox.warning(self, "AI", "Сначала получите или заполните название и описание Qidian.")
+            QMessageBox.warning(self, "AI", "Сначала получите или заполните название и описание источника.")
             return
 
         provider_id = self.key_widget.get_selected_provider()
@@ -459,7 +463,8 @@ class QidianCreatorPage(ShellPage):
                 self,
                 "Обложка",
                 "Введите ссылку вида https://www.qidian.com/book/1041604040/ "
-                "или https://fanqienovel.com/page/7229603492648717324",
+                "или https://fanqienovel.com/page/7229603492648717324 "
+                "или https://www.ciweimao.com/book/100441110",
             )
             return
 
@@ -511,7 +516,8 @@ class QidianCreatorPage(ShellPage):
     def _translate_cover_in_codex(self) -> None:
         cover_url = self.cover_url_edit.text().strip()
         source_image_path = getattr(self, "_local_source_cover_path", "")
-        if not cover_url and not source_image_path:
+        source_image_data = getattr(self, "_source_cover_image_data", b"")
+        if not cover_url and not source_image_path and not source_image_data:
             QMessageBox.warning(
                 self,
                 "Codex",
@@ -533,6 +539,7 @@ class QidianCreatorPage(ShellPage):
             title_ru,
             referer=self.source_url_edit.text().strip() or self.qidian_url_edit.text().strip(),
             source_image_path=source_image_path,
+            source_image_data=source_image_data,
         )
         worker.log_signal.connect(self._log)
         worker.cover_ready.connect(self._apply_codex_cover)
@@ -844,6 +851,7 @@ class QidianCreatorPage(ShellPage):
     def _set_cover_preview(self, image_data: bytes) -> None:
         pixmap = QPixmap()
         if image_data and pixmap.loadFromData(image_data):
+            self._source_cover_image_data = bytes(image_data)
             scaled = pixmap.scaled(
                 self.cover_preview_label.size(),
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -852,6 +860,7 @@ class QidianCreatorPage(ShellPage):
             self.cover_preview_label.setPixmap(scaled)
             self.cover_preview_label.setToolTip(SOURCE_COVER_DROP_TOOLTIP)
             return
+        self._source_cover_image_data = b""
         self.cover_preview_label.clear()
         self.cover_preview_label.setText("Обложка не загружена")
         self.cover_preview_label.setToolTip(SOURCE_COVER_DROP_TOOLTIP)
