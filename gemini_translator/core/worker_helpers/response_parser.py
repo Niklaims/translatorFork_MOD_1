@@ -33,10 +33,10 @@ class ResponseParser:
         import re
         if not isinstance(raw_response, str):
             return raw_response
-            
+
         pattern = re.compile(r"<new_glossary>([\s\S]*?)</new_glossary>", re.IGNORECASE)
         match = pattern.search(raw_response)
-        
+
         if match:
             json_text = match.group(1).strip()
             if json_text:
@@ -44,20 +44,45 @@ class ResponseParser:
                     json_match = re.search(r"\{[\s\S]*\}", json_text)
                     if json_match:
                         json_text = json_match.group(0)
-                        
+
                     new_terms = json.loads(json_text)
-                    if isinstance(new_terms, dict) and new_terms and hasattr(self.worker, 'context_manager'):
-                        self.worker.context_manager.add_custom_words(new_terms)
-                        self.log(f"[GLOSSARY] Извлечено новых терминов: {len(new_terms)}")
-                        if hasattr(self.worker, '_post_event'):
-                            self.worker._post_event('new_glossary_terms_extracted', {'terms': new_terms})
+                    if not isinstance(new_terms, dict):
+                        self.log(f"[WARN] Глоссарий из AI не является dict: {type(new_terms).__name__}")
+                    elif new_terms:
+                        context_manager = getattr(self.worker, 'context_manager', None)
+                        if context_manager is None:
+                            self.log("[WARN] context_manager недоступен — новые термины не сохранены в глоссарий сессии")
+                        else:
+                            # Нормализуем данные: гарантируем корректный формат {rus: str, note: str}
+                            normalized_terms = {}
+                            for term, data in new_terms.items():
+                                term = str(term).strip()
+                                if not term:
+                                    continue
+                                if isinstance(data, dict):
+                                    normalized_terms[term] = {
+                                        'rus': str(data.get('rus') or '').strip(),
+                                        'note': str(data.get('note') or '').strip(),
+                                    }
+                                elif isinstance(data, str):
+                                    normalized_terms[term] = {'rus': data.strip(), 'note': ''}
+                                else:
+                                    normalized_terms[term] = {'rus': str(data).strip(), 'note': ''}
+
+                            if normalized_terms:
+                                context_manager.add_custom_words(normalized_terms)
+                                self.log(f"[GLOSSARY] Извлечено {len(normalized_terms)} новых терминов из ответа AI")
+                                if hasattr(self.worker, '_post_event'):
+                                    self.worker._post_event('new_glossary_terms_extracted', {'terms': normalized_terms})
+                    else:
+                        self.log("[GLOSSARY] AI вернул пустой глоссарий — новых терминов нет")
                 except json.JSONDecodeError as e:
                     self.log(f"[WARN] Ошибка парсинга JSON глоссария: {e}")
                 except Exception as e:
-                    self.log(f"[WARN] Ошибка добавления терминов: {e}")
-            
+                    self.log(f"[WARN] Ошибка обработки новых терминов: {e}")
+
             return pattern.sub("", raw_response)
-            
+
         return raw_response
     
     def _get_text_length_before(self, element, soup):

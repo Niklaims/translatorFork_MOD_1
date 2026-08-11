@@ -159,22 +159,24 @@ class ContextManager:
         if not new_terms or not isinstance(new_terms, dict):
             return
 
-        updated = False
+        added_count = 0
+        added_terms = {}
         for term, data in new_terms.items():
             if term not in self.global_glossary:
                 self.global_glossary[term] = data
-                updated = True
+                added_terms[term] = data
+                added_count += 1
 
-        if updated:
-            print(f"[ContextManager] Добавлено {len(new_terms)} новых терминов. Перекомпиляция Regex-сервиса…")
+        if added_count > 0:
+            print(f"[ContextManager] Добавлено {added_count} новых терминов (из {len(new_terms)}). Перекомпиляция Regex-сервиса…")
             self.regex_service = GlossaryRegexService(self.global_glossary)
-            
+
             if self.similarity_map is not None and getattr(self, 'glossary_logic', None):
                 glossary_list = [{'original': k, **(v if isinstance(v, dict) else {'rus': v})} for k, v in self.global_glossary.items()]
                 self.similarity_map = self.glossary_logic.build_similarity_map(glossary_list, getattr(self, 'fuzzy_threshold', 100), self.use_jieba_for_glossary)
-            
+
             if self.chinese_processor:
-                self.chinese_processor.add_custom_words(new_terms)
+                self.chinese_processor.add_custom_words(added_terms)
 
     def prepare_html_for_translation(self, html_content, log_callback=None):
         """

@@ -394,6 +394,7 @@ class InitialSetupPage(ShellPage):
             'task_state_changed',
             'task_finished',
             'geoblock_detected',
+            'new_glossary_terms_extracted',
         )
         self.engine = app.engine
         self.engine_thread = app.engine_thread
@@ -2123,10 +2124,17 @@ class InitialSetupPage(ShellPage):
                 continue
                 
             if original not in glossary_map:
+                if isinstance(trans_data, dict):
+                    rus = str(trans_data.get('rus') or '').strip()
+                    note = str(trans_data.get('note') or '').strip()
+                else:
+                    rus = str(trans_data or '').strip()
+                    note = 'Авто-извлечение'
+
                 new_entry = {
                     'original': original,
-                    'rus': str(trans_data.get('rus') if isinstance(trans_data, dict) else trans_data),
-                    'note': str(trans_data.get('note') if isinstance(trans_data, dict) else 'Авто-извлечение')
+                    'rus': rus,
+                    'note': note,
                 }
                 current_glossary.append(new_entry)
                 glossary_map[original] = new_entry
