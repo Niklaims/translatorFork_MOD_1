@@ -16,6 +16,23 @@
       "reset_minute": 1
     },
     "models": {
+      "Gemini 3.7 Flash": {
+        "id": "gemini-3.7-flash",
+        "rpm": 5,
+        "tpm": 250000,
+        "rpd": 20,
+        "context_length": 230000,
+        "needs_chunking": true,
+        "max_concurrent_requests": 10,
+        "max_output_tokens": 65536,
+        "thinkingLevel": [
+          "high",
+          "medium",
+          "low",
+          "minimal"
+        ],
+        "min_thinking_budget": "minimal"
+      },
       "Gemini 3.6 Flash": {
         "id": "gemini-3.6-flash",
         "rpm": 5,
@@ -258,10 +275,10 @@
     "models": {
       "DeepSeek V4 Flash NonThink": {
         "id": "deepseek-v4-flash",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 384000,
         "context_length": 1000000,
         "deepseek_thinking": "disabled",
@@ -269,10 +286,10 @@
       },
       "DeepSeek V4 Flash Think": {
         "id": "deepseek-v4-flash",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 384000,
         "context_length": 1000000,
         "deepseek_thinking": "enabled",
@@ -285,10 +302,10 @@
       },
       "DeepSeek V4 Pro NonThink": {
         "id": "deepseek-v4-pro",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 384000,
         "context_length": 1000000,
         "deepseek_thinking": "disabled",
@@ -296,10 +313,10 @@
       },
       "DeepSeek V4 Pro Think": {
         "id": "deepseek-v4-pro",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 384000,
         "context_length": 1000000,
         "deepseek_thinking": "enabled",
@@ -312,10 +329,10 @@
       },
       "deepseek-chat NonThink": {
         "id": "deepseek-chat",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 8192,
         "context_window": 128000,
         "deepseek_thinking": "disabled",
@@ -323,10 +340,10 @@
       },
       "deepseek-reasoner Think": {
         "id": "deepseek-reasoner",
-        "rpm": 5,
+        "rpm": 100,
         "tpm": 50000,
         "needs_chunking": true,
-        "max_concurrent_requests": 1,
+        "max_concurrent_requests": 0,
         "max_output_tokens": 64000,
         "context_window": 128000,
         "deepseek_thinking": "enabled",
@@ -1106,6 +1123,14 @@
         "max_output_tokens": 8192,
         "context_length": 128000
       },
+      "Gemini 3.7 Flash Tiered": {
+        "id": "gemini-3.7-flash-tiered",
+        "rpm": 6,
+        "needs_chunking": true,
+        "max_concurrent_requests": 3,
+        "max_output_tokens": 8192,
+        "context_length": 128000
+      },
       "Gemini 3.5 Flash High": {
         "id": "gemini-3.5-flash-agent",
         "rpm": 6,
@@ -1366,6 +1391,16 @@
       },
       "Qwen3.7-Max": {
         "id": "Qwen3.7-Max",
+        "rpm": 30,
+        "rpd": 0,
+        "needs_chunking": true,
+        "context_length": 200000,
+        "max_concurrent_requests": 1,
+        "max_output_tokens": 16384,
+        "min_thinking_budget": false
+      },
+      "Qwen3.8-Max": {
+        "id": "Qwen3.8-Max",
         "rpm": 30,
         "rpd": 0,
         "needs_chunking": true,

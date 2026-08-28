@@ -523,6 +523,9 @@ class TranslationEngine(QObject):
         Начисляет штрафные баллы ключу.
         Если установлен лимит RPD, и текущее использование ключа > 90% от RPD,
         то ЛЮБОЕ предупреждение немедленно помечает ключ как Exhausted (красный).
+
+        Повторные временные паузы не доказывают исчерпание суточной квоты:
+        счетчик только передает ключ в механизм ротации/краткой паузы.
         """
 
         if worker_id not in self.active_workers_map:
@@ -577,33 +580,8 @@ class TranslationEngine(QObject):
         self._post_event('log_message', {
             'message': f"[MANAGER-WARN] 🟡 Ключ …{worker_key[-4:]} получил {log_message_penalty} ({current_warnings}/{self.MAX_REPEATED_WAITS})."
         })
-        
-        if current_warnings >= self.MAX_REPEATED_WAITS:
-            self._post_event('log_message', {
-                'message': f"[FATAL] ⛔ Ключ …{worker_key[-4:]} набрал максимальное количество штрафов. Считаем квоту исчерпанной."
-            })
-            
-            fake_exception = Exception("Warning limit exceeded.")
 
-            payload = {
-                "type": "quota_exceeded",
-                "model_id": model_id,
-                "exception": fake_exception
-            }
-            
-            event = {
-                'event': "fatal_error",
-                'source': f'worker_{worker_id}',
-                'worker_key': worker_key,
-                'session_id': worker_session,
-                'data': {'payload': payload}
-            }
-
-            self.bus.event_posted.emit(event)
-            
-            return True # Да, ключ был исчерпан
-            
-        return False # Нет, ключ еще в игре
+        return False # Временная пауза: ключ еще не исчерпан
 
     def _reset_key_warning_counter(self, worker_id: str):
         """Сбрасывает счетчик предупреждений для указанного ключа."""
@@ -890,11 +868,14 @@ class TranslationEngine(QObject):
         self.is_cancelled = True 
         self.is_soft_stopping = False
         
-        self._post_event('stop_session_requested', {'reason': reason}) 
-        self._stop_timers()
-        
-        self._terminate_all_workers()
-        self._unregister_active_session()
+        try:
+            self._post_event('stop_session_requested', {'reason': reason})
+            self._stop_timers()
+
+            self._terminate_all_workers()
+            self._unregister_active_session()
+        finally:
+            self._release_power_inhibitor()
         
         self._end_session_event(reason, self.session_id)
         if not self.summary_shown_for_session:
@@ -910,7 +891,6 @@ class TranslationEngine(QObject):
         self.is_starting = False # <-- Сбрасываем и этот флаг тоже
         
     def _end_session_event(self, reason: str, session_id_event=None):
-        self._release_power_inhibitor()
         self._post_event('session_finished', {
             'reason': reason,
             "session_id_log": self.session_id,
@@ -1036,9 +1016,33 @@ class TranslationEngine(QObject):
             worker_params['browser_profiles_count'] = profile_count
             worker_params['workascii_workspace_index'] = worker_params['browser_profile_index']
         
-        worker = UniversalWorker(**worker_params)
+        worker = None
+        try:
+            worker = UniversalWorker(**worker_params)
+            future = self._spawn_worker(worker.provider_config, worker)
+        except Exception as exc:
+            if worker is not None:
+                disconnect = getattr(worker, '_disconnect_from_bus', None)
+                if callable(disconnect):
+                    try:
+                        disconnect()
+                    except Exception:
+                        pass
+            self.keys_map.pop(uuid_worker, None)
+            self.keys_map.pop(api_key, None)
+            if self.api_key_manager:
+                self.api_key_manager.update_map(self.keys_map)
+            reason = (
+                "Не удалось запустить обработчик API: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            self._post_event('log_message', {
+                'message': f"[MANAGER-ERROR] {reason}"
+            })
+            print(f"[MANAGER-ERROR] {reason}\n{traceback.format_exc()}")
+            self._end_session(reason)
+            return
 
-        future = self._spawn_worker(worker.provider_config, worker)
         self.active_workers_map[uuid_worker] = future
         
         # --- ГЛАВНОЕ ИЗМЕНЕНИЕ: Теперь колбэк ИСПУСКАЕТ СИГНАЛ ---
