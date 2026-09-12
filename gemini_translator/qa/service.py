@@ -1155,22 +1155,32 @@ class TranslationQualityService:
 # The reason can come from a runner process reached over the network - for a
 # remote COMETKiwi server, an unauthenticated one - and is about to be
 # written into translation_qa.json and the CSV export, so it is bounded to a
-# short machine-readable token before it is persisted.
-_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
+# short machine-readable token before it is persisted. One optional
+# colon-separated suffix is allowed, matching what _safe_reason() in
+# cometkiwi_client.py produces ("runner_error", or "runner_error:<suffix>").
+# [0-9] here is the ASCII digit range on purpose: _safe_reason() keeps any
+# character str.isdigit() calls true, which also includes non-ASCII digits
+# such as "²" or "٣", so its own output is not guaranteed ASCII -
+# this pattern, not that function, is the actual bound.
+_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}(?::[a-z0-9_]{1,64})?")
 
 
-# The value this returns is "<status>:<reason>"; a consumer that wants the
-# reason must split on the first ":".
+# The value this returns is "<status>:<reason>", and <reason> may itself
+# contain one more ":" (for example "runner_error:out_of_memory"). A
+# consumer must split on the FIRST ":" only, never on every ":".
 def _quality_score_status(estimate) -> str:
     """Turn one quality estimate into the value stored in quality_score_status.
 
     A completed estimate always gives "completed" - unchanged, and this is
     also what clears an earlier reason once a chapter is rechecked and the
     estimator answers again. A non-completed estimate whose metadata carries
-    a usable reason gives "<status>:<reason>". Anything else - no metadata,
-    no "reason" key, metadata that is not a mapping, or a reason that is not
-    a bounded lowercase token - gives the bare status, exactly as before this
-    function existed.
+    a usable reason gives "<status>:<reason>", where <reason> is one ASCII
+    identifier or two such identifiers joined by one ":" - the shape
+    _safe_reason() produces for a runner failure, e.g.
+    "runner_error:out_of_memory". A consumer must split on the FIRST ":"
+    only. Anything else - no metadata, no "reason" key, metadata that is not
+    a mapping, or a reason that is not that bounded shape - gives the bare
+    status, exactly as before this function existed.
     """
     status = str(getattr(estimate, "status", "") or "unavailable")
     if status == "completed":

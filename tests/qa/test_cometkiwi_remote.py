@@ -324,6 +324,39 @@ def test_hostile_reasons_are_never_persisted_verbatim(hostile_reason):
     assert _quality_score_status(estimate) == "unavailable:invalid_reason"
 
 
+def test_a_compound_runner_reason_is_persisted_as_two_segments():
+    """A runner's own failure - out_of_memory above all - must reach the journal."""
+    estimate = unavailable(
+        "cometkiwi", "wmt22-cometkiwi-da", "runner_error:out_of_memory"
+    )
+
+    assert _quality_score_status(estimate) == "unavailable:runner_error:out_of_memory"
+
+
+def test_the_real_safe_reason_output_survives_the_composition():
+    """Regression guard: neither function may silently collapse this again."""
+    from gemini_translator.qa.estimators.cometkiwi_client import _safe_reason
+
+    estimate = unavailable(
+        "cometkiwi", "wmt22-cometkiwi-da", _safe_reason("Out of memory")
+    )
+
+    assert _quality_score_status(estimate) == "unavailable:runner_error:out_of_memory"
+
+
+def test_a_non_ascii_digit_in_the_suffix_is_still_rejected():
+    """str.isdigit() is true for non-ASCII digits; the persistence bound is not."""
+    estimate = unavailable("cometkiwi", "wmt22-cometkiwi-da", "runner_error:gpu²")
+
+    assert _quality_score_status(estimate) == "unavailable:invalid_reason"
+
+
+def test_a_reason_with_two_colons_is_rejected():
+    estimate = unavailable("cometkiwi", "wmt22-cometkiwi-da", "a:b:c")
+
+    assert _quality_score_status(estimate) == "unavailable:invalid_reason"
+
+
 def test_attach_quality_estimate_persists_the_reason_and_round_trips(tmp_path):
     """The journal, not just the in-memory result, must carry the reason."""
     service, journal, journal_path = _service(tmp_path)
