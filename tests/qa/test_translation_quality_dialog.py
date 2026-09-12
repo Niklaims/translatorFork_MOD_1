@@ -276,3 +276,57 @@ def test_the_chunk_spin_offers_the_automatic_size(qt_app):
     dialog.language_chunk_spin.setValue(0)
 
     assert dialog.qa_settings().language_chunk_chars == 0
+
+
+def test_the_quality_window_carries_the_cometkiwi_address_both_ways(qt_app):
+    """Адрес ПК — единственная настройка CometKiwi, которая реально меняется."""
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+            cometkiwi_endpoint="http://192.168.1.50:8765",
+        )
+    )
+
+    assert dialog.cometkiwi_endpoint_edit.text() == "http://192.168.1.50:8765"
+
+    dialog.cometkiwi_endpoint_edit.setText("  http://192.168.1.77:9000  ")
+
+    assert dialog.qa_settings().cometkiwi_endpoint == "http://192.168.1.77:9000"
+
+
+def test_an_empty_address_says_the_scoring_stays_on_this_machine(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    dialog.cometkiwi_endpoint_edit.setText("")
+    dialog.cometkiwi_check_button.click()
+
+    assert "на этом компьютере" in dialog.cometkiwi_status_label.text()
+
+
+def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
+    """Адрес вписан — окно не должно продолжать называть CometKiwi ненастроенным.
+
+    qa_settings() reads the widget directly, so a missing textChanged hookup is
+    invisible to the other tests. This one watches what the user actually sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+    emitted = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.cometkiwi_endpoint_edit.setText("http://192.168.1.50:8765")
+
+    assert emitted, "typing an address must report a settings edit"
+    assert emitted[-1].cometkiwi_endpoint == "http://192.168.1.50:8765"
+    assert "cometkiwi" not in dialog.capability_status_label.text()
+
+    dialog.cometkiwi_endpoint_edit.setText("")
+
+    assert "cometkiwi" in dialog.capability_status_label.text()

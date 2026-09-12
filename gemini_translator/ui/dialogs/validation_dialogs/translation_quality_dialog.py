@@ -399,6 +399,25 @@ class TranslationQualityDialog(QDialog):
             self.capability_checks[QaCapabilityKey.LANGUAGE_TOOL].isChecked()
         )
 
+        cometkiwi_row = QHBoxLayout()
+        cometkiwi_row.addWidget(QLabel("Адрес счётного сервера:", group))
+        self.cometkiwi_endpoint_edit = QLineEdit(group)
+        self.cometkiwi_endpoint_edit.setPlaceholderText(
+            "http://192.168.1.50:8765 — пусто: считать на этом компьютере"
+        )
+        # Reported like every other editable field in this dialog. Without it the
+        # readiness labels, which read self._settings rather than the widgets,
+        # keep calling CometKiwi unconfigured after an address is typed.
+        self.cometkiwi_endpoint_edit.textChanged.connect(self._on_settings_edited)
+        cometkiwi_row.addWidget(self.cometkiwi_endpoint_edit)
+        self.cometkiwi_check_button = QPushButton("Проверить связь", group)
+        self.cometkiwi_check_button.clicked.connect(self._check_cometkiwi_endpoint)
+        cometkiwi_row.addWidget(self.cometkiwi_check_button)
+        layout.addLayout(cometkiwi_row)
+        # Deliberately not tied to the CometKiwi checkbox the way the LanguageTool
+        # row above is tied: disabling the button while the capability is off
+        # would make click() silently do nothing in tests and for users alike.
+
         self.cometkiwi_status_label = QLabel("", group)
         self.cometkiwi_status_label.setWordWrap(True)
         layout.addWidget(self.cometkiwi_status_label)
@@ -518,6 +537,7 @@ class TranslationQualityDialog(QDialog):
             cometkiwi_runner_path=self._settings.cometkiwi_runner_path,
             cometkiwi_model=self._settings.cometkiwi_model,
             cometkiwi_device=self._settings.cometkiwi_device,
+            cometkiwi_endpoint=self.cometkiwi_endpoint_edit.text().strip(),
             cometkiwi_license_accepted=self._settings.cometkiwi_license_accepted,
         )
 
@@ -561,6 +581,7 @@ class TranslationQualityDialog(QDialog):
             settings.capabilities.cometkiwi_enabled
         )
         self.language_tool_endpoint_edit.setText(settings.language_tool_endpoint)
+        self.cometkiwi_endpoint_edit.setText(settings.cometkiwi_endpoint)
         self._refresh_setup_warnings()
 
     def _reload_key_choices(self, selected_key: str) -> None:
@@ -660,6 +681,35 @@ class TranslationQualityDialog(QDialog):
                 self._cometkiwi_last_seconds,
             )
         )
+
+    def _check_cometkiwi_endpoint(self) -> None:
+        """Ask the scoring server what it is, without loading anything there."""
+        endpoint = self.cometkiwi_endpoint_edit.text().strip()
+        if not endpoint:
+            self.cometkiwi_status_label.setText(
+                "Адрес пуст: оценка будет считаться на этом компьютере."
+            )
+            return
+        import json
+        import urllib.error
+        import urllib.request
+
+        url = endpoint.rstrip("/") + "/health"
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                health = json.loads(response.read(100_000))
+            loaded = "веса в памяти" if health.get("loaded") else "веса ещё не загружены"
+            self.cometkiwi_status_label.setText(
+                f"Связь есть: {health.get('model', '?')} на "
+                f"{health.get('device', '?')}, {loaded}."
+            )
+        except urllib.error.URLError:
+            self.cometkiwi_status_label.setText(
+                "Сервер не отвечает. Проверьте, запущен ли он на ПК, "
+                "и открыт ли порт в брандмауэре."
+            )
+        except Exception:  # noqa: BLE001 - a failed check never breaks the dialog
+            self.cometkiwi_status_label.setText("Ответ сервера не разобран.")
 
     def _on_selection_changed(self, *_args) -> None:
         chapter_id = self.selected_chapter_id()
