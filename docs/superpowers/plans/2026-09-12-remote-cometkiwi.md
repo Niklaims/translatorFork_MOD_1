@@ -1198,11 +1198,38 @@ def test_an_empty_address_says_the_scoring_stays_on_this_machine(qt_app):
     dialog.cometkiwi_check_button.click()
 
     assert "на этом компьютере" in dialog.cometkiwi_status_label.text()
+
+
+def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
+    """Адрес вписан — окно не должно продолжать называть CometKiwi ненастроенным.
+
+    qa_settings() reads the widget directly, so a missing textChanged hookup is
+    invisible to the other tests. This one watches what the user actually sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+    emitted = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.cometkiwi_endpoint_edit.setText("http://192.168.1.50:8765")
+
+    assert emitted, "typing an address must report a settings edit"
+    assert emitted[-1].cometkiwi_endpoint == "http://192.168.1.50:8765"
+    assert "cometkiwi" not in dialog.capability_status_label.text()
+
+    dialog.cometkiwi_endpoint_edit.setText("")
+
+    assert "cometkiwi" in dialog.capability_status_label.text()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/qa/test_translation_quality_dialog.py -k cometkiwi_address -v`
+Run: `.venv/bin/python -m pytest tests/qa/test_translation_quality_dialog.py -k address -v`
 Expected: FAIL with `AttributeError: 'TranslationQualityDialog' object has no attribute 'cometkiwi_endpoint_edit'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1210,18 +1237,26 @@ Expected: FAIL with `AttributeError: 'TranslationQualityDialog' object has no at
 Add the widgets in the CometKiwi group, just above `self.cometkiwi_status_label`:
 
 ```python
+        cometkiwi_row = QHBoxLayout()
+        cometkiwi_row.addWidget(QLabel("Адрес счётного сервера:", group))
         self.cometkiwi_endpoint_edit = QLineEdit(group)
         self.cometkiwi_endpoint_edit.setPlaceholderText(
             "http://192.168.1.50:8765 — пусто: считать на этом компьютере"
         )
-        layout.addWidget(QLabel("Адрес счётного сервера:", group))
-        layout.addWidget(self.cometkiwi_endpoint_edit)
+        # Reported like every other editable field in this dialog. Without it the
+        # readiness labels, which read self._settings rather than the widgets,
+        # keep calling CometKiwi unconfigured after an address is typed.
+        self.cometkiwi_endpoint_edit.textChanged.connect(self._on_settings_edited)
+        cometkiwi_row.addWidget(self.cometkiwi_endpoint_edit)
         self.cometkiwi_check_button = QPushButton("Проверить связь", group)
         self.cometkiwi_check_button.clicked.connect(self._check_cometkiwi_endpoint)
-        layout.addWidget(self.cometkiwi_check_button)
+        cometkiwi_row.addWidget(self.cometkiwi_check_button)
+        layout.addLayout(cometkiwi_row)
 ```
 
-Add `QLineEdit` and `QPushButton` to the Qt imports at the top of the file if they are not already there.
+`QLineEdit`, `QPushButton` and `QHBoxLayout` are already imported by this file — do not add a second import. The row mirrors the LanguageTool endpoint row directly above it.
+
+**Why the `textChanged` connection is not optional:** every other editable field in this dialog connects to `self._on_settings_edited`, which re-reads `self._settings` from the widgets, reruns `_refresh_setup_warnings()` — the method that writes `capability_status_label` and `cometkiwi_status_label` — and emits `settings_changed`. Leave it out and the user types the PC address while the dialog keeps saying CometKiwi is unconfigured. Do not tie the field or the button to the CometKiwi capability checkbox the way the LanguageTool row is tied: that would disable the check button while the capability is off, and Qt ignores `click()` on a disabled button.
 
 In `qa_settings()` (the method that collects the widgets, around `:518`), add the endpoint next to the other CometKiwi lines:
 
