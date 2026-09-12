@@ -255,7 +255,7 @@ class QaSettings:
         if self.capabilities.language_tool_enabled and not self.language_tool_endpoint:
             missing.append(QaCapabilityKey.LANGUAGE_TOOL.value)
         if self.capabilities.cometkiwi_enabled and (
-            not (self.cometkiwi_endpoint or self.cometkiwi_runner_path)
+            not (self.cometkiwi_is_remote or self.cometkiwi_runner_path)
             or not self.cometkiwi_model
             or not self.cometkiwi_license_accepted
         ):

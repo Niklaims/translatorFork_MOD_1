@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import threading
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6 import QtWidgets
+from PyQt6.QtCore import Qt
 
 from gemini_translator.qa.capabilities import QaCapabilitySettings
 from gemini_translator.qa.journal import QaJournal
@@ -20,6 +23,7 @@ from gemini_translator.ui.dialogs.validation_dialogs import (
     BookQaReportSnapshot,
     ChapterQaTableModel,
     TranslationQualityDialog,
+    translation_quality_dialog as dialog_module,
 )
 
 
@@ -439,3 +443,171 @@ def test_check_reports_an_http_error_distinctly_from_unreachable(qt_app):
     text = dialog.cometkiwi_status_label.text()
     assert "ответил ошибкой 404" in text
     assert "брандмауэр" not in text
+
+
+# --- the check takes scoring's route and names what actually went wrong ----
+
+
+def _health(model: str = "wmt22-cometkiwi-da") -> bytes:
+    return json.dumps(
+        {"schema_version": 1, "model": model, "device": "cuda", "loaded": True}
+    ).encode("utf-8")
+
+
+def _check(dialog: TranslationQualityDialog, address: str) -> str:
+    dialog.cometkiwi_endpoint_edit.setText(address)
+    dialog._check_cometkiwi_endpoint()
+    return dialog.cometkiwi_status_label.text()
+
+
+def test_check_goes_straight_to_the_pc_whatever_proxy_is_configured(
+    qt_app, monkeypatch
+):
+    """Scoring's aiohttp session ignores proxies; a check that honoured them lied."""
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    # urlopen() caches one opener, built from the environment of its first
+    # call; dropping it keeps this test from depending on the order tests run.
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, _health())) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Связь есть: wmt22-cometkiwi-da на cuda, веса в памяти."
+
+
+@pytest.mark.parametrize("address", ["192.168.1.50:8765", "pc-in-the-hall"])
+def test_check_names_an_address_scoring_would_refuse_and_dials_nothing(
+    qt_app, monkeypatch, address
+):
+    """Scoring writes endpoint_invalid for these; the check used to blame a firewall."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    attempts = []
+    real_open = urllib.request.OpenerDirector.open
+
+    def _recording_open(self, *args, **kwargs):
+        attempts.append(args)
+        return real_open(self, *args, **kwargs)
+
+    def _recording_connection(*args, **kwargs):
+        attempts.append(args)
+        raise OSError("the check must not open a connection")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _recording_open)
+    monkeypatch.setattr(socket, "create_connection", _recording_connection)
+
+    text = _check(dialog, address)
+
+    assert text == "Адрес не разобран: нужен вид http://host:port."
+    assert attempts == []
+
+
+def test_check_says_the_server_accepted_the_connection_but_never_answered(
+    qt_app, monkeypatch
+):
+    monkeypatch.setattr(dialog_module, "COMETKIWI_CHECK_TIMEOUT_SECONDS", 0.3)
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    # listen() and never accept(): the kernel completes the handshake, so the
+    # connection is accepted, and nothing on the other side ever answers.
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        host, port = listener.getsockname()[:2]
+        text = _check(dialog, f"http://{host}:{port}")
+
+    assert text == "Сервер принял соединение, но не ответил за 0.3 с."
+
+
+def test_check_reports_json_that_is_not_an_object_as_unparsed(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"[1, 2]")) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Ответ сервера не разобран."
+
+
+def _hanging_up():
+    """Build a handler that reads each GET and closes without answering it."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            self.close_connection = True
+
+        def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
+            pass
+
+    return _Handler
+
+
+def test_check_reports_any_other_failure_without_its_exception_text(qt_app):
+    """http.client's RemoteDisconnected is neither a URLError nor a timeout."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_hanging_up()) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Проверка связи не удалась."
+
+
+def test_check_warns_when_the_pc_runs_another_model_than_the_settings_name(qt_app):
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(cometkiwi_model="wmt22-cometkiwi-da")
+    )
+
+    with _RealHealthServer(
+        _answering(200, _health(model="wmt23-cometkiwi-da-xl"))
+    ) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == (
+        "Связь есть: wmt23-cometkiwi-da-xl на cuda, веса в памяти. "
+        "Внимание: на ПК модель wmt23-cometkiwi-da-xl, "
+        "а в настройках — wmt22-cometkiwi-da."
+    )
+
+
+def test_check_cuts_each_model_name_in_the_warning_to_80_characters(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings(cometkiwi_model="c" * 100))
+
+    with _RealHealthServer(_answering(200, _health(model="s" * 100))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text.endswith(
+        f" Внимание: на ПК модель {'s' * 80}, а в настройках — {'c' * 80}."
+    )
+
+
+@pytest.mark.parametrize(
+    "server_model, configured_model",
+    [
+        ("wmt22-cometkiwi-da", "wmt22-cometkiwi-da"),
+        ("wmt22-cometkiwi-da", ""),
+        ("", "wmt22-cometkiwi-da"),
+    ],
+)
+def test_check_warns_only_when_two_names_disagree(
+    qt_app, server_model, configured_model
+):
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(cometkiwi_model=configured_model)
+    )
+
+    with _RealHealthServer(_answering(200, _health(model=server_model))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text.startswith("Связь есть:")
+    assert "Внимание" not in text
+
+
+def test_a_model_name_from_the_network_is_shown_as_plain_text(qt_app):
+    """The server is unauthenticated: nothing it sends is rendered as markup."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, _health(model="<b>x</b>"))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert "<b>x</b>" in text
+    assert dialog.cometkiwi_status_label.textFormat() == Qt.TextFormat.PlainText

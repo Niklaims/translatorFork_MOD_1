@@ -20,6 +20,7 @@ from ..model_bundle import (
     ModelBundleFile,
     ModelBundleManager,
 )
+from .cometkiwi_client import usable_endpoint
 
 
 CometKiwiModelFile = ModelBundleFile
@@ -182,13 +183,18 @@ def describe_cometkiwi_setup(
     """One line saying what is set up, what is missing, and what it last cost.
 
     Ticking the checkbox is not the same as having the estimator: this text is
-    what tells the user which of the three parts — runner, weights, licence —
-    they still owe, before anything is downloaded or started.
+    what tells the user which of the parts — a runner or a usable address,
+    weights, licence — they still owe, before anything is downloaded or started.
     """
     if not getattr(settings.capabilities, "cometkiwi_enabled", False):
         return ""
     missing: list[str] = []
-    remote = bool(str(getattr(settings, "cometkiwi_endpoint", "") or "").strip())
+    endpoint = str(getattr(settings, "cometkiwi_endpoint", "") or "").strip()
+    remote = bool(endpoint)
+    if remote and not usable_endpoint(endpoint.rstrip("/")):
+        # The address stands in for the runner, and scoring refuses one it
+        # cannot dial - as endpoint_invalid, for every chapter.
+        missing.append("адрес вида http://host:port")
     if not remote and not str(getattr(settings, "cometkiwi_runner_path", "") or "").strip():
         missing.append("путь к runner")
     if not str(getattr(settings, "cometkiwi_model", "") or "").strip():

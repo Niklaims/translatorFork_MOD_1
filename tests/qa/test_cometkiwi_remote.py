@@ -6,6 +6,7 @@ import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -25,10 +26,16 @@ from gemini_translator.qa.estimators.cometkiwi_client import (
     RunnerProcessError,
     remote_transport,
 )
+from gemini_translator.qa.journal import QaJournal
 from gemini_translator.qa.models import ChapterMetrics, RiskLevel
-from gemini_translator.qa.service import ChapterQaResult, _quality_score_status
+from gemini_translator.qa.repair_store import RepairStore
+from gemini_translator.qa.service import (
+    ChapterQaResult,
+    TranslationQualityService,
+    _quality_score_status,
+)
 from gemini_translator.qa.settings import QaCapabilitySettings, QaSettings
-from tests.qa.test_translation_quality_service import _service
+from gemini_translator.qa.structural_repair import StructuralRepairEngine
 
 
 def _remote(**overrides) -> CometKiwiRunnerConfig:
@@ -278,6 +285,74 @@ def test_the_setup_description_asks_for_the_address_not_for_local_weights():
     assert "установленные веса" not in described
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    ["192.168.1.50:8765", "pc-in-the-hall", "http://", "http://192.168.1.50:abc"],
+)
+def test_the_setup_description_names_an_address_scoring_cannot_use(endpoint):
+    """Scoring writes endpoint_invalid for every chapter; the setup line says so first."""
+    from gemini_translator.qa.estimators.cometkiwi_model_manager import (
+        describe_cometkiwi_setup,
+    )
+
+    described = describe_cometkiwi_setup(
+        _settings(cometkiwi_endpoint=endpoint), None, None
+    )
+
+    assert described == (
+        "COMETKiwi: требует настройки — не хватает: адрес вида http://host:port."
+    )
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    ["http://192.168.1.50:8765", "http://192.168.1.50:8765/", "http://pc-in-the-hall"],
+)
+def test_the_setup_description_does_not_ask_for_a_usable_address(endpoint):
+    from gemini_translator.qa.estimators.cometkiwi_model_manager import (
+        describe_cometkiwi_setup,
+    )
+
+    described = describe_cometkiwi_setup(
+        _settings(cometkiwi_endpoint=endpoint, cometkiwi_model=""), None, None
+    )
+
+    assert described == "COMETKiwi: требует настройки — не хватает: модель."
+
+
+def test_the_assembly_gives_a_remote_estimator_no_local_paths(tmp_path):
+    """The runner and the weights are on the PC: nothing local is built for them."""
+    from gemini_translator.qa.assembly import build_quality_estimator
+
+    estimator = build_quality_estimator(
+        _settings(cometkiwi_runner_path="/opt/cometkiwi/run"),
+        SimpleNamespace(cometkiwi_models=tmp_path),
+    )
+
+    config = estimator._config
+    assert (config.endpoint, config.runner_path, config.model_dir) == (
+        "http://192.168.1.50:8765",
+        "",
+        "",
+    )
+
+
+def test_the_assembly_keeps_the_local_paths_without_an_address(tmp_path):
+    from gemini_translator.qa.assembly import build_quality_estimator
+
+    estimator = build_quality_estimator(
+        _settings(cometkiwi_endpoint="", cometkiwi_runner_path="/opt/cometkiwi/run"),
+        SimpleNamespace(cometkiwi_models=tmp_path),
+    )
+
+    config = estimator._config
+    assert (config.endpoint, config.runner_path, config.model_dir) == (
+        "",
+        "/opt/cometkiwi/run",
+        str(tmp_path / "wmt22-cometkiwi-da"),
+    )
+
+
 # --- the reason travels into quality_score_status, bounded ----------------
 
 
@@ -357,9 +432,35 @@ def test_a_reason_with_two_colons_is_rejected():
     assert _quality_score_status(estimate) == "unavailable:invalid_reason"
 
 
+class _NeverCalled:
+    """Stands in for every collaborator a check needs and recording an estimate must not."""
+
+    def _refuse(self, *args, **kwargs):
+        raise AssertionError("recording a quality estimate must not run a check")
+
+    analyze = verify = propose = validate = _refuse
+
+
+def _recording_service(tmp_path):
+    """Just enough of the QA service to record an estimate in a real journal."""
+    journal = QaJournal.empty(book_id="book-1")
+    never_called = _NeverCalled()
+    service = TranslationQualityService(
+        coverage=never_called,
+        verifier=never_called,
+        repairer=never_called,
+        repair_engine=StructuralRepairEngine("ru", QaCapabilitySettings()),
+        repair_validator=never_called,
+        store=RepairStore(tmp_path / "backups", session_id="session-1"),
+        journal=journal,
+        journal_path=tmp_path / "translation_qa.json",
+    )
+    return service, journal
+
+
 def test_attach_quality_estimate_persists_the_reason_and_round_trips(tmp_path):
     """The journal, not just the in-memory result, must carry the reason."""
-    service, journal, journal_path = _service(tmp_path)
+    service, journal = _recording_service(tmp_path)
     result = ChapterQaResult(
         chapter_id="chapter-1",
         risk_level=RiskLevel.LOW,

@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 
 from ....qa.capabilities import CAPABILITY_DESCRIPTIONS, QaCapabilityKey, QaCapabilitySettings
 from ....qa.assembly import EMBEDDING_KEY_NAMESPACES
+from ....qa.estimators.cometkiwi_client import usable_endpoint
 from ....qa.estimators.cometkiwi_model_manager import describe_cometkiwi_setup
 from ....qa.language_validation import MAX_LANGUAGE_CHUNK_CHARS
 from ....qa.settings import QaSettings
@@ -70,6 +71,13 @@ CAPABILITY_ORDER = (
 # The log keeps the newest chapters; a six-hundred-chapter book would otherwise
 # grow one document until the window slows down.
 LOG_MAX_BLOCKS = 4000
+
+# How long «Проверить связь» waits for the scoring server. The check runs on the
+# GUI thread, and a server that is up answers /health in milliseconds.
+COMETKIWI_CHECK_TIMEOUT_SECONDS = 5.0
+# How much of each model name the check's warning shows: one of the two names
+# is whatever an unauthenticated server chose to send.
+COMETKIWI_MODEL_NAME_CHARS = 80
 
 
 def mask_key(value: str) -> str:
@@ -420,6 +428,9 @@ class TranslationQualityDialog(QDialog):
 
         self.cometkiwi_status_label = QLabel("", group)
         self.cometkiwi_status_label.setWordWrap(True)
+        # It repeats what the scoring server says about itself, and that server
+        # is unauthenticated: a QLabel would otherwise render its text as markup.
+        self.cometkiwi_status_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.cometkiwi_status_label)
 
         self.capability_status_label = QLabel("", group)
@@ -690,19 +701,28 @@ class TranslationQualityDialog(QDialog):
                 "Адрес пуст: оценка будет считаться на этом компьютере."
             )
             return
+        base_url = endpoint.rstrip("/")
+        # The rule scoring itself applies. An address scoring refuses as
+        # endpoint_invalid is named as such and never dialled: urllib would
+        # read "192.168.1.50:8765" as an unknown scheme and blame the firewall.
+        if not usable_endpoint(base_url):
+            self.cometkiwi_status_label.setText(
+                "Адрес не разобран: нужен вид http://host:port."
+            )
+            return
         import json
         import urllib.error
         import urllib.request
 
-        url = endpoint.rstrip("/") + "/health"
+        # No proxy of any kind, the system's included. Scoring reaches the PC
+        # through an aiohttp session that ignores them all; a check that took
+        # another route could fail where scoring works, or pass where it fails.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            with urllib.request.urlopen(url, timeout=5) as response:
-                health = json.loads(response.read(100_000))
-            loaded = "веса в памяти" if health.get("loaded") else "веса ещё не загружены"
-            self.cometkiwi_status_label.setText(
-                f"Связь есть: {health.get('model', '?')} на "
-                f"{health.get('device', '?')}, {loaded}."
-            )
+            with opener.open(
+                base_url + "/health", timeout=COMETKIWI_CHECK_TIMEOUT_SECONDS
+            ) as response:
+                raw = response.read(100_000)
         except urllib.error.HTTPError as error:
             # HTTPError subclasses URLError, so it must be caught first: a
             # server that answered with 404/500 is not the same failure as one
@@ -712,13 +732,52 @@ class TranslationQualityDialog(QDialog):
                 f"Сервер ответил ошибкой {error.code}: по этому адресу отвечает "
                 "не счётный сервер или не тот порт."
             )
+            return
         except urllib.error.URLError:
             self.cometkiwi_status_label.setText(
                 "Сервер не отвечает. Проверьте, запущен ли он на ПК, "
                 "и открыт ли порт в брандмауэре."
             )
+            return
+        except TimeoutError:
+            # urllib wraps a connection that never came up in URLError, but a
+            # read that times out after the server accepted escapes it bare.
+            self.cometkiwi_status_label.setText(
+                "Сервер принял соединение, но не ответил за "
+                f"{COMETKIWI_CHECK_TIMEOUT_SECONDS:g} с."
+            )
+            return
         except Exception:  # noqa: BLE001 - a failed check never breaks the dialog
+            self.cometkiwi_status_label.setText("Проверка связи не удалась.")
+            return
+        try:
+            health = json.loads(raw)
+        except ValueError:
+            health = None
+        if not isinstance(health, dict):
             self.cometkiwi_status_label.setText("Ответ сервера не разобран.")
+            return
+        loaded = "веса в памяти" if health.get("loaded") else "веса ещё не загружены"
+        text = (
+            f"Связь есть: {health.get('model', '?')} на "
+            f"{health.get('device', '?')}, {loaded}."
+        )
+        server_model = health.get("model")
+        configured_model = self._settings.cometkiwi_model
+        if (
+            isinstance(server_model, str)
+            and server_model
+            and configured_model
+            and server_model != configured_model
+        ):
+            # The journal keeps no model name, so this is the one place where a
+            # PC started under another model than the settings name shows up.
+            text += (
+                " Внимание: на ПК модель "
+                f"{server_model[:COMETKIWI_MODEL_NAME_CHARS]}, а в настройках — "
+                f"{configured_model[:COMETKIWI_MODEL_NAME_CHARS]}."
+            )
+        self.cometkiwi_status_label.setText(text)
 
     def _on_selection_changed(self, *_args) -> None:
         chapter_id = self.selected_chapter_id()
