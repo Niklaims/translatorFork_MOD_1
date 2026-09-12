@@ -128,7 +128,9 @@ class CometKiwiEstimator:
         self._config = config
         self._enabled = bool(enabled)
         self._license_accepted = bool(license_accepted)
-        self._run_process = run_process or run_runner_process
+        self._run_process = run_process or (
+            remote_transport(config) if config.is_remote else run_runner_process
+        )
         self._request_id_factory = request_id_factory or _default_request_id
 
     async def estimate(
@@ -237,6 +239,54 @@ async def run_runner_process(
     if len(stdout) > MAX_RESPONSE_BYTES:
         raise RunnerProcessError("response_too_large")
     return stdout.decode("utf-8", errors="replace")
+
+
+def remote_transport(config: CometKiwiRunnerConfig):
+    """Send one request to a runner on another machine, over the local network.
+
+    The signature matches ``run_runner_process`` on purpose: the estimator does
+    not know, and must not know, which side of the network answered it.  The
+    ``command`` argument is unused here and accepted only to keep that shape.
+    """
+
+    url = config.score_url()
+
+    async def send(command, payload, *, timeout, cancellation=None) -> str:
+        import aiohttp  # noqa: PLC0415 - only a remote estimate pays for it
+
+        session_timeout = aiohttp.ClientTimeout(total=timeout)
+        try:
+            async with aiohttp.ClientSession(timeout=session_timeout) as session:
+                async with session.post(
+                    url,
+                    data=payload.encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    if response.status != 200:
+                        raise RunnerProcessError(
+                            f"endpoint_status_{response.status}"
+                        )
+                    # Read in bounded chunks rather than one read(N+1) call: a
+                    # single read only returns whatever is already buffered
+                    # and can come back well under N+1 even when the sender
+                    # has far more queued, so it cannot be trusted alone to
+                    # catch an oversized answer.
+                    body = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        body.extend(chunk)
+                        if len(body) > MAX_RESPONSE_BYTES:
+                            raise RunnerProcessError("response_too_large")
+        except asyncio.CancelledError:
+            raise
+        except RunnerProcessError:
+            raise
+        except (TimeoutError, asyncio.TimeoutError):
+            raise TimeoutError("cometkiwi endpoint timed out") from None
+        except Exception:  # noqa: BLE001 - every network fault is one reason
+            raise RunnerProcessError("endpoint_unreachable") from None
+        return body.decode("utf-8", errors="replace")
+
+    return send
 
 
 def _terminate(process) -> None:
