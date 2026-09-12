@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import partial
 import hashlib
+import re
 import time
 from pathlib import Path
 
@@ -671,7 +672,7 @@ class TranslationQualityService:
         """
         metrics = result.metrics
         if metrics is None or getattr(estimate, "status", "") != "completed":
-            status = getattr(estimate, "status", "unavailable")
+            status = _quality_score_status(estimate)
             if metrics is None:
                 return result
             updated = replace(
@@ -1149,6 +1150,40 @@ class TranslationQualityService:
         except OSError:
             # A journal that cannot be written must not undo an applied repair.
             return
+
+
+# The reason can come from a runner process reached over the network - for a
+# remote COMETKiwi server, an unauthenticated one - and is about to be
+# written into translation_qa.json and the CSV export, so it is bounded to a
+# short machine-readable token before it is persisted.
+_REASON_PATTERN = re.compile(r"[a-z0-9_]{1,64}")
+
+
+# The value this returns is "<status>:<reason>"; a consumer that wants the
+# reason must split on the first ":".
+def _quality_score_status(estimate) -> str:
+    """Turn one quality estimate into the value stored in quality_score_status.
+
+    A completed estimate always gives "completed" - unchanged, and this is
+    also what clears an earlier reason once a chapter is rechecked and the
+    estimator answers again. A non-completed estimate whose metadata carries
+    a usable reason gives "<status>:<reason>". Anything else - no metadata,
+    no "reason" key, metadata that is not a mapping, or a reason that is not
+    a bounded lowercase token - gives the bare status, exactly as before this
+    function existed.
+    """
+    status = str(getattr(estimate, "status", "") or "unavailable")
+    if status == "completed":
+        return status
+    metadata = getattr(estimate, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return status
+    reason = metadata.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return status
+    if not _REASON_PATTERN.fullmatch(reason):
+        reason = "invalid_reason"
+    return f"{status}:{reason}"
 
 
 def _chapter_status(result: ChapterQaResult) -> str:

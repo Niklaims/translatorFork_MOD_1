@@ -31,6 +31,11 @@ SCHEMA_VERSION = 1
 # than a list of floats needs, and an unbounded read is a way to be hanged.
 MAX_RESPONSE_BYTES = 1_000_000
 DEFAULT_TIMEOUT_SECONDS = 900.0
+# The transport's own bound on the TCP handshake alone, separate from the
+# total budget above.  A live PC on a home LAN accepts in milliseconds; a
+# sleeping one whose address the router still remembers must not make a
+# chapter wait anywhere near the full timeout just to learn that.
+REMOTE_CONNECT_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,7 +259,14 @@ def remote_transport(config: CometKiwiRunnerConfig):
     async def send(command, payload, *, timeout, cancellation=None) -> str:
         import aiohttp  # noqa: PLC0415 - only a remote estimate pays for it
 
-        session_timeout = aiohttp.ClientTimeout(total=timeout)
+        # Resolved after the deferred import above: aiohttp gained this
+        # class in 3.10, and the project does not pin aiohttp's version.
+        connection_timeout_error = getattr(
+            aiohttp, "ConnectionTimeoutError", aiohttp.ServerTimeoutError
+        )
+        session_timeout = aiohttp.ClientTimeout(
+            total=timeout, sock_connect=REMOTE_CONNECT_TIMEOUT_SECONDS
+        )
         try:
             async with aiohttp.ClientSession(timeout=session_timeout) as session:
                 async with session.post(
@@ -280,6 +292,10 @@ def remote_transport(config: CometKiwiRunnerConfig):
             raise
         except RunnerProcessError:
             raise
+        except connection_timeout_error:
+            # The connection itself never came up - a sleeping or absent
+            # machine, not a slow one, so this must not become "timeout".
+            raise RunnerProcessError("endpoint_unreachable") from None
         except (TimeoutError, asyncio.TimeoutError):
             raise TimeoutError("cometkiwi endpoint timed out") from None
         except Exception:  # noqa: BLE001 - every network fault is one reason
