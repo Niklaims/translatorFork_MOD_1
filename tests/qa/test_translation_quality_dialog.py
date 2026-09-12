@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -330,3 +333,109 @@ def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
     dialog.cometkiwi_endpoint_edit.setText("")
 
     assert "cometkiwi" in dialog.capability_status_label.text()
+
+
+# --- _check_cometkiwi_endpoint's network path, over a real socket ---------
+#
+# In PyQt6 an exception escaping a slot reaches sys.excepthook, and by default
+# Qt's qFatal() aborts the whole application. The except branches below are
+# what stand between a bad address and a crashed app, so they are exercised
+# against a real local HTTP server rather than only the empty-address early
+# return. Each server is a ThreadingHTTPServer bound to an OS-assigned port
+# ("127.0.0.1", 0), served from a daemon thread, and torn down through
+# shutdown() then server_close() — the same idiom test_cometkiwi_server.py
+# uses for the real server this dialog eventually talks to, redefined locally
+# per this task's instructions rather than imported from that test module.
+
+
+def _answering(status: int, body: bytes):
+    """Build a request handler that answers every GET with one fixed response."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
+            pass
+
+    return _Handler
+
+
+class _RealHealthServer:
+    """A real local HTTP server, for exercising the check's actual socket path."""
+
+    def __init__(self, handler_class) -> None:
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+
+    def __enter__(self):
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        return False
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+
+def test_check_reports_a_healthy_server_over_a_real_connection(qt_app):
+    body = json.dumps(
+        {
+            "schema_version": 1,
+            "model": "wmt22-cometkiwi-da",
+            "device": "cuda",
+            "loaded": True,
+        }
+    ).encode("utf-8")
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, body)) as server:
+        dialog.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog._check_cometkiwi_endpoint()
+
+    text = dialog.cometkiwi_status_label.text()
+    assert "Связь есть" in text
+    assert "wmt22-cometkiwi-da" in text
+    assert "cuda" in text
+    assert "веса в памяти" in text
+
+
+def test_check_reports_an_unreachable_server(qt_app):
+    """Port 9 (discard) refuses at once, so this never waits out the timeout."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    dialog.cometkiwi_endpoint_edit.setText("http://127.0.0.1:9")
+
+    dialog._check_cometkiwi_endpoint()
+
+    assert "Сервер не отвечает" in dialog.cometkiwi_status_label.text()
+
+
+def test_check_reports_an_unparseable_response(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"not json")) as server:
+        dialog.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog._check_cometkiwi_endpoint()
+
+    assert dialog.cometkiwi_status_label.text() == "Ответ сервера не разобран."
+
+
+def test_check_reports_an_http_error_distinctly_from_unreachable(qt_app):
+    """A 404 from the wrong service must not be blamed on a firewall."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(404, b'{"error": "not_found"}')) as server:
+        dialog.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog._check_cometkiwi_endpoint()
+
+    text = dialog.cometkiwi_status_label.text()
+    assert "ответил ошибкой 404" in text
+    assert "брандмауэр" not in text

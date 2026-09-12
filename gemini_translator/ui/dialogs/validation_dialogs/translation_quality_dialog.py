@@ -703,6 +703,15 @@ class TranslationQualityDialog(QDialog):
                 f"Связь есть: {health.get('model', '?')} на "
                 f"{health.get('device', '?')}, {loaded}."
             )
+        except urllib.error.HTTPError as error:
+            # HTTPError subclasses URLError, so it must be caught first: a
+            # server that answered with 404/500 is not the same failure as one
+            # that never answered, and telling the user to check their
+            # firewall for the wrong reason is worse than a vague message.
+            self.cometkiwi_status_label.setText(
+                f"Сервер ответил ошибкой {error.code}: по этому адресу отвечает "
+                "не счётный сервер или не тот порт."
+            )
         except urllib.error.URLError:
             self.cometkiwi_status_label.setText(
                 "Сервер не отвечает. Проверьте, запущен ли он на ПК, "
