@@ -19,7 +19,8 @@
 - The server takes its model directory and device from its own command line and ignores the `model_dir` and `device` fields of any request.
 - No new third-party dependency. `aiohttp` is already in `requirements.txt`; the PC server uses only the standard library plus what the existing runner already needs.
 - Run tests with the project interpreter: `.venv/bin/python -m pytest`.
-- Comments and docstrings in the application code are written in English, matching the surrounding files. The plan and the spec are in Russian.
+- Comments and docstrings in the application code are written in English, matching the surrounding files. The spec is in Russian; this plan is in English.
+- A commit trailer names the model that actually wrote the commit, exactly as your own harness gives it. Never copy a model name from this plan: the commit blocks below leave it as a placeholder on purpose.
 
 ---
 
@@ -190,7 +191,7 @@ Expected: PASS, all of them.
 git add gemini_translator/qa/estimators/cometkiwi_client.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): let the CometKiwi config name a runner on another machine
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -428,7 +429,7 @@ Expected: PASS
 git add gemini_translator/qa/estimators/cometkiwi_client.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): score a chapter through a CometKiwi runner on the network
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -549,7 +550,7 @@ Expected: PASS, including every test that existed before.
 git add tools/translation_qa_cometkiwi_runner.py tests/qa/test_cometkiwi_runner_protocol.py
 git commit -m "refactor(qa): separate loading the CometKiwi weights from scoring with them
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -978,7 +979,7 @@ Expected: PASS
 git add tools/translation_qa_cometkiwi_server.py tests/qa/test_cometkiwi_server.py
 git commit -m "feat(qa): serve CometKiwi scoring from the machine that owns the GPU
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1151,7 +1152,7 @@ Expected: PASS, every test in the directory.
 git add gemini_translator/qa/settings.py gemini_translator/qa/estimators/cometkiwi_model_manager.py gemini_translator/qa/assembly.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): accept a network address in place of a local CometKiwi runner
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1316,7 +1317,7 @@ Expected: PASS
 git add gemini_translator/ui/dialogs/validation_dialogs/translation_quality_dialog.py tests/qa/test_translation_quality_dialog.py
 git commit -m "feat(ui): type the CometKiwi server address and check it answers
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1356,10 +1357,16 @@ pause
 
 - [ ] **Step 2: Write the documentation**
 
-Append a section to `docs/translation-quality-qa.md`. Match the heading level and tone of the sections already there.
+Do NOT append to the end of `docs/translation-quality-qa.md`: the file ends with `## Что проверка не делает`, a list of limitations. Insert the subsection below at the END of the existing `## Дополнительные анализаторы` section — immediately before the line `## Что проверка не делает` — so it sits beside the table that already describes COMETKiwi, under the same name the dialog gives the group that holds the new field.
+
+In the same section, the COMETKiwi row of the analyzers table currently says the analyzer «Требует отдельного runner'а, согласия с лицензией и заметных ресурсов.» That stops being true once an address can stand in for the runner. Change exactly that sentence to:
+
+«Требует отдельного runner'а или адреса счётного сервера на другом компьютере, согласия с лицензией и заметных ресурсов.»
+
+Leave the rest of the row, and the rest of the table, as it is.
 
 ```markdown
-## Счёт качества на другом компьютере
+### Счёт качества на другом компьютере
 
 COMETKiwi можно считать не на той машине, где идёт перевод, а на домашнем ПК с
 видеокартой. Перевод при этом ничего не ждёт: если ПК выключен, глава просто
@@ -1376,8 +1383,9 @@ COMETKiwi можно считать не на той машине, где идё
    **частной** сети.
 4. На роутере закрепите за ПК постоянный адрес (резервирование DHCP). Без этого
    адрес сменится после перезагрузки, и оценки тихо пропадут.
-5. В окне «Качество перевода» впишите адрес вида `http://192.168.1.50:8765` и
-   нажмите «Проверить связь». Должно ответить именем модели и устройством.
+5. Откройте **🎯 Качество перевода**, вкладку «Настройки проверки», группу
+   «Дополнительные анализаторы». Впишите адрес вида `http://192.168.1.50:8765`
+   и нажмите «Проверить связь» — должно ответить именем модели и устройством.
 
 Пустое поле адреса возвращает прежнее поведение: счёт идёт на этой машине через
 локальный `translation_qa_cometkiwi_runner.py`.
@@ -1400,7 +1408,7 @@ Expected: prints `Каталог весов не найден: /nope` and exits 
 git add tools/start_cometkiwi_server.bat docs/translation-quality-qa.md
 git commit -m "docs(qa): explain how to run CometKiwi on the PC with the GPU
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1414,11 +1422,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Run: `.venv/bin/python -m pytest tests/ -q`
 
-Expected: no new failures. Three failures in `tests/test_dedup_pcluster_22_safe_call.py` pre-date this work and come from unrelated uncommitted changes in `gemini_translator/core/chapter_qa_coordinator.py`; confirm they are the same three and nothing else.
+Expected: 0 failures. This worktree's baseline, measured before Task 1, was 4407 passed, 9 skipped, 0 failures, so every failure you see was caused by this branch and must be fixed. An earlier draft of this step said three failures in `tests/test_dedup_pcluster_22_safe_call.py` pre-dated the work; that was true only of the main checkout's uncommitted changes, which this branch does not carry. Do not excuse any failure on that basis, in that file or any other.
 
 - [ ] **Step 2: Confirm the local path is untouched**
 
-Run: `git diff --stat HEAD~7 -- tests/qa/test_cometkiwi_estimator.py tests/qa/test_cometkiwi_runner_protocol.py`
+Run: `git diff --stat e332930 -- tests/qa/test_cometkiwi_estimator.py tests/qa/test_cometkiwi_runner_protocol.py`
+
+`e332930` is the commit this branch was created from. Do not substitute `HEAD~N`: the branch carries plan-document commits and one task landed as three commits, so any fixed offset points into the middle of the branch and the check would silently cover the wrong range.
 Expected: `test_cometkiwi_estimator.py` unchanged; `test_cometkiwi_runner_protocol.py` has only the two appended tests from Task 3 and no edits to existing ones.
 
 - [ ] **Step 3: Commit any fixes**
@@ -1427,7 +1437,7 @@ Expected: `test_cometkiwi_estimator.py` unchanged; `test_cometkiwi_runner_protoc
 git add -- <named files only>
 git commit -m "fix(qa): <what the suite caught>
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 **Note:** this repository is shared with other sessions. Always stage files by name; never `git add -A`.
