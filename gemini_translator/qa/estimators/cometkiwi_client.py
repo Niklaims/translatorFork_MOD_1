@@ -14,6 +14,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .base import (
     QualityEstimate,
@@ -42,9 +43,15 @@ class CometKiwiRunnerConfig:
     device: str = "cpu"
     python_executable: str = ""
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    # Where the runner lives.  Empty means this machine, in a subprocess, which
+    # is what every existing installation does.  Set means another machine on
+    # the local network answers the same protocol over HTTP: the runner script
+    # and the weights are on that machine, and asking for them here would
+    # switch the whole capability off for a setup that is perfectly valid.
+    endpoint: str = ""
 
     def __post_init__(self) -> None:
-        for field_name in ("runner_path", "model_dir", "model", "device"):
+        for field_name in ("runner_path", "model_dir", "model", "device", "endpoint"):
             value = getattr(self, field_name)
             if not isinstance(value, str):
                 raise QualityEstimateError(f"{field_name} must be a string")
@@ -55,14 +62,28 @@ class CometKiwiRunnerConfig:
         if self.timeout_seconds <= 0:
             raise QualityEstimateError("timeout_seconds must be positive")
 
+    @property
+    def is_remote(self) -> bool:
+        """Report whether scoring happens on another machine."""
+        return bool(self.endpoint.strip())
+
+    def _base_url(self) -> str:
+        return self.endpoint.strip().rstrip("/")
+
+    def score_url(self) -> str:
+        """The address one scoring request is sent to."""
+        return f"{self._base_url()}/score"
+
     def setup_problem(self) -> str:
         """Name the one thing that is missing, or an empty string when ready."""
+        if not self.model.strip():
+            return "model_missing"
+        if self.is_remote:
+            return "" if _usable_endpoint(self._base_url()) else "endpoint_invalid"
         if not self.runner_path.strip():
             return "runner_missing"
         if not Path(self.runner_path).is_file():
             return "runner_not_found"
-        if not self.model.strip():
-            return "model_missing"
         if not self.model_dir.strip() or not Path(self.model_dir).is_dir():
             return "weights_missing"
         return ""
@@ -73,6 +94,21 @@ class CometKiwiRunnerConfig:
         if interpreter:
             return (interpreter, self.runner_path)
         return (self.runner_path,)
+
+
+def _usable_endpoint(url: str) -> bool:
+    """Report whether the address can be dialled at all, without dialling it."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "http" or not parts.hostname:
+        return False
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return port is None or 1 <= port <= 65535
 
 
 class CometKiwiEstimator:
