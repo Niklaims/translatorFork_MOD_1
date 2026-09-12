@@ -106,6 +106,7 @@ def test_configured_analyzers_become_effective():
         ),
         language_tool_endpoint="http://localhost:8081/v2/check",
         cometkiwi_runner_path="/opt/cometkiwi/run",
+        cometkiwi_model="wmt22-cometkiwi-da",
         cometkiwi_license_accepted=True,
     )
 

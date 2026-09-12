@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
+from gemini_translator.qa.capabilities import QaCapabilityKey
 from gemini_translator.qa.estimators.base import (
     QualityEstimateRequest,
     SourceTranslationWindow,
@@ -20,6 +21,7 @@ from gemini_translator.qa.estimators.cometkiwi_client import (
     RunnerProcessError,
     remote_transport,
 )
+from gemini_translator.qa.settings import QaCapabilitySettings, QaSettings
 
 
 def _remote(**overrides) -> CometKiwiRunnerConfig:
@@ -211,3 +213,59 @@ def test_an_explicit_transport_still_wins_over_the_address():
     estimate = asyncio.run(estimator.estimate(_request()))
 
     assert estimate.status == "completed"
+
+
+# --- settings and readiness: an address stands in for a local install -----
+
+
+def _settings(**overrides) -> QaSettings:
+    values = {
+        "capabilities": QaCapabilitySettings(cometkiwi_enabled=True),
+        "cometkiwi_model": "wmt22-cometkiwi-da",
+        "cometkiwi_license_accepted": True,
+        "cometkiwi_endpoint": "http://192.168.1.50:8765",
+    }
+    values.update(overrides)
+    return QaSettings(**values)
+
+
+def test_an_address_stands_in_for_the_local_runner_and_weights():
+    """Иначе возможность выключится молча: раннера и весов на этой машине нет."""
+    settings = _settings()
+
+    assert settings.cometkiwi_is_remote is True
+    assert QaCapabilityKey.COMETKIWI.value not in settings.unsatisfied_requirements()
+    assert settings.effective_capabilities().cometkiwi_enabled is True
+
+
+def test_without_an_address_the_local_runner_is_still_required():
+    settings = _settings(cometkiwi_endpoint="")
+
+    assert QaCapabilityKey.COMETKIWI.value in settings.unsatisfied_requirements()
+    assert settings.effective_capabilities().cometkiwi_enabled is False
+
+
+def test_the_licence_is_owed_in_both_modes():
+    settings = _settings(cometkiwi_license_accepted=False)
+
+    assert QaCapabilityKey.COMETKIWI.value in settings.unsatisfied_requirements()
+
+
+def test_the_address_survives_a_save_and_a_load():
+    settings = _settings()
+
+    assert QaSettings.from_dict(settings.to_dict()).cometkiwi_endpoint == (
+        "http://192.168.1.50:8765"
+    )
+
+
+def test_the_setup_description_asks_for_the_address_not_for_local_weights():
+    from gemini_translator.qa.estimators.cometkiwi_model_manager import (
+        describe_cometkiwi_setup,
+    )
+
+    assert describe_cometkiwi_setup(_settings(), None, None) == ""
+    described = describe_cometkiwi_setup(_settings(cometkiwi_model=""), None, None)
+    assert "модель" in described
+    assert "путь к runner" not in described
+    assert "установленные веса" not in described

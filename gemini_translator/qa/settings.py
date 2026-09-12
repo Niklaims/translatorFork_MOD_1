@@ -71,6 +71,9 @@ class QaSettings:
     cometkiwi_runner_path: str = ""
     cometkiwi_model: str = ""
     cometkiwi_device: str = "cpu"
+    # The runner on another machine, as ``http://host:port``.  Empty means the
+    # local subprocess, which is what every existing installation uses.
+    cometkiwi_endpoint: str = ""
     cometkiwi_license_accepted: bool = False
 
     def __post_init__(self) -> None:
@@ -142,6 +145,7 @@ class QaSettings:
             "language_tool_endpoint",
             "cometkiwi_runner_path",
             "cometkiwi_model",
+            "cometkiwi_endpoint",
         ):
             object.__setattr__(self, field_name, str(getattr(self, field_name) or "").strip())
         for field_name in (
@@ -214,6 +218,7 @@ class QaSettings:
             "cometkiwi_runner_path": self.cometkiwi_runner_path,
             "cometkiwi_model": self.cometkiwi_model,
             "cometkiwi_device": self.cometkiwi_device,
+            "cometkiwi_endpoint": self.cometkiwi_endpoint,
             "cometkiwi_license_accepted": self.cometkiwi_license_accepted,
         }
 
@@ -239,13 +244,20 @@ class QaSettings:
                 return "Для OpenAI-совместимых эмбеддингов не указан адрес сервиса."
         return ""
 
+    @property
+    def cometkiwi_is_remote(self) -> bool:
+        """Report whether scoring is configured to happen on another machine."""
+        return bool(self.cometkiwi_endpoint)
+
     def unsatisfied_requirements(self) -> tuple[str, ...]:
         """Return the capabilities that are switched on but not yet set up."""
         missing: list[str] = []
         if self.capabilities.language_tool_enabled and not self.language_tool_endpoint:
             missing.append(QaCapabilityKey.LANGUAGE_TOOL.value)
         if self.capabilities.cometkiwi_enabled and (
-            not self.cometkiwi_runner_path or not self.cometkiwi_license_accepted
+            not (self.cometkiwi_endpoint or self.cometkiwi_runner_path)
+            or not self.cometkiwi_model
+            or not self.cometkiwi_license_accepted
         ):
             missing.append(QaCapabilityKey.COMETKIWI.value)
         return tuple(missing)

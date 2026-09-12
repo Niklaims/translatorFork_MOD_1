@@ -188,16 +188,21 @@ def describe_cometkiwi_setup(
     if not getattr(settings.capabilities, "cometkiwi_enabled", False):
         return ""
     missing: list[str] = []
-    if not str(getattr(settings, "cometkiwi_runner_path", "") or "").strip():
+    remote = bool(str(getattr(settings, "cometkiwi_endpoint", "") or "").strip())
+    if not remote and not str(getattr(settings, "cometkiwi_runner_path", "") or "").strip():
         missing.append("путь к runner")
     if not str(getattr(settings, "cometkiwi_model", "") or "").strip():
         missing.append("модель")
     if not getattr(settings, "cometkiwi_license_accepted", False):
         missing.append("принятая лицензия")
-    if status is None or status.state != "ready":
+    if not remote and (status is None or status.state != "ready"):
         missing.append("установленные веса")
     if missing:
         return "COMETKiwi: требует настройки — не хватает: " + ", ".join(missing) + "."
+    if status is None or status.state != "ready":
+        # Remote scoring has no local install to describe: the weights live on
+        # the other machine, so there is nothing further to add here.
+        return ""
 
     parts = [
         f"COMETKiwi: {status.model}",

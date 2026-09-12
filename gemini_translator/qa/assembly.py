@@ -681,13 +681,17 @@ def build_quality_estimator(qa_settings: QaSettings, paths: "ProjectQaPaths"):
             CometKiwiRunnerConfig,
         )
 
+        remote = bool(qa_settings.cometkiwi_endpoint)
         config = CometKiwiRunnerConfig(
-            runner_path=qa_settings.cometkiwi_runner_path,
-            model_dir=str(paths.cometkiwi_models / qa_settings.cometkiwi_model)
-            if qa_settings.cometkiwi_model
-            else "",
+            runner_path="" if remote else qa_settings.cometkiwi_runner_path,
+            # The weights are on the other machine; a local path built here
+            # would point at a directory that does not exist.
+            model_dir=""
+            if remote or not qa_settings.cometkiwi_model
+            else str(paths.cometkiwi_models / qa_settings.cometkiwi_model),
             model=qa_settings.cometkiwi_model,
             device=qa_settings.cometkiwi_device,
+            endpoint=qa_settings.cometkiwi_endpoint,
         )
         return CometKiwiEstimator(
             config,
