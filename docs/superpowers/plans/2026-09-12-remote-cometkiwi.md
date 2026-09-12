@@ -31,7 +31,7 @@
 
 **Interfaces:**
 - Consumes: `CometKiwiRunnerConfig`, `QualityEstimateError` from `cometkiwi_client.py`.
-- Produces: `CometKiwiRunnerConfig.endpoint: str` (default `""`), `CometKiwiRunnerConfig.is_remote` property returning `bool`, and `setup_problem()` returning `"endpoint_invalid"` for a malformed address.
+- Produces: `CometKiwiRunnerConfig.endpoint: str` (default `""`), `CometKiwiRunnerConfig.is_remote` property returning `bool`, `score_url()` returning the POST address, and `setup_problem()` returning `"endpoint_invalid"` for a malformed address. Do NOT add a `health_url()` helper: the dialog in Task 6 holds a `QaSettings`, not this config, and builds its own health URL inline.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -97,7 +97,6 @@ def test_a_trailing_slash_does_not_make_a_second_address():
         "http://192.168.1.50:8765/score"
     )
     assert _remote().score_url() == "http://192.168.1.50:8765/score"
-    assert _remote().health_url() == "http://192.168.1.50:8765/health"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -144,10 +143,6 @@ Add the property and the two URL helpers, and rewrite `setup_problem()`:
     def score_url(self) -> str:
         """The address one scoring request is sent to."""
         return f"{self._base_url()}/score"
-
-    def health_url(self) -> str:
-        """The address that answers without loading the model."""
-        return f"{self._base_url()}/health"
 
     def setup_problem(self) -> str:
         """Name the one thing that is missing, or an empty string when ready."""
@@ -1168,7 +1163,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/qa/test_translation_quality_dialog.py` (append)
 
 **Interfaces:**
-- Consumes: `QaSettings.cometkiwi_endpoint` from Task 5, `CometKiwiRunnerConfig.health_url()` from Task 1.
+- Consumes: `QaSettings.cometkiwi_endpoint` from Task 5. The dialog builds the health URL inline from that string; it does not construct a `CometKiwiRunnerConfig`.
 - Produces: `self.cometkiwi_endpoint_edit` (a `QLineEdit`) and `self.cometkiwi_check_button` (a `QPushButton`) on the dialog.
 
 **The harness already exists** in `tests/qa/test_translation_quality_dialog.py`: that file sets `QT_QPA_PLATFORM=offscreen` at import, defines a module-scoped `qt_app` fixture, and builds the dialog with `TranslationQualityDialog(**kwargs)`. Use those. The dialog takes `settings=` as a keyword argument and hands its collected settings back from `qa_settings()` — not `collect_settings()`.
