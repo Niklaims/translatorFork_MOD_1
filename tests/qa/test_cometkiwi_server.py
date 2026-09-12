@@ -307,3 +307,77 @@ def test_the_log_never_carries_a_word_of_the_chapter(server_module, capsys):
     captured = capsys.readouterr()
     assert phrase not in captured.err
     assert phrase not in captured.out
+
+
+# --- the transport-layer backstop, and the guard next to it ---------------
+#
+# Review found two gaps in the same handler: an exception that escapes
+# do_GET/do_POST used to reach socketserver's own handle_error, which prints
+# a full traceback and never goes through log_message; and a negative
+# Content-Length parsed fine but sent rfile.read() to read until EOF, hanging
+# the request thread. Both are fixed in build_handler; these tests pin both.
+
+
+def test_an_exception_that_escapes_the_service_leaks_neither_itself_nor_the_chapter(
+    server_module, capsys
+):
+    """Safe even if ScoringService's own catch-all is bypassed entirely.
+
+    ``socketserver.BaseServer.handle_error`` prints a full traceback for any
+    exception ``do_POST`` does not catch itself, and it never goes through
+    ``log_message``. A fake service whose ``handle`` raises directly (rather
+    than a real ``ScoringService``, whose own ``handle`` already turns
+    exceptions into a short reason) proves the handler's own backstop catches
+    it independently of that inner discipline.
+    """
+    exception_text = "traceback-leak-canary-4f2c8e19"
+    chapter_phrase = "ГлаваКоторуюНельзяУвидетьВЛоге-a1b2c3"
+
+    class _RaisingService:
+        def health(self) -> dict:
+            return {
+                "schema_version": 1,
+                "model": "m",
+                "device": "cpu",
+                "loaded": False,
+            }
+
+        def handle(self, payload):
+            raise RuntimeError(exception_text)
+
+    with _RealServer(server_module, _RaisingService()) as server:
+        status, body = _post(
+            server.base_url,
+            "/score",
+            _payload(segments=[{"source": "源", "translation": chapter_phrase}]),
+        )
+
+    captured = capsys.readouterr()
+    assert status == 500
+    assert body == {"error": "server_error"}
+    assert exception_text not in captured.err
+    assert exception_text not in captured.out
+    assert chapter_phrase not in captured.err
+    assert chapter_phrase not in captured.out
+
+
+def test_a_negative_content_length_is_refused_promptly_not_read_until_eof(
+    server_module,
+):
+    """``int("-1")`` parses fine; ``rfile.read(-1)`` reads until EOF and hangs."""
+    service, _, loads = _service(server_module)
+    with _RealServer(server_module, service) as server:
+        connection = http.client.HTTPConnection(server.host, server.port, timeout=5)
+        try:
+            connection.putrequest("POST", "/score")
+            connection.putheader("Content-Length", "-1")
+            connection.endheaders()
+            response = connection.getresponse()
+            status = response.status
+            body = json.loads(response.read())
+        finally:
+            connection.close()
+
+    assert status == 400
+    assert body == {"error": "invalid_request"}
+    assert loads == []

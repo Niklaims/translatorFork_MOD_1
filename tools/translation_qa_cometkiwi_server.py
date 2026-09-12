@@ -153,31 +153,74 @@ def build_handler(service: ScoringService):
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "CometKiwiQA/1"
+        _responded = False
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
-            if self.path.rstrip("/") != "/health":
-                self._send(404, {"error": "not_found"})
-                return
-            self._send(200, service.health())
+            self._responded = False
+            try:
+                if self.path.rstrip("/") != "/health":
+                    self._send(404, {"error": "not_found"})
+                    return
+                self._send(200, service.health())
+            except Exception:  # noqa: BLE001 - the transport-layer backstop below
+                self._fail_safely()
 
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
-            if self.path.rstrip("/") != "/score":
-                self._send(404, {"error": "not_found"})
+            self._responded = False
+            try:
+                if self.path.rstrip("/") != "/score":
+                    self._send(404, {"error": "not_found"})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    self._send(400, {"error": "invalid_request"})
+                    return
+                if length < 0:
+                    # int("-1") parses fine, and rfile.read(-1) reads until EOF -
+                    # a negative length is malformed, not merely "too large",
+                    # so it gets the same answer as any other unparsable value.
+                    self._send(400, {"error": "invalid_request"})
+                    return
+                if length > MAX_REQUEST_BYTES:
+                    self._send(413, {"error": "request_too_large"})
+                    return
+                try:
+                    payload = json.loads(self.rfile.read(length) or b"")
+                except ValueError:
+                    self._send(400, {"error": "invalid_request"})
+                    return
+                self._send(200, service.handle(payload))
+            except Exception:  # noqa: BLE001 - the transport-layer backstop below
+                self._fail_safely()
+
+        def _fail_safely(self) -> None:
+            """Catch whatever ``ScoringService.handle`` did not.
+
+            That method already turns every exception it sees into a short
+            reason with no request content in it, but that is one function's
+            discipline, not a structural guarantee against everything
+            between the socket and it. Left uncaught, an exception here
+            would reach ``socketserver.BaseServer.handle_error``, which
+            prints a full traceback and never goes through ``log_message``
+            at all. This is the transport-layer backstop: one fixed log
+            line and, if nothing has been sent yet, one fixed body -
+            regardless of what broke or what the request contained.
+            """
+            self.log_message("unhandled exception")
+            if self._responded:
                 return
             try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                self._send(400, {"error": "invalid_request"})
-                return
-            if length > MAX_REQUEST_BYTES:
-                self._send(413, {"error": "request_too_large"})
-                return
-            try:
-                payload = json.loads(self.rfile.read(length) or b"")
-            except ValueError:
-                self._send(400, {"error": "invalid_request"})
-                return
-            self._send(200, service.handle(payload))
+                encoded = json.dumps({"error": "server_error"}).encode("utf-8")
+                self.send_response_only(500)
+                self.send_header("Server", self.version_string())
+                self.send_header("Date", self.date_time_string())
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+            except Exception:  # noqa: BLE001 - the connection may already be gone
+                pass
 
         def _send(self, status: int, body: dict) -> None:
             encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -185,6 +228,10 @@ def build_handler(service: ScoringService):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
+            # Headers are irreversibly on the wire past this point: a later
+            # failure (e.g. the client vanishing mid-write) must not trigger
+            # a second send_response() call.
+            self._responded = True
             self.wfile.write(encoded)
 
         def log_message(self, fmt, *args):
