@@ -77,12 +77,20 @@ def read_request(stream) -> dict:
     return payload
 
 
-def score(payload: dict) -> list[float]:
-    """Import the deep-learning stack only now, and only for a valid request."""
+def load_model(model_dir: Path | str):
+    """Import the deep-learning stack only now, and load the installed weights.
+
+    Split out of ``score`` so a long-lived server may load once and answer many
+    requests; the console runner still loads and scores in one breath.
+    """
     from comet import load_from_checkpoint  # noqa: PLC0415 - deliberately late
 
-    checkpoint = _checkpoint_path(Path(payload["model_dir"]))
-    model = load_from_checkpoint(str(checkpoint))
+    checkpoint = _checkpoint_path(Path(model_dir))
+    return load_from_checkpoint(str(checkpoint))
+
+
+def score_with(model, payload: dict) -> list[float]:
+    """Score one validated request with a model that is already loaded."""
     data = [
         {"src": segment["source"], "mt": segment["translation"]}
         for segment in payload["segments"]
@@ -100,6 +108,11 @@ def score(payload: dict) -> list[float]:
     if scores is None:
         raise RequestError("invalid_model_output")
     return [float(value) for value in scores]
+
+
+def score(payload: dict) -> list[float]:
+    """Load the weights this request names and score it in one call."""
+    return score_with(load_model(payload["model_dir"]), payload)
 
 
 def _checkpoint_path(model_dir: Path) -> Path:
