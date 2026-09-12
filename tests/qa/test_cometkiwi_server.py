@@ -7,8 +7,10 @@ from http.server import ThreadingHTTPServer
 import importlib.util
 import json
 from pathlib import Path
+import socket
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -170,13 +172,27 @@ def test_a_failing_model_answers_a_reason_and_never_the_chapter_text(server_modu
 # side of this same wire protocol.
 
 
+class _JoinedServer(ThreadingHTTPServer):
+    """A ThreadingHTTPServer whose server_close() waits for its request threads.
+
+    ThreadingHTTPServer serves each request on a daemon thread, and
+    socketserver's server_close() joins only non-daemon ones. The handler now
+    writes its log line after the answer, so a client can return before that
+    line exists; with daemon threads, captured stderr read after the ``with``
+    block would still race the request thread.
+    """
+
+    daemon_threads = False
+
+
 class _RealServer:
     """A real HTTP server on a free port, built from the module's own handler."""
 
-    def __init__(self, server_module, service) -> None:
-        self._httpd = ThreadingHTTPServer(
-            ("127.0.0.1", 0), server_module.build_handler(service)
-        )
+    def __init__(self, server_module, service, *, handler_timeout=None) -> None:
+        handler = server_module.build_handler(service)
+        if handler_timeout is not None:
+            handler.timeout = handler_timeout
+        self._httpd = _JoinedServer(("127.0.0.1", 0), handler)
         self.host = "127.0.0.1"
         self.port = self._httpd.server_address[1]
         self.base_url = f"http://{self.host}:{self.port}"
@@ -359,6 +375,8 @@ def test_an_exception_that_escapes_the_service_leaks_neither_itself_nor_the_chap
     assert exception_text not in captured.out
     assert chapter_phrase not in captured.err
     assert chapter_phrase not in captured.out
+    # One fixed line for the whole failure, written after the 500 went out.
+    assert captured.err == "POST /score -> unhandled exception\n"
 
 
 def test_a_negative_content_length_is_refused_promptly_not_read_until_eof(
@@ -381,3 +399,271 @@ def test_a_negative_content_length_is_refused_promptly_not_read_until_eof(
     assert status == 400
     assert body == {"error": "invalid_request"}
     assert loads == []
+
+
+# --- the request log: never a traceback, never the request, always after ----
+#
+# log_message used to read self.command and self.path, which the stdlib has
+# not set yet when it reports a malformed request line: the AttributeError
+# went to socketserver's handle_error, which printed a traceback and sent the
+# client nothing. The same line said "done" whatever the outcome, and it was
+# written from send_response(), before the answer, so a Windows console
+# holding a text selection held the answer as well. The line now follows the
+# answer, which is why every assertion that a line IS present reads captured
+# stderr only after _RealServer has closed the server and joined its threads.
+
+
+def _exchange(host: str, port: int, raw: bytes) -> bytes:
+    """Send raw bytes on a fresh connection and read until the server closes it."""
+    with socket.create_connection((host, port), timeout=5) as connection:
+        connection.sendall(raw)
+        received = bytearray()
+        while chunk := connection.recv(65536):
+            received.extend(chunk)
+    return bytes(received)
+
+
+@pytest.mark.parametrize(
+    "raw, status_line",
+    [
+        # Four words ending in a valid version: the stdlib records that
+        # version before it rejects the syntax, so its 400 has a status line.
+        (b"GET /a /b-canary-5e1d HTTP/1.1\r\n", b"HTTP/1.0 400 "),
+        # One byte over the stdlib's 65536-byte limit and nothing after it:
+        # the server reads every byte it was sent, so it closes cleanly
+        # instead of resetting a connection with unread data in it.
+        (b"GET /" + b"a" * 65532, b"HTTP/1.0 414 "),
+    ],
+    ids=["malformed-request-line", "request-line-over-65536-bytes"],
+)
+def test_a_malformed_request_line_is_answered_4xx_not_dropped(
+    server_module, capsys, raw, status_line
+):
+    service, _, loads = _service(server_module)
+    with _RealServer(server_module, service) as server:
+        response = _exchange(server.host, server.port, raw)
+
+    captured = capsys.readouterr()
+    assert response.startswith(status_line)
+    assert "Traceback" not in captured.err
+    assert "canary" not in captured.err
+    assert loads == []
+
+
+def test_a_request_line_with_an_unparsable_version_gets_an_answer_not_a_traceback(
+    server_module, capsys
+):
+    """The review's own probe line.
+
+    The stdlib rejects the last word as a version before it has recorded any
+    version at all, so it answers the way HTTP/0.9 is answered: an error page
+    with no status line. What matters here is that the page is sent at all.
+    """
+    service, _, _ = _service(server_module)
+    with _RealServer(server_module, service) as server:
+        response = _exchange(
+            server.host, server.port, b"GET / HTTP/1.1 canary-77d0\r\n"
+        )
+
+    captured = capsys.readouterr()
+    assert b"400" in response
+    assert "Traceback" not in captured.err
+    assert "canary" not in captured.err
+
+
+def test_log_message_writes_its_fixed_format_and_never_its_arguments(
+    server_module, capsys
+):
+    """For a malformed request line the stdlib passes that raw line as an argument."""
+    service, _, _ = _service(server_module)
+    handler_class = server_module.build_handler(service)
+    # No request was ever parsed on this instance: command and path are unset.
+    handler = handler_class.__new__(handler_class)
+
+    handler.log_message("code %d, message %s", 400, "Bad request syntax ('canary')")
+
+    assert capsys.readouterr().err == "? ? -> code %d, message %s\n"
+
+
+def test_each_answer_is_logged_with_its_own_status(server_module, capsys):
+    service, _, _ = _service(server_module)
+    with _RealServer(server_module, service) as server:
+        score_status, _ = _post(server.base_url, "/score", _payload())
+        health_status, _ = _get(server.base_url, "/health")
+        missing_status, _ = _get(server.base_url, "/nope")
+
+    captured = capsys.readouterr()
+    assert (score_status, health_status, missing_status) == (200, 200, 404)
+    # Each line follows its own answer, so two requests in a row may log in
+    # either order.
+    assert sorted(captured.err.splitlines()) == sorted(
+        ["POST /score -> 200", "GET /health -> 200", "GET ? -> 404"]
+    )
+
+
+def test_a_path_this_server_does_not_serve_never_reaches_the_log(
+    server_module, capsys
+):
+    """A path is the client's own text: only a route this server serves is named."""
+    service, _, _ = _service(server_module)
+    with _RealServer(server_module, service) as server:
+        response = _exchange(
+            server.host, server.port, b"GET /\x1b[2Jcanary-3c9a HTTP/1.0\r\n\r\n"
+        )
+
+    captured = capsys.readouterr()
+    assert response.startswith(b"HTTP/1.0 404 ")
+    assert captured.err == "GET ? -> 404\n"
+
+
+# --- a client that stops sending ---------------------------------------------
+
+
+def test_the_handler_gives_up_on_a_silent_connection_after_a_minute(server_module):
+    service, _, _ = _service(server_module)
+
+    assert server_module.build_handler(service).timeout == 60
+
+
+def test_a_client_that_stalls_mid_body_is_disconnected(server_module):
+    """Without a socket timeout this request thread would wait in rfile.read() for good."""
+    service, _, loads = _service(server_module)
+    with _RealServer(server_module, service, handler_timeout=0.5) as server:
+        with socket.create_connection(
+            (server.host, server.port), timeout=5
+        ) as connection:
+            connection.sendall(
+                b"POST /score HTTP/1.0\r\nContent-Length: 100\r\n\r\n" + b'{"schema'
+            )
+            started = time.monotonic()
+            try:
+                while connection.recv(65536):
+                    pass
+            except TimeoutError:
+                pytest.fail("the server kept a stalled connection open")
+            elapsed = time.monotonic() - started
+
+    assert 0.3 <= elapsed < 3
+    assert loads == []
+
+
+# --- one server per port on Windows ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "platform, reuses_address", [("win32", False), ("darwin", True)]
+)
+def test_the_server_refuses_to_share_its_port_only_on_windows(
+    server_module, monkeypatch, platform, reuses_address
+):
+    """On Windows SO_REUSEADDR lets a second process bind a port already listening."""
+    service, _, _ = _service(server_module)
+    monkeypatch.setattr(sys, "platform", platform)
+    server = server_module.ScoringHTTPServer(
+        ("127.0.0.1", 0), server_module.build_handler(service)
+    )
+    try:
+        option = server.socket.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+    finally:
+        server.server_close()
+
+    assert server.allow_reuse_address is reuses_address
+    # Decided before bind(): the option is actually on the socket, or not.
+    assert bool(option) is reuses_address
+
+
+# --- a weights directory the loader would find nothing in --------------------
+
+
+def _refuse_to_serve(*args, **kwargs):
+    raise AssertionError("main() must not construct a server")
+
+
+def test_main_refuses_a_weights_directory_with_no_checkpoint_in_it(
+    server_module, monkeypatch, capsys, tmp_path
+):
+    """Hugging Face keeps the .ckpt in checkpoints/, one level below the model root.
+
+    Started on that root, the server used to pass the connection check and then
+    answer checkpoint_missing for every chapter.
+    """
+    (tmp_path / "checkpoints").mkdir()
+    (tmp_path / "checkpoints" / "model.ckpt").write_bytes(b"")
+    (tmp_path / "hparams.yaml").write_text("", encoding="utf-8")
+    monkeypatch.setattr(server_module, "ScoringHTTPServer", _refuse_to_serve)
+
+    code = server_module.main(
+        ["--model-dir", str(tmp_path), "--model", "wmt22-cometkiwi-da"]
+    )
+
+    assert code == 2
+    assert capsys.readouterr().err == (
+        f"В каталоге весов нет файла .ckpt: {tmp_path}\n"
+        "Укажите каталог, в котором лежит сам .ckpt — у модели, скачанной с "
+        "Hugging Face, это подкаталог checkpoints. Остальные файлы модели не "
+        "перемещайте.\n"
+    )
+
+
+def test_main_starts_on_the_directory_that_holds_the_checkpoint(
+    server_module, monkeypatch, capsys, tmp_path
+):
+    (tmp_path / "model.ckpt").write_bytes(b"")
+    constructed = []
+
+    class _IdleServer:
+        def __init__(self, address, handler_class):
+            constructed.append(address)
+
+        def serve_forever(self):
+            return
+
+        def server_close(self):
+            return
+
+    monkeypatch.setattr(server_module, "ScoringHTTPServer", _IdleServer)
+
+    code = server_module.main(
+        ["--model-dir", str(tmp_path), "--model", "wmt22-cometkiwi-da", "--port", "8765"]
+    )
+
+    assert code == 0
+    assert constructed == [("0.0.0.0", 8765)]
+    assert ".ckpt" not in capsys.readouterr().err
+
+
+def test_main_still_refuses_a_weights_directory_that_does_not_exist(
+    server_module, monkeypatch, capsys, tmp_path
+):
+    missing = tmp_path / "absent"
+    monkeypatch.setattr(server_module, "ScoringHTTPServer", _refuse_to_serve)
+
+    code = server_module.main(
+        ["--model-dir", str(missing), "--model", "wmt22-cometkiwi-da"]
+    )
+
+    assert code == 2
+    assert capsys.readouterr().err == f"Каталог весов не найден: {missing}\n"
+
+
+# --- the batch file that starts it on the PC ---------------------------------
+
+
+def test_the_batch_file_reads_as_utf8_and_names_the_checkpoints_directory():
+    path = Path(__file__).resolve().parents[2] / "tools" / "start_cometkiwi_server.bat"
+    raw = path.read_bytes()
+
+    # cmd reads a .bat in the OEM codepage, so chcp 65001 comes first; a BOM
+    # would break the @echo off in front of it; and the file stays CRLF.
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    assert b"\n" not in raw.replace(b"\r\n", b"")
+    lines = raw.decode("utf-8").split("\r\n")
+    assert lines[:2] == ["@echo off", "chcp 65001 >nul"]
+    weights = next(
+        index for index, line in enumerate(lines) if line.startswith("set KIWI_WEIGHTS=")
+    )
+    assert lines[weights - 1] == (
+        "rem Каталог, в котором лежит сам файл .ckpt "
+        "(у модели с Hugging Face — подкаталог checkpoints)."
+    )
+    assert lines[weights] == r"set KIWI_WEIGHTS=C:\kiwi\weights\wmt22-cometkiwi-da\checkpoints"

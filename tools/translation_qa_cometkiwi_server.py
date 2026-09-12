@@ -50,6 +50,16 @@ MAX_SEGMENTS = _RUNNER.MAX_SEGMENTS
 MAX_REQUEST_BYTES = _RUNNER.MAX_REQUEST_BYTES
 RequestError = _RUNNER.RequestError
 DEFAULT_PORT = 8765
+# A refusal is answered under the request's own id when that id is a string no
+# longer than this, even before the rest of the request has been validated.
+MAX_ECHOED_REQUEST_ID_CHARS = 128
+# The method and the path of a request line are the client's own text, and
+# none of it reaches the terminal: a known method and a route this server
+# serves are named in the log, anything else is written as "?".
+_LOGGED_METHODS = frozenset(
+    {"GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"}
+)
+_LOGGED_ROUTES = frozenset({"/score", "/health"})
 
 
 def validate_payload(payload: object) -> dict:
@@ -105,7 +115,11 @@ class ScoringService:
         }
 
     def handle(self, payload: object) -> dict:
-        request_id = ""
+        # Taken before validation, so that a refusal is still answered under
+        # the request's own id: the client compares ids before it reads an
+        # error, and an empty id turned a Mac and a PC on different schema
+        # versions into request_id_mismatch instead of the reason itself.
+        request_id = _echoable_request_id(payload)
         try:
             request = validate_payload(payload)
             request_id = request["request_id"]
@@ -137,6 +151,11 @@ class ScoringService:
         except ImportError:
             return _failure(request_id, "runner_environment_incomplete")
         except Exception as error:  # noqa: BLE001 - the caller sees only a reason
+            if type(error).__name__ == "OutOfMemoryError":
+                # torch.OutOfMemoryError, a CUDA allocation that failed,
+                # subclasses RuntimeError rather than MemoryError. It is matched
+                # by name so that this process never imports torch to know it.
+                return _failure(request_id, "out_of_memory")
             return _failure(request_id, type(error).__name__.lower())
 
 
@@ -148,11 +167,27 @@ def _failure(request_id: str, reason: str) -> dict:
     }
 
 
+def _echoable_request_id(payload: object) -> str:
+    """The request's own id if it is a short string, read before any validation."""
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("request_id")
+    if isinstance(value, str) and 1 <= len(value) <= MAX_ECHOED_REQUEST_ID_CHARS:
+        return value
+    return ""
+
+
 def build_handler(service: ScoringService):
     """Return a handler bound to one service, with no logging of request bodies."""
 
     class _Handler(BaseHTTPRequestHandler):
         server_version = "CometKiwiQA/1"
+        # Set on each connection's socket by StreamRequestHandler.setup().
+        # Without it a client that vanishes halfway through its body leaves
+        # this thread blocked in rfile.read() for good. It bounds one read or
+        # one write, not a request: scoring touches no socket while it runs,
+        # so a long batch on the GPU is not cut short by it.
+        timeout = 60
         _responded = False
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler's spelling
@@ -207,20 +242,20 @@ def build_handler(service: ScoringService):
             line and, if nothing has been sent yet, one fixed body -
             regardless of what broke or what the request contained.
             """
+            if not self._responded:
+                try:
+                    encoded = json.dumps({"error": "server_error"}).encode("utf-8")
+                    self.send_response_only(500)
+                    self.send_header("Server", self.version_string())
+                    self.send_header("Date", self.date_time_string())
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(encoded)))
+                    self.end_headers()
+                    self.wfile.write(encoded)
+                except Exception:  # noqa: BLE001 - the connection may already be gone
+                    pass
+            # After the answer, like every line this handler writes: see _send.
             self.log_message("unhandled exception")
-            if self._responded:
-                return
-            try:
-                encoded = json.dumps({"error": "server_error"}).encode("utf-8")
-                self.send_response_only(500)
-                self.send_header("Server", self.version_string())
-                self.send_header("Date", self.date_time_string())
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(encoded)))
-                self.end_headers()
-                self.wfile.write(encoded)
-            except Exception:  # noqa: BLE001 - the connection may already be gone
-                pass
 
         def _send(self, status: int, body: dict) -> None:
             encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -233,13 +268,56 @@ def build_handler(service: ScoringService):
             # a second send_response() call.
             self._responded = True
             self.wfile.write(encoded)
+            # Only now, with the answer on the wire. A Windows console holding
+            # a text selection (QuickEdit) blocks every write to it; while this
+            # line was written from send_response(), before the headers, that
+            # selection held the answer too, and the Mac waited out its whole
+            # timeout for a chapter the PC had already scored.
+            self._log(str(status))
+
+        def log_request(self, code="-", size="-"):
+            # send_response() calls this before anything is sent. The one line
+            # per answer is written by _send, after the body instead.
+            return
 
         def log_message(self, fmt, *args):
-            # The default logs the request line.  Nothing of a chapter belongs
-            # in a terminal that may be left open all day.
-            sys.stderr.write(f"{self.command} {self.path} -> done\n")
+            # Everything else the stdlib logs arrives here, send_error()'s
+            # report on a malformed request line among it: that report comes
+            # before any command or path is set, and its args carry the raw
+            # request line. So the fixed format string alone, never fmt % args.
+            self._log(str(fmt))
+
+        def _log(self, outcome: str) -> None:
+            """Write one line: method, route, outcome, and nothing a client wrote.
+
+            The default logs the request line. Nothing of a chapter, and no
+            text a client chose, belongs in a terminal left open all day.
+            """
+            command = getattr(self, "command", None)
+            path = getattr(self, "path", None)
+            route = path.rstrip("/") if isinstance(path, str) else ""
+            method = command if command in _LOGGED_METHODS else "?"
+            shown_route = route if route in _LOGGED_ROUTES else "?"
+            try:
+                sys.stderr.write(f"{method} {shown_route} -> {outcome}\n")
+            except Exception:  # noqa: BLE001 - a log line is never worth an answer
+                pass
 
     return _Handler
+
+
+class ScoringHTTPServer(ThreadingHTTPServer):
+    """The server ``main`` runs: a thread per request, and one instance per port."""
+
+    def __init__(self, server_address, handler_class, bind_and_activate=True):
+        # HTTPServer turns SO_REUSEADDR on. Elsewhere that only lets a restarted
+        # server rebind a port still in TIME_WAIT; on Windows it lets a second
+        # process bind a port that is already listening, so an autostarted
+        # server and a manual launch would both come up and both load the
+        # model into the same card's memory. Decided per instance, and before
+        # super().__init__() binds the socket.
+        self.allow_reuse_address = sys.platform != "win32"
+        super().__init__(server_address, handler_class, bind_and_activate)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -254,9 +332,22 @@ def main(argv: list[str] | None = None) -> int:
     if not Path(args.model_dir).is_dir():
         sys.stderr.write(f"Каталог весов не найден: {args.model_dir}\n")
         return 2
+    try:
+        # The lookup load_model() makes on the first request, made up front:
+        # a directory it finds no checkpoint in would otherwise start a server
+        # that passes the connection check and then fails every chapter.
+        _RUNNER._checkpoint_path(Path(args.model_dir))
+    except RequestError:
+        sys.stderr.write(
+            f"В каталоге весов нет файла .ckpt: {args.model_dir}\n"
+            "Укажите каталог, в котором лежит сам .ckpt — у модели, скачанной "
+            "с Hugging Face, это подкаталог checkpoints. Остальные файлы модели "
+            "не перемещайте.\n"
+        )
+        return 2
 
     service = ScoringService(args.model_dir, args.device, args.model)
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(service))
+    server = ScoringHTTPServer((args.host, args.port), build_handler(service))
     sys.stderr.write(
         f"COMETKiwi слушает http://{args.host}:{args.port} "
         f"({args.model}, {args.device}). Ctrl+C — остановить.\n"
