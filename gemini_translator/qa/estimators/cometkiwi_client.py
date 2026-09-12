@@ -84,7 +84,7 @@ class CometKiwiRunnerConfig:
         if not self.model.strip():
             return "model_missing"
         if self.is_remote:
-            return "" if _usable_endpoint(self._base_url()) else "endpoint_invalid"
+            return "" if usable_endpoint(self._base_url()) else "endpoint_invalid"
         if not self.runner_path.strip():
             return "runner_missing"
         if not Path(self.runner_path).is_file():
@@ -101,8 +101,13 @@ class CometKiwiRunnerConfig:
         return (self.runner_path,)
 
 
-def _usable_endpoint(url: str) -> bool:
-    """Report whether the address can be dialled at all, without dialling it."""
+def usable_endpoint(url: str) -> bool:
+    """Report whether the address can be dialled at all, without dialling it.
+
+    Public because the settings dialog's connection check and its setup line
+    apply the same rule: an address scoring refuses as ``endpoint_invalid``
+    must not look like a server that is merely switched off.
+    """
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -198,8 +203,10 @@ class CometKiwiEstimator:
                 scores,
                 {"device": config.device, **metadata},
             )
-        except QualityEstimateError as error:
-            return unavailable(ESTIMATOR_NAME, config.model, str(error))
+        except QualityEstimateError:
+            # aggregate() explains a bad score in free text, which the bound on
+            # a persisted reason could only replace with invalid_reason.
+            return unavailable(ESTIMATOR_NAME, config.model, "invalid_scores")
 
 
 class RunnerProcessError(RuntimeError):
@@ -319,6 +326,10 @@ def _exit_reason(returncode: int | None, stderr: bytes) -> str:
         return "out_of_memory"
     if returncode is None:
         return "runner_crashed"
+    if returncode < 0:
+        # asyncio reports a process killed by a POSIX signal as the negated
+        # signal number, and "runner_exit_-9" would fail the persisted bound.
+        return f"runner_signal_{-returncode}"
     return f"runner_exit_{returncode}"
 
 
