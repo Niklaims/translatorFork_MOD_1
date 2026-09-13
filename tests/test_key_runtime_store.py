@@ -354,7 +354,12 @@ def test_corruption_classification_is_narrow(code, message, expected):
 
 def test_quick_check_runs_once_and_detects_reported_corruption(tmp_path, monkeypatch):
     path = tmp_path / "runtime.sqlite3"
-    KeyRuntimeStore(path).merge_statuses({"KEY": {"model": {"requests": [10]}}})
+    seeded = KeyRuntimeStore(path)
+    seeded.merge_statuses({"KEY": {"model": {"requests": [10]}}})
+    # Отброшенное хранилище держит файл до сборки мусора: в Python 3.11
+    # sqlite3.Connection зациклен на свой кэш запросов. Windows не даст
+    # переименовать открытый файл в карантин.
+    seeded.close()
     real_connect = sqlite3.connect
     checks = []
     recovered = []
