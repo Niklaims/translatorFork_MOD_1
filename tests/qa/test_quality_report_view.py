@@ -46,19 +46,6 @@ def _headers(view: QualityReportView) -> list[str]:
     ]
 
 
-def test_the_totals_match_the_snapshot(qt_app):
-    view = QualityReportView()
-
-    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
-
-    assert view.checked_card.value_label.text() == "1 из 3"
-    assert view.checked_card.detail_label.text() == "отложено 1, блокирует 1"
-    assert view.repaired_card.value_label.text() == "2"
-    assert view.repaired_card.detail_label.text() == "В главах: 1."
-    assert view.pending_card.value_label.text() == "0"
-    assert not view.pending_card.action_button.isEnabled()
-
-
 def test_a_language_only_book_shows_the_four_base_columns(qt_app):
     view = QualityReportView()
 
@@ -100,73 +87,6 @@ def test_completeness_and_score_columns_appear_only_with_their_data(qt_app):
     assert view.table.item(0, 4).text() == "2.90"
     assert view.table.item(0, 6).text() == "0.83"
     assert view.table.item(1, 4).text() == "—"
-
-
-def test_the_status_colour_is_the_readable_status_token(qt_app):
-    from gemini_translator.ui import theme_manager
-
-    view = QualityReportView()
-
-    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
-
-    assert view.table.item(0, 1).foreground().color().name() == theme_manager.color(
-        "success_text"
-    )
-    assert view.table.item(2, 1).foreground().color().name() == theme_manager.color(
-        "danger_text"
-    )
-
-
-def test_the_chapter_card_follows_the_selection(qt_app):
-    view = QualityReportView()
-    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
-
-    assert view.chapter_title_label.text() == "Глава не выбрана"
-    assert view.select_chapter("chapter-1") is True
-    assert view.selected_chapter_id() == "chapter-1"
-    assert view.chapter_title_label.text() == "chapter-1"
-    assert view.chapter_meta_label.text() == (
-        "Проверена · 9 сентября 2026, 10:05 · риск: низкий · "
-        "исправлено автоматически: 2"
-    )
-
-    view.select_chapter("chapter-2")
-
-    assert view.chapter_title_label.text() == "chapter-2"
-    assert view.select_chapter("chapter-404") is False
-
-
-def test_a_blocked_chapter_says_why(qt_app):
-    class _Gate:
-        chapter_id = "chapter-3"
-        reason = "подтверждённый пропуск"
-
-    view = QualityReportView()
-    view.set_report(BookQaReportSnapshot.from_journal(_journal(), [_Gate()]))
-
-    view.select_chapter("chapter-3")
-
-    assert view.table.item(2, 1).text() == "⛔ Блокирует"
-    assert "Перевод остановлен: подтверждённый пропуск" in view.chapter_details_label.text()
-
-
-def test_actions_follow_the_selection_and_the_busy_state(qt_app):
-    view = QualityReportView()
-    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
-
-    assert not view.check_chapter_button.isEnabled()
-    assert view.undo_all_button.isEnabled()
-    view.select_chapter("chapter-2")
-    assert view.check_chapter_button.isEnabled()
-    assert not view.undo_chapter_button.isEnabled()
-    view.select_chapter("chapter-1")
-    assert view.undo_chapter_button.isEnabled()
-
-    view.set_busy(True)
-
-    assert not view.check_chapter_button.isEnabled()
-    assert not view.undo_chapter_button.isEnabled()
-    assert not view.undo_all_button.isEnabled()
 
 
 def test_the_buttons_ask_for_what_is_selected(qt_app):
@@ -300,4 +220,186 @@ def test_the_chapter_column_takes_the_spare_width(qt_app):
         header.sectionResizeMode(column) == QHeaderView.ResizeMode.ResizeToContents
         for column in range(1, view.table.columnCount())
     )
+
+
+def test_the_totals_match_the_snapshot(qt_app):
+    """Итоги были протоколом: «отложено 1, блокирует 0», «В главах: 409.»."""
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.checked_card.value_label.text() == "1 из 3"
+    assert view.checked_card.detail_label.text() == (
+        "1 глава отложена. 1 глава блокирует перевод."
+    )
+    assert view.repaired_card.value_label.text() == "2"
+    assert view.repaired_card.detail_label.text() == "В 1 главе. Откатываются по главе."
+    assert view.pending_card.value_label.text() == "0"
+    assert view.pending_card.detail_label.text() == "Непринятых правок нет."
+    # Leads to an empty state that explains itself; greyed out it looked broken.
+    assert view.pending_card.action_button.isEnabled()
+
+
+def test_the_totals_agree_with_their_numbers(qt_app):
+    journal = QaJournal.empty(book_id="book-1")
+    for index in range(1, 8):
+        journal.record_chapter_state(
+            QaChapterState(
+                chapter_id=f"chapter-{index}",
+                status="deferred" if index <= 5 else "checked",
+            )
+        )
+    for index in range(1, 3):
+        journal.append_repair({"patch_id": f"p-{index}", "chapter_id": f"chapter-{index}"})
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    assert view.checked_card.detail_label.text() == "5 глав отложено."
+    assert view.repaired_card.detail_label.text() == "В 2 главах. Откатываются по главе."
+
+
+def test_a_book_with_nothing_held_back_says_so(qt_app):
+    journal = QaJournal.empty(book_id="book-1")
+    journal.record_chapter_state(QaChapterState(chapter_id="chapter-1", status="checked"))
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(journal), scoring_enabled=True)
+
+    assert view.checked_card.detail_label.text() == "Отложенных и блокирующих глав нет."
+    assert view.repaired_card.detail_label.text() == "Автоисправлений пока нет."
+    assert view.score_card.detail_label.text() == "Оценок пока нет."
+
+
+def test_only_chapters_that_need_attention_are_coloured(qt_app):
+    """Зелёной была вся колонка — и единственная «Отложена» терялась среди 483 строк."""
+    from PyQt6.QtCore import Qt
+
+    from gemini_translator.ui import theme_manager
+
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.table.item(0, 1).data(Qt.ItemDataRole.ForegroundRole) is None
+    assert view.table.item(1, 1).foreground().color().name() == theme_manager.color(
+        "warning_text"
+    )
+    assert view.table.item(2, 1).foreground().color().name() == theme_manager.color(
+        "danger_text"
+    )
+
+
+def test_status_colours_follow_a_theme_switch(qt_app):
+    """Цвет вшивался в ячейку: после смены темы на лету «Отложена» почти не читалась."""
+    from gemini_translator.ui import theme_manager
+
+    theme_manager.apply(qt_app, mode="light", manual_colors={"accent": "#d87a3a"})
+    view = QualityReportView()
+    try:
+        view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+        view.show()
+        qt_app.processEvents()
+        light = view.table.item(1, 1).foreground().color().name()
+
+        theme_manager.apply(qt_app, mode="dark", manual_colors={"accent": "#d87a3a"})
+        qt_app.processEvents()
+
+        dark = view.table.item(1, 1).foreground().color().name()
+        assert dark != light
+        assert dark == theme_manager.color("warning_text")
+    finally:
+        view.close()
+        view.deleteLater()
+        qt_app.setStyleSheet("")
+        for name in ("_theme_palette", "_active_theme_mode", "_glass_active"):
+            if hasattr(qt_app, name):
+                delattr(qt_app, name)
+        qt_app.processEvents()
+
+
+def test_the_chapter_that_needs_attention_is_chosen_first(qt_app):
+    """Сразу после открытия правая половина пустовала: «Глава не выбрана»."""
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.selected_chapter_id() == "chapter-3"
+
+
+def test_a_book_without_trouble_opens_on_its_first_chapter(qt_app):
+    journal = QaJournal.empty(book_id="book-1")
+    for chapter_id in ("chapter-1", "chapter-2"):
+        journal.record_chapter_state(QaChapterState(chapter_id=chapter_id, status="checked"))
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    assert view.selected_chapter_id() == "chapter-1"
+
+
+def test_a_later_report_keeps_the_users_choice(qt_app):
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    view.select_chapter("chapter-1")
+
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.selected_chapter_id() == "chapter-1"
+
+
+def test_the_chapter_card_follows_the_selection(qt_app):
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.select_chapter("chapter-1") is True
+    assert view.chapter_title_label.text() == "chapter-1"
+    assert view.chapter_meta_label.text() == (
+        "Проверена 9 сентября 2026, 10:05, риск низкий. Исправлено автоматически: 2."
+    )
+
+    view.select_chapter("chapter-2")
+
+    assert view.chapter_title_label.text() == "chapter-2"
+    assert view.chapter_meta_label.text().startswith("Отложена 9 сентября 2026, 10:05")
+    assert view.select_chapter("chapter-404") is False
+
+
+def test_a_blocked_chapter_says_why(qt_app):
+    class _Gate:
+        chapter_id = "chapter-3"
+        reason = "подтверждённый пропуск"
+
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal(), [_Gate()]))
+
+    view.select_chapter("chapter-3")
+
+    assert view.table.item(2, 1).text() == "⛔ Блокирует"
+    assert not view.chapter_block_chip.isHidden()
+    assert view.chapter_block_chip.text() == "Перевод остановлен"
+    assert view.chapter_block_chip.property("tone") == "danger"
+    assert "Причина: подтверждённый пропуск" in view.chapter_details_label.text()
+
+    view.select_chapter("chapter-1")
+
+    assert view.chapter_block_chip.isHidden()
+
+
+def test_actions_follow_the_selection_and_the_busy_state(qt_app):
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    assert view.undo_all_button.isEnabled()
+    view.select_chapter("chapter-2")
+    assert view.check_chapter_button.isEnabled()
+    assert not view.undo_chapter_button.isEnabled()
+    view.select_chapter("chapter-1")
+    assert view.undo_chapter_button.isEnabled()
+
+    view.set_busy(True)
+
+    assert not view.check_chapter_button.isEnabled()
+    assert not view.undo_chapter_button.isEnabled()
+    assert not view.undo_all_button.isEnabled()
 

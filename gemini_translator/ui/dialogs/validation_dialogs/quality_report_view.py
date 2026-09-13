@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -28,14 +28,28 @@ from ... import theme_manager
 from .quality_widgets import (
     EmptyState,
     MetricCard,
+    StatusChip,
+    chapters_caption,
     format_checked_at,
     make_button,
     make_label,
+    plural,
 )
 from .translation_quality_models import DECISION_LABELS
 
 
-STATUS_TONES = {"checked": "success", "deferred": "warning", "blocked": "danger"}
+# Only the statuses that ask for attention are coloured: a column where every
+# «Проверена» is green hides the one chapter that is not.
+ATTENTION_TONES = {"deferred": "warning", "blocked": "danger"}
+# How the chapter card's sentence begins.  A blocked chapter was checked; that
+# it holds the translation up is what the chip under the sentence says.
+STATUS_SENTENCES = {
+    "checked": "Проверена",
+    "blocked": "Проверена",
+    "deferred": "Отложена",
+    "": "Нет данных о проверке",
+}
+BLOCK_CHIP_TEXT = "Перевод остановлен"
 BASE_COLUMNS = (
     ("Глава", "chapter_id"),
     ("Статус", "status"),
@@ -114,6 +128,8 @@ class QualityReportView(QWidget):
         row.setSpacing(10)
         self.checked_card = MetricCard("Проверено", parent=self.content)
         self.repaired_card = MetricCard("Исправлено автоматически", parent=self.content)
+        # Always available: with nothing waiting it leads to an empty state that
+        # says why, while a greyed-out button only looked broken.
         self.pending_card = MetricCard("Ждут решения", "Открыть предложения", self.content)
         self.pending_card.action_clicked.connect(self.open_suggestions_requested.emit)
         self.score_card = MetricCard("Оценка CometKiwi", parent=self.content)
@@ -176,6 +192,12 @@ class QualityReportView(QWidget):
         self.chapter_meta_label = make_label(
             NO_CHAPTER_TEXT, "heroSubtitle", wrap=True, parent=self.chapter_card
         )
+        block_row = QHBoxLayout()
+        block_row.setContentsMargins(0, 0, 0, 0)
+        self.chapter_block_chip = StatusChip(BLOCK_CHIP_TEXT, "danger", self.chapter_card)
+        self.chapter_block_chip.setVisible(False)
+        block_row.addWidget(self.chapter_block_chip)
+        block_row.addStretch(1)
         self.chapter_details_label = make_label(
             "", "mutedLabel", wrap=True, parent=self.chapter_card
         )
@@ -183,6 +205,7 @@ class QualityReportView(QWidget):
         self.chapter_layout.addWidget(self.chapter_title_label)
         self.chapter_layout.addWidget(self.chapter_path_label)
         self.chapter_layout.addWidget(self.chapter_meta_label)
+        self.chapter_layout.addLayout(block_row)
         self.chapter_layout.addWidget(self.chapter_details_label)
         self.chapter_layout.addStretch(1)
 
@@ -217,6 +240,10 @@ class QualityReportView(QWidget):
         self._refresh_totals()
         if snapshot.rows != previous.rows or self.table.rowCount() != len(snapshot.rows):
             self._rebuild_table()
+        if snapshot.rows and not self.selected_chapter_id():
+            # Opening on nothing left half the tab empty; the chapter that most
+            # needs a look is the natural place to start.
+            self.select_chapter(_attention_chapter(snapshot))
         self._refresh_chapter_card()
         self._update_actions()
 
@@ -237,6 +264,15 @@ class QualityReportView(QWidget):
                 self.table.selectRow(index)
                 return True
         return False
+
+    # -- Qt events ---------------------------------------------------------
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.StyleChange:
+            # The theme installs its stylesheet before its palette, so the
+            # colours are read once both have changed.
+            QTimer.singleShot(0, self._recolor_statuses)
 
     # -- internals ---------------------------------------------------------
 
@@ -281,23 +317,43 @@ class QualityReportView(QWidget):
         if selected:
             self.select_chapter(selected)
 
+    def _recolor_statuses(self) -> None:
+        """Repaint the coloured statuses in the palette that is current now."""
+        columns = report_columns(self._snapshot)
+        column = next(
+            (index for index, (_title, name) in enumerate(columns) if name == "status"),
+            None,
+        )
+        if column is None or self.table.rowCount() != len(self._snapshot.rows):
+            return
+        for row_index, row in enumerate(self._snapshot.rows):
+            item = self.table.item(row_index, column)
+            if item is not None:
+                _paint_status(item, row)
+
     def _refresh_totals(self) -> None:
         snapshot = self._snapshot
         self.checked_card.set_values(
             f"{snapshot.checked_count} из {len(snapshot.rows)}",
-            f"отложено {snapshot.deferred_count}, блокирует {snapshot.blocking_count}",
+            _held_back(snapshot.deferred_count, snapshot.blocking_count),
         )
         self.repaired_card.set_values(
-            str(snapshot.repair_count), f"В главах: {len(snapshot.repaired_chapters)}."
+            str(snapshot.repair_count),
+            f"{_in_chapters(len(snapshot.repaired_chapters))} Откатываются по главе."
+            if snapshot.repair_count
+            else "Автоисправлений пока нет.",
         )
         self.pending_card.set_values(
             str(snapshot.pending_suggestion_count),
-            f"В главах: {len(snapshot.pending_suggestion_chapters)}.",
+            _in_chapters(len(snapshot.pending_suggestion_chapters))
+            if snapshot.pending_suggestion_count
+            else "Непринятых правок нет.",
         )
         average = snapshot.average_score
         scored = sum(1 for row in snapshot.rows if row.quality_score is not None)
         self.score_card.set_values(
-            f"{average:.2f}" if average is not None else "—", f"Оценено глав: {scored}."
+            f"{average:.2f}" if average is not None else "—",
+            f"Оценено: {chapters_caption(scored)}." if scored else "Оценок пока нет.",
         )
         self.score_card.setVisible(self._scoring_enabled)
 
@@ -316,6 +372,7 @@ class QualityReportView(QWidget):
             self.chapter_path_label.clear()
             self.chapter_path_label.setVisible(False)
             self.chapter_meta_label.setText(NO_CHAPTER_TEXT)
+            self.chapter_block_chip.setVisible(False)
             self.chapter_details_label.clear()
             self.chapter_details_label.setVisible(False)
             return
@@ -327,6 +384,7 @@ class QualityReportView(QWidget):
         self.chapter_path_label.setText(row.chapter_id if shows_path else "")
         self.chapter_path_label.setVisible(shows_path)
         self.chapter_meta_label.setText(_chapter_meta(row))
+        self.chapter_block_chip.setVisible(row.status == "blocked" or bool(row.blocked_reason))
         details = _chapter_details(
             row, self._snapshot.decisions_by_chapter.get(row.chapter_id, ())
         )
@@ -346,9 +404,6 @@ class QualityReportView(QWidget):
             bool(chapter_id) and chapter_id in repaired and idle
         )
         self.undo_all_button.setEnabled(bool(repaired) and idle)
-        self.pending_card.action_button.setEnabled(
-            self._snapshot.pending_suggestion_count > 0
-        )
 
     def _request_check_chapter(self) -> None:
         chapter_id = self.selected_chapter_id()
@@ -361,10 +416,54 @@ class QualityReportView(QWidget):
             self.undo_chapter_requested.emit(chapter_id)
 
 
+def _attention_chapter(snapshot: BookQaReportSnapshot) -> str:
+    """The chapter to open on: blocking first, then deferred, then one with suggestions."""
+    rows = snapshot.rows
+    for needs_attention in (
+        lambda row: row.status == "blocked" or bool(row.blocked_reason),
+        lambda row: row.status == "deferred",
+        lambda row: row.pending_suggestions > 0,
+    ):
+        found = next((row for row in rows if needs_attention(row)), None)
+        if found is not None:
+            return found.chapter_id
+    return rows[0].chapter_id if rows else ""
+
+
+def _held_back(deferred: int, blocking: int) -> str:
+    """Say how many chapters are held back, in words that agree with the numbers."""
+    parts = []
+    if deferred:
+        parts.append(
+            f"{chapters_caption(deferred)} "
+            f"{plural(deferred, 'отложена', 'отложены', 'отложено')}."
+        )
+    if blocking:
+        parts.append(
+            f"{chapters_caption(blocking)} "
+            f"{plural(blocking, 'блокирует', 'блокируют', 'блокируют')} перевод."
+        )
+    return " ".join(parts) or "Отложенных и блокирующих глав нет."
+
+
+def _in_chapters(count: int) -> str:
+    """«В 1 главе», «В 21 главе», «В 2 главах»: the locative after a number."""
+    noun = "главе" if count % 10 == 1 and count % 100 != 11 else "главах"
+    return f"В {count} {noun}."
+
+
 def _alignment(field_name: str) -> Qt.AlignmentFlag:
     if field_name in TEXT_FIELDS:
         return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
     return Qt.AlignmentFlag.AlignCenter
+
+
+def _paint_status(item: QTableWidgetItem, row: ChapterQaRow) -> None:
+    tone = ATTENTION_TONES.get(row.status)
+    if tone:
+        item.setForeground(QBrush(QColor(theme_manager.color(f"{tone}_text"))))
+    else:
+        item.setData(Qt.ItemDataRole.ForegroundRole, None)
 
 
 def _item(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> QTableWidgetItem:
@@ -375,9 +474,7 @@ def _item(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> QTableWi
         if item.text() != row.chapter_id:
             item.setToolTip(row.chapter_id)
     elif field_name == "status":
-        tone = STATUS_TONES.get(row.status)
-        if tone:
-            item.setForeground(QBrush(QColor(theme_manager.color(f"{tone}_text"))))
+        _paint_status(item, row)
         if row.blocked_reason:
             item.setToolTip(f"Перевод остановлен: {row.blocked_reason}")
     return item
@@ -403,20 +500,21 @@ def _cell_text(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> str
 
 
 def _chapter_meta(row: ChapterQaRow) -> str:
-    parts = [CHAPTER_STATUS_LABELS.get(row.status, row.status)]
+    sentence = STATUS_SENTENCES.get(
+        row.status, CHAPTER_STATUS_LABELS.get(row.status, row.status)
+    )
     checked_at = format_checked_at(row.checked_at)
     if checked_at:
-        parts.append(checked_at)
+        sentence += f" {checked_at}"
     if row.risk_label:
-        parts.append(f"риск: {row.risk_label.lower()}")
-    parts.append(f"исправлено автоматически: {row.applied_repairs}")
-    return " · ".join(parts)
+        sentence += f", риск {row.risk_label.lower()}"
+    return f"{sentence}. Исправлено автоматически: {row.applied_repairs}."
 
 
 def _chapter_details(row: ChapterQaRow, decisions) -> str:
     lines: list[str] = []
     if row.blocked_reason:
-        lines.append(f"Перевод остановлен: {row.blocked_reason}")
+        lines.append(f"Причина: {row.blocked_reason}")
     if row.has_completeness:
         lines.append(
             f"{row.language_pair}, длина {row.length_ratio:.2f} — {row.profile_status}"

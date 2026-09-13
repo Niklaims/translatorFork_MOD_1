@@ -60,20 +60,6 @@ def _dialog(qt_app, **kwargs) -> TranslationQualityDialog:
     return dialog
 
 
-def test_check_chapter_emits_the_selected_chapter(qt_app):
-    """The action must apply to what the user has selected, or to nothing."""
-    dialog = _dialog(qt_app)
-    seen: list[str] = []
-    dialog.check_chapter_requested.connect(seen.append)
-
-    dialog._request_check_chapter()
-    assert seen == []
-
-    dialog.select_chapter("chapter-2")
-    dialog._request_check_chapter()
-    assert seen == ["chapter-2"]
-
-
 def test_progress_reports_real_counts(qt_app):
     """A whole-book pass must show how far it actually is."""
     dialog = _dialog(qt_app)
@@ -550,4 +536,19 @@ def test_check_survives_json_nested_past_the_recursion_limit(qt_app):
 
     assert text == "Ответ сервера не разобран."
 
+
+def test_check_chapter_emits_the_selected_chapter(qt_app):
+    """The action applies to what is selected, and to nothing when there is no report."""
+    seen: list[str] = []
+    empty = TranslationQualityDialog()
+    empty.check_chapter_requested.connect(seen.append)
+
+    empty._request_check_chapter()
+    assert seen == []
+
+    dialog = _dialog(qt_app)
+    dialog.check_chapter_requested.connect(seen.append)
+    dialog.select_chapter("chapter-2")
+    dialog._request_check_chapter()
+    assert seen == ["chapter-2"]
 
