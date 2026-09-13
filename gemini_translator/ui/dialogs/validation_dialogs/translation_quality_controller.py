@@ -44,6 +44,9 @@ class TranslationQualityController(QObject):
     # and what was only suggested.  A pass over a book runs for hours, and the
     # report used to appear only when it ended.
     chapter_logged = pyqtSignal(str)
+    # The answer of «Проверить подключение», shown next to the embedding settings
+    # as well as in the window's status line.
+    embedding_checked = pyqtSignal(str)
 
     def __init__(
         self,
@@ -85,6 +88,8 @@ class TranslationQualityController(QObject):
         self.progress_changed.connect(dialog.set_progress)
         if hasattr(dialog, "append_log"):
             self.chapter_logged.connect(dialog.append_log)
+        if hasattr(dialog, "set_embedding_result"):
+            self.embedding_checked.connect(dialog.set_embedding_result)
         self.refresh_report()
 
     # -- actions -----------------------------------------------------------
@@ -252,8 +257,10 @@ class TranslationQualityController(QObject):
         problem = qa_settings.embedding_setup_problem()
         if problem:
             self.status_changed.emit(problem)
+            self.embedding_checked.emit(problem)
             return
         self.status_changed.emit("Проверяем подключение…")
+        self.embedding_checked.emit("Проверяем подключение…")
 
         # Прокси приложения читаем здесь, в GUI-потоке: SettingsManager не
         # предназначен для чтения из фонового потока, а проба обязана ходить тем
@@ -264,6 +271,7 @@ class TranslationQualityController(QObject):
         def run() -> None:
             message = _probe_embedding(qa_settings, proxy_settings=proxy_settings)
             self.status_changed.emit(message)
+            self.embedding_checked.emit(message)
 
         threading.Thread(target=run, name="qa-embedding-probe", daemon=True).start()
 

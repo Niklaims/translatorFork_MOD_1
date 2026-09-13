@@ -2989,13 +2989,11 @@ class TranslationValidatorPage(ShellPage):
         dialog = TranslationQualityDialog(
             self,
             settings=qa_settings,
-            api_keys=self._quality_api_keys(settings_manager),
+            key_counter=self._quality_key_counter(settings_manager),
+            book_title=self._quality_book_title(),
         )
         dialog.settings_changed.connect(settings_manager.save_qa_settings)
-        dialog.set_status(
-            qa_settings.embedding_setup_problem()
-            or "Готово к смысловому сравнению."
-        )
+        dialog.set_status(qa_settings.embedding_setup_problem() or "Готово.")
         controller = TranslationQualityController(
             coordinator_provider=self._quality_coordinator,
             journal_loader=self._quality_journal,
@@ -3022,11 +3020,20 @@ class TranslationValidatorPage(ShellPage):
         return getattr(app, "settings_manager", None)
 
     @staticmethod
-    def _quality_api_keys(settings_manager):
-        try:
-            return tuple(settings_manager.load_key_statuses())
-        except Exception:
-            return ()
+    def _quality_key_counter(settings_manager):
+        """Count a provider's working embedding keys for the quality window."""
+        from ...qa.assembly import embedding_key_counts
+
+        def count(provider_id: str, model_id: str) -> tuple[int, int]:
+            return embedding_key_counts(settings_manager, provider_id, model_id)
+
+        return count
+
+    def _quality_book_title(self) -> str:
+        """The project folder's name, which is the book's name on disk."""
+        project_manager = getattr(self, "project_manager", None)
+        folder = str(getattr(project_manager, "project_folder", "") or "")
+        return os.path.basename(os.path.normpath(folder)) if folder else ""
 
     def _quality_coordinator(self):
         """Return the session's QA runtime, or build one for this project.

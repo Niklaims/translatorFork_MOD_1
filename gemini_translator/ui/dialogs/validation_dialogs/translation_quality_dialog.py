@@ -1,92 +1,48 @@
 # -*- coding: utf-8 -*-
-"""The «Качество перевода» section: one report, four actions, one setup place."""
+"""The «Качество перевода» window: a header, four tabs and one action bar."""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QCheckBox,
-    QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
-    QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
     QMessageBox,
     QProgressBar,
-    QPushButton,
-    QScrollArea,
-    QSpinBox,
-    QSplitter,
     QTabWidget,
-    QTableView,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ....qa.capabilities import CAPABILITY_DESCRIPTIONS, QaCapabilityKey, QaCapabilitySettings
-from ....qa.assembly import EMBEDDING_KEY_NAMESPACES
-from ....qa.estimators.cometkiwi_client import usable_endpoint
-from ....qa.estimators.cometkiwi_model_manager import describe_cometkiwi_setup
-from ....qa.language_validation import MAX_LANGUAGE_CHUNK_CHARS
+from ....qa.report_snapshot import BookQaReportSnapshot
 from ....qa.settings import QaSettings
-from .translation_quality_models import (
-    CHAPTER_STATUS_LABELS,
-    BookQaReportSnapshot,
-    ChapterQaTableModel,
-    DECISION_LABELS,
-)
-
-
-EMBEDDING_PROVIDER_CHOICES = (
-    ("Автоматически (ключ сессии)", "auto"),
-    ("Gemini", "gemini"),
-    ("OpenAI-совместимый", "openai_compatible"),
-    ("Локальная модель (без сети)", "local_onnx"),
-)
-EMBEDDING_MODEL_SUGGESTIONS = {
-    "auto": ("gemini-embedding-001", "text-embedding-004"),
-    "gemini": ("gemini-embedding-001", "text-embedding-004"),
-    "openai_compatible": (
-        "text-embedding-3-small",
-        "text-embedding-3-large",
-        "text-embedding-ada-002",
-    ),
-    "local_onnx": ("multilingual-e5-small", "multilingual-e5-base"),
-}
-CAPABILITY_ORDER = (
-    QaCapabilityKey.RAZDEL,
-    QaCapabilityKey.LANGUAGE_TOOL,
-    QaCapabilityKey.SLOVNET,
-    QaCapabilityKey.COMETKIWI,
-)
+from .quality_report_view import QualityReportView
+from .quality_settings_view import QualitySettingsView
+from .quality_suggestions_view import QualitySuggestionsView
+from .quality_widgets import StatusChip, format_checked_at, make_button, make_label
 
 
 # The log keeps the newest chapters; a six-hundred-chapter book would otherwise
 # grow one document until the window slows down.
 LOG_MAX_BLOCKS = 4000
 
-# How long «Проверить связь» waits for the scoring server. The check runs on the
-# GUI thread, and a server that is up answers /health in milliseconds.
-COMETKIWI_CHECK_TIMEOUT_SECONDS = 5.0
-# How much of each model name the check's warning shows: one of the two names
-# is whatever an unauthenticated server chose to send.
-COMETKIWI_MODEL_NAME_CHARS = 80
 
-
-def mask_key(value: str) -> str:
-    """Show enough of a key to recognise it and never enough to leak it."""
-    text = str(value or "")
-    if len(text) <= 8:
-        return "•" * len(text)
-    return f"{text[:4]}…{text[-4:]}"
+def describe_checks(settings: QaSettings) -> str:
+    """Name the checks that run after each chapter, the way the header says it."""
+    checks = []
+    if settings.check_language_after_chapter:
+        checks.append("язык")
+    if settings.check_completeness_after_chapter:
+        checks.append("полнота")
+    if settings.capabilities.cometkiwi_enabled:
+        checks.append("оценка CometKiwi")
+    if not checks:
+        return "Проверки после глав выключены."
+    return "После каждой главы: " + ", ".join(checks) + "."
 
 
 class TranslationQualityDialog(QDialog):
@@ -102,75 +58,89 @@ class TranslationQualityDialog(QDialog):
     embedding_test_requested = pyqtSignal(object)
     export_requested = pyqtSignal(str)
 
-    def __init__(self, parent=None, *, settings: QaSettings | None = None, api_keys=()) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        settings: QaSettings | None = None,
+        key_counter=None,
+        book_title: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Качество перевода")
         self.setMinimumSize(1040, 640)
         self._settings = settings or QaSettings()
-        self._api_keys = tuple(api_keys or ())
-        self._cometkiwi_model_status = None
-        self._cometkiwi_last_seconds: float | None = None
-        self._loading = True
+        self._snapshot = BookQaReportSnapshot()
+        self._busy = False
 
-        self.table_model = ChapterQaTableModel(self)
         layout = QVBoxLayout(self)
-        self.tabs = QTabWidget(self)
-        self.tabs.addTab(self._build_report_tab(), "Отчёт")
-        self.tabs.addTab(self._build_log_tab(), "Журнал правок")
-        self.tabs.addTab(self._build_settings_tab(), "Настройки проверки")
-        layout.addWidget(self.tabs)
-        layout.addLayout(self._build_action_bar())
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        layout.addWidget(self._build_header(book_title))
 
-        self._apply_settings_to_widgets()
-        self._loading = False
+        self.report_view = QualityReportView(self)
+        self.suggestions_view = QualitySuggestionsView(self)
+        self.settings_view = QualitySettingsView(
+            self._settings, key_counter=key_counter, parent=self
+        )
+        self.tabs = QTabWidget(self)
+        self.tabs.addTab(self.report_view, "Отчёт")
+        self.tabs.addTab(self.suggestions_view, "Предложения")
+        self.tabs.addTab(self._build_log_tab(), "Журнал правок")
+        self.tabs.addTab(self.settings_view, "Настройки")
+        layout.addWidget(self.tabs, 1)
+        layout.addWidget(self._build_action_bar())
+
+        self.report_view.check_chapter_requested.connect(self.check_chapter_requested.emit)
+        self.report_view.undo_chapter_requested.connect(self._request_undo_chapter)
+        self.report_view.undo_all_requested.connect(self._request_undo_all)
+        self.report_view.open_suggestions_requested.connect(
+            lambda: self.tabs.setCurrentWidget(self.suggestions_view)
+        )
+        self.settings_view.settings_changed.connect(self._on_settings_changed)
+        self.settings_view.embedding_test_requested.connect(
+            self.embedding_test_requested.emit
+        )
+
+        self._refresh_header()
         self._update_action_state()
 
-    # -- report ------------------------------------------------------------
+    # -- building ----------------------------------------------------------
 
-    def _build_report_tab(self) -> QWidget:
-        page = QWidget(self)
-        layout = QVBoxLayout(page)
-        self.summary_label = QLabel("Проверка ещё не выполнялась.", page)
-        self.summary_label.setWordWrap(True)
-        layout.addWidget(self.summary_label)
-
-        splitter = QSplitter(Qt.Orientation.Vertical, page)
-        self.table = QTableView(splitter)
-        self.table.setModel(self.table_model)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.ResizeToContents
+    def _build_header(self, book_title: str) -> QFrame:
+        header = QFrame(self)
+        header.setObjectName("projectHeaderCard")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(12)
+        intro = QVBoxLayout()
+        intro.setSpacing(2)
+        intro.addWidget(make_label("Качество перевода", "sectionEyebrow", parent=header))
+        self.title_label = make_label(
+            book_title or "Книга без названия", "heroTitle", wrap=True, parent=header
         )
-        self.table.selectionModel().selectionChanged.connect(self._on_selection_changed)
-        splitter.addWidget(self.table)
-
-        self.details = QTextEdit(splitter)
-        self.details.setReadOnly(True)
-        self.details.setPlainText("Выберите главу, чтобы увидеть решения проверки.")
-        splitter.addWidget(self.details)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        layout.addWidget(splitter)
-
-        self.progress = QProgressBar(page)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-        return page
+        self.subtitle_label = make_label("", "heroSubtitle", wrap=True, parent=header)
+        intro.addWidget(self.title_label)
+        intro.addWidget(self.subtitle_label)
+        row.addLayout(intro, 1)
+        self.state_chip = StatusChip("Готово к проверке", "success", header)
+        row.addWidget(self.state_chip, 0, Qt.AlignmentFlag.AlignTop)
+        return header
 
     def _build_log_tab(self) -> QWidget:
         """The running account of what the check changed, chapter by chapter.
 
-        The report table is built from the journal and only after a pass ends;
-        a pass over a book takes hours, and until it finished there was nothing
-        to read at all.
+        The report is rebuilt from the journal; a pass over a book takes hours,
+        and this is what can be read while it runs.
         """
         page = QWidget(self)
-        layout = QVBoxLayout(page)
-        self.log_view = QTextEdit(page)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 10, 0, 0)
+        card = QFrame(page)
+        card.setObjectName("projectPathCard")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(12, 10, 12, 10)
+        self.log_view = QTextEdit(card)
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText(
             "Здесь появится каждая глава: что найдено, что исправлено и что "
@@ -178,326 +148,70 @@ class TranslationQualityDialog(QDialog):
         )
         # A long book would otherwise grow the document without limit.
         self.log_view.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
-        layout.addWidget(self.log_view)
+        card_layout.addWidget(self.log_view)
+        page_layout.addWidget(card)
         return page
 
-    def _build_action_bar(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        self.check_chapter_button = QPushButton("Проверить и исправить главу", self)
-        self.check_all_button = QPushButton("Проверить и исправить все главы", self)
-        self.resume_button = QPushButton("Продолжить проверку", self)
+    def _build_action_bar(self) -> QFrame:
+        bar = QFrame(self)
+        bar.setObjectName("actionBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 8, 12, 8)
+        row.setSpacing(8)
+        self.status_label = make_label("", "helperLabel", wrap=True, parent=bar)
+        row.addWidget(self.status_label, 1)
+        self.progress = QProgressBar(bar)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setMinimumWidth(220)
+        self.progress.setVisible(False)
+        row.addWidget(self.progress)
+
+        self.export_button = make_button("Экспорт отчёта", "compactActionButton", bar)
+        self.check_all_button = make_button("Проверить все главы", "compactActionButton", bar)
+        self.resume_button = make_button("Продолжить проверку", "primaryActionButton", bar)
         self.resume_button.setToolTip(
             "Проверить только те главы, которые ещё не проверялись, были "
             "отложены, остались с неустранённым риском или изменились после "
             "проверки. Уже улаженные главы не перепроверяются."
         )
-        self.undo_chapter_button = QPushButton("Отменить исправления главы", self)
-        self.undo_all_button = QPushButton("Отменить все автоматические исправления", self)
-        self.cancel_button = QPushButton("Остановить проверку", self)
-        self.cancel_button.setEnabled(False)
-        self.export_button = QPushButton("Экспорт отчёта (CSV)", self)
+        # Takes the primary button's place while a pass runs: the one thing to
+        # do then is stop it.
+        self.cancel_button = make_button("Остановить проверку", "dangerActionButton", bar)
+        self.close_button = make_button("Закрыть", "ghostActionButton", bar)
 
-        self.check_chapter_button.clicked.connect(self._request_check_chapter)
+        self.export_button.clicked.connect(self._request_export)
         self.check_all_button.clicked.connect(self.check_all_requested.emit)
         self.resume_button.clicked.connect(self.resume_requested.emit)
-        self.undo_chapter_button.clicked.connect(self._request_undo_chapter)
-        self.undo_all_button.clicked.connect(self._request_undo_all)
         self.cancel_button.clicked.connect(self.cancel_requested.emit)
-        self.export_button.clicked.connect(self._request_export)
-
+        self.close_button.clicked.connect(self.reject)
         for button in (
-            self.check_chapter_button,
+            self.export_button,
             self.check_all_button,
             self.resume_button,
-            self.undo_chapter_button,
-            self.undo_all_button,
             self.cancel_button,
-            self.export_button,
+            self.close_button,
         ):
             row.addWidget(button)
-        row.addStretch(1)
-        self.close_button = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Close, parent=self
-        )
-        self.close_button.button(QDialogButtonBox.StandardButton.Close).setText(
-            "Закрыть"
-        )
-        self.close_button.rejected.connect(self.reject)
-        row.addWidget(self.close_button)
-        return row
-
-    # -- settings ----------------------------------------------------------
-
-    def _build_settings_tab(self) -> QWidget:
-        page = QWidget(self)
-        layout = QVBoxLayout(page)
-        layout.addWidget(self._build_stage_group(page))
-        layout.addWidget(self._build_embedding_group(page))
-        layout.addWidget(self._build_capability_group(page))
-        layout.addStretch(1)
-        area = QScrollArea(self)
-        area.setWidgetResizable(True)
-        area.setWidget(page)
-        return area
-
-    def _build_stage_group(self, parent) -> QGroupBox:
-        group = QGroupBox("Что проверять после каждой главы", parent)
-        layout = QVBoxLayout(group)
-        self.completeness_check = QCheckBox("Проверять полноту перевода", group)
-        self.repair_omissions_check = QCheckBox(
-            "Автоматически допереводить подтверждённые пропуски", group
-        )
-        self.language_check = QCheckBox("Проверять язык перевода", group)
-        self.repair_language_check = QCheckBox(
-            "Автоматически исправлять объективные языковые дефекты", group
-        )
-        self.final_pass_check = QCheckBox(
-            "Делать итоговый проход по книге в конце сессии", group
-        )
-        for widget in (
-            self.completeness_check,
-            self.repair_omissions_check,
-            self.language_check,
-            self.repair_language_check,
-            self.final_pass_check,
-        ):
-            widget.toggled.connect(self._on_settings_edited)
-            layout.addWidget(widget)
-
-        # A chapter is diagnosed piece by piece, and the piece size is what the
-        # check costs: a larger piece is fewer requests over the same text.
-        chunk_row = QHBoxLayout()
-        self.language_chunk_spin = QSpinBox(group)
-        self.language_chunk_spin.setRange(0, MAX_LANGUAGE_CHUNK_CHARS)
-        self.language_chunk_spin.setSingleStep(1000)
-        self.language_chunk_spin.setSuffix(" символов")
-        # The lowest position is not a size but the absence of one: the check
-        # then asks the project how much it translates in, and matches it.
-        self.language_chunk_spin.setSpecialValueText("как при переводе")
-        self.language_chunk_spin.setToolTip(
-            "Сколько текста главы уходит в один запрос языковой проверки:\n"
-            "перевод и оригинал вместе.\n"
-            "«Как при переводе» — тот же размер, которым переводилась книга.\n"
-            "Больше — меньше запросов на главу и дешевле проверка;\n"
-            "меньше — модель разбирает каждый кусок внимательнее."
-        )
-        self.language_chunk_spin.valueChanged.connect(self._on_settings_edited)
-        chunk_row.addWidget(QLabel("Размер куска языковой проверки:", group))
-        chunk_row.addWidget(self.language_chunk_spin)
-        chunk_row.addStretch(1)
-        layout.addLayout(chunk_row)
-        return group
-
-    def _build_embedding_group(self, parent) -> QGroupBox:
-        group = QGroupBox("Смысловое сравнение (embeddings)", parent)
-        layout = QFormLayout(group)
-        self.embedding_provider_combo = QComboBox(group)
-        for label, value in EMBEDDING_PROVIDER_CHOICES:
-            self.embedding_provider_combo.addItem(label, value)
-        self.embedding_provider_combo.currentIndexChanged.connect(
-            self._on_embedding_provider_changed
-        )
-        layout.addRow("Провайдер:", self.embedding_provider_combo)
-
-        # A session key is a bad default for embeddings: a content-filter
-        # fallback can move the session to a provider with no embedding endpoint
-        # at all.  Naming a provider instead uses every healthy key it has.
-        self.embedding_key_provider_combo = QComboBox(group)
-        self.embedding_key_provider_combo.addItem("Ключ сессии перевода", "")
-        for provider_id, provider_cfg in _embedding_key_providers():
-            self.embedding_key_provider_combo.addItem(
-                provider_cfg.get("display_name") or provider_id, provider_id
-            )
-        self.embedding_key_provider_combo.currentIndexChanged.connect(
-            self._on_settings_edited
-        )
-        layout.addRow("Ключи провайдера:", self.embedding_key_provider_combo)
-
-        self.embedding_key_combo = QComboBox(group)
-        self.embedding_key_combo.setEditable(False)
-        self.embedding_key_combo.currentIndexChanged.connect(self._on_key_choice_changed)
-        layout.addRow("Ключ:", self.embedding_key_combo)
-
-        self.embedding_key_edit = QLineEdit(group)
-        self.embedding_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.embedding_key_edit.setPlaceholderText("Свой ключ для эмбеддингов")
-        self.embedding_key_edit.textChanged.connect(self._on_settings_edited)
-        layout.addRow("Свой ключ:", self.embedding_key_edit)
-
-        self.embedding_model_combo = QComboBox(group)
-        self.embedding_model_combo.setEditable(True)
-        self.embedding_model_combo.currentTextChanged.connect(self._on_settings_edited)
-        layout.addRow("Модель:", self.embedding_model_combo)
-
-        self.embedding_base_url_edit = QLineEdit(group)
-        self.embedding_base_url_edit.setPlaceholderText("https://api.openai.com/v1")
-        self.embedding_base_url_edit.textChanged.connect(self._on_settings_edited)
-        layout.addRow("Адрес сервиса:", self.embedding_base_url_edit)
-
-        self.embedding_status_label = QLabel("", group)
-        self.embedding_status_label.setWordWrap(True)
-        layout.addRow("", self.embedding_status_label)
-
-        self.local_model_label = QLabel("", group)
-        self.local_model_label.setWordWrap(True)
-        self.local_model_label.setVisible(False)
-        layout.addRow("Локальная модель:", self.local_model_label)
-
-        self.embedding_test_button = QPushButton("Проверить подключение", group)
-        self.embedding_test_button.clicked.connect(
-            lambda: self.embedding_test_requested.emit(self.qa_settings())
-        )
-        layout.addRow("", self.embedding_test_button)
-        return group
-
-    def _describe_embedding_keys(self) -> str:
-        """Say which keys embeddings will actually use, in the user's own terms."""
-        settings = self._settings
-        if settings.embedding_api_key:
-            return "Эмбеддинги используют выбранный ключ."
-        if settings.embedding_key_provider:
-            return (
-                "Эмбеддинги используют все зелёные ключи провайдера "
-                f"'{settings.embedding_key_provider}'. Лимит считается по модели "
-                "эмбеддингов, перевод он не затрагивает."
-            )
-        return (
-            "Эмбеддинги используют ключ сессии перевода — он может уйти на "
-            "резервную модель провайдера без эмбеддингов."
-        )
-
-    def _build_capability_group(self, parent) -> QGroupBox:
-        group = QGroupBox("Дополнительные анализаторы", parent)
-        layout = QVBoxLayout(group)
-        self.capability_checks: dict[QaCapabilityKey, QCheckBox] = {}
-        for key in CAPABILITY_ORDER:
-            description = CAPABILITY_DESCRIPTIONS[key]
-            check = QCheckBox(description.title, group)
-            check.setToolTip(
-                "\n".join(
-                    (
-                        description.summary,
-                        f"Нагрузка: {description.load_level} ({', '.join(description.resources)})",
-                        f"Скорость: {description.speed_impact}",
-                        f"Польза: {description.quality_benefit}",
-                        f"Риск: {description.quality_risk}",
-                        f"Сеть: {description.network_policy}",
-                    )
-                )
-            )
-            check.toggled.connect(self._on_settings_edited)
-            layout.addWidget(check)
-            caption = QLabel(f"    {description.summary}", group)
-            caption.setWordWrap(True)
-            layout.addWidget(caption)
-            self.capability_checks[key] = check
-
-        endpoint_row = QHBoxLayout()
-        endpoint_row.addWidget(QLabel("Адрес LanguageTool:", group))
-        self.language_tool_endpoint_edit = QLineEdit(group)
-        self.language_tool_endpoint_edit.setPlaceholderText(
-            "например http://localhost:8081/v2/check"
-        )
-        self.language_tool_endpoint_edit.textChanged.connect(self._on_settings_edited)
-        endpoint_row.addWidget(self.language_tool_endpoint_edit)
-        layout.addLayout(endpoint_row)
-        self.capability_checks[QaCapabilityKey.LANGUAGE_TOOL].toggled.connect(
-            self.language_tool_endpoint_edit.setEnabled
-        )
-        self.language_tool_endpoint_edit.setEnabled(
-            self.capability_checks[QaCapabilityKey.LANGUAGE_TOOL].isChecked()
-        )
-
-        cometkiwi_row = QHBoxLayout()
-        cometkiwi_row.addWidget(QLabel("Адрес счётного сервера:", group))
-        self.cometkiwi_endpoint_edit = QLineEdit(group)
-        self.cometkiwi_endpoint_edit.setPlaceholderText(
-            "http://192.168.1.50:8765 — пусто: считать на этом компьютере"
-        )
-        # Reported like every other editable field in this dialog. Without it the
-        # readiness labels, which read self._settings rather than the widgets,
-        # keep calling CometKiwi unconfigured after an address is typed.
-        self.cometkiwi_endpoint_edit.textChanged.connect(self._on_settings_edited)
-        cometkiwi_row.addWidget(self.cometkiwi_endpoint_edit)
-        self.cometkiwi_check_button = QPushButton("Проверить связь", group)
-        self.cometkiwi_check_button.clicked.connect(self._check_cometkiwi_endpoint)
-        cometkiwi_row.addWidget(self.cometkiwi_check_button)
-        layout.addLayout(cometkiwi_row)
-        # Deliberately not tied to the CometKiwi checkbox the way the LanguageTool
-        # row above is tied: disabling the button while the capability is off
-        # would make click() silently do nothing in tests and for users alike.
-
-        # The model name and the licence are what unsatisfied_requirements() asks
-        # of CometKiwi besides a runner or an address, and nothing else in the
-        # application sets them: without these two widgets only a hand-edited
-        # settings.json could, and the next save of a running app undid that.
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Модель COMETKiwi:", group))
-        self.cometkiwi_model_edit = QLineEdit(group)
-        self.cometkiwi_model_edit.setPlaceholderText("wmt22-cometkiwi-da")
-        self.cometkiwi_model_edit.setToolTip(
-            "Для счёта на этом компьютере — имя папки с весами.\n"
-            "«Проверить связь» предупредит, если на ПК запущена другая модель."
-        )
-        self.cometkiwi_model_edit.textChanged.connect(self._on_settings_edited)
-        model_row.addWidget(self.cometkiwi_model_edit)
-        layout.addLayout(model_row)
-
-        self.cometkiwi_license_check = QCheckBox(
-            "Принимаю лицензию модели CC BY-NC-SA 4.0 — "
-            "только некоммерческое использование",
-            group,
-        )
-        self.cometkiwi_license_check.toggled.connect(self._on_settings_edited)
-        layout.addWidget(self.cometkiwi_license_check)
-
-        self.cometkiwi_status_label = QLabel("", group)
-        self.cometkiwi_status_label.setWordWrap(True)
-        # It repeats what the scoring server says about itself, and that server
-        # is unauthenticated: a QLabel would otherwise render its text as markup.
-        self.cometkiwi_status_label.setTextFormat(Qt.TextFormat.PlainText)
-        layout.addWidget(self.cometkiwi_status_label)
-
-        self.capability_status_label = QLabel("", group)
-        self.capability_status_label.setWordWrap(True)
-        layout.addWidget(self.capability_status_label)
-        return group
+        return bar
 
     # -- public API --------------------------------------------------------
 
     def set_report(self, snapshot: BookQaReportSnapshot) -> None:
         """Replace the report with an immutable snapshot from the journal."""
-        self.table_model.set_snapshot(snapshot)
-        hidden = set(self.table_model.hidden_columns())
-        for column in range(self.table_model.columnCount()):
-            self.table.setColumnHidden(column, column in hidden)
-        blocked = snapshot.blocked_chapters
-        repaired = snapshot.repaired_chapters
-        parts = [
-            f"Глав в отчёте: {len(snapshot.rows)}",
-            f"проверено: {snapshot.checked_count}",
-        ]
-        if snapshot.deferred_count:
-            parts.append(f"отложено: {snapshot.deferred_count}")
-        if repaired:
-            parts.append(f"с автоматическими исправлениями: {len(repaired)}")
-        if blocked:
-            parts.append(
-                "перевод остановлен на: " + ", ".join(blocked[:5])
-                + ("…" if len(blocked) > 5 else "")
-            )
-        if snapshot.limited_mode_chapters:
-            parts.append(
-                f"без смыслового сравнения: {len(snapshot.limited_mode_chapters)}"
-            )
-        self.summary_label.setText(". ".join(parts) + ".")
+        self.report_view.set_report(
+            snapshot, scoring_enabled=self._settings.capabilities.cometkiwi_enabled
+        )
+        self._snapshot = snapshot
+        self._refresh_header()
         self._update_action_state()
 
     def set_busy(self, busy: bool) -> None:
         """Disable everything a running check must own exclusively."""
         self._busy = bool(busy)
-        self.progress.setVisible(bool(busy))
-        self.cancel_button.setEnabled(bool(busy))
+        self.progress.setVisible(self._busy)
+        self.report_view.set_busy(self._busy)
+        self._refresh_header()
         self._update_action_state()
 
     def set_progress(self, checked: int, total: int, chapter_id: str = "") -> None:
@@ -523,365 +237,57 @@ class TranslationQualityDialog(QDialog):
 
     def set_status(self, message: str) -> None:
         """Report one short outcome or failure without touching the report."""
-        self.embedding_status_label.setText(str(message or ""))
+        self.status_label.setText(str(message or ""))
+
+    def set_embedding_result(self, message: str) -> None:
+        """Show what the connection check answered next to the embedding settings."""
+        self.settings_view.set_embedding_result(message)
 
     def selected_chapter_id(self) -> str:
         """Return the chapter the user is acting on, if any."""
-        indexes = self.table.selectionModel().selectedRows()
-        if not indexes:
-            return ""
-        row = self.table_model.row_at(indexes[0].row())
-        return row.chapter_id if row else ""
+        return self.report_view.selected_chapter_id()
 
     def select_chapter(self, chapter_id: str) -> bool:
-        """Move the table to one chapter; used when navigating from a finding."""
-        row = self.table_model.row_for_chapter(chapter_id)
-        if row < 0:
-            return False
-        self.table.selectRow(row)
-        return True
+        """Move the report to one chapter; used when navigating from a finding."""
+        return self.report_view.select_chapter(chapter_id)
 
     def qa_settings(self) -> QaSettings:
-        """Return the settings exactly as the widgets currently express them."""
-        provider = self.embedding_provider_combo.currentData() or "auto"
-        chosen_key = self.embedding_key_combo.currentData() or ""
-        manual_key = self.embedding_key_edit.text().strip()
-        return QaSettings(
-            check_completeness_after_chapter=self.completeness_check.isChecked(),
-            auto_repair_confirmed_omissions=self.repair_omissions_check.isChecked(),
-            check_language_after_chapter=self.language_check.isChecked(),
-            language_chunk_chars=self.language_chunk_spin.value(),
-            auto_repair_objective_language_issues=self.repair_language_check.isChecked(),
-            embedding_provider=str(provider),
-            embedding_model=self.embedding_model_combo.currentText().strip(),
-            embedding_api_key=manual_key or str(chosen_key),
-            embedding_key_provider=str(
-                self.embedding_key_provider_combo.currentData() or ""
-            ),
-            embedding_base_url=self.embedding_base_url_edit.text().strip(),
-            correction_model_mode=self._settings.correction_model_mode,
-            correction_provider=self._settings.correction_provider,
-            correction_model=self._settings.correction_model,
-            final_book_pass=self.final_pass_check.isChecked(),
-            capabilities=QaCapabilitySettings(
-                razdel_enabled=self.capability_checks[QaCapabilityKey.RAZDEL].isChecked(),
-                language_tool_enabled=self.capability_checks[
-                    QaCapabilityKey.LANGUAGE_TOOL
-                ].isChecked(),
-                slovnet_enabled=self.capability_checks[QaCapabilityKey.SLOVNET].isChecked(),
-                cometkiwi_enabled=self.capability_checks[
-                    QaCapabilityKey.COMETKIWI
-                ].isChecked(),
-            ),
-            language_tool_endpoint=self.language_tool_endpoint_edit.text().strip(),
-            language_tool_mode=self._settings.language_tool_mode,
-            language_tool_disabled_rules=self._settings.language_tool_disabled_rules,
-            slovnet_cpu_threads=self._settings.slovnet_cpu_threads,
-            slovnet_batch_size=self._settings.slovnet_batch_size,
-            cometkiwi_runner_path=self._settings.cometkiwi_runner_path,
-            cometkiwi_model=self.cometkiwi_model_edit.text().strip(),
-            cometkiwi_device=self._settings.cometkiwi_device,
-            cometkiwi_endpoint=self.cometkiwi_endpoint_edit.text().strip(),
-            cometkiwi_license_accepted=self.cometkiwi_license_check.isChecked(),
-        )
+        """Return the settings exactly as the settings tab currently expresses them."""
+        return self.settings_view.qa_settings()
 
     # -- internals ---------------------------------------------------------
 
-    def _apply_settings_to_widgets(self) -> None:
-        settings = self._settings
-        self.completeness_check.setChecked(settings.check_completeness_after_chapter)
-        self.repair_omissions_check.setChecked(settings.auto_repair_confirmed_omissions)
-        self.language_check.setChecked(settings.check_language_after_chapter)
-        self.language_chunk_spin.setValue(settings.language_chunk_chars)
-        self.repair_language_check.setChecked(
-            settings.auto_repair_objective_language_issues
+    def _on_settings_changed(self, settings: QaSettings) -> None:
+        self._settings = settings
+        self.report_view.set_report(
+            self._snapshot, scoring_enabled=settings.capabilities.cometkiwi_enabled
         )
-        self.final_pass_check.setChecked(settings.final_book_pass)
+        self._refresh_header()
+        self.settings_changed.emit(settings)
 
-        index = self.embedding_provider_combo.findData(settings.embedding_provider)
-        self.embedding_provider_combo.setCurrentIndex(max(index, 0))
-        key_provider_index = self.embedding_key_provider_combo.findData(
-            settings.embedding_key_provider
-        )
-        self.embedding_key_provider_combo.setCurrentIndex(max(key_provider_index, 0))
-        self._reload_key_choices(settings.embedding_api_key)
-        self._reload_model_choices(settings.embedding_provider, settings.embedding_model)
-        self.embedding_base_url_edit.setText(settings.embedding_base_url)
-        self.embedding_base_url_edit.setEnabled(
-            settings.embedding_provider == "openai_compatible"
-        )
-        self._refresh_local_model_state(settings.embedding_provider)
-
-        self.capability_checks[QaCapabilityKey.RAZDEL].setChecked(
-            settings.capabilities.razdel_enabled
-        )
-        self.capability_checks[QaCapabilityKey.LANGUAGE_TOOL].setChecked(
-            settings.capabilities.language_tool_enabled
-        )
-        self.capability_checks[QaCapabilityKey.SLOVNET].setChecked(
-            settings.capabilities.slovnet_enabled
-        )
-        self.capability_checks[QaCapabilityKey.COMETKIWI].setChecked(
-            settings.capabilities.cometkiwi_enabled
-        )
-        self.language_tool_endpoint_edit.setText(settings.language_tool_endpoint)
-        self.cometkiwi_endpoint_edit.setText(settings.cometkiwi_endpoint)
-        self.cometkiwi_model_edit.setText(settings.cometkiwi_model)
-        self.cometkiwi_license_check.setChecked(settings.cometkiwi_license_accepted)
-        self._refresh_setup_warnings()
-
-    def _reload_key_choices(self, selected_key: str) -> None:
-        self.embedding_key_combo.blockSignals(True)
-        self.embedding_key_combo.clear()
-        self.embedding_key_combo.addItem("Ключ сессии перевода", "")
-        matched = False
-        for item in self._api_keys:
-            key = str(item.get("key", "") if isinstance(item, dict) else item or "")
-            if not key:
-                continue
-            provider = str(item.get("provider", "")) if isinstance(item, dict) else ""
-            label = f"{mask_key(key)} ({provider})" if provider else mask_key(key)
-            self.embedding_key_combo.addItem(label, key)
-            if key == selected_key:
-                self.embedding_key_combo.setCurrentIndex(
-                    self.embedding_key_combo.count() - 1
-                )
-                matched = True
-        self.embedding_key_combo.blockSignals(False)
-        self.embedding_key_edit.blockSignals(True)
-        self.embedding_key_edit.setText("" if matched or not selected_key else selected_key)
-        self.embedding_key_edit.blockSignals(False)
-
-    def _reload_model_choices(self, provider: str, selected_model: str) -> None:
-        suggestions = EMBEDDING_MODEL_SUGGESTIONS.get(provider, ())
-        self.embedding_model_combo.blockSignals(True)
-        self.embedding_model_combo.clear()
-        for name in suggestions:
-            self.embedding_model_combo.addItem(name)
-        # An empty model field would silently fall back to a default the user
-        # never saw; show the one that will actually be used.
-        self.embedding_model_combo.setEditText(
-            selected_model or (suggestions[0] if suggestions else "")
-        )
-        self.embedding_model_combo.blockSignals(False)
-
-    def _on_embedding_provider_changed(self) -> None:
-        provider = str(self.embedding_provider_combo.currentData() or "auto")
-        self._reload_model_choices(provider, self.embedding_model_combo.currentText().strip())
-        self.embedding_base_url_edit.setEnabled(provider == "openai_compatible")
-        self._refresh_local_model_state(provider)
-        self._on_settings_edited()
-
-    def _refresh_local_model_state(self, provider: str) -> None:
-        """Say plainly whether the local model is present, and where it is sought."""
-        self.local_model_label.setVisible(provider == "local_onnx")
-        self.embedding_key_combo.setEnabled(provider != "local_onnx")
-        self.embedding_key_edit.setEnabled(provider != "local_onnx")
-        if provider != "local_onnx":
-            return
-        try:
-            from ....qa.assembly import local_embedding_model_state
-
-            installed, root = local_embedding_model_state()
-        except Exception:  # noqa: BLE001 - the dialog must open regardless
-            self.local_model_label.setText("Состояние локальной модели неизвестно.")
-            return
-        self.local_model_label.setText(
-            (
-                f"Модель найдена: {root}"
-                if installed
-                else "Модель не установлена. Положите model.onnx и tokenizer.json в "
-                f"{root} — загрузка не выполняется автоматически."
-            )
-        )
-
-    def _on_key_choice_changed(self) -> None:
-        if self.embedding_key_combo.currentData():
-            self.embedding_key_edit.blockSignals(True)
-            self.embedding_key_edit.clear()
-            self.embedding_key_edit.blockSignals(False)
-        self._on_settings_edited()
-
-    def _on_settings_edited(self) -> None:
-        if self._loading:
-            return
-        self._settings = self.qa_settings()
-        self._refresh_setup_warnings()
-        self.settings_changed.emit(self._settings)
-
-    def _refresh_setup_warnings(self) -> None:
-        problem = self._settings.embedding_setup_problem()
-        self.embedding_status_label.setText(
-            problem or self._describe_embedding_keys()
-        )
-        missing = self._settings.unsatisfied_requirements()
-        self.capability_status_label.setText(
-            "Не настроены и поэтому выключены: " + ", ".join(missing)
-            if missing
-            else ""
-        )
-        self.cometkiwi_status_label.setText(
-            describe_cometkiwi_setup(
-                self._settings,
-                self._cometkiwi_model_status,
-                self._cometkiwi_last_seconds,
-            )
-        )
-
-    def _check_cometkiwi_endpoint(self) -> None:
-        """Ask the scoring server what it is, without loading anything there."""
-        endpoint = self.cometkiwi_endpoint_edit.text().strip()
-        if not endpoint:
-            self.cometkiwi_status_label.setText(
-                "Адрес пуст: оценка будет считаться на этом компьютере."
-            )
-            return
-        base_url = endpoint.rstrip("/")
-        # The rule scoring itself applies. An address scoring refuses as
-        # endpoint_invalid is named as such and never dialled: urllib would
-        # read "192.168.1.50:8765" as an unknown scheme and blame the firewall.
-        if not usable_endpoint(base_url):
-            self.cometkiwi_status_label.setText(
-                "Адрес не разобран: нужен вид http://host:port."
-            )
-            return
-        import json
-        import urllib.error
-        import urllib.request
-
-        # No proxy of any kind, the system's included. Scoring reaches the PC
-        # through an aiohttp session that ignores them all; a check that took
-        # another route could fail where scoring works, or pass where it fails.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(
-                base_url + "/health", timeout=COMETKIWI_CHECK_TIMEOUT_SECONDS
-            ) as response:
-                raw = response.read(100_000)
-        except urllib.error.HTTPError as error:
-            # HTTPError subclasses URLError, so it must be caught first: a
-            # server that answered with 404/500 is not the same failure as one
-            # that never answered, and telling the user to check their
-            # firewall for the wrong reason is worse than a vague message.
-            self.cometkiwi_status_label.setText(
-                f"Сервер ответил ошибкой {error.code}: по этому адресу отвечает "
-                "не счётный сервер или не тот порт."
-            )
-            return
-        except urllib.error.URLError:
-            self.cometkiwi_status_label.setText(
-                "Сервер не отвечает. Проверьте, запущен ли он на ПК, "
-                "и открыт ли порт в брандмауэре."
-            )
-            return
-        except TimeoutError:
-            # urllib wraps a connection that never came up in URLError, but a
-            # read that times out after the server accepted escapes it bare.
-            self.cometkiwi_status_label.setText(
-                "Сервер принял соединение, но не ответил за "
-                f"{COMETKIWI_CHECK_TIMEOUT_SECONDS:g} с."
-            )
-            return
-        except Exception:  # noqa: BLE001 - a failed check never breaks the dialog
-            self.cometkiwi_status_label.setText("Проверка связи не удалась.")
-            return
-        try:
-            health = json.loads(raw)
-        except (ValueError, RecursionError):
-            # json raises RecursionError, not ValueError, for nesting past the
-            # recursion limit. This runs in a Qt slot, where an escaping
-            # exception quits the whole application, and the body comes from
-            # an unauthenticated service on the network.
-            health = None
-        if not isinstance(health, dict):
-            self.cometkiwi_status_label.setText("Ответ сервера не разобран.")
-            return
-        loaded = "веса в памяти" if health.get("loaded") else "веса ещё не загружены"
-        text = (
-            f"Связь есть: {health.get('model', '?')} на "
-            f"{health.get('device', '?')}, {loaded}."
-        )
-        server_model = health.get("model")
-        configured_model = self._settings.cometkiwi_model
-        if (
-            isinstance(server_model, str)
-            and server_model
-            and configured_model
-            and server_model != configured_model
-        ):
-            # The journal keeps no model name, so this is the one place where a
-            # PC started under another model than the settings name shows up.
-            text += (
-                " Внимание: на ПК модель "
-                f"{server_model[:COMETKIWI_MODEL_NAME_CHARS]}, а в настройках — "
-                f"{configured_model[:COMETKIWI_MODEL_NAME_CHARS]}."
-            )
-        self.cometkiwi_status_label.setText(text)
-
-    def _on_selection_changed(self, *_args) -> None:
-        chapter_id = self.selected_chapter_id()
-        row = self.table_model.row_at(
-            self.table_model.row_for_chapter(chapter_id)
-        ) if chapter_id else None
-        if row is None:
-            self.details.setPlainText("Выберите главу, чтобы увидеть решения проверки.")
+    def _refresh_header(self) -> None:
+        parts = [describe_checks(self._settings)]
+        last_pass = format_checked_at(self._snapshot.last_checked_at)
+        if last_pass:
+            parts.append(f"Последний проход: {last_pass}.")
+        self.subtitle_label.setText(" ".join(parts))
+        if self._busy:
+            self.state_chip.set_state("Идёт проверка", "warning")
         else:
-            decisions = self.table_model.snapshot.decisions_by_chapter.get(chapter_id, ())
-            lines = [
-                f"Глава: {row.chapter_id}",
-                f"Статус: {CHAPTER_STATUS_LABELS.get(row.status, row.status)}",
-            ]
-            if row.checked_at:
-                lines.append(f"Проверена: {row.checked_at}")
-            if row.has_completeness:
-                lines.extend(
-                    (
-                        f"Языковая пара: {row.language_pair}",
-                        f"Коэффициент длины: {row.length_ratio:.2f} — {row.profile_status}",
-                        f"Книжная норма: {row.book_position}",
-                        f"Возможные пропуски: {row.possible_gaps}, "
-                        f"подтверждённые: {row.confirmed_gaps}",
-                        f"Конфликты терминов: {row.glossary_conflicts}, "
-                        f"остатки исходника: {row.untranslated_fragments}, "
-                        f"языковые дефекты: {row.language_issues}",
-                    )
-                )
-            lines.append(f"Исправлено автоматически: {row.applied_repairs}")
-            if row.risk_label:
-                lines.append(f"Риск: {row.risk_label}")
-            if row.blocked_reason:
-                lines.append(f"Перевод остановлен: {row.blocked_reason}")
-            if decisions:
-                lines.append("")
-                lines.append("Решения проверки:")
-                lines.extend(
-                    f"  • {DECISION_LABELS.get(decision, decision)}"
-                    for decision in decisions
-                )
-            self.details.setPlainText("\n".join(lines))
-        self._update_action_state()
+            self.state_chip.set_state("Готово к проверке", "success")
 
     def _update_action_state(self) -> None:
-        busy = getattr(self, "_busy", False)
-        has_rows = self.table_model.rowCount() > 0
-        chapter_id = self.selected_chapter_id()
-        repaired = set(self.table_model.snapshot.repaired_chapters)
-        self.export_button.setEnabled(has_rows and not busy)
-        self.check_chapter_button.setEnabled(bool(chapter_id) and not busy)
+        busy = self._busy
+        self.export_button.setEnabled(bool(self._snapshot.rows) and not busy)
         self.check_all_button.setEnabled(not busy)
         self.resume_button.setEnabled(not busy)
-        self.undo_chapter_button.setEnabled(
-            bool(chapter_id) and chapter_id in repaired and not busy
-        )
-        self.undo_all_button.setEnabled(bool(repaired) and not busy)
+        self.resume_button.setVisible(not busy)
         self.cancel_button.setEnabled(busy)
-        self.table.setEnabled(has_rows)
+        self.cancel_button.setVisible(busy)
 
     def _request_export(self) -> None:
         """Ask where to write the report bundle, then hand the path over."""
-        directory = QFileDialog.getExistingDirectory(
-            self, "Куда сохранить отчёт", ""
-        )
+        directory = QFileDialog.getExistingDirectory(self, "Куда сохранить отчёт", "")
         if directory:
             self.export_requested.emit(directory)
 
@@ -890,15 +296,13 @@ class TranslationQualityDialog(QDialog):
         if chapter_id:
             self.check_chapter_requested.emit(chapter_id)
 
-    def _request_undo_chapter(self) -> None:
-        chapter_id = self.selected_chapter_id()
-        if not chapter_id:
-            return
-        if self._confirm_undo([chapter_id]):
+    def _request_undo_chapter(self, chapter_id: str = "") -> None:
+        chapter_id = chapter_id or self.selected_chapter_id()
+        if chapter_id and self._confirm_undo([chapter_id]):
             self.undo_chapter_requested.emit(chapter_id)
 
     def _request_undo_all(self) -> None:
-        chapters = list(self.table_model.snapshot.repaired_chapters)
+        chapters = list(self._snapshot.repaired_chapters)
         if chapters and self._confirm_undo(chapters):
             self.undo_all_requested.emit()
 
@@ -916,18 +320,3 @@ class TranslationQualityDialog(QDialog):
             QMessageBox.StandardButton.No,
         )
         return answer == QMessageBox.StandardButton.Yes
-
-
-def _embedding_key_providers():
-    """Providers whose keys an embedding backend can actually accept."""
-    try:
-        from ....api import config as api_config
-
-        view = api_config.api_providers_view()
-    except Exception:  # noqa: BLE001 - a settings dialog must open regardless
-        return ()
-    return tuple(
-        (provider_id, dict(provider_cfg or {}))
-        for provider_id, provider_cfg in view.items()
-        if provider_id in EMBEDDING_KEY_NAMESPACES
-    )

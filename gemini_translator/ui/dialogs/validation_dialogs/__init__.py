@@ -11,7 +11,6 @@ from .translation_quality_dialog import TranslationQualityDialog
 from .translation_quality_models import (
     BookQaReportSnapshot,
     ChapterQaRow,
-    ChapterQaTableModel,
 )
 from .untranslated_detector import (
     UntranslatedWordDetector,
@@ -24,7 +23,6 @@ __all__ = [
     # Translation quality report
     'BookQaReportSnapshot',
     'ChapterQaRow',
-    'ChapterQaTableModel',
     'TranslationQualityDialog',
     # Untranslated Detector
     'UntranslatedWordDetector',

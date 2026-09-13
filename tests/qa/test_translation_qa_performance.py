@@ -184,35 +184,3 @@ def test_a_disabled_analyzer_makes_no_call_at_all():
     assert nlp_result.status == "disabled"
 
 
-def test_the_report_table_updates_with_one_reset_not_one_signal_per_cell():
-    """A per-cell signal storm freezes the window on a long book."""
-    from PyQt6 import QtWidgets
-
-    from gemini_translator.qa.journal import QaJournal
-    from gemini_translator.ui.dialogs.validation_dialogs import (
-        BookQaReportSnapshot,
-        ChapterQaTableModel,
-    )
-
-    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    journal = QaJournal.empty(book_id="book-1")
-    for index in range(200):
-        journal.upsert_metrics(
-            ChapterMetrics(
-                chapter_id=f"chapter-{index}",
-                source_language="zh",
-                target_language="ru",
-                source_chars=1000,
-                translated_chars=2900,
-            )
-        )
-    model = ChapterQaTableModel()
-    resets, changes = [], []
-    model.modelReset.connect(lambda: resets.append(1))
-    model.dataChanged.connect(lambda *_args: changes.append(1))
-
-    model.set_snapshot(BookQaReportSnapshot.from_journal(journal))
-
-    assert model.rowCount() == 200
-    assert len(resets) == 1
-    assert changes == []

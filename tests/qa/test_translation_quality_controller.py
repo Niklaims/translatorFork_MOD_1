@@ -324,7 +324,7 @@ def test_attaching_a_dialog_connects_both_directions(qt_app):
 
     controller.attach(dialog)
 
-    assert dialog.table_model.rowCount() == 1
+    assert dialog.report_view.table.rowCount() == 1
     dialog.select_chapter("chapter-1")
     dialog.check_chapter_requested.emit("chapter-1")
     assert coordinator.checked == ["chapter-1"]
@@ -488,3 +488,15 @@ def test_current_proxy_settings_come_from_the_app_settings_manager():
     assert _current_proxy_settings(_App()) == proxy
     assert _current_proxy_settings(object()) is None
     assert _current_proxy_settings(_BrokenApp()) is None
+
+
+def test_the_probe_answer_also_goes_to_the_settings_card(qt_app):
+    from gemini_translator.qa.settings import QaSettings
+
+    controller = _controller(_Coordinator())
+    answers: list[str] = []
+    controller.embedding_checked.connect(answers.append)
+
+    controller.test_embedding(QaSettings(embedding_provider="openai_compatible"))
+
+    assert answers and "ключ" in answers[-1].lower()
