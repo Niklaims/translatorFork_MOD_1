@@ -58,6 +58,7 @@ class ChapterQaRow:
     # Only a completeness check produces metrics; without them every field
     # above that describes length, gaps or the book norm is a placeholder.
     has_completeness: bool = False
+    quality_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,20 @@ class BookQaReportSnapshot:
     @property
     def pending_suggestion_chapters(self) -> tuple[str, ...]:
         return tuple(row.chapter_id for row in self.rows if row.pending_suggestions)
+
+    @property
+    def has_scores(self) -> bool:
+        return any(row.quality_score is not None for row in self.rows)
+
+    @property
+    def average_score(self) -> float | None:
+        scores = [row.quality_score for row in self.rows if row.quality_score is not None]
+        return sum(scores) / len(scores) if scores else None
+
+    @property
+    def last_checked_at(self) -> str:
+        # One writer, one ISO format: the newest date is also the largest string.
+        return max((row.checked_at for row in self.rows if row.checked_at), default="")
 
     @classmethod
     def from_journal(cls, journal, open_gates=()) -> "BookQaReportSnapshot":
@@ -260,6 +275,7 @@ def _row_for(
         status=status,
         checked_at=checked_at,
         has_completeness=True,
+        quality_score=metrics.quality_score,
     )
 
 

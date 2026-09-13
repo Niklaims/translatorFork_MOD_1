@@ -1,0 +1,393 @@
+# -*- coding: utf-8 -*-
+"""The «Отчёт» tab: book totals, the chapter list, and the selected chapter."""
+
+from __future__ import annotations
+
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ....qa.report_snapshot import (
+    CHAPTER_STATUS_LABELS,
+    BookQaReportSnapshot,
+    ChapterQaRow,
+)
+from ... import theme_manager
+from .quality_widgets import (
+    EmptyState,
+    MetricCard,
+    format_checked_at,
+    make_button,
+    make_label,
+)
+from .translation_quality_models import DECISION_LABELS
+
+
+STATUS_TONES = {"checked": "success", "deferred": "warning", "blocked": "danger"}
+BASE_COLUMNS = (
+    ("Глава", "chapter_id"),
+    ("Статус", "status"),
+    ("Исправлено", "applied_repairs"),
+    ("Ждут решения", "pending_suggestions"),
+)
+COMPLETENESS_COLUMNS = (
+    ("Длина", "length_ratio"),
+    ("Пропуски", "possible_gaps"),
+    ("Подтверждённые", "confirmed_gaps"),
+    ("Книжная норма", "book_position"),
+)
+SCORE_COLUMNS = (("Оценка", "quality_score"),)
+REPORT_EMPTY_TITLE = "Отчёт пока пуст"
+REPORT_EMPTY_TEXT = (
+    "Проверенные главы появятся здесь после первого прохода. Проверка идёт после "
+    "каждой переведённой главы или по кнопке «Проверить все главы»."
+)
+NO_CHAPTER_TITLE = "Глава не выбрана"
+NO_CHAPTER_TEXT = "Выберите главу в списке слева."
+
+
+def report_columns(snapshot: BookQaReportSnapshot) -> tuple[tuple[str, str], ...]:
+    """The table's columns: completeness and score only where the book has them."""
+    columns = BASE_COLUMNS
+    if snapshot.has_completeness:
+        columns += COMPLETENESS_COLUMNS
+    if snapshot.has_scores:
+        columns += SCORE_COLUMNS
+    return columns
+
+
+class QualityReportView(QWidget):
+    """Show one report snapshot and ask for actions on what the user selected."""
+
+    check_chapter_requested = pyqtSignal(str)
+    undo_chapter_requested = pyqtSignal(str)
+    undo_all_requested = pyqtSignal()
+    open_suggestions_requested = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._snapshot = BookQaReportSnapshot()
+        self._busy = False
+        self._scoring_enabled = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 10, 0, 0)
+        self.stack = QStackedWidget(self)
+        layout.addWidget(self.stack)
+        self.content = QWidget(self.stack)
+        self.empty_state = EmptyState(REPORT_EMPTY_TITLE, REPORT_EMPTY_TEXT, self.stack)
+        self.stack.addWidget(self.content)
+        self.stack.addWidget(self.empty_state)
+
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.addLayout(self._build_totals())
+        split = QHBoxLayout()
+        split.setSpacing(10)
+        split.addWidget(self._build_chapter_list(), 5)
+        split.addWidget(self._build_chapter_card(), 6)
+        content_layout.addLayout(split, 1)
+
+        self.stack.setCurrentWidget(self.empty_state)
+        self._update_actions()
+
+    # -- building ----------------------------------------------------------
+
+    def _build_totals(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        self.checked_card = MetricCard("Проверено", parent=self.content)
+        self.repaired_card = MetricCard("Исправлено автоматически", parent=self.content)
+        self.pending_card = MetricCard("Ждут решения", "Открыть предложения", self.content)
+        self.pending_card.action_clicked.connect(self.open_suggestions_requested.emit)
+        self.score_card = MetricCard("Оценка CometKiwi", parent=self.content)
+        self.score_card.setVisible(False)
+        row.addWidget(self.checked_card, 3)
+        row.addWidget(self.repaired_card, 2)
+        row.addWidget(self.pending_card, 2)
+        row.addWidget(self.score_card, 2)
+        return row
+
+    def _build_chapter_list(self) -> QFrame:
+        card = QFrame(self.content)
+        card.setObjectName("projectPathCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+        layout.addWidget(make_label("Главы", "projectCardTitle", parent=card))
+
+        self.table = QTableWidget(0, len(BASE_COLUMNS), card)
+        self.table.setObjectName("qualityChapterTable")
+        self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setHorizontalHeaderLabels([title for title, _field in BASE_COLUMNS])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        layout.addWidget(self.table, 1)
+
+        undo_row = QHBoxLayout()
+        self.undo_all_button = make_button(
+            "Отменить все автоисправления книги", "dangerActionButton", card
+        )
+        self.undo_all_button.clicked.connect(self.undo_all_requested.emit)
+        undo_row.addWidget(self.undo_all_button)
+        undo_row.addStretch(1)
+        layout.addLayout(undo_row)
+        return card
+
+    def _build_chapter_card(self) -> QFrame:
+        self.chapter_card = QFrame(self.content)
+        self.chapter_card.setObjectName("projectHeaderCard")
+        self.chapter_layout = QVBoxLayout(self.chapter_card)
+        self.chapter_layout.setContentsMargins(14, 12, 14, 12)
+        self.chapter_layout.setSpacing(8)
+        self.chapter_layout.addWidget(
+            make_label("Глава", "sectionEyebrow", parent=self.chapter_card)
+        )
+        self.chapter_title_label = make_label(
+            NO_CHAPTER_TITLE, "heroTitle", wrap=True, parent=self.chapter_card
+        )
+        self.chapter_meta_label = make_label(
+            NO_CHAPTER_TEXT, "heroSubtitle", wrap=True, parent=self.chapter_card
+        )
+        self.chapter_details_label = make_label(
+            "", "mutedLabel", wrap=True, parent=self.chapter_card
+        )
+        self.chapter_details_label.setVisible(False)
+        self.chapter_layout.addWidget(self.chapter_title_label)
+        self.chapter_layout.addWidget(self.chapter_meta_label)
+        self.chapter_layout.addWidget(self.chapter_details_label)
+        self.chapter_layout.addStretch(1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.check_chapter_button = make_button(
+            "Проверить главу", "compactActionButton", self.chapter_card
+        )
+        self.undo_chapter_button = make_button(
+            "Отменить исправления главы", "compactActionButton", self.chapter_card
+        )
+        self.check_chapter_button.clicked.connect(self._request_check_chapter)
+        self.undo_chapter_button.clicked.connect(self._request_undo_chapter)
+        buttons.addWidget(self.check_chapter_button)
+        buttons.addWidget(self.undo_chapter_button)
+        buttons.addStretch(1)
+        self.chapter_layout.addLayout(buttons)
+        return self.chapter_card
+
+    # -- public API --------------------------------------------------------
+
+    def set_report(
+        self, snapshot: BookQaReportSnapshot, *, scoring_enabled: bool = False
+    ) -> None:
+        """Show one immutable report; an unchanged chapter list is not rebuilt."""
+        if not isinstance(snapshot, BookQaReportSnapshot):
+            raise TypeError("snapshot must be a BookQaReportSnapshot")
+        previous = self._snapshot
+        self._snapshot = snapshot
+        self._scoring_enabled = bool(scoring_enabled)
+        self.stack.setCurrentWidget(self.content if snapshot.rows else self.empty_state)
+        self._refresh_totals()
+        if snapshot.rows != previous.rows or self.table.rowCount() != len(snapshot.rows):
+            self._rebuild_table()
+        self._refresh_chapter_card()
+        self._update_actions()
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = bool(busy)
+        self._update_actions()
+
+    def selected_chapter_id(self) -> str:
+        indexes = self.table.selectionModel().selectedRows()
+        if not indexes:
+            return ""
+        item = self.table.item(indexes[0].row(), 0)
+        return str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
+
+    def select_chapter(self, chapter_id: str) -> bool:
+        for index, row in enumerate(self._snapshot.rows):
+            if row.chapter_id == chapter_id:
+                self.table.selectRow(index)
+                return True
+        return False
+
+    # -- internals ---------------------------------------------------------
+
+    def _rebuild_table(self) -> None:
+        selected = self.selected_chapter_id()
+        columns = report_columns(self._snapshot)
+        rows = self._snapshot.rows
+        table = self.table
+        table.setUpdatesEnabled(False)
+        table.blockSignals(True)
+        try:
+            table.clearContents()
+            table.setColumnCount(len(columns))
+            table.setHorizontalHeaderLabels([title for title, _field in columns])
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                for column_index, (_title, field_name) in enumerate(columns):
+                    table.setItem(row_index, column_index, _item(row, field_name))
+        finally:
+            table.blockSignals(False)
+            table.setUpdatesEnabled(True)
+        if selected:
+            self.select_chapter(selected)
+
+    def _refresh_totals(self) -> None:
+        snapshot = self._snapshot
+        self.checked_card.set_values(
+            f"{snapshot.checked_count} из {len(snapshot.rows)}",
+            f"отложено {snapshot.deferred_count}, блокирует {snapshot.blocking_count}",
+        )
+        self.repaired_card.set_values(
+            str(snapshot.repair_count), f"В главах: {len(snapshot.repaired_chapters)}."
+        )
+        self.pending_card.set_values(
+            str(snapshot.pending_suggestion_count),
+            f"В главах: {len(snapshot.pending_suggestion_chapters)}.",
+        )
+        average = snapshot.average_score
+        scored = sum(1 for row in snapshot.rows if row.quality_score is not None)
+        self.score_card.set_values(
+            f"{average:.2f}" if average is not None else "—", f"Оценено глав: {scored}."
+        )
+        self.score_card.setVisible(self._scoring_enabled)
+
+    def _selected_row(self) -> ChapterQaRow | None:
+        chapter_id = self.selected_chapter_id()
+        if not chapter_id:
+            return None
+        return next(
+            (row for row in self._snapshot.rows if row.chapter_id == chapter_id), None
+        )
+
+    def _refresh_chapter_card(self) -> None:
+        row = self._selected_row()
+        if row is None:
+            self.chapter_title_label.setText(NO_CHAPTER_TITLE)
+            self.chapter_meta_label.setText(NO_CHAPTER_TEXT)
+            self.chapter_details_label.clear()
+            self.chapter_details_label.setVisible(False)
+            return
+        self.chapter_title_label.setText(row.chapter_id)
+        self.chapter_meta_label.setText(_chapter_meta(row))
+        details = _chapter_details(
+            row, self._snapshot.decisions_by_chapter.get(row.chapter_id, ())
+        )
+        self.chapter_details_label.setText(details)
+        self.chapter_details_label.setVisible(bool(details))
+
+    def _on_selection_changed(self) -> None:
+        self._refresh_chapter_card()
+        self._update_actions()
+
+    def _update_actions(self) -> None:
+        chapter_id = self.selected_chapter_id()
+        repaired = set(self._snapshot.repaired_chapters)
+        idle = not self._busy
+        self.check_chapter_button.setEnabled(bool(chapter_id) and idle)
+        self.undo_chapter_button.setEnabled(
+            bool(chapter_id) and chapter_id in repaired and idle
+        )
+        self.undo_all_button.setEnabled(bool(repaired) and idle)
+        self.pending_card.action_button.setEnabled(
+            self._snapshot.pending_suggestion_count > 0
+        )
+
+    def _request_check_chapter(self) -> None:
+        chapter_id = self.selected_chapter_id()
+        if chapter_id:
+            self.check_chapter_requested.emit(chapter_id)
+
+    def _request_undo_chapter(self) -> None:
+        chapter_id = self.selected_chapter_id()
+        if chapter_id:
+            self.undo_chapter_requested.emit(chapter_id)
+
+
+def _item(row: ChapterQaRow, field_name: str) -> QTableWidgetItem:
+    item = QTableWidgetItem(_cell_text(row, field_name))
+    if field_name == "chapter_id":
+        item.setData(Qt.ItemDataRole.UserRole, row.chapter_id)
+    elif field_name == "status":
+        tone = STATUS_TONES.get(row.status)
+        if tone:
+            item.setForeground(QBrush(QColor(theme_manager.color(f"{tone}_text"))))
+        if row.blocked_reason:
+            item.setToolTip(f"Перевод остановлен: {row.blocked_reason}")
+    else:
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+    return item
+
+
+def _cell_text(row: ChapterQaRow, field_name: str) -> str:
+    if field_name == "chapter_id":
+        return row.chapter_id
+    if field_name == "status":
+        label = CHAPTER_STATUS_LABELS.get(row.status, row.status)
+        # Colour is never the only signal: a blocked chapter says so in words.
+        return f"⛔ {label}" if row.blocked_reason else label
+    if field_name in ("applied_repairs", "pending_suggestions"):
+        value = int(getattr(row, field_name))
+        return str(value) if value else ""
+    if field_name == "quality_score":
+        return f"{row.quality_score:.2f}" if row.quality_score is not None else "—"
+    if not row.has_completeness:
+        return "—"
+    if field_name == "length_ratio":
+        return f"{row.length_ratio:.2f}"
+    return str(getattr(row, field_name))
+
+
+def _chapter_meta(row: ChapterQaRow) -> str:
+    parts = [CHAPTER_STATUS_LABELS.get(row.status, row.status)]
+    checked_at = format_checked_at(row.checked_at)
+    if checked_at:
+        parts.append(checked_at)
+    if row.risk_label:
+        parts.append(f"риск: {row.risk_label.lower()}")
+    parts.append(f"исправлено автоматически: {row.applied_repairs}")
+    return " · ".join(parts)
+
+
+def _chapter_details(row: ChapterQaRow, decisions) -> str:
+    lines: list[str] = []
+    if row.blocked_reason:
+        lines.append(f"Перевод остановлен: {row.blocked_reason}")
+    if row.has_completeness:
+        lines.append(
+            f"{row.language_pair}, длина {row.length_ratio:.2f} — {row.profile_status}"
+        )
+        lines.append(f"Книжная норма: {row.book_position}")
+        lines.append(
+            f"Возможные пропуски: {row.possible_gaps}, подтверждённые: {row.confirmed_gaps}"
+        )
+        lines.append(
+            f"Конфликты терминов: {row.glossary_conflicts}, остатки исходника: "
+            f"{row.untranslated_fragments}, языковые дефекты: {row.language_issues}"
+        )
+    if row.quality_score is not None:
+        lines.append(f"Оценка CometKiwi: {row.quality_score:.2f}")
+    if decisions:
+        lines.append(
+            "Решения проверки: "
+            + ", ".join(DECISION_LABELS.get(decision, decision) for decision in decisions)
+        )
+    return "\n".join(lines)
