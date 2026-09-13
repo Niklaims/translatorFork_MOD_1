@@ -113,6 +113,49 @@ def _rgba(color: str, alpha: float) -> str:
     return f"rgba({red}, {green}, {blue}, {alpha:.2f})"
 
 
+def _wcag_luminance(color: str) -> float:
+    """Relative luminance as WCAG defines it; `_luminance` above is a cruder blend."""
+
+    def channel(value: int) -> float:
+        scaled = value / 255.0
+        return scaled / 12.92 if scaled <= 0.03928 else ((scaled + 0.055) / 1.055) ** 2.4
+
+    red, green, blue = (channel(value) for value in _hex_to_rgb(color))
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+
+def _contrast_ratio(color_a: str, color_b: str) -> float:
+    high, low = sorted((_wcag_luminance(color_a), _wcag_luminance(color_b)), reverse=True)
+    return (high + 0.05) / (low + 0.05)
+
+
+# How opaque the soft status fills are at rest and under the pointer.
+STATUS_SOFT_ALPHA = 0.14
+STATUS_HOVER_ALPHA = 0.22
+# A little above WCAG AA's 4.5:1, so rounding in the final blend never drops a
+# pair under the line.
+READABLE_STATUS_CONTRAST = 4.6
+
+
+def _readable_status_text(tone: str, surfaces, towards: str, alphas) -> str:
+    """Shift a status colour toward the title text until it reads on its own fills.
+
+    The soft fill is the status colour itself at low opacity, so the text is
+    checked against that fill over every surface a chip or a danger button
+    sits on.  A colour that already reads comes back as it is.
+    """
+    for step in range(21):
+        candidate = _mix(tone, towards, step * 0.05)
+        if all(
+            _contrast_ratio(candidate, _mix(surface, tone, alpha))
+            >= READABLE_STATUS_CONTRAST
+            for surface in surfaces
+            for alpha in alphas
+        ):
+            return candidate
+    return towards
+
+
 def build_theme_palette(theme_colors: Any = None) -> dict[str, str]:
     base = editable_theme_colors(theme_colors)
     window_bg = base["window_bg"]
@@ -145,6 +188,16 @@ def build_theme_palette(theme_colors: Any = None) -> dict[str, str]:
     warning = _status("#b5730a", "#e6a23c", window_bg)
     danger = _status("#c0392b", "#ef6b62", window_bg)
     info = _status("#2563c9", "#6aa6ff", window_bg)
+    status_surfaces = (panel_bg, list_bg, list_alt_bg)
+    success_text = _readable_status_text(
+        success, status_surfaces, title_text, (STATUS_SOFT_ALPHA,)
+    )
+    warning_text = _readable_status_text(
+        warning, status_surfaces, title_text, (STATUS_SOFT_ALPHA,)
+    )
+    danger_text = _readable_status_text(
+        danger, status_surfaces, title_text, (STATUS_SOFT_ALPHA, STATUS_HOVER_ALPHA)
+    )
 
     return {
         "window_bg": window_bg,
@@ -176,11 +229,15 @@ def build_theme_palette(theme_colors: Any = None) -> dict[str, str]:
         "scroll_handle_hover": scroll_handle_hover,
         "splitter_bg": splitter_bg,
         "success": success,
-        "success_soft_bg": _rgba(success, 0.14),
+        "success_soft_bg": _rgba(success, STATUS_SOFT_ALPHA),
+        "success_text": success_text,
         "warning": warning,
-        "warning_soft_bg": _rgba(warning, 0.14),
+        "warning_soft_bg": _rgba(warning, STATUS_SOFT_ALPHA),
+        "warning_text": warning_text,
         "danger": danger,
-        "danger_soft_bg": _rgba(danger, 0.14),
+        "danger_soft_bg": _rgba(danger, STATUS_SOFT_ALPHA),
+        "danger_hover_bg": _rgba(danger, STATUS_HOVER_ALPHA),
+        "danger_text": danger_text,
         "info": info,
     }
 
@@ -350,6 +407,33 @@ QLabel#keyLegendChip[state="exhausted"] {
     background-color: __DANGER_SOFT_BG__;
     border-color: __DANGER__;
     color: __DANGER__;
+}
+
+QLabel#statusChip {
+    background-color: __CHIP_BG__;
+    border: 1px solid __BORDER_STRONG__;
+    border-radius: 10px;
+    padding: 4px 10px;
+    color: __TEXT_SECONDARY__;
+    font-weight: 600;
+}
+
+QLabel#statusChip[tone="success"] {
+    background-color: __SUCCESS_SOFT_BG__;
+    border-color: __SUCCESS__;
+    color: __SUCCESS_TEXT__;
+}
+
+QLabel#statusChip[tone="warning"] {
+    background-color: __WARNING_SOFT_BG__;
+    border-color: __WARNING__;
+    color: __WARNING_TEXT__;
+}
+
+QLabel#statusChip[tone="danger"] {
+    background-color: __DANGER_SOFT_BG__;
+    border-color: __DANGER__;
+    color: __DANGER_TEXT__;
 }
 
 /* Tabs */
@@ -619,15 +703,28 @@ QPushButton#primaryActionButton:pressed {
 }
 
 QPushButton#dangerActionButton {
-    background-color: #412026;
-    color: #ffd8d8;
-    border: 1px solid #7a3945;
+    background-color: __DANGER_SOFT_BG__;
+    color: __DANGER_TEXT__;
+    border: 1px solid __DANGER__;
     font-weight: 600;
 }
 
 QPushButton#dangerActionButton:hover {
-    background-color: #542630;
-    border-color: #93424f;
+    background-color: __DANGER_HOVER_BG__;
+    border-color: __DANGER_TEXT__;
+}
+
+QPushButton#dangerActionButton:pressed {
+    background-color: __DANGER_SOFT_BG__;
+    border-color: __DANGER_TEXT__;
+}
+
+QPushButton#dangerActionButton:disabled,
+QPushButton#dangerActionButton:disabled:hover,
+QPushButton#dangerActionButton:disabled:pressed {
+    background-color: __INPUT_DISABLED_BG__;
+    color: __TEXT_MUTED__;
+    border-color: __BORDER__;
 }
 
 QPushButton#ghostActionButton,
