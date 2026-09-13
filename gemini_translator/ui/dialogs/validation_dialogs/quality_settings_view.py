@@ -65,6 +65,10 @@ COMETKIWI_MODEL_NAME_CHARS = 80
 # What the result line says until a connection check has answered for the
 # embedding setup the card currently shows.
 EMBEDDING_NOT_CHECKED_TEXT = "Подключение ещё не проверялось."
+COMETKIWI_NOT_CHECKED_TEXT = "Связь с ПК ещё не проверялась."
+# An analyzer's description starts under its switch's text, not under the box:
+# the indicator and the gap after it.
+ANALYZER_DETAIL_INDENT = 24
 
 
 class QualitySettingsView(QWidget):
@@ -91,6 +95,7 @@ class QualitySettingsView(QWidget):
         # an edit elsewhere keeps it, a change to that setup retires it.
         self._probe_identity: tuple[str, ...] | None = None
         self._embedding_answer: tuple[tuple[str, ...], str] | None = None
+        self._cometkiwi_answer: tuple[tuple, str] | None = None
         self._loading = True
 
         content = QWidget(self)
@@ -275,7 +280,7 @@ class QualitySettingsView(QWidget):
         self.cometkiwi_check_button = make_button("Проверить связь", "compactActionButton", card)
         # Deliberately not tied to the CometKiwi checkbox: disabling the button
         # while the capability is off would make click() silently do nothing.
-        self.cometkiwi_check_button.clicked.connect(self._check_cometkiwi_endpoint)
+        self.cometkiwi_check_button.clicked.connect(self._run_cometkiwi_check)
         address_row.addWidget(self.cometkiwi_endpoint_edit, 1)
         address_row.addWidget(self.cometkiwi_check_button)
         grid.addWidget(make_label("Адрес ПК", "mutedLabel", parent=card), 0, 0)
@@ -313,25 +318,39 @@ class QualitySettingsView(QWidget):
     def _build_analyzers_card(self, parent) -> QFrame:
         card, layout = self._card(parent, "Дополнительные анализаторы")
         self.capability_checks: dict[QaCapabilityKey, QCheckBox] = {}
-        for key in ANALYZER_ORDER:
-            description = CAPABILITY_DESCRIPTIONS[key]
-            check = QCheckBox(description.title, card)
-            check.setToolTip(_capability_tooltip(description))
-            check.toggled.connect(self._on_settings_edited)
-            layout.addWidget(check)
-            layout.addWidget(make_label(description.summary, "mutedLabel", wrap=True, parent=card))
-            self.capability_checks[key] = check
-
-        endpoint_row = QHBoxLayout()
-        endpoint_row.setSpacing(8)
-        endpoint_row.addWidget(make_label("Адрес LanguageTool", "mutedLabel", parent=card))
         self.language_tool_endpoint_edit = QLineEdit(card)
         self.language_tool_endpoint_edit.setPlaceholderText(
             "например http://localhost:8081/v2/check"
         )
         self.language_tool_endpoint_edit.textChanged.connect(self._on_settings_edited)
-        endpoint_row.addWidget(self.language_tool_endpoint_edit, 1)
-        layout.addLayout(endpoint_row)
+        pairs = QVBoxLayout()
+        pairs.setSpacing(12)
+        for key in ANALYZER_ORDER:
+            description = CAPABILITY_DESCRIPTIONS[key]
+            check = QCheckBox(description.title, card)
+            check.setToolTip(_capability_tooltip(description))
+            check.toggled.connect(self._on_settings_edited)
+            self.capability_checks[key] = check
+            # A switch and what it does belong together: the description sits
+            # right under the switch's text, and the LanguageTool address with it.
+            pair = QVBoxLayout()
+            pair.setSpacing(2)
+            pair.addWidget(check)
+            detail = QVBoxLayout()
+            detail.setContentsMargins(ANALYZER_DETAIL_INDENT, 0, 0, 0)
+            detail.setSpacing(6)
+            detail.addWidget(
+                make_label(description.summary, "mutedLabel", wrap=True, parent=card)
+            )
+            if key is QaCapabilityKey.LANGUAGE_TOOL:
+                endpoint_row = QHBoxLayout()
+                endpoint_row.setSpacing(8)
+                endpoint_row.addWidget(make_label("Адрес", "mutedLabel", parent=card))
+                endpoint_row.addWidget(self.language_tool_endpoint_edit, 1)
+                detail.addLayout(endpoint_row)
+            pair.addLayout(detail)
+            pairs.addLayout(pair)
+        layout.addLayout(pairs)
         self.capability_checks[QaCapabilityKey.LANGUAGE_TOOL].toggled.connect(
             self.language_tool_endpoint_edit.setEnabled
         )
@@ -573,12 +592,28 @@ class QualitySettingsView(QWidget):
         self.capability_status_label.setText(
             "Не настроены и поэтому выключены: " + ", ".join(missing) if missing else ""
         )
-        self.cometkiwi_status_label.setText(
-            describe_cometkiwi_setup(
-                self._settings,
-                self._cometkiwi_model_status,
-                self._cometkiwi_last_seconds,
-            )
+        self.cometkiwi_status_label.setText(self._cometkiwi_status_text())
+
+    def _cometkiwi_status_text(self) -> str:
+        """The check's own answer while it still applies, else what is missing or unchecked."""
+        settings = self._settings
+        answer = self._cometkiwi_answer
+        if answer is not None and answer[0] == _cometkiwi_identity(settings):
+            return answer[1]
+        setup = describe_cometkiwi_setup(
+            settings, self._cometkiwi_model_status, self._cometkiwi_last_seconds
+        )
+        if setup:
+            return setup
+        if settings.capabilities.cometkiwi_enabled and settings.cometkiwi_endpoint:
+            return COMETKIWI_NOT_CHECKED_TEXT
+        return ""
+
+    def _run_cometkiwi_check(self) -> None:
+        self._check_cometkiwi_endpoint()
+        self._cometkiwi_answer = (
+            _cometkiwi_identity(self.qa_settings()),
+            self.cometkiwi_status_label.text(),
         )
 
     def _check_cometkiwi_endpoint(self) -> None:
@@ -680,6 +715,16 @@ def _embedding_identity(settings: QaSettings) -> tuple[str, ...]:
         settings.embedding_api_key,
         settings.embedding_key_provider,
         settings.embedding_base_url,
+    )
+
+
+def _cometkiwi_identity(settings: QaSettings) -> tuple:
+    """The part of the settings «Проверить связь» actually answers for."""
+    return (
+        settings.capabilities.cometkiwi_enabled,
+        settings.cometkiwi_endpoint,
+        settings.cometkiwi_model,
+        settings.cometkiwi_license_accepted,
     )
 
 

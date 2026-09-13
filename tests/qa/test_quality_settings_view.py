@@ -337,3 +337,64 @@ def test_changing_the_embedding_setup_retires_the_old_answer(qt_app):
 
     assert view.embedding_result_label.text() == "Подключение ещё не проверялось."
 
+
+def _configured_pc(**overrides) -> QaSettings:
+    values = {
+        "capabilities": QaCapabilitySettings(cometkiwi_enabled=True),
+        "cometkiwi_endpoint": "http://192.168.1.50:8765",
+        "cometkiwi_model": "wmt22-cometkiwi-da",
+        "cometkiwi_license_accepted": True,
+    }
+    values.update(overrides)
+    return QaSettings(**values)
+
+
+def test_a_configured_pc_says_the_connection_was_not_checked_yet(qt_app):
+    """Карточка CometKiwi молчала, пока не нажмёшь «Проверить связь»."""
+    view = QualitySettingsView(_configured_pc())
+
+    assert view.cometkiwi_status_label.text() == "Связь с ПК ещё не проверялась."
+
+
+def test_a_connection_answer_survives_an_edit_in_another_card(qt_app):
+    view = QualitySettingsView(_configured_pc(cometkiwi_endpoint="192.168.1.50:8765"))
+
+    view.cometkiwi_check_button.click()
+    answer = view.cometkiwi_status_label.text()
+    view.final_pass_check.setChecked(False)
+
+    assert answer == "Адрес не разобран: нужен вид http://host:port."
+    assert view.cometkiwi_status_label.text() == answer
+
+
+def test_changing_the_pc_settings_retires_the_old_answer(qt_app):
+    view = QualitySettingsView(_configured_pc(cometkiwi_endpoint="192.168.1.50:8765"))
+    view.cometkiwi_check_button.click()
+
+    view.cometkiwi_endpoint_edit.setText("http://192.168.1.77:8765")
+
+    assert view.cometkiwi_status_label.text() == "Связь с ПК ещё не проверялась."
+
+
+def test_the_languagetool_address_sits_under_its_own_switch(qt_app):
+    """Поле адреса стояло после Slovnet, оторванное от своего переключателя."""
+    from PyQt6.QtCore import QPoint
+
+    view = QualitySettingsView(QaSettings())
+    view.resize(1100, 900)
+    view.show()
+    qt_app.processEvents()
+    try:
+        def origin(widget):
+            return widget.mapTo(view, QPoint(0, 0))
+
+        language_tool = view.capability_checks[QaCapabilityKey.LANGUAGE_TOOL]
+        slovnet = view.capability_checks[QaCapabilityKey.SLOVNET]
+        address = view.language_tool_endpoint_edit
+
+        assert origin(language_tool).y() < origin(address).y() < origin(slovnet).y()
+        assert origin(address).x() > origin(language_tool).x()
+    finally:
+        view.close()
+        view.deleteLater()
+
