@@ -303,3 +303,37 @@ def test_values_the_window_does_not_show_survive_an_edit(qt_app):
 
     assert published[-1].batch_concurrency == 3
     assert published[-1].auto_fix_language_categories == ("typo",)
+
+
+def test_the_result_line_says_the_connection_was_not_checked_yet(qt_app):
+    view = QualitySettingsView(
+        QaSettings(embedding_provider="gemini", embedding_key_provider="gemini")
+    )
+
+    assert view.embedding_result_label.text() == "Подключение ещё не проверялось."
+
+
+def test_an_unrelated_edit_keeps_the_probe_answer(qt_app):
+    """Ответ проверки пропадал при любой правке, даже галочки в другой карточке."""
+    view = QualitySettingsView(
+        QaSettings(embedding_provider="gemini", embedding_key_provider="gemini")
+    )
+    view.embedding_test_button.click()
+    view.set_embedding_result("Подключение работает: gemini, модель x, 3 измерений.")
+
+    view.final_pass_check.setChecked(False)
+
+    assert view.embedding_result_label.text().startswith("Подключение работает")
+
+
+def test_changing_the_embedding_setup_retires_the_old_answer(qt_app):
+    view = QualitySettingsView(
+        QaSettings(embedding_provider="gemini", embedding_key_provider="gemini")
+    )
+    view.embedding_test_button.click()
+    view.set_embedding_result("Подключение работает: gemini, модель x, 3 измерений.")
+
+    view.embedding_model_combo.setEditText("text-embedding-004")
+
+    assert view.embedding_result_label.text() == "Подключение ещё не проверялось."
+

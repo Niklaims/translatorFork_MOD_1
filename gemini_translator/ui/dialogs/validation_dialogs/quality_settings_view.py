@@ -62,6 +62,9 @@ COMETKIWI_CHECK_TIMEOUT_SECONDS = 5.0
 # How much of each model name the check's warning shows: one of the two names
 # is whatever an unauthenticated server chose to send.
 COMETKIWI_MODEL_NAME_CHARS = 80
+# What the result line says until a connection check has answered for the
+# embedding setup the card currently shows.
+EMBEDDING_NOT_CHECKED_TEXT = "Подключение ещё не проверялось."
 
 
 class QualitySettingsView(QWidget):
@@ -84,6 +87,10 @@ class QualitySettingsView(QWidget):
         self._kept_api_key = ""
         self._cometkiwi_model_status = None
         self._cometkiwi_last_seconds: float | None = None
+        # The last connection answer and the embedding setup it answered for:
+        # an edit elsewhere keeps it, a change to that setup retires it.
+        self._probe_identity: tuple[str, ...] | None = None
+        self._embedding_answer: tuple[tuple[str, ...], str] | None = None
         self._loading = True
 
         content = QWidget(self)
@@ -235,9 +242,7 @@ class QualitySettingsView(QWidget):
         self.embedding_test_button = make_button(
             "Проверить подключение", "compactActionButton", card
         )
-        self.embedding_test_button.clicked.connect(
-            lambda: self.embedding_test_requested.emit(self.qa_settings())
-        )
+        self.embedding_test_button.clicked.connect(self._request_embedding_test)
         self.embedding_result_label = make_label("", "helperLabel", wrap=True, parent=card)
         test_row.addWidget(self.embedding_test_button)
         test_row.addWidget(self.embedding_result_label, 1)
@@ -439,13 +444,21 @@ class QualitySettingsView(QWidget):
         )
 
     def set_embedding_result(self, text: str) -> None:
-        """Show what the last connection check answered."""
-        self.embedding_result_label.setText(str(text or ""))
+        """Show what the last connection check answered, for the setup it checked."""
+        message = str(text or "")
+        identity = self._probe_identity or _embedding_identity(self.qa_settings())
+        self._embedding_answer = (identity, message)
+        self.embedding_result_label.setText(message)
 
     # -- embeddings --------------------------------------------------------
 
     def _provider(self) -> str:
         return str(self.embedding_provider_combo.currentData() or "auto")
+
+    def _request_embedding_test(self) -> None:
+        settings = self.qa_settings()
+        self._probe_identity = _embedding_identity(settings)
+        self.embedding_test_requested.emit(settings)
 
     def _on_embedding_provider_changed(self) -> None:
         if not self._loading:
@@ -547,7 +560,15 @@ class QualitySettingsView(QWidget):
         self.settings_changed.emit(self._settings)
 
     def _refresh_setup_warnings(self) -> None:
-        self.embedding_result_label.setText(self._settings.embedding_setup_problem())
+        problem = self._settings.embedding_setup_problem()
+        answer = self._embedding_answer
+        if problem:
+            result = problem
+        elif answer is not None and answer[0] == _embedding_identity(self._settings):
+            result = answer[1]
+        else:
+            result = EMBEDDING_NOT_CHECKED_TEXT
+        self.embedding_result_label.setText(result)
         missing = self._settings.unsatisfied_requirements()
         self.capability_status_label.setText(
             "Не настроены и поэтому выключены: " + ", ".join(missing) if missing else ""
@@ -649,6 +670,17 @@ class QualitySettingsView(QWidget):
                 f"{configured_model[:COMETKIWI_MODEL_NAME_CHARS]}."
             )
         self.cometkiwi_status_label.setText(text)
+
+
+def _embedding_identity(settings: QaSettings) -> tuple[str, ...]:
+    """The part of the settings a connection check actually answers for."""
+    return (
+        settings.embedding_provider,
+        settings.embedding_model,
+        settings.embedding_api_key,
+        settings.embedding_key_provider,
+        settings.embedding_base_url,
+    )
 
 
 def _capability_tooltip(description) -> str:
