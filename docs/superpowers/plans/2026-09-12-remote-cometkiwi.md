@@ -19,7 +19,8 @@
 - The server takes its model directory and device from its own command line and ignores the `model_dir` and `device` fields of any request.
 - No new third-party dependency. `aiohttp` is already in `requirements.txt`; the PC server uses only the standard library plus what the existing runner already needs.
 - Run tests with the project interpreter: `.venv/bin/python -m pytest`.
-- Comments and docstrings in the application code are written in English, matching the surrounding files. The plan and the spec are in Russian.
+- Comments and docstrings in the application code are written in English, matching the surrounding files. The spec is in Russian; this plan is in English.
+- A commit trailer names the model that actually wrote the commit, exactly as your own harness gives it. Never copy a model name from this plan: the commit blocks below leave it as a placeholder on purpose.
 
 ---
 
@@ -31,7 +32,7 @@
 
 **Interfaces:**
 - Consumes: `CometKiwiRunnerConfig`, `QualityEstimateError` from `cometkiwi_client.py`.
-- Produces: `CometKiwiRunnerConfig.endpoint: str` (default `""`), `CometKiwiRunnerConfig.is_remote` property returning `bool`, and `setup_problem()` returning `"endpoint_invalid"` for a malformed address.
+- Produces: `CometKiwiRunnerConfig.endpoint: str` (default `""`), `CometKiwiRunnerConfig.is_remote` property returning `bool`, `score_url()` returning the POST address, and `setup_problem()` returning `"endpoint_invalid"` for a malformed address. Do NOT add a `health_url()` helper: the dialog in Task 6 holds a `QaSettings`, not this config, and builds its own health URL inline.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -97,7 +98,6 @@ def test_a_trailing_slash_does_not_make_a_second_address():
         "http://192.168.1.50:8765/score"
     )
     assert _remote().score_url() == "http://192.168.1.50:8765/score"
-    assert _remote().health_url() == "http://192.168.1.50:8765/health"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -145,10 +145,6 @@ Add the property and the two URL helpers, and rewrite `setup_problem()`:
         """The address one scoring request is sent to."""
         return f"{self._base_url()}/score"
 
-    def health_url(self) -> str:
-        """The address that answers without loading the model."""
-        return f"{self._base_url()}/health"
-
     def setup_problem(self) -> str:
         """Name the one thing that is missing, or an empty string when ready."""
         if not self.model.strip():
@@ -195,7 +191,7 @@ Expected: PASS, all of them.
 git add gemini_translator/qa/estimators/cometkiwi_client.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): let the CometKiwi config name a runner on another machine
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -433,7 +429,7 @@ Expected: PASS
 git add gemini_translator/qa/estimators/cometkiwi_client.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): score a chapter through a CometKiwi runner on the network
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -554,7 +550,7 @@ Expected: PASS, including every test that existed before.
 git add tools/translation_qa_cometkiwi_runner.py tests/qa/test_cometkiwi_runner_protocol.py
 git commit -m "refactor(qa): separate loading the CometKiwi weights from scoring with them
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -983,7 +979,7 @@ Expected: PASS
 git add tools/translation_qa_cometkiwi_server.py tests/qa/test_cometkiwi_server.py
 git commit -m "feat(qa): serve CometKiwi scoring from the machine that owns the GPU
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1156,7 +1152,7 @@ Expected: PASS, every test in the directory.
 git add gemini_translator/qa/settings.py gemini_translator/qa/estimators/cometkiwi_model_manager.py gemini_translator/qa/assembly.py tests/qa/test_cometkiwi_remote.py
 git commit -m "feat(qa): accept a network address in place of a local CometKiwi runner
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1168,7 +1164,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Test: `tests/qa/test_translation_quality_dialog.py` (append)
 
 **Interfaces:**
-- Consumes: `QaSettings.cometkiwi_endpoint` from Task 5, `CometKiwiRunnerConfig.health_url()` from Task 1.
+- Consumes: `QaSettings.cometkiwi_endpoint` from Task 5. The dialog builds the health URL inline from that string; it does not construct a `CometKiwiRunnerConfig`.
 - Produces: `self.cometkiwi_endpoint_edit` (a `QLineEdit`) and `self.cometkiwi_check_button` (a `QPushButton`) on the dialog.
 
 **The harness already exists** in `tests/qa/test_translation_quality_dialog.py`: that file sets `QT_QPA_PLATFORM=offscreen` at import, defines a module-scoped `qt_app` fixture, and builds the dialog with `TranslationQualityDialog(**kwargs)`. Use those. The dialog takes `settings=` as a keyword argument and hands its collected settings back from `qa_settings()` — not `collect_settings()`.
@@ -1203,11 +1199,38 @@ def test_an_empty_address_says_the_scoring_stays_on_this_machine(qt_app):
     dialog.cometkiwi_check_button.click()
 
     assert "на этом компьютере" in dialog.cometkiwi_status_label.text()
+
+
+def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
+    """Адрес вписан — окно не должно продолжать называть CometKiwi ненастроенным.
+
+    qa_settings() reads the widget directly, so a missing textChanged hookup is
+    invisible to the other tests. This one watches what the user actually sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+    emitted = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.cometkiwi_endpoint_edit.setText("http://192.168.1.50:8765")
+
+    assert emitted, "typing an address must report a settings edit"
+    assert emitted[-1].cometkiwi_endpoint == "http://192.168.1.50:8765"
+    assert "cometkiwi" not in dialog.capability_status_label.text()
+
+    dialog.cometkiwi_endpoint_edit.setText("")
+
+    assert "cometkiwi" in dialog.capability_status_label.text()
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `.venv/bin/python -m pytest tests/qa/test_translation_quality_dialog.py -k cometkiwi_address -v`
+Run: `.venv/bin/python -m pytest tests/qa/test_translation_quality_dialog.py -k address -v`
 Expected: FAIL with `AttributeError: 'TranslationQualityDialog' object has no attribute 'cometkiwi_endpoint_edit'`
 
 - [ ] **Step 3: Write minimal implementation**
@@ -1215,18 +1238,26 @@ Expected: FAIL with `AttributeError: 'TranslationQualityDialog' object has no at
 Add the widgets in the CometKiwi group, just above `self.cometkiwi_status_label`:
 
 ```python
+        cometkiwi_row = QHBoxLayout()
+        cometkiwi_row.addWidget(QLabel("Адрес счётного сервера:", group))
         self.cometkiwi_endpoint_edit = QLineEdit(group)
         self.cometkiwi_endpoint_edit.setPlaceholderText(
             "http://192.168.1.50:8765 — пусто: считать на этом компьютере"
         )
-        layout.addWidget(QLabel("Адрес счётного сервера:", group))
-        layout.addWidget(self.cometkiwi_endpoint_edit)
+        # Reported like every other editable field in this dialog. Without it the
+        # readiness labels, which read self._settings rather than the widgets,
+        # keep calling CometKiwi unconfigured after an address is typed.
+        self.cometkiwi_endpoint_edit.textChanged.connect(self._on_settings_edited)
+        cometkiwi_row.addWidget(self.cometkiwi_endpoint_edit)
         self.cometkiwi_check_button = QPushButton("Проверить связь", group)
         self.cometkiwi_check_button.clicked.connect(self._check_cometkiwi_endpoint)
-        layout.addWidget(self.cometkiwi_check_button)
+        cometkiwi_row.addWidget(self.cometkiwi_check_button)
+        layout.addLayout(cometkiwi_row)
 ```
 
-Add `QLineEdit` and `QPushButton` to the Qt imports at the top of the file if they are not already there.
+`QLineEdit`, `QPushButton` and `QHBoxLayout` are already imported by this file — do not add a second import. The row mirrors the LanguageTool endpoint row directly above it.
+
+**Why the `textChanged` connection is not optional:** every other editable field in this dialog connects to `self._on_settings_edited`, which re-reads `self._settings` from the widgets, reruns `_refresh_setup_warnings()` — the method that writes `capability_status_label` and `cometkiwi_status_label` — and emits `settings_changed`. Leave it out and the user types the PC address while the dialog keeps saying CometKiwi is unconfigured. Do not tie the field or the button to the CometKiwi capability checkbox the way the LanguageTool row is tied: that would disable the check button while the capability is off, and Qt ignores `click()` on a disabled button.
 
 In `qa_settings()` (the method that collects the widgets, around `:518`), add the endpoint next to the other CometKiwi lines:
 
@@ -1286,7 +1317,7 @@ Expected: PASS
 git add gemini_translator/ui/dialogs/validation_dialogs/translation_quality_dialog.py tests/qa/test_translation_quality_dialog.py
 git commit -m "feat(ui): type the CometKiwi server address and check it answers
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1326,10 +1357,16 @@ pause
 
 - [ ] **Step 2: Write the documentation**
 
-Append a section to `docs/translation-quality-qa.md`. Match the heading level and tone of the sections already there.
+Do NOT append to the end of `docs/translation-quality-qa.md`: the file ends with `## Что проверка не делает`, a list of limitations. Insert the subsection below at the END of the existing `## Дополнительные анализаторы` section — immediately before the line `## Что проверка не делает` — so it sits beside the table that already describes COMETKiwi, under the same name the dialog gives the group that holds the new field.
+
+In the same section, the COMETKiwi row of the analyzers table currently says the analyzer «Требует отдельного runner'а, согласия с лицензией и заметных ресурсов.» That stops being true once an address can stand in for the runner. Change exactly that sentence to:
+
+«Требует отдельного runner'а или адреса счётного сервера на другом компьютере, согласия с лицензией и заметных ресурсов.»
+
+Leave the rest of the row, and the rest of the table, as it is.
 
 ```markdown
-## Счёт качества на другом компьютере
+### Счёт качества на другом компьютере
 
 COMETKiwi можно считать не на той машине, где идёт перевод, а на домашнем ПК с
 видеокартой. Перевод при этом ничего не ждёт: если ПК выключен, глава просто
@@ -1346,8 +1383,9 @@ COMETKiwi можно считать не на той машине, где идё
    **частной** сети.
 4. На роутере закрепите за ПК постоянный адрес (резервирование DHCP). Без этого
    адрес сменится после перезагрузки, и оценки тихо пропадут.
-5. В окне «Качество перевода» впишите адрес вида `http://192.168.1.50:8765` и
-   нажмите «Проверить связь». Должно ответить именем модели и устройством.
+5. Откройте **🎯 Качество перевода**, вкладку «Настройки проверки», группу
+   «Дополнительные анализаторы». Впишите адрес вида `http://192.168.1.50:8765`
+   и нажмите «Проверить связь» — должно ответить именем модели и устройством.
 
 Пустое поле адреса возвращает прежнее поведение: счёт идёт на этой машине через
 локальный `translation_qa_cometkiwi_runner.py`.
@@ -1370,7 +1408,7 @@ Expected: prints `Каталог весов не найден: /nope` and exits 
 git add tools/start_cometkiwi_server.bat docs/translation-quality-qa.md
 git commit -m "docs(qa): explain how to run CometKiwi on the PC with the GPU
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 ---
@@ -1384,11 +1422,13 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Run: `.venv/bin/python -m pytest tests/ -q`
 
-Expected: no new failures. Three failures in `tests/test_dedup_pcluster_22_safe_call.py` pre-date this work and come from unrelated uncommitted changes in `gemini_translator/core/chapter_qa_coordinator.py`; confirm they are the same three and nothing else.
+Expected: 0 failures. This worktree's baseline, measured before Task 1, was 4407 passed, 9 skipped, 0 failures, so every failure you see was caused by this branch and must be fixed. An earlier draft of this step said three failures in `tests/test_dedup_pcluster_22_safe_call.py` pre-dated the work; that was true only of the main checkout's uncommitted changes, which this branch does not carry. Do not excuse any failure on that basis, in that file or any other.
 
 - [ ] **Step 2: Confirm the local path is untouched**
 
-Run: `git diff --stat HEAD~7 -- tests/qa/test_cometkiwi_estimator.py tests/qa/test_cometkiwi_runner_protocol.py`
+Run: `git diff --stat e332930 -- tests/qa/test_cometkiwi_estimator.py tests/qa/test_cometkiwi_runner_protocol.py`
+
+`e332930` is the commit this branch was created from. Do not substitute `HEAD~N`: the branch carries plan-document commits and one task landed as three commits, so any fixed offset points into the middle of the branch and the check would silently cover the wrong range.
 Expected: `test_cometkiwi_estimator.py` unchanged; `test_cometkiwi_runner_protocol.py` has only the two appended tests from Task 3 and no edits to existing ones.
 
 - [ ] **Step 3: Commit any fixes**
@@ -1397,7 +1437,7 @@ Expected: `test_cometkiwi_estimator.py` unchanged; `test_cometkiwi_runner_protoc
 git add -- <named files only>
 git commit -m "fix(qa): <what the suite caught>
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
+Co-Authored-By: <the model your own harness names> <noreply@anthropic.com>"
 ```
 
 **Note:** this repository is shared with other sessions. Always stage files by name; never `git add -A`.

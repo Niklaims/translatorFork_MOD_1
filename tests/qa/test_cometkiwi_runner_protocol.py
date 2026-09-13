@@ -311,6 +311,48 @@ def test_the_runner_answers_a_failure_instead_of_crashing(tmp_path, capsys):
     assert answer["schema_version"] == 1
 
 
+def test_scoring_is_separable_from_loading_so_a_server_can_keep_the_model(tmp_path):
+    """Сервер на ПК грузит веса один раз; консольный раннер — как и раньше."""
+    runner = _load_runner()
+
+    class _Model:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(self, data, **kwargs):
+            self.calls += 1
+            return {"scores": [0.5 for _ in data]}
+
+    model = _Model()
+    payload = {
+        "segments": [
+            {"source": "源", "translation": "Перевод"},
+            {"source": "文", "translation": "Текст"},
+        ],
+        "device": "cuda",
+    }
+
+    assert runner.score_with(model, payload) == [0.5, 0.5]
+    assert runner.score_with(model, payload) == [0.5, 0.5]
+    assert model.calls == 2
+
+
+def test_the_device_decides_whether_a_gpu_is_asked_for(tmp_path):
+    runner = _load_runner()
+    seen = {}
+
+    class _Model:
+        def predict(self, data, **kwargs):
+            seen.update(kwargs)
+            return {"scores": [0.5]}
+
+    segments = [{"source": "源", "translation": "Перевод"}]
+    runner.score_with(_Model(), {"segments": segments, "device": "cuda"})
+    assert seen["gpus"] == 1
+    runner.score_with(_Model(), {"segments": segments, "device": "cpu"})
+    assert seen["gpus"] == 0
+
+
 class _Stream:
     def __init__(self, payload: str) -> None:
         self._payload = payload

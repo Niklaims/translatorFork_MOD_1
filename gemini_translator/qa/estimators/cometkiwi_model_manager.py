@@ -20,6 +20,7 @@ from ..model_bundle import (
     ModelBundleFile,
     ModelBundleManager,
 )
+from .cometkiwi_client import usable_endpoint
 
 
 CometKiwiModelFile = ModelBundleFile
@@ -182,22 +183,32 @@ def describe_cometkiwi_setup(
     """One line saying what is set up, what is missing, and what it last cost.
 
     Ticking the checkbox is not the same as having the estimator: this text is
-    what tells the user which of the three parts — runner, weights, licence —
-    they still owe, before anything is downloaded or started.
+    what tells the user which of the parts — a runner or a usable address,
+    weights, licence — they still owe, before anything is downloaded or started.
     """
     if not getattr(settings.capabilities, "cometkiwi_enabled", False):
         return ""
     missing: list[str] = []
-    if not str(getattr(settings, "cometkiwi_runner_path", "") or "").strip():
+    endpoint = str(getattr(settings, "cometkiwi_endpoint", "") or "").strip()
+    remote = bool(endpoint)
+    if remote and not usable_endpoint(endpoint.rstrip("/")):
+        # The address stands in for the runner, and scoring refuses one it
+        # cannot dial - as endpoint_invalid, for every chapter.
+        missing.append("адрес вида http://host:port")
+    if not remote and not str(getattr(settings, "cometkiwi_runner_path", "") or "").strip():
         missing.append("путь к runner")
     if not str(getattr(settings, "cometkiwi_model", "") or "").strip():
         missing.append("модель")
     if not getattr(settings, "cometkiwi_license_accepted", False):
         missing.append("принятая лицензия")
-    if status is None or status.state != "ready":
+    if not remote and (status is None or status.state != "ready"):
         missing.append("установленные веса")
     if missing:
         return "COMETKiwi: требует настройки — не хватает: " + ", ".join(missing) + "."
+    if status is None or status.state != "ready":
+        # Remote scoring has no local install to describe: the weights live on
+        # the other machine, so there is nothing further to add here.
+        return ""
 
     parts = [
         f"COMETKiwi: {status.model}",
