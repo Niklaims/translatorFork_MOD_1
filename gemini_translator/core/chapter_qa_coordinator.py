@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 import threading
 import time
@@ -31,6 +31,7 @@ from .task_manager import QaQueueOutcome
 # How many chapters in a row must lose semantic comparison before the session
 # is told.  One is noise; a run of three is a broken setup.
 LIMITED_MODE_ALERT_STREAK = 3
+_REQUEST_NOT_BUILT = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +130,7 @@ class ChapterQaCoordinator:
         log=None,
         max_concurrency: int = 1,
         quality_estimator=None,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         if not callable(getattr(service, "check_chapter", None)):
             raise TypeError("service must provide check_chapter")
@@ -145,6 +147,7 @@ class ChapterQaCoordinator:
         self._pending_tasks_provider = pending_tasks_provider
         self._analysis_identity_value = analysis_identity
         self._quality_estimator = quality_estimator
+        self._stop_requested = stop_requested if callable(stop_requested) else None
         self._limited_streak = 0
         self._limited_reported = False
         self._log = log
@@ -402,6 +405,7 @@ class ChapterQaCoordinator:
         outcomes: dict[int, ChapterQaResult] = {}
         total = len(events)
         done = 0
+        attempted = False
 
         def report_progress(chapter_id: str) -> None:
             safe_call(on_progress, done, total, chapter_id)
@@ -415,14 +419,28 @@ class ChapterQaCoordinator:
             safe_call(on_chapter, result)
 
         async def check(index: int, event: TranslationReadyEvent) -> None:
-            nonlocal done
+            nonlocal attempted, done
             if self._cancellation.is_cancelled:
                 return
             result: ChapterQaResult | None = None
             async with limit:
                 if self._cancellation.is_cancelled:
                     return
-                result = await self._check_one(event, resolved)
+                request = self._build_request(event)
+                # A pool can already be terminal when the user starts a new
+                # pass in the same application session.  Always let the first
+                # buildable chapter reach the service so the report explains
+                # that state; silently skipping the entire book looks like a
+                # frozen UI.  An unreadable chapter is not an API attempt, so
+                # it must not prevent the next valid chapter from explaining
+                # why the provider is unavailable.
+                if request is not None:
+                    if attempted and self._should_stop():
+                        return
+                    attempted = True
+                    result = await self._check_one(
+                        event, resolved, request=request
+                    )
                 if result is not None:
                     outcomes[index] = result
             # Counted whether the chapter produced a result or not: the reader
@@ -443,6 +461,15 @@ class ChapterQaCoordinator:
         )
         return BookQaResult(results, tuple(dict.fromkeys(skipped)))
 
+    def _should_stop(self) -> bool:
+        stop_requested = getattr(self, "_stop_requested", None)
+        if stop_requested is None:
+            return False
+        try:
+            return bool(stop_requested())
+        except Exception:  # noqa: BLE001 - a broken probe must not cancel QA
+            return False
+
     async def undo_chapter(self, chapter_id: str):
         """Revert one chapter's automatic repairs through the same service."""
         return await self._service.undo_chapter(chapter_id)
@@ -452,20 +479,15 @@ class ChapterQaCoordinator:
         return await self._service.undo_session(self._service.session_id)
 
     async def _check_one(
-        self, event: TranslationReadyEvent, options: QaOptions
+        self,
+        event: TranslationReadyEvent,
+        options: QaOptions,
+        *,
+        request=_REQUEST_NOT_BUILT,
     ) -> ChapterQaResult | None:
-        try:
-            request = self._request_builder(event)
-        except Exception as error:  # noqa: BLE001 - QA never breaks translation
-            self._report(f"[QA] Не удалось собрать запрос для '{event.chapter_id}': {error}")
-            return None
+        if request is _REQUEST_NOT_BUILT:
+            request = self._build_request(event)
         if request is None:
-            # Measured on a live book: sixty chapters vanished this way, with
-            # no trace in the journal and none in the log.
-            self._report(
-                f"[QA] Глава '{event.chapter_id}' пропущена: не удалось прочитать "
-                "оригинал или перевод."
-            )
             return None
         try:
             async with self._one_check_at_a_time():
@@ -481,6 +503,23 @@ class ChapterQaCoordinator:
         self._note_limited_mode(result)
         self._report_chapter(event, result)
         return result
+
+    def _build_request(self, event: TranslationReadyEvent):
+        """Build one request and report project-state failures consistently."""
+        try:
+            request = self._request_builder(event)
+        except Exception as error:  # noqa: BLE001 - QA never breaks translation
+            self._report(f"[QA] Не удалось собрать запрос для '{event.chapter_id}': {error}")
+            return None
+        if request is None:
+            # Measured on a live book: sixty chapters vanished this way, with
+            # no trace in the journal and none in the log.
+            self._report(
+                f"[QA] Глава '{event.chapter_id}' пропущена: не удалось прочитать "
+                "оригинал или перевод."
+            )
+            return None
+        return request
 
     def _one_check_at_a_time(self) -> asyncio.Semaphore:
         """The semaphore every check passes through, bound to the running loop.

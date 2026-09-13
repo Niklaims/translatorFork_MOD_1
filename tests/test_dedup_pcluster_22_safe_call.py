@@ -135,8 +135,10 @@ def test_chapter_qa_report_progress_routes_through_safe_call(monkeypatch):
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
     coordinator._options = lambda: coordinator_module.QaOptions()
+    # check_all_now builds each request itself and hands it to _check_one.
+    coordinator._build_request = lambda event: event
 
-    async def fake_check_one(event, options):
+    async def fake_check_one(event, options, *, request=None):
         return None
 
     coordinator._check_one = fake_check_one
@@ -173,10 +175,12 @@ def test_chapter_qa_report_chapter_routes_through_safe_call(monkeypatch):
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
     coordinator._options = lambda: coordinator_module.QaOptions()
+    # check_all_now builds each request itself and hands it to _check_one.
+    coordinator._build_request = lambda event: event
 
     sentinel_result = object()
 
-    async def fake_check_one(event, options):
+    async def fake_check_one(event, options, *, request=None):
         return sentinel_result
 
     coordinator._check_one = fake_check_one
@@ -214,8 +218,10 @@ def test_chapter_qa_report_chapter_skips_none_result_without_calling_safe_call(
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
     coordinator._options = lambda: coordinator_module.QaOptions()
+    # check_all_now builds each request itself and hands it to _check_one.
+    coordinator._build_request = lambda event: event
 
-    async def fake_check_one(event, options):
+    async def fake_check_one(event, options, *, request=None):
         return None
 
     coordinator._check_one = fake_check_one

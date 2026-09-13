@@ -106,6 +106,59 @@ def test_unresolved_high_risk_blocks_the_task(tmp_path):
     assert "chapter-1" in outcome.outcome.reason
 
 
+def test_book_pass_stops_scheduling_after_terminal_provider_failure():
+    terminal = False
+
+    class _TerminalService(_ServiceStub):
+        async def check_chapter(self, request, options, cancellation):
+            nonlocal terminal
+            result = await super().check_chapter(request, options, cancellation)
+            terminal = True
+            return result
+
+    service = _TerminalService()
+    coordinator = ChapterQaCoordinator(
+        service=service,
+        task_manager=None,
+        request_builder=lambda event: event.chapter_id,
+        stop_requested=lambda: terminal,
+    )
+
+    outcome = asyncio.run(
+        coordinator.check_all_now(
+            tuple(_event(f"chapter-{index}") for index in range(1, 4))
+        )
+    )
+
+    assert service.calls == ["chapter-1"]
+    assert [result.chapter_id for result in outcome.results] == ["chapter-1"]
+    assert outcome.skipped == ("chapter-2", "chapter-3")
+
+
+def test_book_pass_attempts_one_chapter_when_provider_was_already_terminal():
+    """A repeated pass must explain a dead pool instead of silently doing nothing."""
+    service = _ServiceStub()
+    coordinator = ChapterQaCoordinator(
+        service=service,
+        task_manager=None,
+        request_builder=lambda event: (
+            None if event.chapter_id == "chapter-1" else event.chapter_id
+        ),
+        stop_requested=lambda: True,
+        max_concurrency=4,
+    )
+
+    outcome = asyncio.run(
+        coordinator.check_all_now(
+            tuple(_event(f"chapter-{index}") for index in range(1, 4))
+        )
+    )
+
+    assert service.calls == ["chapter-2"]
+    assert [result.chapter_id for result in outcome.results] == ["chapter-2"]
+    assert outcome.skipped == ("chapter-1", "chapter-3")
+
+
 def test_infrastructure_warnings_defer_instead_of_blocking():
     """An embedding outage must never stop a translation session."""
     service = _ServiceStub(

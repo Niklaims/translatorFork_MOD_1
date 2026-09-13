@@ -3079,15 +3079,16 @@ class TranslationValidatorPage(ShellPage):
             return None
         proxy_settings = settings_manager.load_proxy_settings()
         try:
+            key_pool = QaKeyPool(
+                keys, model_id=model_name, settings_manager=settings_manager
+            )
             coordinator = attach_chapter_qa_coordinator(
                 app,
                 project_manager=project_manager,
                 settings_manager=settings_manager,
                 handler_factory=build_qa_handler_factory(
                     settings_manager=settings_manager,
-                    key_pool=QaKeyPool(
-                        keys, model_id=model_name, settings_manager=settings_manager
-                    ),
+                    key_pool=key_pool,
                     session_settings=manual_session_settings(
                         settings_manager, proxy_settings
                     ),
@@ -3099,6 +3100,7 @@ class TranslationValidatorPage(ShellPage):
                 translation_model=model_name,
                 epub_path=str(getattr(self, "original_epub_path", "") or ""),
                 source_language_resolver=detect_source_language,
+                stop_requested=lambda: key_pool.seconds_until_available() is None,
             )
         except Exception as error:  # noqa: BLE001 - a report never crashes the window
             self._quality_setup_problem = f"Проверку не удалось собрать: {error}"

@@ -432,6 +432,7 @@ def attach_chapter_qa_coordinator(
     translation_model: str,
     epub_path: str = "",
     source_language_resolver: Callable[[str], str] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
     log=None,
 ):
     """Build and attach the coordinator the workers report saved chapters to.
@@ -535,6 +536,7 @@ def attach_chapter_qa_coordinator(
         ).preprocessing_identity,
         quality_estimator=build_quality_estimator(qa_settings, paths),
         max_concurrency=qa_settings.batch_concurrency,
+        stop_requested=stop_requested,
         log=log,
     )
     app.qa_coordinator = coordinator

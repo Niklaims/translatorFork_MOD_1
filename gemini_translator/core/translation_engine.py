@@ -888,6 +888,7 @@ class TranslationEngine(EventBusMixin, QObject):
                 translation_model=model_name,
                 epub_path=str(getattr(self, '_qa_epub_path', '') or ''),
                 source_language_resolver=detect_source_language,
+                stop_requested=lambda: key_pool.seconds_until_available() is None,
                 log=log,
             )
             if coordinator is not None:
