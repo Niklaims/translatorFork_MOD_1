@@ -286,7 +286,7 @@ def test_the_chunk_spin_offers_the_automatic_size(qt_app):
 
 
 def test_the_quality_window_carries_the_cometkiwi_address_both_ways(qt_app):
-    """Адрес ПК — единственная настройка CometKiwi, которая реально меняется."""
+    """Адрес ПК доходит из настроек до поля и обратно."""
     dialog = TranslationQualityDialog(
         settings=QaSettings(
             capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
@@ -337,6 +337,105 @@ def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
     dialog.cometkiwi_endpoint_edit.setText("")
 
     assert "cometkiwi" in dialog.capability_status_label.text()
+
+
+def test_the_cometkiwi_model_and_licence_round_trip_through_the_dialog(qt_app):
+    """Имя модели и согласие с лицензией раньше менялись только правкой settings.json.
+
+    The constructor applies the settings to the widgets; qa_settings() used to
+    pass both values through from those settings, so the edits below are what
+    tells a widget-backed round trip from a pass-through.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+
+    assert dialog.cometkiwi_model_edit.text() == "wmt22-cometkiwi-da"
+    assert dialog.cometkiwi_license_check.isChecked() is True
+    settings = dialog.qa_settings()
+    assert settings.cometkiwi_model == "wmt22-cometkiwi-da"
+    assert settings.cometkiwi_license_accepted is True
+
+    dialog.cometkiwi_model_edit.setText("  wmt23-cometkiwi-da-xl  ")
+    dialog.cometkiwi_license_check.setChecked(False)
+
+    settings = dialog.qa_settings()
+    assert settings.cometkiwi_model == "wmt23-cometkiwi-da-xl"
+    assert settings.cometkiwi_license_accepted is False
+
+
+def test_typing_a_cometkiwi_model_name_publishes_it(qt_app):
+    """The window saves only what settings_changed carries; an unreported edit is lost."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    emitted: list[QaSettings] = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.cometkiwi_model_edit.setText("wmt22-cometkiwi-da")
+
+    assert emitted, "typing a model name must report a settings edit"
+    assert emitted[-1].cometkiwi_model == "wmt22-cometkiwi-da"
+
+
+def test_accepting_the_cometkiwi_licence_publishes_it(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    emitted: list[QaSettings] = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.cometkiwi_license_check.setChecked(True)
+
+    assert emitted, "ticking the licence must report a settings edit"
+    assert emitted[-1].cometkiwi_license_accepted is True
+
+
+def test_the_licence_checkbox_names_the_licence_and_its_limit(qt_app):
+    """Согласие ничего не значит, если в подписи не сказано, с чем соглашаются."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    label = dialog.cometkiwi_license_check.text()
+
+    assert "CC BY-NC-SA 4.0" in label
+    assert "некоммерческ" in label
+
+
+def _name_the_model(dialog: TranslationQualityDialog) -> None:
+    dialog.cometkiwi_model_edit.setText("wmt22-cometkiwi-da")
+
+
+def _accept_the_licence(dialog: TranslationQualityDialog) -> None:
+    dialog.cometkiwi_license_check.setChecked(True)
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [(_name_the_model, _accept_the_licence), (_accept_the_licence, _name_the_model)],
+    ids=["model-first", "licence-first"],
+)
+def test_cometkiwi_is_named_unconfigured_until_both_model_and_licence_are_set(
+    qt_app, first, second
+):
+    """Адрес вписан, но без модели и согласия с лицензией оценка всё равно выключена.
+
+    Either order: whichever of the two widgets is set last must be the one that
+    refreshes what the user sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_endpoint="http://192.168.1.50:8765",
+        )
+    )
+    assert "cometkiwi" in dialog.capability_status_label.text()
+
+    first(dialog)
+
+    assert "cometkiwi" in dialog.capability_status_label.text()
+
+    second(dialog)
+
+    assert "cometkiwi" not in dialog.capability_status_label.text()
 
 
 # --- _check_cometkiwi_endpoint's network path, over a real socket ---------

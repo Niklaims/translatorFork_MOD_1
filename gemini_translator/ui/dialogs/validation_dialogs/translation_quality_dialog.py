@@ -426,6 +426,30 @@ class TranslationQualityDialog(QDialog):
         # row above is tied: disabling the button while the capability is off
         # would make click() silently do nothing in tests and for users alike.
 
+        # The model name and the licence are what unsatisfied_requirements() asks
+        # of CometKiwi besides a runner or an address, and nothing else in the
+        # application sets them: without these two widgets only a hand-edited
+        # settings.json could, and the next save of a running app undid that.
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Модель COMETKiwi:", group))
+        self.cometkiwi_model_edit = QLineEdit(group)
+        self.cometkiwi_model_edit.setPlaceholderText("wmt22-cometkiwi-da")
+        self.cometkiwi_model_edit.setToolTip(
+            "Для счёта на этом компьютере — имя папки с весами.\n"
+            "«Проверить связь» предупредит, если на ПК запущена другая модель."
+        )
+        self.cometkiwi_model_edit.textChanged.connect(self._on_settings_edited)
+        model_row.addWidget(self.cometkiwi_model_edit)
+        layout.addLayout(model_row)
+
+        self.cometkiwi_license_check = QCheckBox(
+            "Принимаю лицензию модели CC BY-NC-SA 4.0 — "
+            "только некоммерческое использование",
+            group,
+        )
+        self.cometkiwi_license_check.toggled.connect(self._on_settings_edited)
+        layout.addWidget(self.cometkiwi_license_check)
+
         self.cometkiwi_status_label = QLabel("", group)
         self.cometkiwi_status_label.setWordWrap(True)
         # It repeats what the scoring server says about itself, and that server
@@ -546,10 +570,10 @@ class TranslationQualityDialog(QDialog):
             slovnet_cpu_threads=self._settings.slovnet_cpu_threads,
             slovnet_batch_size=self._settings.slovnet_batch_size,
             cometkiwi_runner_path=self._settings.cometkiwi_runner_path,
-            cometkiwi_model=self._settings.cometkiwi_model,
+            cometkiwi_model=self.cometkiwi_model_edit.text().strip(),
             cometkiwi_device=self._settings.cometkiwi_device,
             cometkiwi_endpoint=self.cometkiwi_endpoint_edit.text().strip(),
-            cometkiwi_license_accepted=self._settings.cometkiwi_license_accepted,
+            cometkiwi_license_accepted=self.cometkiwi_license_check.isChecked(),
         )
 
     # -- internals ---------------------------------------------------------
@@ -593,6 +617,8 @@ class TranslationQualityDialog(QDialog):
         )
         self.language_tool_endpoint_edit.setText(settings.language_tool_endpoint)
         self.cometkiwi_endpoint_edit.setText(settings.cometkiwi_endpoint)
+        self.cometkiwi_model_edit.setText(settings.cometkiwi_model)
+        self.cometkiwi_license_check.setChecked(settings.cometkiwi_license_accepted)
         self._refresh_setup_warnings()
 
     def _reload_key_choices(self, selected_key: str) -> None:
