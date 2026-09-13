@@ -435,13 +435,13 @@ def test_maintenance_preserves_newer_concurrent_exhaustion_without_json_write(tm
         "model": {"exhausted_at": expired, "exhausted_level": 2, "requests": [expired, now]},
     })
     second = SettingsManager(config_file=str(path))
-    real_maintain = first._key_runtime_store.maintain_model
+    real_maintain = first._key_runtime_store.maintain_models
 
-    def interleave(key, model, cutoff, *, clear_exhausted_at=None):
-        second.mark_key_as_exhausted(key, model)
-        return real_maintain(key, model, cutoff, clear_exhausted_at=clear_exhausted_at)
+    def interleave(pairs):
+        second.mark_key_as_exhausted("KEY", "model")
+        return real_maintain(pairs)
 
-    monkeypatch.setattr(first._key_runtime_store, "maintain_model", interleave)
+    monkeypatch.setattr(first._key_runtime_store, "maintain_models", interleave)
     before = path.stat().st_mtime_ns
     bus.events.clear()
     first._refresh_expired_key_limits()
@@ -454,12 +454,72 @@ def test_maintenance_preserves_newer_concurrent_exhaustion_without_json_write(tm
     assert bus.events[-1]["data"] == {"reason": "automatic_limit_reset"}
 
 
+def test_limit_maintenance_serves_every_key_model_pair_in_one_write_transaction(
+    tmp_path, monkeypatch,
+):
+    """Тик обслуживания лимитов — одна транзакция записи на все пары.
+
+    Раньше каждая пара ключ×модель шла отдельной транзакцией: при 144 ключах и
+    1308 парах тик раз в 5 с означал 1308 коммитов.
+    """
+    statements = []
+    real_connect = sqlite3.connect
+
+    def tracing_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(sqlite3, "connect", tracing_connect)
+    manager = SettingsManager(config_file=str(tmp_path / "settings.json"))
+    now = int(time.time())
+    expired = now - 48 * 3600
+    keys = ["KEY_A", "KEY_B", "KEY_C"]
+    models = ["model-a", "model-b"]
+    manager.save_key_statuses([{"key": key, "provider": "gemini"} for key in keys])
+    manager._key_runtime_store.merge_statuses({
+        key: {model: {"requests": [expired, now]} for model in models} for key in keys
+    })
+
+    statements.clear()
+    manager._refresh_expired_key_limits()
+
+    assert statements.count("BEGIN IMMEDIATE") == 1
+    stored = manager._key_runtime_store.load_statuses(keys)
+    assert {
+        (key, model): state.requests
+        for key, states in stored.items()
+        for model, state in states.items()
+    } == {(key, model): (now,) for key in keys for model in models}
+
+
+def test_flush_leaves_runtime_state_in_the_database_file_itself(tmp_path):
+    """После flush база самодостаточна и без -wal.
+
+    Пока соединение открыто, свежие записи живут в -wal. flush вызывается при
+    выходе из приложения, и копия одного settings.runtime.sqlite3, снятая после
+    выхода, не должна терять блокировки ключей.
+    """
+    manager = SettingsManager(config_file=str(tmp_path / "settings.json"))
+    manager.save_key_statuses([{"key": "KEY", "provider": "gemini"}])
+    manager.mark_key_as_exhausted("KEY", "model")
+
+    manager.flush()
+
+    database = tmp_path / "settings.runtime.sqlite3"
+    assert not (tmp_path / "settings.runtime.sqlite3-wal").exists()
+    with sqlite3.connect(f"{database.as_uri()}?immutable=1", uri=True) as connection:
+        assert connection.execute(
+            "SELECT exhausted_level FROM key_model_status"
+        ).fetchall() == [(2,)]
+
+
 @pytest.mark.parametrize("method,store_method", [
     ("increment_request_count", "increment"),
     ("decrement_request_count", "decrement"),
     ("mark_key_as_exhausted", "set_exhausted"),
     ("clear_key_exhaustion_status", "clear_exhaustion"),
-    ("_refresh_expired_key_limits", "maintain_model"),
+    ("_refresh_expired_key_limits", "maintain_models"),
 ])
 def test_runtime_mutation_failure_is_reported_without_success_event(
     tmp_path, monkeypatch, method, store_method,

@@ -126,28 +126,38 @@ def test_path_is_read_only(tmp_path):
         store.path = tmp_path / "other.runtime.sqlite3"
 
 
-def test_public_operations_explicitly_close_every_sqlite_connection(
-    tmp_path, monkeypatch
-):
-    real_connect = sqlite3.connect
-    closed_connections = []
+def test_operation_series_keeps_wal_and_shm_files_in_place(tmp_path):
+    """Серия операций не пересоздаёт -wal и -shm.
 
-    class TrackingConnection(sqlite3.Connection):
-        def close(self):
-            closed_connections.append(self)
-            super().close()
+    Закрытие последнего соединения удаляет оба файла, следующее открытие
+    создаёт их заново. С соединением на операцию таймер обслуживания лимитов,
+    обходящий все пары ключ×модель, давал сотни таких циклов в секунду, и поток
+    файловых событий раздувал fseventsd на macOS.
+    """
+    path = tmp_path / "settings.runtime.sqlite3"
+    sidecars = [
+        tmp_path / "settings.runtime.sqlite3-wal",
+        tmp_path / "settings.runtime.sqlite3-shm",
+    ]
+    store = KeyRuntimeStore(path)
+    store.increment("KEY", "model", 10, cutoff=0)
+    assert all(sidecar.exists() for sidecar in sidecars)
+    identities = [sidecar.stat().st_ino for sidecar in sidecars]
 
-    def tracking_connect(*args, **kwargs):
-        kwargs["factory"] = TrackingConnection
-        return real_connect(*args, **kwargs)
-
-    monkeypatch.setattr(key_runtime_store_module.sqlite3, "connect", tracking_connect)
-    store = KeyRuntimeStore(tmp_path / "settings.runtime.sqlite3")
-
-    store.merge_statuses({"KEY": {"model": {"requests": [10]}}})
-    store.load_statuses(["KEY"])
-
-    assert len(closed_connections) == 3
+    operations = [
+        lambda: store.load_statuses(["KEY"]),
+        lambda: store.merge_statuses({"KEY": {"model": {"requests": [20]}}}),
+        lambda: store.maintain_model("KEY", "model", cutoff=5),
+        lambda: store.maintain_models([("KEY", "model", 5, None)]),
+        lambda: store.set_exhausted("KEY", "model", exhausted_at=30.0),
+        lambda: store.clear_exhaustion("KEY", "model"),
+        lambda: store.decrement("KEY", "model", cutoff=0),
+        lambda: store.delete_keys(["OTHER"]),
+    ]
+    for operation in operations:
+        operation()
+        assert all(sidecar.exists() for sidecar in sidecars)
+        assert [sidecar.stat().st_ino for sidecar in sidecars] == identities
 
 
 def test_load_statuses_returns_one_snapshot_when_merge_happens_between_selects(
@@ -383,7 +393,7 @@ def test_maintenance_rolls_back_pruning_when_clear_fails(tmp_path):
     )
 
 
-def test_mutations_close_connections_after_success_and_rollback(tmp_path, monkeypatch):
+def test_operations_share_one_connection_until_a_failure_replaces_it(tmp_path, monkeypatch):
     real_connect = sqlite3.connect
     connections = []
 
@@ -394,18 +404,27 @@ def test_mutations_close_connections_after_success_and_rollback(tmp_path, monkey
 
     monkeypatch.setattr(key_runtime_store_module.sqlite3, "connect", tracking_connect)
     store = KeyRuntimeStore(tmp_path / "runtime.sqlite3")
+    store.ensure_ready()
+    opened_for_initialization = len(connections)
     store.increment("KEY", "model", 10, 0)
     store.decrement("KEY", "model", 0)
     store.set_exhausted("KEY", "model", 1)
     store.clear_exhaustion("KEY", "model")
     store.maintain_model("KEY", "model", 0)
     store.delete_keys(["KEY"])
-    store.delete_orphans([])
+    assert len(connections) == opened_for_initialization + 1
+    shared = connections[-1]
+
+    # После сбоя соединение не просто откатывается, а закрывается: следующая
+    # операция начинает с нового, как раньше начинала каждая.
     with pytest.raises(sqlite3.IntegrityError):
         store.increment("KEY", "model", None, 0)
-    for connection in connections:
-        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
-            connection.execute("SELECT 1")
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        shared.execute("SELECT 1")
+
+    store.increment("KEY", "model", 20, 0)
+    assert len(connections) == opened_for_initialization + 2
+    assert store.load_statuses(["KEY"])["KEY"]["model"].requests == (20,)
 
 
 def test_connection_configuration_failure_closes_connection(tmp_path, monkeypatch):
@@ -467,6 +486,63 @@ def test_quarantine_preserves_main_and_sidecars_if_move_fails(tmp_path, monkeypa
     assert path.read_bytes() == b"broken"
     assert wal.read_bytes() == b"preserve wal"
     assert list(tmp_path.glob("*.corrupt-*")) == []
+
+
+def _is_open(connection):
+    try:
+        connection.execute("SELECT 1")
+    except sqlite3.ProgrammingError:
+        return False
+    return True
+
+
+def test_quarantine_closes_the_store_connection_before_moving_the_file(tmp_path, monkeypatch):
+    path = tmp_path / "runtime.sqlite3"
+    real_connect = sqlite3.connect
+    connections = []
+
+    def tracking_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(key_runtime_store_module.sqlite3, "connect", tracking_connect)
+    store = KeyRuntimeStore(path)
+    store.increment("KEY", "model", 10, cutoff=0)
+    open_at_move = []
+    real_replace = type(path).replace
+
+    def checked_replace(source, target):
+        if source == path:
+            open_at_move.append([c for c in connections if _is_open(c)])
+        return real_replace(source, target)
+
+    monkeypatch.setattr(type(path), "replace", checked_replace)
+    store._quarantine()
+
+    assert open_at_move == [[]]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows не даёт переименовать открытую базу")
+def test_store_follows_the_path_after_another_store_quarantines_the_file(tmp_path):
+    """Карантин в другом процессе подменяет файл под открытым соединением.
+
+    Такое соединение смотрит в файл, уже переименованный в резервную копию:
+    всё, что пишется через него, в рабочую базу не попадает.
+    """
+    path = tmp_path / "runtime.sqlite3"
+    working = KeyRuntimeStore(path)
+    working.increment("KEY", "model", 10, cutoff=0)
+
+    recovering = KeyRuntimeStore(path)
+    recovering._quarantine()
+    recovering.ensure_ready()
+
+    working.increment("KEY", "model", 20, cutoff=0)
+
+    assert recovering.load_statuses(["KEY"]) == {
+        "KEY": {"model": ModelRuntimeState(requests=(20,))},
+    }
 
 
 def test_delete_keys_rolls_back_request_removal_when_status_delete_fails(tmp_path):

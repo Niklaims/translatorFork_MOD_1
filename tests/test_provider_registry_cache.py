@@ -60,6 +60,9 @@ class SettingsLimitCheckHotPathTests(unittest.TestCase):
         # Таймер обслуживания лимитов пережил бы тест и его временный каталог,
         # см. tests/test_settings_live_key_reset.py.
         self.addCleanup(self.manager._limit_maintenance_timer.stop)
+        # Хранилище квот держит соединение с базой открытым, а Windows не даёт
+        # удалить временный каталог с открытым файлом.
+        self.addCleanup(self.manager._key_runtime_store.close)
         now = int(time.time())
         self.manager.save_key_statuses([
             {"key": f"KEY_{index}", "provider": "gemini"} for index in range(30)

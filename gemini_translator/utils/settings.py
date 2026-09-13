@@ -488,6 +488,9 @@ class SettingsManager(QObject):
         if self._save_timer.isActive():
             self._save_timer.stop()
         self._perform_save()
+        # Хранилище квот держит соединение открытым, и свежие записи лежат в -wal.
+        # Закрытие последнего соединения переносит их в основной файл базы.
+        self._key_runtime_store.close()
 
     @pyqtSlot(str, str, int)
     def _emit_request_count_updated(self, key_to_update, model_id, new_count):
@@ -875,22 +878,26 @@ class SettingsManager(QObject):
         return True
     
     def _check_and_reset_limits_in_cache(self):
-        """Обслуживает SQLite без блокировки конфигурационного кэша."""
-        changed = False
+        """Обслуживает SQLite без блокировки конфигурационного кэша.
+
+        Все пары ключ×модель уходят одной транзакцией. Таймер вызывает это раз
+        в 5 с, и транзакция на пару при 144 ключах означала 1308 коммитов за тик.
+        """
         now = time.time()
         now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
+        pairs = []
         for key_info in self._materialize_key_statuses_unsafe():
             cutoff = self._request_window_cutoff(self._get_request_policy(key_info), int(now))
             for model_id, status in key_info.get("status_by_model", {}).items():
                 clear_at = None
                 if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
                     clear_at = status.get("exhausted_at")
-                pruned, _, cleared = self._run_runtime_store_operation(
-                    "maintain_model", self._key_runtime_store.maintain_model,
-                    key_info["key"], model_id, cutoff, clear_exhausted_at=clear_at,
-                )
-                changed = changed or pruned or cleared
-        return changed
+                pairs.append((key_info["key"], model_id, cutoff, clear_at))
+        if not pairs:
+            return False
+        return self._run_runtime_store_operation(
+            "maintain_models", self._key_runtime_store.maintain_models, pairs,
+        )
     
     def get_qa_settings(self):
         """Return translation QA settings, migrating a missing section to defaults."""

@@ -40,6 +40,9 @@ class SettingsLiveKeyResetTests(unittest.TestCase):
         # временного каталога: хранилище квот пересоздаёт пустую базу и падает
         # с «no such table» внутри чужого теста, который крутит цикл событий.
         self.addCleanup(manager._limit_maintenance_timer.stop)
+        # Хранилище квот держит соединение с базой открытым, а Windows не даёт
+        # удалить временный каталог с открытым файлом.
+        self.addCleanup(manager._key_runtime_store.close)
         return manager
 
     def test_expired_gemini_key_is_reset_and_announced_without_reload(self):

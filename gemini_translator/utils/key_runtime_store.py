@@ -78,6 +78,17 @@ class KeyRuntimeStore:
         self._on_corrupt = on_corrupt
         self._ready = False
         self._ready_lock = threading.Lock()
+        # Операции идут по очереди через одно соединение. Соединение на каждую
+        # операцию обходилось дорого: закрытие последнего соединения с базой в
+        # режиме WAL удаляет -wal и -shm, а следующее открытие создаёт их заново.
+        # RLock, а не Lock: случайно вложенная транзакция упадёт ошибкой SQLite,
+        # а не повесит поток.
+        self._connection: sqlite3.Connection | None = None
+        self._connection_lock = threading.RLock()
+        # Файл, прошедший проверку в ensure_ready. Карантин в другом процессе
+        # кладёт по тому же пути новую базу, и соединение со старым файлом
+        # писало бы уже в резервную копию.
+        self._validated_file: os.stat_result | None = None
 
     @property
     def path(self) -> Path:
@@ -89,6 +100,9 @@ class KeyRuntimeStore:
             str(self.path),
             timeout=self._busy_timeout_ms / 1000,
             isolation_level=None,
+            # Соединение переживает операцию и достаётся разным потокам;
+            # доступ к нему сериализует _connection_lock.
+            check_same_thread=False,
         )
         try:
             connection.row_factory = sqlite3.Row
@@ -97,6 +111,11 @@ class KeyRuntimeStore:
             connection.close()
             raise
         return connection
+
+    def close(self) -> None:
+        """Закрывает соединение с базой; следующая операция откроет новое."""
+        with self._connection_lock:
+            self._discard_connection()
 
     def ensure_ready(self) -> None:
         if self._ready:
@@ -114,6 +133,7 @@ class KeyRuntimeStore:
                     raise
                 backup = self._quarantine()
                 self._initialize()
+            self._validated_file = os.stat(self.path)
             self._ready = True
         if backup is not None and self._on_corrupt is not None:
             self._on_corrupt(self.path, backup)
@@ -168,6 +188,10 @@ class KeyRuntimeStore:
             connection.execute("PRAGMA user_version=1")
 
     def _quarantine(self) -> Path:
+        # Своё соединение закрываем до переименования: Windows не переименует
+        # открытый файл, а на других системах соединение осталось бы смотреть
+        # в резервную копию.
+        self.close()
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         candidate = self.path.with_name(f"{self.path.name}.corrupt-{stamp}")
         suffix = 0
@@ -196,7 +220,6 @@ class KeyRuntimeStore:
         if not raw_keys:
             return {}
 
-        self.ensure_ready()
         statuses_by_key = {api_key: {} for api_key in raw_keys}
         keys_by_hash: dict[str, list[str]] = defaultdict(list)
         for api_key in statuses_by_key:
@@ -206,31 +229,24 @@ class KeyRuntimeStore:
         placeholders = ", ".join("?" for _ in key_hashes)
         requests_by_model: dict[tuple[str, str], list[int]] = defaultdict(list)
 
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN")
-            try:
-                status_rows = connection.execute(
-                    """
-                    SELECT key_hash, model_name, exhausted_at, exhausted_level
-                    FROM key_model_status
-                    WHERE key_hash IN ({placeholders})
-                    """.format(placeholders=placeholders),
-                    key_hashes,
-                ).fetchall()
-                request_rows = connection.execute(
-                    """
-                    SELECT key_hash, model_name, requested_at
-                    FROM key_requests
-                    WHERE key_hash IN ({placeholders})
-                    ORDER BY requested_at, id
-                    """.format(placeholders=placeholders),
-                    key_hashes,
-                ).fetchall()
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            else:
-                connection.execute("COMMIT")
+        with self._transaction("BEGIN") as connection:
+            status_rows = connection.execute(
+                """
+                SELECT key_hash, model_name, exhausted_at, exhausted_level
+                FROM key_model_status
+                WHERE key_hash IN ({placeholders})
+                """.format(placeholders=placeholders),
+                key_hashes,
+            ).fetchall()
+            request_rows = connection.execute(
+                """
+                SELECT key_hash, model_name, requested_at
+                FROM key_requests
+                WHERE key_hash IN ({placeholders})
+                ORDER BY requested_at, id
+                """.format(placeholders=placeholders),
+                key_hashes,
+            ).fetchall()
 
         for row in request_rows:
             requests_by_model[(row["key_hash"], row["model_name"])].append(
@@ -257,56 +273,48 @@ class KeyRuntimeStore:
         if not statuses_by_key:
             return
 
-        self.ensure_ready()
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                for api_key, statuses_by_model in statuses_by_key.items():
-                    key_hash = key_id(api_key)
-                    for model_name, status in statuses_by_model.items():
-                        exhausted_at = status.get("exhausted_at")
-                        exhausted_level = status.get("exhausted_level", 0)
-                        requests = tuple(status.get("requests", ()))
-                        connection.execute(
-                            """
-                            INSERT INTO key_model_status (
-                                key_hash, model_name, exhausted_at, exhausted_level
-                            ) VALUES (?, ?, ?, ?)
-                            ON CONFLICT(key_hash, model_name) DO UPDATE SET
-                                exhausted_at=excluded.exhausted_at,
-                                exhausted_level=excluded.exhausted_level
-                            """,
-                            (key_hash, model_name, exhausted_at, exhausted_level),
-                        )
+        with self._transaction() as connection:
+            for api_key, statuses_by_model in statuses_by_key.items():
+                key_hash = key_id(api_key)
+                for model_name, status in statuses_by_model.items():
+                    exhausted_at = status.get("exhausted_at")
+                    exhausted_level = status.get("exhausted_level", 0)
+                    requests = tuple(status.get("requests", ()))
+                    connection.execute(
+                        """
+                        INSERT INTO key_model_status (
+                            key_hash, model_name, exhausted_at, exhausted_level
+                        ) VALUES (?, ?, ?, ?)
+                        ON CONFLICT(key_hash, model_name) DO UPDATE SET
+                            exhausted_at=excluded.exhausted_at,
+                            exhausted_level=excluded.exhausted_level
+                        """,
+                        (key_hash, model_name, exhausted_at, exhausted_level),
+                    )
 
-                        existing_requests = Counter(
-                            row[0]
-                            for row in connection.execute(
-                                """
-                                SELECT requested_at
-                                FROM key_requests
-                                WHERE key_hash = ? AND model_name = ?
-                                """,
-                                (key_hash, model_name),
-                            )
+                    existing_requests = Counter(
+                        row[0]
+                        for row in connection.execute(
+                            """
+                            SELECT requested_at
+                            FROM key_requests
+                            WHERE key_hash = ? AND model_name = ?
+                            """,
+                            (key_hash, model_name),
                         )
-                        incoming_requests = Counter(requests)
-                        for requested_at, count in incoming_requests.items():
-                            missing = count - existing_requests[requested_at]
-                            if missing > 0:
-                                connection.executemany(
-                                    """
-                                    INSERT INTO key_requests (
-                                        key_hash, model_name, requested_at
-                                    ) VALUES (?, ?, ?)
-                                    """,
-                                    [(key_hash, model_name, requested_at)] * missing,
-                                )
-            except BaseException:
-                connection.execute("ROLLBACK")
-                raise
-            else:
-                connection.execute("COMMIT")
+                    )
+                    incoming_requests = Counter(requests)
+                    for requested_at, count in incoming_requests.items():
+                        missing = count - existing_requests[requested_at]
+                        if missing > 0:
+                            connection.executemany(
+                                """
+                                INSERT INTO key_requests (
+                                    key_hash, model_name, requested_at
+                                ) VALUES (?, ?, ?)
+                                """,
+                                [(key_hash, model_name, requested_at)] * missing,
+                            )
 
     def import_legacy_once(
         self,
@@ -342,17 +350,61 @@ class KeyRuntimeStore:
         return True
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
-        self.ensure_ready()
-        with closing(self._connect()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
+    def _transaction(self, begin: str = "BEGIN IMMEDIATE") -> Iterator[sqlite3.Connection]:
+        connection = self._acquire_connection()
+        try:
+            connection.execute(begin)
+            yield connection
+            connection.execute("COMMIT")
+        except BaseException:
+            # Сбой закрывает соединение целиком: незавершённая транзакция
+            # не удержит блокировку, а следующая операция начнёт с нового.
+            self._discard_connection()
+            raise
+        finally:
+            self._connection_lock.release()
+
+    def _acquire_connection(self) -> sqlite3.Connection:
+        """Отдаёт соединение с проверенным файлом, оставляя _connection_lock захваченным."""
+        while True:
+            self.ensure_ready()
+            self._connection_lock.acquire()
             try:
-                yield connection
-                connection.execute("COMMIT")
+                if self._ready and self._is_validated_file():
+                    if self._connection is None:
+                        self._connection = self._connect()
+                    return self._connection
+                # По пути лежит другой файл или никакого: закрываем старое
+                # соединение и проверяем то, что лежит сейчас. SQLite видит,
+                # что файл перемещён, и -wal с -shm новой базы не трогает.
+                self._discard_connection()
+                self._ready = False
             except BaseException:
-                if connection.in_transaction:
-                    connection.execute("ROLLBACK")
+                self._connection_lock.release()
                 raise
+            self._connection_lock.release()
+
+    def _is_validated_file(self) -> bool:
+        try:
+            current = os.stat(self.path)
+        except FileNotFoundError:
+            return False
+        return self._validated_file is not None and os.path.samestat(
+            current, self._validated_file
+        )
+
+    def _discard_connection(self) -> None:
+        """Закрывает соединение. Вызывать под _connection_lock."""
+        connection, self._connection = self._connection, None
+        if connection is None:
+            return
+        try:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass  # close() всё равно откатит незавершённую транзакцию
+        finally:
+            connection.close()
 
     @staticmethod
     def _count_requests(
@@ -421,6 +473,25 @@ class KeyRuntimeStore:
                 (key_id(api_key), model_id),
             ).rowcount > 0
 
+    @staticmethod
+    def _maintain_pair(
+        connection: sqlite3.Connection, key_hash: str, model_id: str,
+        cutoff: float, clear_exhausted_at: float | None,
+    ) -> tuple[bool, bool]:
+        pruned = connection.execute(
+            """DELETE FROM key_requests
+               WHERE key_hash = ? AND model_name = ? AND requested_at <= ?""",
+            (key_hash, model_id, cutoff),
+        ).rowcount > 0
+        cleared = False
+        if clear_exhausted_at is not None:
+            cleared = connection.execute(
+                """UPDATE key_model_status SET exhausted_at = NULL, exhausted_level = 0
+                   WHERE key_hash = ? AND model_name = ? AND exhausted_at = ?""",
+                (key_hash, model_id, clear_exhausted_at),
+            ).rowcount > 0
+        return pruned, cleared
+
     def maintain_model(
         self, api_key: str, model_id: str, cutoff: float, *,
         clear_exhausted_at: float | None = None,
@@ -428,20 +499,33 @@ class KeyRuntimeStore:
         """Prune expired requests and clear only the observed exhaustion value."""
         key_hash = key_id(api_key)
         with self._transaction() as connection:
-            changed = connection.execute(
-                """DELETE FROM key_requests
-                   WHERE key_hash = ? AND model_name = ? AND requested_at <= ?""",
-                (key_hash, model_id, cutoff),
-            ).rowcount > 0
-            cleared = False
-            if clear_exhausted_at is not None:
-                cleared = connection.execute(
-                    """UPDATE key_model_status SET exhausted_at = NULL, exhausted_level = 0
-                       WHERE key_hash = ? AND model_name = ? AND exhausted_at = ?""",
-                    (key_hash, model_id, clear_exhausted_at),
-                ).rowcount > 0
+            changed, cleared = self._maintain_pair(
+                connection, key_hash, model_id, cutoff, clear_exhausted_at,
+            )
             count = self._count_requests(connection, key_hash, model_id, cutoff)
             return changed, count, cleared
+
+    def maintain_models(
+        self, items: Iterable[tuple[str, str, float, float | None]]
+    ) -> bool:
+        """Обслуживает много пар ключ×модель одной транзакцией.
+
+        Элемент — `(api_key, model_id, cutoff, clear_exhausted_at)`, смысл полей
+        тот же, что у `maintain_model`. Возвращает True, если изменилась хоть
+        одна пара.
+        """
+        pairs = [
+            (key_id(api_key), model_id, cutoff, clear_exhausted_at)
+            for api_key, model_id, cutoff, clear_exhausted_at in items
+        ]
+        if not pairs:
+            return False
+        changed = False
+        with self._transaction() as connection:
+            for pair in pairs:
+                pruned, cleared = self._maintain_pair(connection, *pair)
+                changed = changed or pruned or cleared
+        return changed
 
     def prune_requests(
         self, api_key: str, model_id: str, cutoff: float
