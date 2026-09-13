@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import secrets
 
+from ..utils.io_utils import atomic_write_text
 from ._json_io import load_task_json
 from .paths import ensure_state_dirs, job_dir
 
@@ -112,17 +113,10 @@ def job_path(state_dir: Path, job_id: str) -> Path:
 def save_job(state_dir: Path, job: JobRecord) -> None:
     directory = job_dir(state_dir, job.id)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "job.json"
     payload = json.dumps(job.to_dict(), ensure_ascii=False, indent=2)
-    temp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
-    try:
-        temp_path.write_text(payload, encoding="utf-8")
-        temp_path.replace(path)
-    finally:
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+    # dups-gt_mcp_ai_bridge-53: общий атомарный хелпер (уникальный temp-файл,
+    # fsync, подчистка) вместо собственной temp+replace копии.
+    atomic_write_text(directory / "job.json", payload)
 
 
 def load_job(state_dir: Path, job_id: str) -> JobRecord:

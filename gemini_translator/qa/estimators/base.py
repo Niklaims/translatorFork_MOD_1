@@ -15,6 +15,8 @@ import math
 from types import MappingProxyType
 from typing import Literal, Protocol
 
+from .._common import validate_nonempty_string as _validate_nonempty_string
+
 
 ESTIMATE_STATES = frozenset({"completed", "disabled", "unavailable"})
 
@@ -29,9 +31,13 @@ class QualityEstimateError(ValueError):
 
 
 def _nonempty(value: object, field_name: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise QualityEstimateError(f"{field_name} must be a nonempty string")
-    return value
+    """Contract check of this layer over the shared
+    ``qa._common.validate_nonempty_string`` (dups-gt_qa_coverage_service-29):
+    the same predicate, re-raised as ``QualityEstimateError``."""
+    try:
+        return _validate_nonempty_string(value, field_name)
+    except ValueError as exc:
+        raise QualityEstimateError(str(exc)) from exc
 
 
 def _score(value: object, field_name: str) -> float:

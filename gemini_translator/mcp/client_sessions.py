@@ -6,6 +6,7 @@ from pathlib import Path
 import secrets
 import time
 
+from ..utils.io_utils import atomic_write_text
 from .jobs import utc_now
 from .paths import clients_dir, ensure_state_dirs, validate_job_id
 
@@ -172,11 +173,13 @@ class McpClientSession:
         if method:
             payload["last_method"] = str(method)
 
-        temp_path = self.path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        if os.name != "nt":
-            temp_path.chmod(0o600)
-        temp_path.replace(self.path)
+        # dups-gt_mcp_ai_bridge-53: общий атомарный хелпер вместо собственной
+        # temp+replace копии; права 0o600 на POSIX, как и раньше.
+        atomic_write_text(
+            self.path,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            mode=None if os.name == "nt" else 0o600,
+        )
 
     def close(self) -> None:
         self._closed = True

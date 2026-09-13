@@ -1408,6 +1408,35 @@ class RulateDownloadWorker(QThread):
 
 # ─── Рабочий поток: создание карточки RanobeLib из Rulate ───────────────────
 
+def _fetch_rulate_edit_metadata(playwright, *, rulate_edit_url: str, rulate_url: str, log, on_browser=None) -> dict:
+    """Открывает edit/info Rulate в persistent-профиле и возвращает
+    нормализованные метаданные книги.
+
+    Общая часть RulateToRanobeMetadataWorker.run и
+    RulateToRanobeCreateWorker._read_rulate_metadata
+    (dups-ranobelib_workers-60). ``on_browser`` получает открытый контекст
+    сразу после запуска — воркер сохраняет его в своём поле, чтобы stop()
+    мог закрыть браузер; закрытие после чтения остаётся на вызывающем.
+    """
+    log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
+    log("INFO", f"Rulate: страница данных: {rulate_edit_url}")
+    log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
+    browser = _launch_persistent_chromium_context(
+        playwright,
+        user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
+        viewport={"width": 1280, "height": 900},
+        log_callback=log,
+    )
+    if on_browser is not None:
+        on_browser(browser)
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    page.goto(rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
+    raw_payload = _merge_public_rulate_cover(page, raw_payload, rulate_url, log)
+    return _normalize_rulate_media_payload(raw_payload, rulate_edit_url)
+
+
 class RulateToRanobeMetadataWorker(QThread):
     log_signal = pyqtSignal(str, str)
     metadata_ready = pyqtSignal(dict)
@@ -1425,21 +1454,16 @@ class RulateToRanobeMetadataWorker(QThread):
     def run(self):
         try:
             with sync_playwright() as p:
-                self.log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
-                self.log("INFO", f"Rulate: страница данных: {self.rulate_edit_url}")
-                self.log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
-                self._browser = _launch_persistent_chromium_context(
+                def _remember_browser(browser):
+                    self._browser = browser
+
+                metadata = _fetch_rulate_edit_metadata(
                     p,
-                    user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
-                    viewport={"width": 1280, "height": 900},
-                    log_callback=self.log,
+                    rulate_edit_url=self.rulate_edit_url,
+                    rulate_url=self.rulate_url,
+                    log=self.log,
+                    on_browser=_remember_browser,
                 )
-                page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
-                page.goto(self.rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-                raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
-                raw_payload = _merge_public_rulate_cover(page, raw_payload, self.rulate_url, self.log)
-                metadata = _normalize_rulate_media_payload(raw_payload, self.rulate_edit_url)
                 self.log("SUCCESS", f"Rulate: данные получены: {metadata['title_ru']}")
                 self.metadata_ready.emit(metadata)
         except Exception as error:
@@ -1560,21 +1584,16 @@ class RulateToRanobeCreateWorker(QThread):
             self.log("INFO", "Rulate: использую данные, уже загруженные в форме. Повторно Rulate не открываю.")
             return prefetched
 
-        self.log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
-        self.log("INFO", f"Rulate: страница данных: {self.rulate_edit_url}")
-        self.log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
-        self._rulate_browser = _launch_persistent_chromium_context(
+        def _remember_browser(browser):
+            self._rulate_browser = browser
+
+        metadata = _fetch_rulate_edit_metadata(
             playwright,
-            user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
-            viewport={"width": 1280, "height": 900},
-            log_callback=self.log,
+            rulate_edit_url=self.rulate_edit_url,
+            rulate_url=self.rulate_url,
+            log=self.log,
+            on_browser=_remember_browser,
         )
-        page = self._rulate_browser.pages[0] if self._rulate_browser.pages else self._rulate_browser.new_page()
-        page.goto(self.rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2500)
-        raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
-        raw_payload = _merge_public_rulate_cover(page, raw_payload, self.rulate_url, self.log)
-        metadata = _normalize_rulate_media_payload(raw_payload, self.rulate_edit_url)
         self._rulate_browser.close()
         self._rulate_browser = None
 

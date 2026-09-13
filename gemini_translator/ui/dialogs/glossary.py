@@ -2302,26 +2302,26 @@ class GlossaryManagerPage(ShellPage):
         else:
             self._update_analysis_widgets()
 
-    def get_glossary(self) -> list:
-        conn = self._get_db_conn()
-        with conn:
-            # Обязательно выбираем timestamp для сохранения в файл
-            cursor = conn.execute("SELECT original, rus, note, timestamp FROM glossary_editor_state ORDER BY sequence ASC")
-            return [dict(row) for row in cursor.fetchall()]
-
-    def _get_glossary_with_db_ids(self) -> list:
-        """Возвращает строки для внутренних редакторов с устойчивым ID из БД."""
+    def get_glossary(self, include_db_id: bool = False) -> list:
+        """Строки редактора в порядке sequence (timestamp обязателен — он
+        уходит в файл). ``include_db_id`` добавляет устойчивый id из БД как
+        ``_db_id`` для внутренних редакторов — раньше это был второй метод с
+        почти тем же SELECT (dups-gt_ui_dialogs_glossary-04)."""
+        columns = "original, rus, note, timestamp"
+        if include_db_id:
+            columns = "id AS _db_id, " + columns
         conn = self._get_db_conn()
         with conn:
             cursor = conn.execute(
-                """
-                SELECT id AS _db_id, original, rus, note, timestamp
-                FROM glossary_editor_state
-                ORDER BY sequence ASC
-                """
+                f"SELECT {columns} FROM glossary_editor_state ORDER BY sequence ASC"
             )
             return [dict(row) for row in cursor.fetchall()]
-    
+
+    def _get_glossary_with_db_ids(self) -> list:
+        """Тонкий алиас get_glossary(include_db_id=True): имя используют
+        conflict-резолверы и tests/test_glossary_conflict_identity.py."""
+        return self.get_glossary(include_db_id=True)
+
     def _remove_selected_terms(self):
         selected_indexes = self.table.selectionModel().selectedIndexes()
         if not selected_indexes: return

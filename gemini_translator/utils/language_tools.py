@@ -40,6 +40,20 @@ from . import cjk_ranges
 STOP_WORDS = {'the', 'a', 'an', 'to', 'in', 'on', 'of', 'for', 'with', 'am', 'i'}
 CJK_STOP_WORDS = {'的', '是', '一', '不', '人', '我', '了', '在', '有', '和', '之'}
 MORPHOLOGY_SUFFIXES_TO_IGNORE = ["'s", "es", "s"]
+
+
+def normalize_word(word):
+    """Удаляет первый подходящий английский суффикс/окончание из
+    MORPHOLOGY_SUFFIXES_TO_IGNORE («первое совпадение»).
+
+    Единая реализация для SmartGlossaryFilter и GlossaryLogic — раньше у
+    каждого класса был свой одинаковый метод _normalize_word
+    (dups-gt_utils_language_tools-39).
+    """
+    for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
+        if word.endswith(suffix):
+            return word[:-len(suffix)]
+    return word
 # Определяем пороги
 ORDERED_SEARCH_THRESHOLD = 99      # Уровень 2: Порядок важен, но прощаем морфологию
 UNORDERED_WORDS_THRESHOLD = 98     # Уровень 3: Разрешаем перестановку слов
@@ -540,16 +554,6 @@ class SmartGlossaryFilter:
         """Применяет универсальную Unicode-нормализацию NFKC."""
         return unicodedata.normalize('NFKC', text)
     
-    def _normalize_word(self, word):
-        """
-        Удаляет распространенные английские суффиксы/окончания из слова.
-        Работает по принципу "первое совпадение".
-        """
-        for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
-            if word.endswith(suffix):
-                return word[:-len(suffix)]
-        return word
-    
     
     
     def filter_glossary_for_text(self, full_glossary, text, 
@@ -1010,7 +1014,7 @@ class SmartGlossaryFilter:
                 else:
                     # В обычном режиме (для порога 99) мы все смягчаем
                     filtered_words = [w for w in term_words if w not in STOP_WORDS]
-                    processed_words = [self._normalize_word(w) for w in filtered_words]
+                    processed_words = [normalize_word(w) for w in filtered_words]
 
                 final_processed_term = " ".join(" ".join(processed_words).split())
 
@@ -1260,13 +1264,6 @@ class GlossaryLogic:
         return similarity_map
 
     
-    def _normalize_word(self, word):
-        """Удаляет распространенные английские суффиксы/окончания."""
-        for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
-            if word.endswith(suffix):
-                return word[:-len(suffix)]
-        return word
-
     def _get_universal_tokens(self, text):
         """УНИВЕРСАЛЬНЫЙ ТОКЕНИЗАТОР: иероглиф или слово - это токен."""
         if LanguageDetector.is_cjk_text(text):
@@ -1275,7 +1272,7 @@ class GlossaryLogic:
             normalized = unicodedata.normalize('NFKC', text).lower()
             clean_text = re.sub(r'\W+', ' ', normalized, flags=re.UNICODE).strip()
             all_tokens = clean_text.split()
-            return [self._normalize_word(token) for token in all_tokens if token not in STOP_WORDS]
+            return [normalize_word(token) for token in all_tokens if token not in STOP_WORDS]
 
     def _calculate_levenshtein_similarity(self, s1, s2):
         """Вычисляет структурную похожесть строк."""
