@@ -11,6 +11,7 @@ from PyQt6 import QtWidgets
 
 from gemini_translator.qa.language_validation import LANGUAGE_ISSUE_CATEGORIES
 from gemini_translator.qa.models import QaSuggestion
+from gemini_translator.qa.text_diff import REMOVED_STYLE
 from gemini_translator.ui.dialogs.validation_dialogs.quality_suggestions_view import (
     QualitySuggestionsView,
 )
@@ -113,17 +114,45 @@ def test_a_stale_card_only_offers_to_take_it_off_the_list(qt_app):
 
     assert card.apply_button is None
     assert card.dismiss_button.text() == "Убрать из списка"
-    assert card.note_label.text() == "устарело: глава изменилась после проверки"
+    assert card.note_label.text() == "Применить нельзя: глава изменилась после проверки."
 
 
 def test_a_card_without_a_replacement_cannot_be_applied(qt_app):
+    """Пустая замена у повтора значит «модель не предложила текст», а не «удалить»."""
     card = SuggestionCard(
-        _suggestion(original="очень-очень", replacement="", reason="no_replacement")
+        _suggestion(
+            original="очень-очень", replacement="", category="repetition", reason="no_replacement"
+        )
     )
 
     assert not card.apply_button.isEnabled()
-    assert "вносит человек" in card.note_label.text()
+    assert card.note_label.text() == "Такую правку вносят вручную."
+    assert "замена не предложена" in card.after_label.text()
+    assert "удалить" not in card.after_label.text()
+
+
+def test_a_meta_comment_without_a_replacement_reads_as_a_deletion(qt_app):
+    """Служебный комментарий исправляют удалением: заменять его нечем."""
+    card = SuggestionCard(
+        _suggestion(
+            original="(прим. пер.: игра слов)",
+            replacement="",
+            category="meta_comment",
+            reason="no_replacement",
+        )
+    )
+
     assert "удалить фрагмент" in card.after_label.text()
+    assert REMOVED_STYLE in card.before_label.text()
+    assert not card.apply_button.isEnabled()
+
+
+@pytest.mark.parametrize("reason", ["ambiguous_span", "paragraph_break"])
+def test_a_fix_the_text_cannot_take_offers_no_apply(qt_app, reason):
+    card = SuggestionCard(_suggestion(reason=reason))
+
+    assert not card.apply_button.isEnabled()
+    assert card.note_label.text() == "Такую правку вносят вручную."
 
 
 def test_model_text_is_never_rendered_as_markup(qt_app):

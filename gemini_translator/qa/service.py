@@ -12,7 +12,11 @@ import re
 import time
 from pathlib import Path
 
-from ..utils.epub_json import build_html_document_model, render_document_html
+from ..utils.epub_json import (
+    build_html_document_model,
+    build_translation_payload,
+    render_document_html,
+)
 from ..utils.text import escape_html
 from .addition_detector import AdditionCandidate, ChapterContext
 from .capabilities import QaCapabilitySettings
@@ -58,6 +62,7 @@ from .repair_store import (
     content_digest,
 )
 from .repair_validator import ChapterSnapshot
+from .semantic_units import flatten_visible_text
 from .structural_repair import (
     RepairValidationContext,
     StructuralPatch,
@@ -749,7 +754,7 @@ class TranslationQualityService:
                 "failed",
                 suggestion_id,
                 chapter_id,
-                "нет текста замены: такую правку вносит человек",
+                "такую правку вносят вручную",
             )
         path = Path(translated_path) if translated_path else None
         try:
@@ -772,7 +777,9 @@ class TranslationQualityService:
                 ),
             )
         except (LanguageRepairConflict, ValueError):
-            return self._suggestion_went_stale(suggestion, "глава изменилась после проверки")
+            return self._suggestion_went_stale(
+                suggestion, _why_it_does_not_fit(before, suggestion)
+            )
         payload = render_document_html(edited).encode("utf-8")
         try:
             backup = self._store.backup_chapter(chapter_id, path)
@@ -1361,6 +1368,9 @@ def _suggestions_for(result: ChapterQaResult) -> tuple[QaSuggestion, ...] | None
     suggestions: dict[str, QaSuggestion] = {}
     for issue in getattr(language, "suggestions", ()) or ():
         replacement = issue.replacement_text or ""
+        if replacement == issue.original_text:
+            # A replacement equal to its original proposes nothing to apply or decline.
+            continue
         suggestion_id = QaSuggestion.identity(
             result.chapter_id, issue.block_id, issue.original_text, replacement
         )
@@ -1379,6 +1389,29 @@ def _suggestions_for(result: ChapterQaResult) -> tuple[QaSuggestion, ...] | None
             ),
         )
     return tuple(suggestions.values())
+
+
+def _why_it_does_not_fit(chapter: bytes, suggestion: QaSuggestion) -> str:
+    """Name what keeps a suggestion out of its chapter.
+
+    A fragment still found in its paragraph means the text has not changed:
+    calling the chapter changed would send the user after an edit nobody made.
+    """
+    try:
+        model = build_html_document_model(
+            chapter.decode("utf-8"), document_id=suggestion.chapter_id
+        )
+        blocks = build_translation_payload(model)["blocks"]
+    except ValueError:
+        return "глава изменилась после проверки"
+    block = next((item for item in blocks if item.get("id") == suggestion.block_id), None)
+    text = flatten_visible_text(block["inlines"])[0] if block is not None else ""
+    found = text.count(suggestion.original_text) if suggestion.original_text.strip() else 0
+    if found > 1:
+        return "фрагмент встречается в абзаце не один раз"
+    if found == 1:
+        return "фрагмент задевает оформление текста, например курсив"
+    return "глава изменилась после проверки"
 
 
 # How much already-translated prose the repairer may see on each side of a gap.

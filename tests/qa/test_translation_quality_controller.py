@@ -650,7 +650,7 @@ def test_a_stale_suggestion_says_the_chapter_was_not_touched(qt_app):
     controller.apply_suggestion("sg-1")
 
     assert statuses[-1] == (
-        "Правка устарела: глава изменилась после проверки. Файл главы не тронут."
+        "Правку применить нельзя: глава изменилась после проверки. Файл главы не тронут."
     )
 
 

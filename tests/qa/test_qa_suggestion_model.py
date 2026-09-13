@@ -72,6 +72,20 @@ def test_what_still_awaits_a_decision(status, awaits, applicable):
 
 
 @pytest.mark.parametrize(
+    ("reason", "applicable"),
+    [
+        ("validation_declined", True),
+        ("low_confidence (0.62 < 0.85)", True),
+        ("ambiguous_span", False),
+        ("paragraph_break", False),
+    ],
+)
+def test_a_fix_the_text_cannot_take_is_left_to_a_person(reason, applicable):
+    """Неоднозначный фрагмент или разрыв абзаца не вписать никаким нажатием."""
+    assert _suggestion(reason=reason).applicable is applicable
+
+
+@pytest.mark.parametrize(
     "damage",
     [
         lambda payload: payload.update(status="maybe"),

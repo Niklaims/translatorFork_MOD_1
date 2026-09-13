@@ -536,6 +536,10 @@ class QaChapterState:
 _SUGGESTION_STATUSES = frozenset({"pending", "applied", "dismissed", "stale"})
 _UNDECIDED_SUGGESTION_STATUSES = frozenset({"pending", "stale"})
 
+# Refusals no decision can overcome: the fragment is not unique in its
+# paragraph, or the fix wants a paragraph break a replacement cannot hold.
+_UNPLACEABLE_REFUSALS = frozenset({"ambiguous_span", "paragraph_break"})
+
 
 @dataclass(frozen=True, slots=True)
 class QaSuggestion:
@@ -591,8 +595,13 @@ class QaSuggestion:
 
     @property
     def applicable(self) -> bool:
-        """Only an exact, non-empty replacement can be written into the chapter."""
-        return self.status == "pending" and bool(self.replacement_text.strip())
+        """Only an exact, non-empty replacement the text can take goes into the chapter."""
+        refusal = self.reason.partition(" (")[0]
+        return (
+            self.status == "pending"
+            and bool(self.replacement_text.strip())
+            and refusal not in _UNPLACEABLE_REFUSALS
+        )
 
     def to_dict(self) -> dict[str, str]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}

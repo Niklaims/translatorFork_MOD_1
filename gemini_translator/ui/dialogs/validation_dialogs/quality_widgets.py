@@ -207,6 +207,14 @@ class EmptyState(QFrame):
         )
 
 
+# A meta comment or an invented fact is fixed by removing it, so an empty
+# replacement there proposes a deletion; anywhere else it means no text came.
+DELETION_CATEGORIES = ("meta_comment", "hallucinated_addition")
+DELETION_TEXT = "удалить фрагмент"
+NO_REPLACEMENT_TEXT = "замена не предложена"
+MANUAL_FIX_NOTE = "Такую правку вносят вручную."
+
+
 class SuggestionCard(QFrame):
     """One refused fix: where, what kind, why it was not applied, and both texts."""
 
@@ -246,10 +254,17 @@ class SuggestionCard(QFrame):
             before_html, after_html = highlight_pair(
                 suggestion.original_text, suggestion.replacement_text
             )
+        elif suggestion.category in DELETION_CATEGORIES:
+            before_html = highlight_pair(suggestion.original_text, "")[0]
+            after_html = f"<i>{DELETION_TEXT}</i>"
         else:
-            before_html, after_html = escape(suggestion.original_text), "удалить фрагмент"
+            before_html = escape(suggestion.original_text)
+            after_html = f"<i>{NO_REPLACEMENT_TEXT}</i>"
         self.before_label = self._text_row(layout, "было", before_html)
         self.after_label = self._text_row(layout, "стало", after_html)
+        if not suggestion.replacement_text:
+            # A description of the change, not text of the book, so it reads as one.
+            self.after_label.setObjectName("mutedLabel")
         if suggestion.explanation:
             layout.addWidget(
                 make_label(suggestion.explanation, "mutedLabel", wrap=True, parent=self)
@@ -270,7 +285,7 @@ class SuggestionCard(QFrame):
         self.apply_button: QPushButton | None = None
         if stale:
             note = suggestion.status_note
-            self.note_label.setText(f"устарело: {note}" if note else "устарело")
+            self.note_label.setText(f"Применить нельзя: {note}." if note else "Применить нельзя.")
         else:
             self.apply_button = make_button("Применить", "compactActionButton", self)
             self.apply_button.clicked.connect(
@@ -278,7 +293,7 @@ class SuggestionCard(QFrame):
             )
             actions.addWidget(self.apply_button)
             if not suggestion.applicable:
-                self.note_label.setText("Нет текста замены: такую правку вносит человек.")
+                self.note_label.setText(MANUAL_FIX_NOTE)
         layout.addLayout(actions)
         self.set_busy(False)
 

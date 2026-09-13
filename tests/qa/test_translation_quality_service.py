@@ -715,6 +715,38 @@ def test_refused_language_fixes_are_kept_for_a_person_to_decide(tmp_path, chapte
     assert chapter.read_text(encoding="utf-8") == _CHAPTER_HTML
 
 
+def test_a_refused_fix_that_changes_nothing_is_not_offered(tmp_path, chapter):
+    """Замена, совпадающая с исходным текстом, не предложение: применять в ней нечего."""
+    from gemini_translator.qa.language_validation import LanguageQaResult
+    from gemini_translator.qa.llm.schemas import LanguageIssue
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            blocks = build_translation_payload(request.document_model)["blocks"]
+            same = LanguageIssue(
+                issue_id="issue-1",
+                category="typo",
+                block_id=blocks[-1]["id"],
+                original_text="сразу ушёл",
+                replacement_text="сразу ушёл",
+                objective=True,
+                confidence=0.9,
+                explanation="Опечатка.",
+            )
+            return LanguageQaResult(
+                chapter_id=request.chapter_id,
+                issues=(same,),
+                suggestions=(same,),
+                refusals={"issue-1": "no_change"},
+            )
+
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner(), language=_Language())
+
+    _check(service, _request(chapter))
+
+    assert journal.suggestions == []
+
+
 def test_a_pass_without_the_language_check_leaves_suggestions_alone(tmp_path, chapter):
     from gemini_translator.qa.models import QaChapterState, QaSuggestion
 
@@ -792,6 +824,39 @@ def test_a_chapter_that_changed_is_left_alone_and_the_suggestion_goes_stale(tmp_
     assert chapter.read_bytes() == edited
     recorded = journal.suggestion(suggestion.suggestion_id)
     assert (recorded.status, recorded.status_note) == ("stale", "глава изменилась после проверки")
+
+
+@pytest.mark.parametrize(
+    ("second_paragraph", "original", "replacement", "detail"),
+    [
+        (
+            "Он <i>сразу</i> ушёл.",
+            "Он сразу",
+            "Он тут же",
+            "фрагмент задевает оформление текста, например курсив",
+        ),
+        (
+            "Он сразу ушёл, сразу ушёл.",
+            "сразу ушёл",
+            "тут же ушёл",
+            "фрагмент встречается в абзаце не один раз",
+        ),
+    ],
+)
+def test_a_fragment_that_does_not_fit_is_left_alone_with_the_real_reason(
+    tmp_path, chapter, second_paragraph, original, replacement, detail
+):
+    """Глава не менялась, и «глава изменилась после проверки» было бы неправдой."""
+    chapter.write_text(f"<p>Он открыл дверь.</p><p>{second_paragraph}</p>", encoding="utf-8")
+    kept = chapter.read_bytes()
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal, original=original, replacement=replacement)
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+
+    assert (outcome.status, outcome.detail) == ("stale", detail)
+    assert chapter.read_bytes() == kept
+    assert journal.suggestion(suggestion.suggestion_id).status_note == detail
 
 
 def test_a_missing_translation_makes_the_suggestion_stale(tmp_path, chapter):
