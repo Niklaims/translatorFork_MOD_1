@@ -2237,7 +2237,7 @@ class ChapterQueueManager(QObject):
         
         # --- ИСПОЛЬЗУЕМ СОХРАНЕННОЕ ЗНАЧЕНИЕ СНАРУЖИ ---
         if rowcount > 0:
-            self._log(f"[TASK] స్త 'Заморожено' {rowcount} задач.")
+            self._log(f"[TASK] ❄️ 'Заморожено' {rowcount} задач.")
             self._safe_request_ui_update()
             
         return rowcount
@@ -2498,7 +2498,7 @@ class ChapterQueueManager(QObject):
         
         # 3. Отправляем сигнал и лог ТОЛЬКО если что-то изменилось
         if updated_count > 0:
-            self._log(f"[TASK] స్త 'Заморожено' {updated_count} задач для пробного запуска.")
+            self._log(f"[TASK] ❄️ 'Заморожено' {updated_count} задач для пробного запуска.")
             self._safe_request_ui_update()
     
     def get_all_pending_tasks(self) -> list[tuple]:

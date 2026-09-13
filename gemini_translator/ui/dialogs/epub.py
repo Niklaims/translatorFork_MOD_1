@@ -528,7 +528,7 @@ class EpubHtmlSelectorDialog(QDialog):
         self.duplicate_cleanup_btn.clicked.connect(self._open_duplicate_cleanup_dialog)
         
         # Кнопка бэкапа
-        self.restore_backup_btn = QPushButton("롤 Восстановить оригинал")
+        self.restore_backup_btn = QPushButton("↩️ Восстановить оригинал")
         self.restore_backup_btn.clicked.connect(self._restore_from_backup)
         self.restore_backup_btn.setVisible(False)
     
