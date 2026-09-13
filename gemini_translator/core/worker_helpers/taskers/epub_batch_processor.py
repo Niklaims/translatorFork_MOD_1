@@ -14,6 +14,7 @@ from gemini_translator.utils.epub_json import (
     estimate_translation_noise,
 )
 from gemini_translator.utils.epub_tools import normalize_epub_chapter_heading_to_h1
+from gemini_translator.utils.io_utils import atomic_write_text
 from gemini_translator.utils.translated_paths import build_translated_output_path
 from gemini_translator.utils.text import clean_html_content, prettify_html
 
@@ -133,8 +134,9 @@ class EpubBatchProcessor(BaseTaskProcessor):
                 if getattr(self.worker, "use_prettify", False):
                     final_html = prettify_html(final_html)
 
-                with open(out_path, "w", encoding="utf-8") as output_file:
-                    output_file.write(final_html)
+                # Атомарная запись (temp-файл + os.replace): сбой посреди
+                # записи не должен оставлять усечённую главу на диске.
+                atomic_write_text(out_path, final_html)
 
                 relative_path = os.path.relpath(out_path, self.worker.output_folder)
                 registrations_to_make.append((original_path, file_suffix, relative_path))

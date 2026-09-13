@@ -10,6 +10,7 @@ from gemini_translator.utils.epub_json import (
     estimate_translation_noise,
 )
 from gemini_translator.utils.epub_tools import normalize_epub_chapter_heading_to_h1
+from gemini_translator.utils.io_utils import atomic_write_text
 from gemini_translator.utils.translated_paths import build_translated_output_path
 from gemini_translator.utils.text import (
     process_body_tag, is_content_effectively_empty, clean_html_content,
@@ -246,8 +247,9 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
 
     def _copy_original_as_result(self, out_path, content, internal_path, suffix):
         """Копирует оригинал на диск и регистрирует его в проекте."""
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        # Атомарная запись (temp-файл + os.replace): сбой посреди записи не
+        # должен оставлять усечённую копию главы на диске.
+        atomic_write_text(out_path, content)
         if self.project_manager:
             relative_path = os.path.relpath(out_path, self.project_manager.project_folder)
             self.project_manager.register_translation(

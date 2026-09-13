@@ -41,7 +41,18 @@ TOKEN_HEADER = "X-Translator-MCP-Token"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 PIPELINE_METADATA_KEYS = {"pipeline_parent", "pipeline_step", "pipeline_index", "pipeline_total"}
 SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
-SSE_QUEUE_POLL_INTERVAL_SECONDS = 0.1
+# Нижняя граница таймаута event_queue.get() в SSE-цикле — защита от нулевого
+# или отрицательного значения, если до следующего keepalive уже пора (см.
+# _serve_sse); НЕ период холостых пробуждений — тот определяется оставшимся
+# временем до keepalive и может быть значительно больше.
+SSE_QUEUE_MIN_WAIT_SECONDS = 0.05
+# Верхняя граница ожидания в select() перед проверкой флага shutdown в
+# accept-loop демона. Реальные запросы обрабатываются немедленно через
+# ThreadingHTTPServer.handle_request() — poll_interval влияет только на то,
+# как часто простаивающий демон просыпается впустую и с какой задержкой
+# он заметит команду stop(). 0.1с давало 10 пробуждений/с бессрочно, пока
+# демон жив (дни); 1с — секунда задержки на stop() не критична.
+DAEMON_IDLE_POLL_INTERVAL_SECONDS = 1.0
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -142,7 +153,7 @@ class McpDaemon:
     def serve_forever(self) -> None:
         self._ensure_server()
         assert self._server is not None
-        self._server.serve_forever(poll_interval=0.1)
+        self._server.serve_forever(poll_interval=DAEMON_IDLE_POLL_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         server = self._server
@@ -989,7 +1000,14 @@ class McpDaemon:
                     next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
                     while True:
                         try:
-                            payload = event_queue.get(timeout=SSE_QUEUE_POLL_INTERVAL_SECONDS)
+                            # Таймаут — не фиксированные 0.1с, а оставшееся до
+                            # следующего keepalive время: событие из очереди
+                            # (event_queue.put) будит get() мгновенно в любом
+                            # случае, а долгий сон при пустой очереди не
+                            # ухудшает отзывчивость доставки, только сокращает
+                            # число бесполезных пробуждений в простое.
+                            remaining = next_keepalive_at - time.monotonic()
+                            payload = event_queue.get(timeout=max(SSE_QUEUE_MIN_WAIT_SECONDS, remaining))
                         except Empty:
                             now = time.monotonic()
                             if now < next_keepalive_at:

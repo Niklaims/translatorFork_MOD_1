@@ -6252,6 +6252,14 @@ class InitialSetupPage(ShellPage):
                         f"Повторный точечный фикс пропущен: {self._format_auto_chapter_list(fix_signature, limit=10)}.",
                         force=True
                     )
+                    # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me
+                    # (код-ревью needs_work, находка 3): в этой ветке run_auto_untranslated_fixer
+                    # так и не вызывается, а build_auto_untranslated_request_details чуть выше
+                    # уже успел положить собранный payload (вместе с soup_cache -- bs4-деревьями
+                    # всех флагованных глав) в одноразовый кеш dialog._auto_untranslated_payload_cache.
+                    # Без явного сброса эти деревья пережили бы dialog.deleteLater() ровно настолько,
+                    # насколько GC отложит уничтожение объекта -- дольше, чем до появления кеша.
+                    dialog._auto_untranslated_payload_cache = None
                     dialog.deleteLater()
                     self._auto_validator_dialog = None
                     self._auto_followup_running = False

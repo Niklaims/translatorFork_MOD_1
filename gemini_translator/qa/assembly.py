@@ -6,11 +6,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
+import threading
 import zipfile
 
 from ..utils.callbacks import safe_call
 from ..utils.epub_json import build_html_document_model, build_translation_payload
 from ..utils.translation_versions import select_target_translation_version
+from ..utils.validation_cache import build_file_fingerprint
 from .addition_detector import AdditionDetector
 from .alignment import MonotonicAligner
 from .capabilities import QaCapabilitySettings
@@ -102,16 +104,43 @@ class ProjectQaPaths:
         )
 
 
+# Кэш прочитанных глоссариев проекта: путь -> (отпечаток файла, термины).
+# QA вызывает load_project_glossary_terms один раз НА КАЖДУЮ главу прохода
+# (build_chapter_qa_request -> ChapterQaCoordinator._check_one), а сам
+# глоссарий за время прохода не меняется, поэтому без кэша книга из сотен
+# глав перечитывает и заново парсит один и тот же файл сотни раз впустую.
+_GLOSSARY_CACHE_LOCK = threading.Lock()
+_GLOSSARY_CACHE: dict[str, tuple[dict[str, int], tuple[GlossaryTerm, ...]]] = {}
+
+
 def load_project_glossary_terms(project_folder: Path | str) -> tuple[GlossaryTerm, ...]:
-    """Read the project glossary, returning nothing when it is absent or broken."""
+    """Read the project glossary, returning nothing when it is absent or broken.
+
+    Результат кэшируется по пути и отпечатку файла (размер + mtime): пока
+    глоссарий не менялся, повторные вызовы (одна на главу QA-прохода) не
+    трогают диск и не парсят JSON заново. Правка глоссария посреди сессии
+    меняет отпечаток и снимает кэш сама собой.
+    """
     path = Path(project_folder) / "project_glossary.json"
+    cache_key = str(path)
+    fingerprint = build_file_fingerprint(path)
+    with _GLOSSARY_CACHE_LOCK:
+        cached = _GLOSSARY_CACHE.get(cache_key)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return ()
-    if not isinstance(payload, list):
-        return ()
-    return glossary_terms_from_project_entries(payload)
+        terms: tuple[GlossaryTerm, ...] = ()
+    else:
+        terms = (
+            glossary_terms_from_project_entries(payload)
+            if isinstance(payload, list)
+            else ()
+        )
+    with _GLOSSARY_CACHE_LOCK:
+        _GLOSSARY_CACHE[cache_key] = (fingerprint, terms)
+    return terms
 
 
 def build_embedding_provider(
@@ -1037,13 +1066,95 @@ def aiohttp_session_factory(proxy_settings=None):
     return factory
 
 
+# Кэш открытых архивов исходного EPUB: путь -> запись с уже открытым
+# дескриптором. ChapterQaCoordinator строит запрос на каждую главу отдельно,
+# и без кэша каждый вызов заново открывал бы zip и разбирал его центральный
+# каталог, хотя исходный EPUB не меняется в течение всего QA-прохода.
+#
+# QA за раз работает ровно с одной книгой, поэтому кэш держит НЕ БОЛЕЕ ОДНОЙ
+# открытой книги: при запросе другого пути (или при устаревании отпечатка
+# того же пути) прежний дескриптор закрывается сразу, а не остаётся висеть
+# до конца жизни процесса. close_cached_source_archives() закрывает и
+# текущую запись — вызывать при остановке QA-прохода/смене книги и из
+# тестов, чтобы дескрипторы не утекали между тестовыми прогонами.
+_EPUB_ARCHIVE_CACHE_LOCK = threading.Lock()
+
+
+@dataclass
+class _CachedArchive:
+    fingerprint: dict[str, int]
+    archive: zipfile.ZipFile
+    # Свой лок на запись, а не общий кэш-лок на всё время чтения: закрытие
+    # ждёт завершения идущего archive.read() именно этой записи, но открытие
+    # или чтение ДРУГОЙ книги не сериализуется на время чужого чтения главы.
+    lock: threading.Lock
+
+
+_EPUB_ARCHIVE_CACHE: dict[str, _CachedArchive] = {}
+
+
+def _close_cached_archive_locked(entry: _CachedArchive) -> None:
+    """Закрыть архив записи, дождавшись завершения идущего в нём чтения."""
+    with entry.lock:
+        try:
+            entry.archive.close()
+        except OSError:
+            pass
+
+
+def close_cached_source_archives() -> None:
+    """Закрыть и забыть все закэшированные дескрипторы исходных EPUB.
+
+    Без явного вызова дескрипторы, открытые _open_source_epub_archive,
+    держались бы до конца жизни процесса. Вызывать при остановке
+    QA-прохода/смене активной книги и из autouse-фикстур тестов.
+    """
+    with _EPUB_ARCHIVE_CACHE_LOCK:
+        stale = list(_EPUB_ARCHIVE_CACHE.values())
+        _EPUB_ARCHIVE_CACHE.clear()
+    for entry in stale:
+        _close_cached_archive_locked(entry)
+
+
+def _open_source_epub_archive(epub_path: str) -> _CachedArchive | None:
+    """Открыть исходный EPUB или отдать уже открытый и не устаревший архив."""
+    fingerprint = build_file_fingerprint(epub_path)
+    if not fingerprint:
+        return None
+    with _EPUB_ARCHIVE_CACHE_LOCK:
+        cached = _EPUB_ARCHIVE_CACHE.get(epub_path)
+        if cached is not None and cached.fingerprint == fingerprint:
+            return cached
+        # Кэш ограничен одной книгой: закрыть всё, что в нём было (устаревшую
+        # запись этого же пути и/или архив другой книги), прежде чем открыть
+        # новый — иначе старые дескрипторы копились бы бессрочно.
+        stale = list(_EPUB_ARCHIVE_CACHE.values())
+        _EPUB_ARCHIVE_CACHE.clear()
+        for entry in stale:
+            _close_cached_archive_locked(entry)
+        try:
+            archive = zipfile.ZipFile(epub_path, "r")
+        except (OSError, zipfile.BadZipFile):
+            return None
+        new_entry = _CachedArchive(fingerprint, archive, threading.Lock())
+        _EPUB_ARCHIVE_CACHE[epub_path] = new_entry
+        return new_entry
+
+
 def _read_source_chapter(event) -> str | None:
     epub_path = str(getattr(event, "epub_path", "") or "")
     chapter_path = str(event.source_path or "")
     if epub_path and chapter_path:
+        entry = _open_source_epub_archive(epub_path)
+        if entry is None:
+            return None
         try:
-            with zipfile.ZipFile(epub_path, "r") as archive:
-                return archive.read(chapter_path).decode("utf-8", "ignore")
+            # Открытие и чтение — под одним удержанием entry.lock, без
+            # промежуточного отпускания: иначе инвалидация могла бы закрыть
+            # архив между ними, и archive.read() упал бы с ValueError на
+            # уже закрытом ZIP.
+            with entry.lock:
+                return entry.archive.read(chapter_path).decode("utf-8", "ignore")
         except (OSError, KeyError, zipfile.BadZipFile):
             return None
     try:

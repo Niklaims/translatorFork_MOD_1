@@ -267,10 +267,27 @@ class ProjectGlossaryController:
 
         return normalized
 
-    def find_entries(self, glossary_entries, term):
+    def build_index(self, glossary_entries):
+        """Строит индекс term_key -> список записей ОДИН раз за проход.
+        Без него find_entries сканирует линейно ВЕСЬ глоссарий для каждого
+        отдельного термина каждой строки (ui-dialogs-validation/runtime/10):
+        на большом глоссарии и большом числе строк это квадратичная
+        стоимость на каждый тик фильтра. Индекс строится один раз перед
+        циклом по строкам и переиспользуется через параметр `index`."""
+        index = {}
+        for entry in glossary_entries:
+            key = glossary_entry_key(entry)
+            if not key:
+                continue
+            index.setdefault(key, []).append(entry)
+        return index
+
+    def find_entries(self, glossary_entries, term, index=None):
         term_key = glossary_entry_key({'original': term})
         if not term_key:
             return []
+        if index is not None:
+            return [entry.copy() for entry in index.get(term_key, [])]
         return [entry.copy() for entry in glossary_entries if glossary_entry_key(entry) == term_key]
 
     def upsert_entry(self, glossary_entries, original, rus, note):
@@ -612,6 +629,36 @@ class AdvancedTagFilterDialog(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить фильтры:\n{e}")
 
+def _partition_blacklist_entries(blacklist_set):
+    """Разбивает набор blacklist на одиночные слова (множество, проверка
+    вхождения за O(1)) и многословные фразы (список, AND-проверка по
+    haystack). Вынесено в свободную функцию (а не метод), чтобы её можно
+    было вызвать один раз ДО цикла по строкам, не требуя от вызывающего
+    объекта ничего, кроме самого множества (ui-dialogs-validation/
+    runtime/10: раньше это разбиение пересобиралось заново — двумя
+    линейными проходами по ВСЕМУ blacklist_set — для КАЖДОГО кандидата
+    КАЖДОЙ строки)."""
+    singles = set()
+    phrases = []
+    for entry in blacklist_set:
+        words = str(entry).split()
+        # Пустые записи (например, из untranslated_filters.json без
+        # валидации) раньше молча игнорировались: len(''.split()) == 0 не
+        # попадало ни в single (==1), ни в phrase (>1) старой ветки.
+        # _phrase_matches_context('', haystack) же трактует пустую фразу как
+        # len(words) <= 1 и возвращает '' in haystack == True для ЛЮБОГО
+        # контекста — если бы такая запись попала в phrases, blacklist
+        # блокировал бы вообще всех кандидатов (ui-dialogs-validation/
+        # runtime/10, доработка). Сохраняем прежнюю семантику: игнорируем.
+        if not words:
+            continue
+        if len(words) == 1:
+            singles.add(entry.lower())
+        else:
+            phrases.append(entry)
+    return singles, phrases
+
+
 # --- ОСНОВНОЙ КЛАСС ---
 class UntranslatedFixerPage(ShellPage):
     """
@@ -699,12 +746,44 @@ class UntranslatedFixerPage(ShellPage):
             item.get('_effective_stats', item.get('stats', (0, 0, 0))),
         )
 
-    def _collect_visible_candidates_for_item(self, item):
+    def _blacklist_partition(self):
+        """Разбивает blacklist_set один раз на одиночные слова (множество
+        для проверки за O(1)) и многословные фразы (список для AND-проверки
+        по haystack). Раньше это разбиение пересобиралось заново — двумя
+        линейными проходами по ВСЕМУ blacklist_set — для КАЖДОГО кандидата
+        КАЖДОЙ строки в _collect_visible_candidates_for_item
+        (ui-dialogs-validation/runtime/10). Вызывающий код, обрабатывающий
+        много строк за раз (apply_filters, подсчёт связанных вхождений),
+        обязан вызвать это один раз до цикла и передать результат."""
+        return _partition_blacklist_entries(self.blacklist_set)
+
+    def _collect_visible_candidates_for_item(self, item, blacklist_partition=None):
+        if blacklist_partition is None:
+            # Свободная функция, а не self._blacklist_partition(): метод
+            # может отсутствовать на минимальных тестовых харнессах, которые
+            # связывают только этот метод целиком (см.
+            # tests/test_untranslated_fixer_navigation.py).
+            blacklist_partition = _partition_blacklist_entries(self.blacklist_set)
+        blacklist_singles, blacklist_phrases = blacklist_partition
+
         _, clean_text, stats = self._get_effective_context_payload(item)
         clean_text_lower = clean_text.lower()
         source_type = item.get('source_type', 'system')
         term = str(item.get('term', '') or '').strip()
         term_lower = term.lower()
+
+        # phrase_blocked_for_item не зависит от кандидата (аргументы —
+        # blacklist_phrases и clean_text_lower, оба инвариантны в обоих
+        # циклах ниже), поэтому считается один раз на item, а не заново на
+        # каждого кандидата в каждом из двух циклов (ui-dialogs-validation/
+        # runtime/10: до этой правки half-фикс ускорял только одиночные
+        # слова — множество O(1) — а фразовый blacklist оставался
+        # мультипликативным: N кандидатов * M фраз * 2 цикла проверок на
+        # КАЖДУЮ строку).
+        phrase_blocked_for_item = any(
+            self._phrase_matches_context(e, clean_text_lower)
+            for e in blacklist_phrases
+        )
 
         all_candidates = ALIEN_WORD_PATTERN.findall(clean_text)
         symbol_candidates = []
@@ -734,29 +813,17 @@ class UntranslatedFixerPage(ShellPage):
         for word in display_candidates:
             word_lower = word.lower()
             # Однословные записи blacklist: точное совпадение с кандидатом
-            # Многословные фразы: проверяем AND по haystack
-            single_blocked = any(
-                len(e.split()) == 1 and e.lower() == word_lower
-                for e in self.blacklist_set
-            )
-            phrase_blocked = any(
-                len(e.split()) > 1 and self._phrase_matches_context(e, clean_text_lower)
-                for e in self.blacklist_set
-            )
-            if not single_blocked and not phrase_blocked:
+            # (проверка за O(1) по предвычисленному множеству).
+            # Многословные фразы: результат один на весь item (см.
+            # phrase_blocked_for_item выше) — не зависит от word.
+            single_blocked = word_lower in blacklist_singles
+            if not single_blocked and not phrase_blocked_for_item:
                 remaining_candidates.append(word)
 
         for word in all_candidates + symbol_candidates:
             word_lower = word.lower()
-            single_blocked = any(
-                len(e.split()) == 1 and e.lower() == word_lower
-                for e in self.blacklist_set
-            )
-            phrase_blocked = any(
-                len(e.split()) > 1 and self._phrase_matches_context(e, clean_text_lower)
-                for e in self.blacklist_set
-            )
-            if not single_blocked and not phrase_blocked:
+            single_blocked = word_lower in blacklist_singles
+            if not single_blocked and not phrase_blocked_for_item:
                 valid_alien_chars_count += len(word)
 
         total_len = stats[0]
@@ -804,11 +871,11 @@ class UntranslatedFixerPage(ShellPage):
 
         return sorted(candidates, key=sort_key)
 
-    def _get_glossary_entries_for_term(self, term):
-        return self.glossary_controller.find_entries(self.project_glossary, term)
+    def _get_glossary_entries_for_term(self, term, index=None):
+        return self.glossary_controller.find_entries(self.project_glossary, term, index=index)
 
-    def _get_glossary_match_summary(self, term):
-        entries = self._get_glossary_entries_for_term(term)
+    def _get_glossary_match_summary(self, term, index=None):
+        entries = self._get_glossary_entries_for_term(term, index=index)
         if not entries:
             return ""
 
@@ -822,17 +889,32 @@ class UntranslatedFixerPage(ShellPage):
             parts.append(f"... и ещё {len(entries) - 3}")
         return "\n".join(parts)
 
+    def _count_related_occurrences_batch(self, terms):
+        """Считает связанные вхождения сразу для НЕСКОЛЬКИХ терминов за один
+        проход по self.original_data. _show_row_action_menu раньше вызывал
+        _count_related_occurrences(term) по кругу для top_candidates[:10] —
+        10 независимых проходов по всем строкам (и внутри каждого —
+        пересборку blacklist-разбиения на строку) вместо одного
+        (ui-dialogs-validation/runtime/10)."""
+        term_keys = {str(t or '').strip().lower() for t in terms}
+        term_keys.discard('')
+        counts = {key: 0 for key in term_keys}
+        if not term_keys:
+            return counts
+
+        blacklist_partition = self._blacklist_partition()
+        for item in self.original_data:
+            candidates = self._collect_visible_candidates_for_item(item, blacklist_partition)['remaining_candidates']
+            candidate_keys = {candidate.lower() for candidate in candidates}
+            for key in term_keys & candidate_keys:
+                counts[key] += 1
+        return counts
+
     def _count_related_occurrences(self, term):
         term_key = (term or '').strip().lower()
         if not term_key:
             return 0
-
-        count = 0
-        for item in self.original_data:
-            candidates = self._collect_visible_candidates_for_item(item)['remaining_candidates']
-            if any(candidate.lower() == term_key for candidate in candidates):
-                count += 1
-        return count
+        return self._count_related_occurrences_batch([term_key]).get(term_key, 0)
 
     def _replace_term_in_context_html(self, html_fragment, term, replacement):
         pattern = re.compile(re.escape(term), re.IGNORECASE)
@@ -858,8 +940,9 @@ class UntranslatedFixerPage(ShellPage):
         if not term_key:
             return changed_groups
 
+        blacklist_partition = self._blacklist_partition()
         for item in self.original_data:
-            candidates = self._collect_visible_candidates_for_item(item)['remaining_candidates']
+            candidates = self._collect_visible_candidates_for_item(item, blacklist_partition)['remaining_candidates']
             if not any(candidate.lower() == term_key for candidate in candidates):
                 continue
 
@@ -1248,7 +1331,16 @@ class UntranslatedFixerPage(ShellPage):
         source_filter = self.source_filter_combo.currentData()
         
         self.filtered_indices = []
-        
+
+        # Разбиение blacklist и индекс глоссария строятся ОДИН раз на весь
+        # проход по строкам, а не заново для каждой строки/кандидата — иначе
+        # apply_filters (подключён к valueChanged/currentIndexChanged всех
+        # фильтров, т.е. срабатывает на каждый тик спинбокса) даёт
+        # квадратичную стоимость по строкам × кандидатам × (blacklist +
+        # размер глоссария) (ui-dialogs-validation/runtime/10).
+        blacklist_partition = self._blacklist_partition()
+        glossary_index = self.glossary_controller.build_index(self.project_glossary)
+
         for i, item in enumerate(self.original_data):
             if item.get('_deleted'):
                 continue
@@ -1259,8 +1351,8 @@ class UntranslatedFixerPage(ShellPage):
 
             # 1. Базовый фильтр по типу языка (по основному кандидату)
             if item.get('lang_tag') not in active_tags: continue
-            
-            payload = self._collect_visible_candidates_for_item(item)
+
+            payload = self._collect_visible_candidates_for_item(item, blacklist_partition)
             clean_text_lower = payload['clean_text_lower']
             remaining_candidates = payload['remaining_candidates']
             total_len, alien_chars, alien_ratio = payload['stats']
@@ -1291,7 +1383,7 @@ class UntranslatedFixerPage(ShellPage):
             item['_all_candidates'] = remaining_candidates
             item['_glossary_matches'] = [
                 candidate for candidate in remaining_candidates
-                if self._get_glossary_entries_for_term(candidate)
+                if self._get_glossary_entries_for_term(candidate, index=glossary_index)
             ]
             # ------------------------------------
 
@@ -1355,13 +1447,21 @@ class UntranslatedFixerPage(ShellPage):
             if txt != stored: self.original_data[idx]['new_context'] = txt
 
     def populate_table(self, indices):
-        self.table.blockSignals(True) 
-        
+        self.table.blockSignals(True)
+
         self.table.clearContents()
         self.table.setRowCount(0)
 
         self.table.setRowCount(len(indices))
-        
+
+        # Индекс глоссария строится один раз на всю страницу, а не на
+        # каждый термин каждой видимой строки внутри
+        # _get_glossary_match_summary -> _get_glossary_entries_for_term
+        # (ui-dialogs-validation/runtime/10, доработка): без него — полный
+        # линейный проход по project_glossary на каждый из до 3 терминов
+        # каждой строки на КАЖДУЮ перерисовку страницы.
+        glossary_index = self.glossary_controller.build_index(self.project_glossary)
+
         for row, idx in enumerate(indices):
             data = self.original_data[idx]
             
@@ -1392,7 +1492,7 @@ class UntranslatedFixerPage(ShellPage):
                 term_item.setForeground(QtGui.QColor("#2ECC71"))
                 tooltip_lines = ["Есть связанные записи в глоссарии:"]
                 for term in glossary_matches[:3]:
-                    tooltip_lines.append(self._get_glossary_match_summary(term))
+                    tooltip_lines.append(self._get_glossary_match_summary(term, index=glossary_index))
                 term_item.setToolTip("\n\n".join(line for line in tooltip_lines if line))
             
             # 2. Context
@@ -1503,9 +1603,15 @@ class UntranslatedFixerPage(ShellPage):
 
         glossary_menu = menu.addMenu("📘 Глоссарий и замены")
         if top_candidates:
-            for term in top_candidates[:10]:
-                related_count = self._count_related_occurrences(term)
-                existing_entries = self._get_glossary_entries_for_term(term)
+            menu_terms = top_candidates[:10]
+            # Один проход по всем строкам на всю пачку терминов и один
+            # индекс глоссария вместо 10 отдельных full-scan на открытие
+            # меню (ui-dialogs-validation/runtime/10).
+            related_counts = self._count_related_occurrences_batch(menu_terms)
+            glossary_index = self.glossary_controller.build_index(self.project_glossary)
+            for term in menu_terms:
+                related_count = related_counts.get(str(term or '').strip().lower(), 0)
+                existing_entries = self._get_glossary_entries_for_term(term, index=glossary_index)
                 submenu_title = f"{term} [{related_count}]"
                 if existing_entries:
                     submenu_title += f" | G:{len(existing_entries)}"

@@ -2118,6 +2118,10 @@ class TranslationValidatorPage(ShellPage):
         self._fixer_filter_state = None
         self._fixer_data_fingerprint = None
         self._fixer_stale_rows: set = set()  # строки, требующие пересчёта untranslated_words
+        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me (автопайплайн):
+        # одноразовый кеш последнего собранного payload помощника недоперевода —
+        # см. _collect_untranslated_fixer_payload_cached.
+        self._auto_untranslated_payload_cache = None
 
         # Контроллер окна «Качество перевода» переживает закрытие самого
         # диалога: проход по книге идёт в фоне и после закрытия окна, и
@@ -6382,18 +6386,58 @@ class TranslationValidatorPage(ShellPage):
 
         return "\n\n".join(blocks)
 
+    def _collect_untranslated_fixer_payload_cached(self, target_internal_paths=None):
+        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me
+        # (перенос из волны 2, остаток находки 7 — автопайплайн):
+        # build_auto_untranslated_request_details собирает payload только
+        # ради текста трассировки для лога, а следом run_auto_untranslated_fixer
+        # тут же собирал его заново — двойной полный BeautifulSoup-парсинг всех
+        # флагованных глав на GUI-потоке при каждом точечном фиксе недоперевода
+        # в авто-режиме. Обе точки вызова в setup.py используют один и тот же
+        # target_internal_paths подряд без изменений results_data между ними,
+        # так что второй сбор — чистое дублирование первого. Одноразовый кеш
+        # (ключ — набор путей глав) переиспользует уже собранный payload и
+        # сразу забывается, чтобы не отдать устаревшие данные, если между
+        # вызовами всё же что-то изменится или run_ вызван без предшествующего
+        # build_ (совместимость — тогда просто собираем как раньше).
+        cache_key = frozenset(target_internal_paths or ())
+        cached = self._auto_untranslated_payload_cache
+        # Кеш одноразовый в любом случае -- забываем сразу при первом же
+        # обращении (совпал ключ или нет), чтобы несвязанный вызов с другим
+        # набором путей не оставил старый payload (и его bs4-деревья) висеть
+        # в памяти до следующего случайного совпадения ключа.
+        self._auto_untranslated_payload_cache = None
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2]
+
+        data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
+            target_internal_paths=target_internal_paths,
+            show_feedback=False,
+        )
+        return data_for_dialog, soup_cache
+
     def build_auto_untranslated_request_details(
         self,
         target_internal_paths=None,
         batch_size: int = 50,
     ):
         try:
-            data_for_dialog, _ = self._collect_untranslated_fixer_payload(
+            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
                 target_internal_paths=target_internal_paths,
                 show_feedback=False,
             )
             if not data_for_dialog:
+                self._auto_untranslated_payload_cache = None
                 return ""
+
+            # Сохраняем собранный payload для последующего run_auto_untranslated_fixer
+            # с тем же набором глав, чтобы не парсить книгу ещё раз (см.
+            # _collect_untranslated_fixer_payload_cached).
+            self._auto_untranslated_payload_cache = (
+                frozenset(target_internal_paths or ()),
+                data_for_dialog,
+                soup_cache,
+            )
 
             indexed_items = list(enumerate(data_for_dialog))
             tasks_list = build_translation_tasks_from_data_items(indexed_items, batch_size=batch_size)
@@ -6416,10 +6460,24 @@ class TranslationValidatorPage(ShellPage):
         request_details_text = ""
         response_details_text = ""
         try:
-            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
-                target_internal_paths=target_internal_paths,
-                show_feedback=False,
-            )
+            # getattr — чтобы не требовать этот метод (появился вместе с
+            # одноразовым кешем payload) от лёгких тестовых дублей, которые
+            # привязывают только тело run_auto_untranslated_fixer и
+            # определяют свой _collect_untranslated_fixer_payload напрямую
+            # (см. tests/test_fix_med_ui_dialogs_validation_c_auto_fixer_timeout.py).
+            # На боевой TranslationValidatorPage метод объявлен в этом же
+            # классе и есть всегда — ветка else здесь недостижима, это чисто
+            # тестовая совместимость, а не боевой путь.
+            collect_cached = getattr(self, '_collect_untranslated_fixer_payload_cached', None)
+            if callable(collect_cached):
+                data_for_dialog, soup_cache = collect_cached(
+                    target_internal_paths=target_internal_paths,
+                )
+            else:
+                data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
+                    target_internal_paths=target_internal_paths,
+                    show_feedback=False,
+                )
             if not data_for_dialog:
                 return {
                     'success': True,

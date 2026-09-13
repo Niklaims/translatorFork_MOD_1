@@ -8,7 +8,7 @@ import posixpath
 import re
 import time
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -125,6 +125,66 @@ def is_term_frequency_payload_valid(payload, glossary_source, epub_path):
     return payload.get("fingerprint") == build_term_frequency_fingerprint(glossary_source, epub_path)
 
 
+class _GlossarySubstringIndex:
+    """Ахо-Корасик индекс терминов глоссария для поиска подстрок за один проход.
+
+    Строится один раз на весь глоссарий (O(суммарной длины терминов)), после
+    чего для каждого найденного термина все содержащиеся в нём более короткие
+    термины глоссария находятся за один проход по его символам —
+    O(len(found_term)), а не полным перебором всего глоссария на каждый
+    найденный термин (было до O(T^2) на книгу)."""
+
+    class _Node:
+        __slots__ = ("children", "fail", "terms")
+
+        def __init__(self):
+            self.children = {}
+            self.fail = None
+            self.terms = frozenset()
+
+    def __init__(self, terms):
+        root = self._Node()
+        for term in terms:
+            if not term:
+                continue
+            node = root
+            for char in term:
+                node = node.children.setdefault(char, self._Node())
+            node.terms = node.terms | {term}
+
+        root.fail = root
+        queue = deque()
+        for child in root.children.values():
+            child.fail = root
+            queue.append(child)
+
+        while queue:
+            current = queue.popleft()
+            for char, child in current.children.items():
+                fail_state = current.fail
+                while fail_state is not root and char not in fail_state.children:
+                    fail_state = fail_state.fail
+                candidate = fail_state.children.get(char, root)
+                child.fail = candidate if candidate is not child else root
+                child.terms = child.terms | child.fail.terms
+                queue.append(child)
+
+        self._root = root
+
+    def find_contained_terms(self, text):
+        """Возвращает множество терминов глоссария, встречающихся в text как подстроки."""
+        found = set()
+        root = self._root
+        node = root
+        for char in text:
+            while node is not root and char not in node.children:
+                node = node.fail
+            node = node.children.get(char, root)
+            if node.terms:
+                found.update(node.terms)
+        return found
+
+
 def aggregate_term_frequency_stats(glossary_source, term_occurrences, term_distribution):
     glossary_terms = collect_glossary_originals(glossary_source)
 
@@ -137,18 +197,19 @@ def aggregate_term_frequency_stats(glossary_source, term_occurrences, term_distr
         for term in glossary_terms
     }
 
+    substring_index = _GlossarySubstringIndex(glossary_terms)
+
     for found_term, found_count in term_occurrences.items():
         found_count = int(found_count or 0)
         if found_count <= 0:
             continue
 
         found_files = set(term_distribution.get(found_term, set()))
-        for sub_term in glossary_terms:
+        for sub_term in substring_index.find_contained_terms(found_term):
             if len(sub_term) >= len(found_term):
                 continue
-            if sub_term in found_term:
-                result_counts[sub_term] = result_counts.get(sub_term, 0) + found_count
-                result_files.setdefault(sub_term, set()).update(found_files)
+            result_counts[sub_term] = result_counts.get(sub_term, 0) + found_count
+            result_files.setdefault(sub_term, set()).update(found_files)
 
     return {
         term: {

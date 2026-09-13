@@ -330,8 +330,32 @@ class ChapterQueueManager(QObject):
         # Воркер для фоновой очистки при завершении сессии
         self._cleanup_worker = None
         # Особый воркер для глоссария, чтобы не блокировать основной поток
-        self._glossary_cleanup_worker = None 
-       
+        self._glossary_cleanup_worker = None
+
+        # Виртуальные (memfs) копии исходных EPUB, созданные _normalize_payload
+        # для задач очереди. Без явного освобождения они живут в mem_fs до
+        # atexit — накапливаясь книга за книгой за весь сеанс приложения.
+        # Освобождаются в clear_all_queues(), где очередь опустошается целиком
+        # и без последующей вставки новых задач в том же вызове — момент, когда
+        # ни одна задача в БД больше не может ссылаться на эти пути.
+        #
+        # _virtual_epub_sources хранит virtual_path -> исходный реальный путь
+        # книги на диске (транзитивно, даже если копия снималась с уже
+        # виртуального пути — например, emerger нарезает главу на чанки из
+        # 'mem://…'). Эта запись НЕ стирается при освобождении: снимок общей
+        # очереди (AI-фиксер недоперевода) хранит уже нормализованный payload
+        # со СТАРЫМ виртуальным путём и восстанавливает его позже через
+        # add_pending_tasks -> _normalize_payload; без сохранённого реального
+        # пути такое повторное копирование было бы невозможно.
+        #
+        # _normalize_payload вызывается не только из GUI-потока — например,
+        # add_priority_tasks дёргается из воркера при разрезании главы на
+        # чанки (emerger_tasks.py) — поэтому оба словаря защищены одним
+        # замком с clear_all_queues/_release_tracked_virtual_epub_paths.
+        self._virtual_paths_lock = Lock()
+        self._active_virtual_epub_paths: set[str] = set()
+        self._virtual_epub_sources: dict[str, str] = {}
+
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(self._IDLE_UPDATE_INTERVAL_MS)
@@ -641,12 +665,40 @@ class ChapterQueueManager(QObject):
         if len(payload_tuple) <= 1: return payload_tuple
         file_data = payload_tuple[1]
         virtual_path = None
+        source_path = file_data
         try:
-            if isinstance(file_data, str): virtual_path = os.copy_to_mem(file_data)
+            if isinstance(file_data, str):
+                virtual_path = os.copy_to_mem(source_path)
+                if not virtual_path:
+                    # source_path мог быть виртуальным путём, чью memfs-копию
+                    # уже освободил _release_tracked_virtual_epub_paths (см.
+                    # clear_all_queues) — copy_to_mem видит несуществующий
+                    # источник и возвращает None. Восстанавливаем копию из
+                    # запомненного исходного реального пути книги, иначе
+                    # снимок общей очереди фиксера восстановится с мёртвым
+                    # путём и упадёт при открытии файла.
+                    with self._virtual_paths_lock:
+                        fallback_source = self._virtual_epub_sources.get(source_path)
+                    if fallback_source and fallback_source != source_path:
+                        source_path = fallback_source
+                        virtual_path = os.copy_to_mem(source_path)
             elif isinstance(file_data, io.BytesIO):
                 file_data.seek(0)
                 virtual_path = os.write_bytes_to_mem(file_data.getvalue(), ".tmp")
-            if virtual_path: return (payload_tuple[0], virtual_path) + payload_tuple[2:]
+            if virtual_path:
+                with self._virtual_paths_lock:
+                    self._active_virtual_epub_paths.add(virtual_path)
+                    if isinstance(source_path, str):
+                        # Транзитивно указываем на исходный реальный путь: если
+                        # source_path сам уже был отслеженным виртуальным путём
+                        # (нарезка emerger'ом), унаследуем его реальный источник;
+                        # иначе source_path и есть реальный путь.
+                        self._virtual_epub_sources[virtual_path] = self._virtual_epub_sources.get(
+                            source_path, source_path
+                        )
+                    # Для BytesIO нет реального пути на диске — восстановить
+                    # такую копию после освобождения нечем, запись не заводим.
+                return (payload_tuple[0], virtual_path) + payload_tuple[2:]
         except AttributeError:
             self._log("[TaskManager WARN] Патч 'os' не применен. Файлы не будут виртуализированы.")
         return payload_tuple
@@ -1635,8 +1687,44 @@ class ChapterQueueManager(QObject):
             conn.execute("DELETE FROM chunk_results")
             conn.execute("DELETE FROM task_errors")
             conn.execute("DELETE FROM tasks")
+        self._release_tracked_virtual_epub_paths()
         self._safe_request_ui_update()
-    
+
+    def _release_tracked_virtual_epub_paths(self) -> None:
+        """
+        Освобождает временные memfs-копии исходных EPUB, накопленные
+        _normalize_payload за время жизни очереди.
+
+        Вызывается там, где очередь только что опустошена целиком (без
+        последующей вставки новых задач в этом же вызове) — в этот момент ни
+        одна задача в БД больше не может ссылаться на отслеженные виртуальные
+        пути, так что их можно безопасно удалить, не дожидаясь выхода из
+        приложения (иначе они лежат в mem_fs до atexit — книга за книгой на
+        весь сеанс).
+
+        Само соответствие virtual_path -> реальный путь книги
+        (self._virtual_epub_sources) НЕ стирается: снимок общей очереди
+        (AI-фиксер недоперевода) хранит уже нормализованный payload со
+        старым виртуальным путём и восстановит его позже через
+        add_pending_tasks -> _normalize_payload, которому нужна эта запись,
+        чтобы пересоздать копию из настоящего файла книги.
+        """
+        with self._virtual_paths_lock:
+            if not self._active_virtual_epub_paths:
+                return
+            paths_to_release = tuple(self._active_virtual_epub_paths)
+            self._active_virtual_epub_paths.clear()
+        for virtual_path in paths_to_release:
+            try:
+                os.remove(virtual_path)
+            except Exception as exc:
+                # Патч 'os' может быть не применён (тогда это обычный
+                # os.remove без поддержки mem://), путь уже мог быть удалён
+                # другим путём, либо это вообще не memfs-путь — ни один из
+                # этих случаев не должен ронять очистку очереди, но след для
+                # отладки утечки стоит оставить.
+                self._log(f"[TaskManager DEBUG] Не удалось освободить memfs-копию {virtual_path}: {exc}")
+
     def schema_has_table(self, table_name: str) -> bool:
         """Report whether one table exists in the task database."""
         rows = self._execute_light_read(
