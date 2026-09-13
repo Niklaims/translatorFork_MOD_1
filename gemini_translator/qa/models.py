@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -530,6 +531,82 @@ class QaChapterState:
             return cls(**dict(payload))
         except (TypeError, ValueError) as exc:
             raise QaModelValidationError("invalid chapter state") from exc
+
+
+_SUGGESTION_STATUSES = frozenset({"pending", "applied", "dismissed", "stale"})
+_UNDECIDED_SUGGESTION_STATUSES = frozenset({"pending", "stale"})
+
+
+@dataclass(frozen=True, slots=True)
+class QaSuggestion:
+    """One language fix the check proposed but did not apply, kept for a person.
+
+    Nothing is recomputed later: applying exactly what was proposed, or
+    refusing to because the chapter has changed, is the whole contract.
+    """
+
+    suggestion_id: str
+    chapter_id: str
+    block_id: str
+    category: str
+    original_text: str
+    replacement_text: str = ""
+    reason: str = ""
+    explanation: str = ""
+    created_at: str = ""
+    status: str = "pending"
+    status_note: str = ""
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "suggestion_id",
+            "chapter_id",
+            "block_id",
+            "category",
+            "original_text",
+        ):
+            _require_nonempty_string(getattr(self, field_name), field_name)
+        for field_name in (
+            "replacement_text",
+            "reason",
+            "explanation",
+            "created_at",
+            "status_note",
+        ):
+            _require_string(getattr(self, field_name), field_name)
+        if self.status not in _SUGGESTION_STATUSES:
+            raise QaModelValidationError("unsupported suggestion status")
+
+    @staticmethod
+    def identity(
+        chapter_id: str, block_id: str, original_text: str, replacement_text: str
+    ) -> str:
+        """The same proposal on the same text gets the same id on every pass."""
+        joined = "\x1f".join((chapter_id, block_id, original_text, replacement_text))
+        return "sg" + hashlib.sha256(joined.encode("utf-8")).hexdigest()[:20]
+
+    @property
+    def awaits_decision(self) -> bool:
+        return self.status in _UNDECIDED_SUGGESTION_STATUSES
+
+    @property
+    def applicable(self) -> bool:
+        """Only an exact, non-empty replacement can be written into the chapter."""
+        return self.status == "pending" and bool(self.replacement_text.strip())
+
+    def to_dict(self) -> dict[str, str]:
+        return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "QaSuggestion":
+        if not isinstance(payload, Mapping):
+            raise QaModelValidationError("suggestion must be an object")
+        if set(payload) != set(cls.__dataclass_fields__):
+            raise QaModelValidationError("suggestion has an invalid schema")
+        try:
+            return cls(**dict(payload))
+        except (TypeError, ValueError) as exc:
+            raise QaModelValidationError("invalid suggestion") from exc
 
 
 @dataclass(frozen=True, slots=True)
