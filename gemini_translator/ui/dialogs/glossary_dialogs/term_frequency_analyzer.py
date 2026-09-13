@@ -33,10 +33,18 @@ class TermFrequencyAnalyzerPage(ShellPage):
     def __init__(self, glossary_data, epub_path=None, parent=None):
         super().__init__(parent)
         self.glossary_data = glossary_data
-        self.glossary_map = {
-            e.get('original', '').strip(): e 
-            for e in glossary_data if e.get('original', '').strip()
-        }
+        # ФИКС: original -> список записей, а не одна запись. Таблица
+        # glossary_editor_state не гарантирует уникальность original (см.
+        # DirectConflictResolverDialog) — при коллизии здесь могут жить
+        # несколько строк с одним и тем же термином. Раньше словарь строился
+        # как original -> entry, и при итерации выживала только последняя
+        # запись: get_patch() адресовал патч только ей, а "скрытый" дубликат
+        # молча оставался в глоссарии нетронутым.
+        self.glossary_map = {}
+        for e in glossary_data:
+            original = e.get('original', '').strip()
+            if original:
+                self.glossary_map.setdefault(original, []).append(e)
         self.epub_path = epub_path
         self.worker = None
         self.frequency_payload = {}
@@ -331,7 +339,11 @@ class TermFrequencyAnalyzerPage(ShellPage):
         table.blockSignals(False)
 
     def _create_row(self, table, row, term, count, editable):
-        entry = self.glossary_map.get(term, {})
+        # В таблице термин показывается одной строкой, поэтому для полей
+        # ввода берём первую запись-дубликат как представительную; сам патч
+        # (get_patch) при этом адресует все записи с этим original.
+        entries = self.glossary_map.get(term) or [{}]
+        entry = entries[0]
         
         # Проверяем, есть ли незакомиченные изменения для этого термина
         current_trans = self.pending_updates.get(term, {}).get('rus', entry.get('rus', ''))
@@ -429,7 +441,8 @@ class TermFrequencyAnalyzerPage(ShellPage):
             
             # Инициализируем запись в pending_updates, если нет
             if term not in self.pending_updates:
-                original_entry = self.glossary_map.get(term, {})
+                original_entries = self.glossary_map.get(term) or [{}]
+                original_entry = original_entries[0]
                 self.pending_updates[term] = {
                     'rus': original_entry.get('rus', ''),
                     'note': original_entry.get('note', '')
@@ -483,28 +496,27 @@ class TermFrequencyAnalyzerPage(ShellPage):
         """
         patch_list = []
         
-        # 1. Сначала обрабатываем удаления
+        # 1. Сначала обрабатываем удаления.
+        # ФИКС: glossary_map хранит СПИСОК записей на original (могут быть
+        # дубликаты-конфликты) — патчим каждую, а не только представительную.
         for term in self.terms_to_delete:
-            old_entry = self.glossary_map.get(term)
-            if old_entry:
+            for old_entry in self.glossary_map.get(term, []):
                 patch_list.append({'before': old_entry, 'after': None})
-        
+
         # 2. Затем обрабатываем обновления (только если термин не удален)
         for term, new_data in self.pending_updates.items():
             if term in self.terms_to_delete:
                 continue
-            
-            old_entry = self.glossary_map.get(term)
-            if not old_entry: continue
-            
-            # Проверяем, изменилось ли что-то реально
-            if (new_data['rus'] != old_entry.get('rus', '') or 
-                new_data['note'] != old_entry.get('note', '')):
-                
-                new_entry = old_entry.copy()
-                new_entry.update(new_data)
-                patch_list.append({'before': old_entry, 'after': new_entry})
-                
+
+            for old_entry in self.glossary_map.get(term, []):
+                # Проверяем, изменилось ли что-то реально
+                if (new_data['rus'] != old_entry.get('rus', '') or
+                    new_data['note'] != old_entry.get('note', '')):
+
+                    new_entry = old_entry.copy()
+                    new_entry.update(new_data)
+                    patch_list.append({'before': old_entry, 'after': new_entry})
+
         return patch_list
 
     def reject(self):

@@ -124,6 +124,25 @@ TASK_OPTIONS_MIN_HEIGHT = 400
 TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
 # --- КОНЕЦ НОВЫХ КОНСТАНТ ---
 
+# Поля, которые нельзя писать в файлы проекта (project_settings.json,
+# queue_snapshot.db): содержат полные строки API-ключей открытым текстом.
+# Папка проекта — пользовательская рабочая папка с переводами, её делятся/
+# архивируют/кладут в облако. В глобальные настройки приложения (через
+# self.settings_manager, вне папки проекта) эти поля по-прежнему пишутся
+# без изменений.
+_SECRET_UI_SETTINGS_KEYS = ('api_keys', 'active_keys_by_provider')
+
+
+def _strip_secret_key_settings(settings: dict) -> dict:
+    """Возвращает копию ``settings`` без полей с полными API-ключами — для
+    записи в файлы проекта. При восстановлении такого снимка отсутствие
+    'api_keys' не должно трактоваться как «активных ключей нет» (см.
+    InitialSetupPage._apply_full_ui_settings)."""
+    sanitized = dict(settings)
+    for key in _SECRET_UI_SETTINGS_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
+
 
 def load_bool_setting(settings_manager, key: str, default: bool) -> bool:
     """Читает один булев флаг из снапшота настроек сессии.
@@ -3413,13 +3432,40 @@ class InitialSetupPage(ShellPage):
                     self.key_management_widget.current_active_keys_by_provider[provider_id] = set(normalized_keys)
 
             provider_id = settings.get('provider')
-            active_keys = settings.get('api_keys', [])
-            if not isinstance(active_keys, (list, tuple, set)):
-                active_keys = []
-            if provider_id:
-                self.key_management_widget.set_active_keys_for_provider(provider_id, active_keys)
+            if 'api_keys' in settings:
+                active_keys = settings.get('api_keys', [])
+                if not isinstance(active_keys, (list, tuple, set)):
+                    active_keys = []
+                if provider_id:
+                    self.key_management_widget.set_active_keys_for_provider(provider_id, active_keys)
+                else:
+                    self.key_management_widget._load_and_refresh_keys()
             else:
-                self.key_management_widget._load_and_refresh_keys()
+                # В применяемом снимке нет 'api_keys' — это ожидаемо для
+                # настроек, прочитанных из файлов проекта (project_settings.json,
+                # queue_snapshot.db): секретные ключи туда намеренно не пишутся
+                # (см. _strip_secret_key_settings). Не трактуем их отсутствие
+                # как «активных ключей нет» и не затираем уже загруженный
+                # активный набор пустым списком. При этом провайдер проекта
+                # всё равно нужно восстановить (иначе комбобокс останется на
+                # чужом провайдере, а model_settings_widget.set_settings
+                # подставит первую попавшуюся модель этого чужого провайдера) —
+                # переключаем его через тот же боевой метод, но передаём уже
+                # имеющийся в памяти активный набор для provider_id (он был
+                # заполнен циклом по 'active_keys_by_provider' выше, если это
+                # поле присутствовало, либо остался от ранее применённых
+                # глобальных настроек), а не пустой список.
+                if provider_id:
+                    preserved_active_keys = sorted(
+                        self.key_management_widget.current_active_keys_by_provider.get(
+                            provider_id, set()
+                        )
+                    )
+                    self.key_management_widget.set_active_keys_for_provider(
+                        provider_id, preserved_active_keys
+                    )
+                else:
+                    self.key_management_widget._load_and_refresh_keys()
 
             self._update_instances_spinbox_limit()
             saved_instances = settings.get('num_instances')
@@ -3456,6 +3502,8 @@ class InitialSetupPage(ShellPage):
         """Сохраняет UI-состояние в метаданные snapshot-файла очереди."""
         if not snapshot_path or not os.path.exists(snapshot_path) or not settings:
             return
+
+        settings = _strip_secret_key_settings(settings)
 
         conn = None
         try:
@@ -3504,7 +3552,9 @@ class InitialSetupPage(ShellPage):
         # ui-dialogs-setup/logic/3-project-settings-manager-wipes).
         custom_models_snapshot = api_config.custom_provider_models_snapshot()
         manager_to_save = SettingsManager(config_file=project_settings_path)
-        manager_to_save.save_full_session_settings(self._get_full_ui_settings())
+        manager_to_save.save_full_session_settings(
+            _strip_secret_key_settings(self._get_full_ui_settings())
+        )
         api_config.set_custom_provider_models(custom_models_snapshot)
 
         self.is_settings_dirty = False

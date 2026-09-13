@@ -2030,6 +2030,10 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
         worker.error.connect(
             lambda worker=worker: self.on_single_fix_error(worker)
         )
+        # Активируем непосредственно перед стартом воркера: между активацией
+        # и start() не должно быть операций, способных бросить исключение
+        # (иначе run_fix() без try/except не освободит инхибитор).
+        self._activate_power_inhibitor_for_config(config)
         worker.start()
 
     def start_manual_fix(self):
@@ -2154,6 +2158,15 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
 
     def _finish_single_fix_ui(self):
         """Возвращает интерфейс в обычное состояние после одиночного исправления."""
+        # single_fix_thread здесь не проверяем: в момент вызова он всё ещё
+        # указывает на завершающийся воркер этого же одиночного исправления.
+        # Снимаем защиту от сна, только если не идёт другая долгая AI-сессия
+        # (анализ или массовое исправление) — по образцу on_engine_error().
+        if not (
+            self._is_thread_running('analysis_thread') or
+            self._is_thread_running('fix_thread')
+        ):
+            self._release_power_inhibitor()
         worker = self.single_fix_thread
         self.single_fix_thread = None
         self.fix_btn.setEnabled(bool(self.current_problem and self.current_chapter))
@@ -2346,6 +2359,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
         config = self._get_current_config()
         
         self._log(f"⚡ Начало массового исправления ({count} проблем)...")
+        self._activate_power_inhibitor_for_config(config)
         # Временно подменяем карту проблем в движке на отфильтрованную
         old_map = self.engine.chapter_problems_map
         self._batch_fix_original_problems_map = old_map
@@ -2392,6 +2406,16 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
     @pyqtSlot(dict)
     def on_batch_fix_finished(self, results):
         """Обрабатывает завершение массового исправления."""
+        # fix_thread здесь не проверяем: в момент вызова он всё ещё указывает
+        # на завершающийся воркер этого же массового исправления. Снимаем
+        # защиту от сна, только если не идёт другая долгая AI-сессия (анализ
+        # или одиночное исправление) — по образцу on_engine_error().
+        if not (
+            self._is_thread_running('analysis_thread') or
+            self._is_thread_running('single_fix_thread') or
+            self._single_fix_in_progress
+        ):
+            self._release_power_inhibitor()
         for path, new_content in results.items():
             self._store_pending_fix(path, new_content)
         self.start_btn.setEnabled(True)

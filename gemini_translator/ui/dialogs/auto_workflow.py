@@ -12,6 +12,7 @@ from ...core.consistency_engine import (
     normalize_consistency_confidence,
     normalize_consistency_confidences,
 )
+from ...utils.io_utils import atomic_write_text
 from ...utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor
 from ...utils.translation_versions import select_target_translation_version
 
@@ -166,8 +167,10 @@ class AutoConsistencyWorker(QtCore.QThread):
             if fixable_problems_count and self.auto_fix:
                 fixed_files = engine.fix_all_chapters(self.chapters, self.config, self.active_keys)
                 for path, content in fixed_files.items():
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(content)
+                    # Атомарная запись (temp-файл + fsync + os.replace) —
+                    # чтобы крах процесса между truncate('w') и завершением
+                    # записи не оставил уже переведённую главу усечённой.
+                    atomic_write_text(path, content)
 
             fixed_chapters = [
                 chapter_name_by_path.get(path, os.path.basename(path))

@@ -17,7 +17,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
@@ -93,6 +93,11 @@ TOMATO_EXE_PATTERNS = (
 )
 _TOMATO_AUTOSTART_PROCESS: subprocess.Popen | None = None
 _TOMATO_AUTOSTART_CLEANUP_REGISTERED = False
+# Защищает check-then-act над двумя глобалами выше: без блокировки два
+# параллельных воркера (например, AiPrepareWorker и CoverPromptWorker),
+# независимо решающих запустить Tomato Web UI, могли оба увидеть
+# _TOMATO_AUTOSTART_PROCESS is None и оба вызвать subprocess.Popen(...).
+_TOMATO_AUTOSTART_LOCK = Lock()
 
 QIDIAN_DESCRIPTION_HEADERS = {
     "作品简介",
@@ -262,6 +267,7 @@ def normalize_rulate_tags(value) -> list[str]:
         value,
         allowed=allowed_tags,
         fallback=_fallback_tags_from_allowed(allowed_tags),
+        limit=15,
     )
 
 
@@ -817,7 +823,7 @@ def parse_catalog_metadata(raw_response: str) -> PreparedRulateMetadata:
     )
 
 
-def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str]) -> list[str]:
+def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str], limit: int = 8) -> list[str]:
     if isinstance(value, str):
         candidates = [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
     elif isinstance(value, list):
@@ -844,7 +850,7 @@ def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str]) ->
             break
         if item not in normalized:
             normalized.append(item)
-    return normalized[:8]
+    return normalized[:limit]
 
 
 def _clean_multiline(value: str | None) -> str:
@@ -1135,7 +1141,8 @@ def _find_tomato_executable() -> Path | None:
 
 
 def _stop_tomato_autostart_process() -> None:
-    process = _TOMATO_AUTOSTART_PROCESS
+    with _TOMATO_AUTOSTART_LOCK:
+        process = _TOMATO_AUTOSTART_PROCESS
     if process and process.poll() is None:
         try:
             process.terminate()
@@ -1163,39 +1170,43 @@ def _start_tomato_web_server(
         log("WARNING", "Tomato: автозапуск доступен только для локального Web UI.")
         return False
 
-    process = _TOMATO_AUTOSTART_PROCESS
-    if process and process.poll() is None:
-        log("INFO", "Tomato: Web UI уже запускается, жду готовности...")
-    else:
-        executable = _find_tomato_executable()
-        if not executable:
-            log(
-                "WARNING",
-                f"Tomato: exe не найден. Укажите путь в {TOMATO_EXE_ENV} или положите TomatoNovelDownloader*.exe рядом с программой.",
-            )
-            return False
+    # Читать/решать/запускать процесс нужно атомарно: без блокировки два
+    # параллельных воркера могут оба увидеть _TOMATO_AUTOSTART_PROCESS is None
+    # и оба запустить свой subprocess.Popen(...) на один и тот же порт.
+    with _TOMATO_AUTOSTART_LOCK:
+        process = _TOMATO_AUTOSTART_PROCESS
+        if process and process.poll() is None:
+            log("INFO", "Tomato: Web UI уже запускается, жду готовности...")
+        else:
+            executable = _find_tomato_executable()
+            if not executable:
+                log(
+                    "WARNING",
+                    f"Tomato: exe не найден. Укажите путь в {TOMATO_EXE_ENV} или положите TomatoNovelDownloader*.exe рядом с программой.",
+                )
+                return False
 
-        env = os.environ.copy()
-        env.setdefault("TOMATO_WEB_ADDR", _tomato_bind_addr_from_base_url(base_url))
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        try:
-            log("INFO", f"Tomato: запускаю Web UI из {executable}...")
-            _TOMATO_AUTOSTART_PROCESS = subprocess.Popen(
-                [str(executable), "--server"],
-                cwd=str(executable.parent),
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
-        except Exception as error:
-            log("WARNING", f"Tomato: не удалось запустить Web UI: {error}")
-            return False
+            env = os.environ.copy()
+            env.setdefault("TOMATO_WEB_ADDR", _tomato_bind_addr_from_base_url(base_url))
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            try:
+                log("INFO", f"Tomato: запускаю Web UI из {executable}...")
+                _TOMATO_AUTOSTART_PROCESS = subprocess.Popen(
+                    [str(executable), "--server"],
+                    cwd=str(executable.parent),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+            except Exception as error:
+                log("WARNING", f"Tomato: не удалось запустить Web UI: {error}")
+                return False
 
-        if not _TOMATO_AUTOSTART_CLEANUP_REGISTERED:
-            atexit.register(_stop_tomato_autostart_process)
-            _TOMATO_AUTOSTART_CLEANUP_REGISTERED = True
+            if not _TOMATO_AUTOSTART_CLEANUP_REGISTERED:
+                atexit.register(_stop_tomato_autostart_process)
+                _TOMATO_AUTOSTART_CLEANUP_REGISTERED = True
 
     deadline = time.monotonic() + TOMATO_STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -1753,9 +1764,43 @@ class QidianFetchWorker(QThread):
             self.finished_signal.emit()
 
 
+def _wait_until_browser_closed_or_interrupted(page, should_stop) -> None:
+    """Ждёт закрытия видимого Chromium пользователем, но также проверяет
+    `should_stop()` на каждой итерации.
+
+    Раньше цикл был `while True` и выходил ТОЛЬКО когда Playwright бросал
+    исключение при обращении к уже закрытой странице — у RulateFillWorker/
+    RulateLoginWorker не было способа остановить их программно, поэтому уход
+    со страницы Qidian Creator, не закрыв браузер руками, оставлял QThread и
+    процесс Chromium висеть в памяти до закрытия всего приложения.
+
+    `should_stop` — обычно `self._cancel_event.is_set` (по образцу
+    `AiPrepareWorker._cancel_event`): сознательно НЕ `QThread.isInterruptionRequested`,
+    потому что Qt делает `requestInterruption()` no-op, пока поток не запущен
+    через `.start()` (`d->running` внутри Qt проверяется до установки флага) —
+    `threading.Event` работает независимо от состояния QThread и тестируется
+    без реального запуска потока.
+    """
+    try:
+        while not should_stop():
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+
 class RulateLoginWorker(QThread):
     log_signal = pyqtSignal(str, str)
     finished_signal = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        """Просит воркер закрыть браузер и выйти из цикла ожидания на
+        следующей проверке (страница-хозяин может звать это при уходе со
+        страницы, не дожидаясь, пока пользователь сам закроет Chromium)."""
+        self._cancel_event.set()
 
     def run(self) -> None:
         try:
@@ -1779,11 +1824,7 @@ class RulateLoginWorker(QThread):
                     "WARNING",
                     "Войдите в Rulate в открытом браузере и закройте окно браузера. Куки сохранятся.",
                 )
-                try:
-                    while True:
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                _wait_until_browser_closed_or_interrupted(page, self._cancel_event.is_set)
             self.log_signal.emit("SUCCESS", "Rulate: браузер закрыт, куки сохранены.")
         except Exception as error:
             self.log_signal.emit("ERROR", f"Rulate login: {error}")
@@ -3025,6 +3066,13 @@ class RulateFillWorker(QThread):
     def __init__(self, draft: RulateBookDraft):
         super().__init__()
         self.draft = draft
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        """Просит воркер закрыть браузер и выйти из цикла ожидания на
+        следующей проверке (страница-хозяин может звать это при уходе со
+        страницы, не дожидаясь, пока пользователь сам закроет Chromium)."""
+        self._cancel_event.set()
 
     def log(self, level: str, message: str) -> None:
         self.log_signal.emit(level, message)
@@ -3065,11 +3113,7 @@ class RulateFillWorker(QThread):
                     "SUCCESS",
                     "Rulate: форма заполнена. Проверьте вкладки и нажмите сохранение вручную.",
                 )
-                try:
-                    while True:
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                _wait_until_browser_closed_or_interrupted(page, self._cancel_event.is_set)
         except Exception as error:
             self.log("ERROR", f"Rulate: {error}")
             self.log("DEBUG", traceback.format_exc())

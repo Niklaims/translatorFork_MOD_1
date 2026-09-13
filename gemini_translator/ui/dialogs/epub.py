@@ -2356,13 +2356,45 @@ class TranslatedChaptersManagerDialog(QDialog):
         self.load_chapters()
         self._update_preview_button_state()
         chapter_filepaths = self._get_build_chapter_filepaths()
-        followup_data = {}
-        if chapter_filepaths:
-            followup_analysis = HtmlDuplicateAnalysisThread(chapter_filepaths, self)
-            followup_analysis.analysis_finished.connect(lambda data: followup_data.setdefault('data', data))
-            followup_analysis.run()
+        if not chapter_filepaths:
+            QMessageBox.information(self, "Повторы удалены", message)
+            return
 
-        remaining = followup_data.get('data') or {}
+        # Повторное сканирование должно идти в фоновом QThread (как и первый
+        # проход выше), поэтому запускаем через .start(), а результат
+        # обрабатываем в слоте, подключённом к analysis_finished, а не читаем
+        # его синхронно сразу после вызова. Пока поток работает, показываем
+        # тот же модальный wait_dialog, что и на первом проходе — иначе
+        # интерфейс не даёт никакой обратной связи, остаётся интерактивным
+        # (можно закрыть окно менеджера или повторно нажать поиск повторов) и
+        # рискует получить "QThread: Destroyed while thread is still running".
+        self.wait_dialog = QMessageBox(self)
+        self.wait_dialog.setWindowTitle("Поиск повторов")
+        self.wait_dialog.setText(
+            "Проверяем, не осталось ли ещё повторов после удаления...\n"
+            "Ищем повторы в начале главы и на стыках/в концовках между главами."
+        )
+        self.wait_dialog.setStandardButtons(QMessageBox.StandardButton.NoButton)
+        self.wait_dialog.setModal(True)
+
+        self.followup_duplicate_analysis_thread = HtmlDuplicateAnalysisThread(chapter_filepaths, self)
+        self.followup_duplicate_analysis_thread.analysis_finished.connect(
+            lambda data: self._on_followup_duplicate_analysis_finished(message, data)
+        )
+        # Завершённый поток остаётся ребёнком диалога до его закрытия — без
+        # deleteLater каждый виток "продолжить удаление" копил бы в памяти
+        # уже отработавшие QThread-объекты.
+        self.followup_duplicate_analysis_thread.finished.connect(
+            self.followup_duplicate_analysis_thread.deleteLater
+        )
+        self.followup_duplicate_analysis_thread.start()
+        self.wait_dialog.show()
+
+    def _on_followup_duplicate_analysis_finished(self, message, remaining_data):
+        if hasattr(self, 'wait_dialog') and self.wait_dialog:
+            self.wait_dialog.accept()
+
+        remaining = remaining_data or {}
         remaining_count = len(remaining.get('start_findings') or []) + len(remaining.get('boundary_findings') or [])
         if remaining_count > 0:
             msg_box = QMessageBox(self)

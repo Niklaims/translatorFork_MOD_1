@@ -2,30 +2,28 @@
 """
 Закрепляющий тест для находки perf:network/3-local-handler-ignores-stream-f.
 
-LocalApiHandler.call_api (gemini_translator/api/handlers/local.py) принимает
-параметр use_stream, но тело метода жёстко отправляет payload["stream"] = False
-независимо от его значения — параметр use_stream нигде дальше не используется.
+Было: LocalApiHandler.call_api (gemini_translator/api/handlers/local.py)
+принимал параметр use_stream, но тело метода жёстко отправляло
+payload["stream"] = False независимо от его значения — параметр use_stream
+нигде дальше не использовался, а ответ всегда дожидался синхронным
+response.json() одним блоком. При обрыве длинной локальной генерации
+(Timeout/ConnectionError) весь накопленный сервером текст терялся без
+partial_text.
 
-Настоящий фикс (потоковое чтение SSE-чанков от локального сервера с накоплением
-partial_text для PartialGenerationError при обрыве) требует, чтобы
-requests.Session.post вызывался с stream=True и разбирал response.iter_lines().
-Все шесть моков fake_post в tests/test_local_api_handler.py объявлены как
-(url, headers=None, json=None, proxies=None, timeout=None) и возвращают
-_DummyResponse без iter_lines()/content — они не эмулируют потоковый ответ.
-Правка этого файла запрещена в рамках данной находки (группа api_handlers_local
-может менять только local.py и новые tests/test_fix_med_api_handlers_local_*.py),
-поэтому находка помечена blocked, а не закрыта.
+Стало: payload["stream"] реально совпадает с переданным use_stream;
+при use_stream=True requests.Session.post вызывается с stream=True и ответ
+разбирается потоково через response.iter_lines() (см.
+LocalApiHandler._collect_local_stream), с сохранением partial_text в
+PartialGenerationError при обрыве потока (закреплено отдельно в
+tests/test_fix_med_api_handlers_local_stream_partial_text.py).
 
-Тест документирует именно этот дефект и помечен xfail(strict=False): он не
-валит сборку сейчас, но автоматически станет зелёным (и тогда xfail будет
-нужно снять), когда payload["stream"] начнёт реально совпадать с переданным
-use_stream.
+xfail снят: этот тест был закладкой при статусе blocked, теперь дефект
+исправлен.
 """
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
-
-import pytest
 
 from gemini_translator.api.handlers.local import LocalApiHandler
 
@@ -35,6 +33,8 @@ class _DummyResponse:
     text = ""
 
     def __init__(self, finish_reason="stop", content="ok"):
+        self._finish_reason = finish_reason
+        self._content = content
         self._payload = {
             "choices": [
                 {
@@ -46,6 +46,14 @@ class _DummyResponse:
 
     def json(self):
         return self._payload
+
+    def iter_lines(self, decode_unicode=True):
+        if self._content:
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": self._content}}]})
+        yield "data: " + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": self._finish_reason}]}
+        )
+        yield "data: [DONE]"
 
 
 class _WorkerStub:
@@ -76,29 +84,46 @@ def _make_handler():
     return handler, worker
 
 
-@pytest.mark.xfail(
-    reason=(
-        "blocked: реальный фикс требует потокового response.iter_lines() и "
-        "совместной правки tests/test_local_api_handler.py (её fake_post не "
-        "эмулирует stream=True) — правка этого файла вне разрешённой области "
-        "находки perf:network/3-local-handler-ignores-stream-f"
-    ),
-    strict=False,
-)
 def test_payload_stream_flag_matches_use_stream_argument():
     handler, _worker = _make_handler()
     captured_payloads = []
+    captured_stream_kwargs = []
 
-    def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+    def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
         captured_payloads.append(json)
+        captured_stream_kwargs.append(stream)
         return _DummyResponse()
 
     with patch(
         "gemini_translator.api.handlers.local.requests.Session.post",
         side_effect=fake_post,
     ):
-        handler.call_api("prompt", "log", use_stream=True)
+        result = handler.call_api("prompt", "log", use_stream=True)
 
-    # Сейчас payload["stream"] всегда False независимо от use_stream —
-    # это и есть дефект perf:network/3-local-handler-ignores-stream-f.
+    # payload["stream"] теперь реально совпадает с переданным use_stream,
+    # и запрос к requests тоже сделан в потоковом режиме.
     assert captured_payloads[0]["stream"] is True
+    assert captured_stream_kwargs[0] is True
+    assert result == "ok"
+
+
+def test_payload_stream_flag_false_keeps_synchronous_json_path():
+    handler, _worker = _make_handler()
+    captured_payloads = []
+    captured_stream_kwargs = []
+
+    def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
+        captured_payloads.append(json)
+        captured_stream_kwargs.append(stream)
+        return _DummyResponse()
+
+    with patch(
+        "gemini_translator.api.handlers.local.requests.Session.post",
+        side_effect=fake_post,
+    ):
+        result = handler.call_api("prompt", "log", use_stream=False)
+
+    # Поведение use_stream=False (эталонный синхронный путь) не изменилось.
+    assert captured_payloads[0]["stream"] is False
+    assert captured_stream_kwargs[0] is False
+    assert result == "ok"

@@ -468,6 +468,18 @@ def split_epub_file(input_path, output_path, settings, log_callback=None, progre
             if "html" not in media_type and "xhtml" not in media_type:
                 continue
 
+            item_properties = manifest_info.get("properties") or ""
+            if "nav" in item_properties or posixpath.basename(internal_path).lower() == "nav.xhtml":
+                # Документ навигации (EPUB3 nav.xhtml) — это оглавление книги,
+                # а не глава для перевода, и его ссылки отдельно обновляет
+                # цикл ниже (по манифесту). Если разбить его здесь как обычную
+                # главу, тот цикл всё равно перечитает исходный файл из архива
+                # и либо затрёт уже сохранённую часть 1 полным содержимым,
+                # либо (если у nav стоит properties="nav") унаследовавшие это
+                # свойство part-файлы упадут там с KeyError — такого файла в
+                # исходном архиве нет.
+                continue
+
             html_text = zin.read(internal_path).decode("utf-8", errors="ignore")
             documents = split_epub_html_document(html_text, settings, used_paths, internal_path)
             if not documents:

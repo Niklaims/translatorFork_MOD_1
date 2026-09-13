@@ -87,10 +87,125 @@ class LocalApiHandler(BaseApiHandler):
         self._drop_http_session()
         await super()._close_thread_session_internal()
 
+    def _collect_local_stream(self, response, debug=False):
+        """Синхронно читает OpenAI-совместимый SSE-поток от локального сервера
+        построчно через response.iter_lines() (эквивалент async-парсера в
+        _sse_stream.py, но без aiohttp -- requests синхронный).
+
+        Формат ровно тот же, что у остальных хендлеров: строки
+        'data: {...}' с choices[0].delta.content / choices[0].finish_reason,
+        пустые строки и 'data: [DONE]' пропускаются, невалидный JSON в
+        отдельной строке молча пропускается.
+
+        Дополнительно отслеживает saw_sse -- была ли хоть одна строка с
+        префиксом 'data: '. Если сервер проигнорировал payload['stream']=True
+        и ответил обычным JSON одним телом, ни одна строка префикса не
+        получит, и вызывающий код (call_api) сможет разобрать накопленное в
+        pre_sse_lines сырое тело как обычный синхронный JSON-ответ вместо
+        того, чтобы потерять текст.
+
+        Если соединение обрывается посреди чтения (Timeout/ConnectionError/
+        ChunkedEncodingError и т.п.) и что-то уже накоплено -- поднимает
+        PartialGenerationError с накопленным текстом (и сбрасывает
+        персистентную HTTP-сессию через _drop_http_session(), как и при
+        обрыве вне стрима) вместо того, чтобы потерять текст молча. Если не
+        накоплено ничего -- исходное исключение requests пробрасывается как
+        есть и обрабатывается обычными except-ветками call_api
+        (Timeout/ConnectionError/RequestException).
+        """
+        collected_text = ""
+        finish_reason = None
+        capture_raw = debug or self._has_debug_trace()
+        raw_lines = [] if capture_raw else None
+        saw_sse = False
+        pre_sse_lines = []
+
+        try:
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if raw_line is None:
+                    continue
+                line_str = raw_line if isinstance(raw_line, str) else raw_line.decode("utf-8", "ignore")
+                line_str = line_str.strip()
+                if raw_lines is not None:
+                    raw_lines.append(line_str)
+                if not saw_sse:
+                    pre_sse_lines.append(line_str)
+                if not line_str or line_str == "data: [DONE]":
+                    continue
+                if not line_str.startswith("data: "):
+                    continue
+                saw_sse = True
+
+                json_str = line_str[6:]
+                try:
+                    chunk = json.loads(json_str)
+                except json.JSONDecodeError:
+                    continue
+
+                choices = chunk.get("choices")
+                if choices:
+                    delta = choices[0].get("delta") or {}
+                    content_part = delta.get("content", "")
+                    if content_part:
+                        collected_text += content_part
+
+                    f_reason = choices[0].get("finish_reason")
+                    if f_reason:
+                        finish_reason = f_reason
+        except (requests.exceptions.RequestException, OSError) as stream_error:
+            if collected_text:
+                self._drop_http_session()
+                raise PartialGenerationError(
+                    f"Обрыв потока локального сервера: {stream_error}",
+                    partial_text=collected_text,
+                    reason="NETWORK_ERROR",
+                ) from stream_error
+            raise
+
+        return collected_text, finish_reason, raw_lines, saw_sse, pre_sse_lines
+
+    def _close_stream_response(self, response):
+        """Закрывает потоковый response, чтобы requests.Session вернул
+        соединение в пул -- при stream=True это не происходит само по себе,
+        пока тело не дочитано полностью или response не закрыт явно."""
+        close = getattr(response, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _try_parse_non_sse_json_body(self, lines):
+        """Если сервер проигнорировал payload['stream']=True и ответил
+        обычным JSON одним телом (не SSE), пытается разобрать накопленные
+        до первой валидной SSE-строки сырые строки как этот JSON. Возвращает
+        dict при успехе, иначе None (тело пустое, не JSON, либо не dict)."""
+        if not lines:
+            return None
+        body = "\n".join(lines).strip()
+        if not body:
+            return None
+        try:
+            result = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        return result if isinstance(result, dict) else None
+
     def call_api(self, prompt, log_prefix, allow_incomplete=False, use_stream=True, debug=False, max_output_tokens=None):
         """
         СИНХРОННАЯ реализация вызова.
         Аргумент `session` (aiohttp) здесь всегда None и не используется.
+
+        ВАЖНО про timeout при use_stream=True: requests трактует `timeout` в
+        потоковом режиме как таймаут ожидания СЛЕДУЮЩЕГО чанка, а не общего
+        времени ответа (в отличие от use_stream=False, где это таймаут на
+        весь запрос). Локальный сервер, медленно капающий токенами дольше
+        timeout_seconds суммарно, но не дающий пауз между чанками длиннее
+        timeout_seconds, не будет прерван по общему дедлайну -- это такое же
+        поведение, как у остальных стримингующих хендлеров (aiohttp ведёт
+        себя аналогично), но раньше локальный путь всегда был ограничен
+        общим self.timeout_seconds, и это стоит иметь в виду при диагностике
+        "зависших" локальных генераций.
         """
         headers = { "Content-Type": "application/json" }
         api_key = str(getattr(self.worker, "api_key", "") or "").strip()
@@ -106,7 +221,7 @@ class LocalApiHandler(BaseApiHandler):
         payload = {
             "model": self.worker.model_id,
             "messages": messages,
-            "stream": False # Синхронные хендлеры обычно проще писать без стриминга
+            "stream": bool(use_stream),
         }
         temperature = self._temperature_payload_value()
         if temperature is not None:
@@ -148,25 +263,85 @@ class LocalApiHandler(BaseApiHandler):
                 headers=headers,
                 json=payload,
                 proxies=self.prepared_proxies,
-                timeout=timeout_seconds
+                timeout=timeout_seconds,
+                stream=use_stream,
             )
-            
+
             # --- Обработка ответа ---
-            
+
             if response.status_code == 200:
+                if use_stream:
+                    # Потоковый путь. В отличие от синхронного ниже, здесь НЕ
+                    # требуем finish_reason == "stop" -- ни один другой хендлер
+                    # (см. deepseek.py) такого требования к стриму не предъявляет,
+                    # а локальные OpenAI-совместимые серверы не всегда шлют
+                    # финальный чанк с явным finish_reason. Единственный особый
+                    # случай -- "length" + allow_incomplete, как и раньше.
+                    try:
+                        content, finish_reason, raw_lines, saw_sse, pre_sse_lines = self._collect_local_stream(
+                            response, debug=debug
+                        )
+                    finally:
+                        # requests не возвращает соединение в пул при stream=True,
+                        # пока response не закрыт явно -- закрываем и на успехе, и
+                        # при исключении (в т.ч. PartialGenerationError из-за обрыва).
+                        self._close_stream_response(response)
+
+                    fallback_result = None if saw_sse else self._try_parse_non_sse_json_body(pre_sse_lines)
+                    if fallback_result is not None and fallback_result.get("choices"):
+                        # Сервер проигнорировал payload["stream"]=True и ответил
+                        # обычным JSON одним телом -- разбираем как синхронный ответ,
+                        # вместо того чтобы терять текст.
+                        self._debug_record_response(
+                            fallback_result,
+                            status="http_200",
+                            extra={"mode": "full_ignored_stream_flag", "http_status": response.status_code},
+                        )
+                        choice = fallback_result["choices"][0]
+                        content = choice.get("message", {}).get("content", "") or ""
+                        finish_reason = choice.get("finish_reason")
+                    elif raw_lines is not None:
+                        self._debug_record_response(
+                            "\n".join(raw_lines),
+                            status=finish_reason or "stream",
+                            extra={"mode": "stream", "http_status": response.status_code},
+                        )
+
+                    has_content = bool(content) or finish_reason is not None
+                    if not has_content:
+                        raise Exception("Пустой потоковый ответ от сервера: не получено ни одного choices-чанка")
+
+                    if finish_reason == "length" and allow_incomplete:
+                        # Логируем предупреждение через воркер (это потокобезопасно)
+                        if "max_tokens" in payload:
+                            limit_source = f"client max_tokens={payload['max_tokens']}"
+                        else:
+                            limit_source = "server/context limit; client max_tokens was not set"
+                        log_payload = {'message': f"[WARN] Ответ локальной модели обрезан лимитом ({limit_source})."}
+                        self.worker._post_event('log_message', log_payload)
+                        raise PartialGenerationError(
+                            "Ответ локальной модели обрезан лимитом",
+                            partial_text=content,
+                            reason="LENGTH",
+                        )
+
+                    return content
+
+                # Синхронный (эталонный) путь -- поведение не изменилось.
                 result = response.json()
                 self._debug_record_response(
                     result,
                     status="http_200",
                     extra={"mode": "full", "http_status": response.status_code},
                 )
-                if 'choices' in result and result['choices']:
+                has_content = bool(result.get('choices'))
+                if has_content:
                     choice = result['choices'][0]
                     finish_reason = choice.get('finish_reason')
+                    content = choice['message']['content']
 
                     is_successful_stop = (finish_reason == "stop")
                     is_acceptable_incomplete = (finish_reason == "length" and allow_incomplete)
-                    content = choice['message']['content']
 
                     if is_successful_stop or is_acceptable_incomplete:
                         if is_acceptable_incomplete:
@@ -182,7 +357,7 @@ class LocalApiHandler(BaseApiHandler):
                                 partial_text=content,
                                 reason="LENGTH",
                             )
-                        
+
                         return content
                     else:
                         raise ValidationFailedError(f"Генерация остановлена: '{finish_reason}'.")

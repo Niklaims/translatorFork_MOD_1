@@ -215,10 +215,22 @@ class SequentialTaskProvider(QObject):
         # 2. Запускаем сессию с гарантированной задержкой.
         # Это дает 100% уверенность, что движок увидит задачу, которую мы подготовили выше.
         QTimer.singleShot(
-            100, 
-            lambda: self._post_event('start_session_requested', {'settings': settings})
+            100,
+            lambda settings=settings: self._emit_deferred_start(settings)
         )
 
+    def _emit_deferred_start(self, settings):
+        """Срабатывает по отложенному таймеру из start().
+
+        Если за эти 100мс пользователь успел остановить оркестратор (hard-stop
+        в окне гонки, когда _is_running уже True, а engine.session_id ещё
+        None), реальный старт сессии движка отправлять нельзя — иначе уже
+        прерванная пользователем генерация всё равно стартует в TranslationEngine
+        без диалога и без оркестратора, который мог бы её остановить.
+        """
+        if not self._is_running or self._is_stopping:
+            return
+        self._post_event('start_session_requested', {'settings': settings})
 
     @pyqtSlot(dict)
     def on_event(self, event: dict):
@@ -2624,20 +2636,38 @@ class GenerationSessionPage(ShellPage):
     def _on_hard_stop_clicked(self):
         """Инициирует ЭКСТРЕННУЮ, немедленную остановку."""
         self._pipeline_stop_requested = True
-        if self.engine and self.engine.session_id:
+        orchestrator_running = bool(self.orchestrator and self.orchestrator._is_running)
+        engine_running = bool(self.engine and self.engine.session_id)
+        if engine_running or orchestrator_running:
             self.hard_stop_btn.setText("Прерывание...")
             self.hard_stop_btn.setEnabled(False)
             self.soft_stop_btn.setEnabled(False)
-            
-            # --- ЛОГИКА ЭКСТРЕННОЙ ОСТАНОВКИ ---
-            # 1. Находим флаг нашего оркестратора и немедленно его снимаем
-            orchestrator_flag_key = self.orchestrator.MANAGED_SESSION_FLAG_KEY if self.orchestrator else None
-            if orchestrator_flag_key and self.bus.pop_data(orchestrator_flag_key, None):
-                 self._post_event_deferred('log_message', {'message': "[SYSTEM] Глобальный флаг управляемой сессии снят принудительно."})
 
-            # 2. Отправляем команду на немедленную остановку движка
-            self._post_event_deferred('log_message', {'message': "[SYSTEM] Отправка запроса на ЭКСТРЕННУЮ остановку сессии…"})
-            self._request_immediate_engine_cancel()
+            if orchestrator_running and not engine_running:
+                # SequentialTaskProvider.start() выставляет _is_running=True синхронно,
+                # а engine.session_id появляется только ~100мс спустя (QTimer.singleShot).
+                # Останавливаем оркестратор напрямую, иначе в этом окне хард-стоп/
+                # принудительное закрытие не делали вообще ничего.
+                # Если engine_running уже True — сессия движка идёт, и её остановка
+                # (ветка ниже) снимает флаг и логирует это сама; вызывать здесь
+                # orchestrator.stop() не нужно и вредно: он первым снимет флаг
+                # управляемой сессии, из-за чего диагностика ниже (строки с
+                # "Глобальный флаг управляемой сессии снят принудительно") станет
+                # мёртвой, а сам stop() может синхронно отправить лишние
+                # 'manual_stop_requested'/'generation_finished'.
+                self.orchestrator.stop()
+
+            if engine_running:
+                # --- ЛОГИКА ЭКСТРЕННОЙ ОСТАНОВКИ ---
+                # 1. Находим флаг нашего оркестратора и немедленно его снимаем
+                orchestrator_flag_key = self.orchestrator.MANAGED_SESSION_FLAG_KEY if self.orchestrator else None
+                if orchestrator_flag_key and self.bus.pop_data(orchestrator_flag_key, None):
+                     self._post_event_deferred('log_message', {'message': "[SYSTEM] Глобальный флаг управляемой сессии снят принудительно."})
+
+                # 2. Отправляем команду на немедленную остановку движка
+                self._post_event_deferred('log_message', {'message': "[SYSTEM] Отправка запроса на ЭКСТРЕННУЮ остановку сессии…"})
+                self._request_immediate_engine_cancel()
+
             self._set_ui_active(False)
             if self.force_exit_on_interrupt:
                 self._finish_forced_interrupt_close()

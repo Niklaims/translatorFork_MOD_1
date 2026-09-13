@@ -1994,6 +1994,40 @@ class ValidationThread(QThread):
 UNTRANSLATED_DETECTOR_RULES_MARKER = "__untranslated_rules_v2__"
 
 
+class _LazyOriginalEpubZip:
+    """Ленивая обёртка над ``zipfile.ZipFile`` архива оригинала.
+
+    Настоящий ``zipfile.ZipFile`` (а значит и чтение центрального каталога
+    EPUB) открывается только на первый вызов :meth:`read` — то есть на
+    первый реальный промах кэша внутри батча (см.
+    ``_repair_ai_artifacts_for_selection``). Если ни одна строка прохода не
+    промахнула кэш, архив вообще не открывается. Дальше открытый хендл
+    переиспользуется для всех последующих промахов — вместо повторного
+    открытия архива на КАЖДЫЙ промах ограниченного LRU-кэша.
+    """
+
+    def __init__(self, epub_path):
+        self._epub_path = epub_path
+        self._zip = None
+        self._tried_open = False
+
+    def read(self, internal_path):
+        if not self._tried_open:
+            self._tried_open = True
+            if self._epub_path and os.path.exists(self._epub_path):
+                try:
+                    self._zip = zipfile.ZipFile(self._epub_path, 'r')
+                except Exception:
+                    self._zip = None
+        if self._zip is None:
+            raise FileNotFoundError(internal_path)
+        return self._zip.read(internal_path)
+
+    def close(self):
+        if self._zip is not None:
+            self._zip.close()
+
+
 # --- Главное окно диалога ---
 class TranslationValidatorPage(ShellPage):
 
@@ -2019,6 +2053,24 @@ class TranslationValidatorPage(ShellPage):
         "retry": "К переотправке",
         "edited": "Редакт.",
     }
+
+    # Watchdog для run_auto_untranslated_fixer: если движок отклонил команду
+    # старта скрытой AI-сессии фиксера недоперевода (is_starting/занятый
+    # session_id в translation_engine — например, пользователь вручную
+    # запустил перевод, пока в фоне ещё шёл автовалидатор), событие
+    # session_started для нашего запуска не придёт никогда, а вложенный
+    # QEventLoop без тайм-аута завис бы навсегда (ui-dialogs-validation/
+    # runtime/4-auto-fixer-nested-eventloop-no).
+    #
+    # Важно: это тайм-аут ТОЛЬКО на подтверждение старта движком, а не на всю
+    # AI-сессию целиком — код-ревью (ui_dialogs_validation_c) справедливо
+    # указал, что первая версия страховки мерила тайм-аутом всю сессию и
+    # обрывала бы совершенно легитимный, просто долгий проход фиксера
+    # (десятки глав, RPM-лимиты, ретраи). Как только dialog._owned_session_id
+    # выставлен (событие session_started дошло), обработчик тайм-аута сам
+    # ничего не делает, и wait_loop ждёт dialog.finished дальше без верхней
+    # границы.
+    AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS = 10 * 60 * 1000
 
     RATIO_PRESETS = {
         **validation_ratio_presets(),
@@ -3700,66 +3752,130 @@ class TranslationValidatorPage(ShellPage):
         ambiguous_glued_words = []
         protected_terms = TranslationValidatorPage._get_ai_repair_protected_terms(self)
 
-        for row in rows:
-            data = self.results_data.get(row)
-            if not isinstance(data, dict):
-                continue
+        # При пустом выделении и включённом «Показать все файлы» это может
+        # быть вся книга — сотни глав синхронно на GUI-потоке. Прогресс-
+        # диалог не только показывает ход дела и даёт отменить длинный
+        # проход по нажатию «Отмена», но и сам пампит цикл событий на каждом
+        # setValue() (тот же приём, что и в _on_consistency_check), так что
+        # интерфейс не выглядит подвисшим между главами.
+        progress = None
+        if len(rows) > 1:
+            progress = QProgressDialog(
+                "Автоправка ошибок ИИ...", "Отмена", 0, len(rows), self
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(300)
 
-            try:
-                original_html = self._ensure_row_original_html_loaded(row)
-                translated_html = self._ensure_row_translated_html_loaded(row)
-                if not translated_html:
-                    unchanged_count += 1
+        # Ленивая обёртка вместо безусловного открытия ZipFile архива
+        # оригинала в начале прохода: реальный zipfile.ZipFile создаётся
+        # только на первый фактический промах кэша (см. _LazyOriginalEpubZip
+        # ниже) и переиспользуется для всех остальных промахов — вместо
+        # повторного открытия архива на каждый промах ограниченного LRU-кэша
+        # (24 главы), но и без лишней платы за чтение центрального каталога
+        # большого EPUB на частом сценарии «одна строка» или «все главы уже
+        # в original_content_cache», когда до архива дело вообще не доходит.
+        original_epub_zip = _LazyOriginalEpubZip(self.original_epub_path)
+
+        canceled = False
+        processed_count = len(rows)
+        try:
+            for index, row in enumerate(rows):
+                if progress is not None:
+                    progress.setValue(index)
+                    if progress.wasCanceled():
+                        canceled = True
+                        processed_count = index
+                        break
+
+                data = self.results_data.get(row)
+                if not isinstance(data, dict):
                     continue
 
-                chapter_name = os.path.basename(
-                    data.get('internal_html_path') or data.get('path') or f"row {row}"
-                )
-                repaired_html = repair_ai_html_artifacts(
-                    original_html,
-                    translated_html,
-                    protected_terms=protected_terms,
-                )
-                _, remaining_glued_candidates = repair_glued_russian_words_in_html(
-                    repaired_html,
-                    protected_terms=protected_terms,
-                )
-                chapter_ambiguous = [
-                    {"chapter": chapter_name, "candidate": candidate}
-                    for candidate in remaining_glued_candidates
-                    if not candidate.confident
-                ]
-                ambiguous_glued_words.extend(chapter_ambiguous)
-                if repaired_html != translated_html:
-                    segments, changes = build_line_review_segments(translated_html, repaired_html)
-                    if changes:
-                        warning = ai_repair_candidate_warning(translated_html, repaired_html)
-                        ambiguity_preview = format_ambiguous_glued_word_preview(chapter_ambiguous)
-                        review_candidates.append({
-                            "row": row,
-                            "chapter": chapter_name,
-                            "original_html": translated_html,
-                            "repaired_html": repaired_html,
-                            "segments": segments,
-                            "changes": changes,
-                            "warning": warning,
-                            "notes": (
-                                "Неоднозначные склейки оставлены без изменений:\n"
-                                + ambiguity_preview
-                                if ambiguity_preview
-                                else ""
-                            ),
-                        })
+                try:
+                    original_html = self._ensure_row_original_html_loaded(row, original_epub_zip)
+                    translated_html = self._ensure_row_translated_html_loaded(row)
+                    if not translated_html:
+                        unchanged_count += 1
+                        continue
+
+                    chapter_name = os.path.basename(
+                        data.get('internal_html_path') or data.get('path') or f"row {row}"
+                    )
+                    repaired_html = repair_ai_html_artifacts(
+                        original_html,
+                        translated_html,
+                        protected_terms=protected_terms,
+                    )
+                    _, remaining_glued_candidates = repair_glued_russian_words_in_html(
+                        repaired_html,
+                        protected_terms=protected_terms,
+                    )
+                    chapter_ambiguous = [
+                        {"chapter": chapter_name, "candidate": candidate}
+                        for candidate in remaining_glued_candidates
+                        if not candidate.confident
+                    ]
+                    ambiguous_glued_words.extend(chapter_ambiguous)
+                    if repaired_html != translated_html:
+                        segments, changes = build_line_review_segments(translated_html, repaired_html)
+                        if changes:
+                            warning = ai_repair_candidate_warning(translated_html, repaired_html)
+                            ambiguity_preview = format_ambiguous_glued_word_preview(chapter_ambiguous)
+                            review_candidates.append({
+                                "row": row,
+                                # internal_html_path строки на МОМЕНТ сбора
+                                # кандидата — прогресс-диалог пампит цикл
+                                # событий на каждом setValue() (см. выше), и
+                                # за время долгого прохода таблица результатов
+                                # может быть перестроена (например,
+                                # _smart_reload_table_preserving_data после
+                                # фоновой синхронизации), из-за чего индекс
+                                # row к моменту применения правки в
+                                # apply_review_result будет указывать уже на
+                                # ДРУГУЮ главу. Сверяем это поле перед
+                                # применением, а не полагаемся на голый row.
+                                "internal_html_path": data.get('internal_html_path'),
+                                "chapter": chapter_name,
+                                "original_html": translated_html,
+                                "repaired_html": repaired_html,
+                                "segments": segments,
+                                "changes": changes,
+                                "warning": warning,
+                                "notes": (
+                                    "Неоднозначные склейки оставлены без изменений:\n"
+                                    + ambiguity_preview
+                                    if ambiguity_preview
+                                    else ""
+                                ),
+                            })
+                        else:
+                            unchanged_count += 1
                     else:
                         unchanged_count += 1
-                else:
-                    unchanged_count += 1
-            except Exception as exc:
-                chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
-                errors.append(f"{chapter_name}: {exc}")
+                except Exception as exc:
+                    chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
+                    errors.append(f"{chapter_name}: {exc}")
+        finally:
+            if progress is not None:
+                progress.setValue(len(rows))
+                # Прогресс-диалог создаётся заново на каждый запуск
+                # автоправки; без явного close()/deleteLater() каждый такой
+                # запуск оставлял бы на долгоживущей странице валидатора ещё
+                # один скрытый дочерний QProgressDialog (autoReset/autoClose
+                # его только прячут, не уничтожают).
+                progress.close()
+                progress.deleteLater()
+            original_epub_zip.close()
+
+        cancel_note = ""
+        if canceled:
+            cancel_note = (
+                f"Проход прерван (нажата «Отмена»): обработаны только "
+                f"{processed_count} из {len(rows)} строк, результат — только по ним.\n\n"
+            )
 
         if not review_candidates:
-            message = "Автоправка не нашла изменений для выбранных строк."
+            message = cancel_note + "Автоправка не нашла изменений для выбранных строк."
             if ambiguous_glued_words:
                 message += (
                     f"\n\nНайдено неоднозначных склеек: {len(ambiguous_glued_words)}. "
@@ -3778,6 +3894,9 @@ class TranslationValidatorPage(ShellPage):
             unchanged_count,
             errors,
             ambiguous_glued_words,
+            canceled=canceled,
+            processed_count=processed_count,
+            total_count=len(rows),
         )
 
     def _push_ai_repair_review_page(
@@ -3787,9 +3906,39 @@ class TranslationValidatorPage(ShellPage):
         unchanged_count,
         errors,
         ambiguous_glued_words=None,
+        canceled=False,
+        processed_count=None,
+        total_count=None,
     ):
         ambiguous_glued_words = list(ambiguous_glued_words or [])
         page = AIRepairReviewPage(review_candidates, self)
+
+        # Проход по строкам мог быть прерван кнопкой «Отмена» в прогресс-
+        # диалоге (см. _repair_ai_artifacts_for_selection): candidates,
+        # unchanged_count и errors в этом случае посчитаны только по
+        # обработанной части. Без явной пометки страница ревью и все
+        # сообщения ниже выглядели бы так, будто прошли ВСЕ строки —
+        # пользователь не узнал бы, что часть глав вообще не проверялась.
+        cancel_note = ""
+        if canceled:
+            cancel_note = (
+                f"Проход был прерван («Отмена»): обработаны только "
+                f"{processed_count} из {total_count} строк — ниже показаны "
+                "предложения только по ним.\n\n"
+            )
+
+        # Индекс строки на момент сбора кандидата (см. комментарий у
+        # "internal_html_path" в _repair_ai_artifacts_for_selection):
+        # прогресс-диалог пампит цикл событий на каждом setValue(), и за
+        # время долгого прохода таблица результатов может быть перестроена
+        # (например, _smart_reload_table_preserving_data после фоновой
+        # синхронизации). Если к моменту применения строка row указывает уже
+        # на другую главу, применять к ней правку нельзя — сверяем это здесь,
+        # а не полагаемся на голый числовой индекс.
+        expected_internal_path_by_row = {
+            candidate["row"]: candidate.get("internal_html_path")
+            for candidate in review_candidates
+        }
 
         def apply_review_result(accepted, page=page):
             if not accepted:
@@ -3799,14 +3948,25 @@ class TranslationValidatorPage(ShellPage):
 
             approved_html_by_row = page.selected_html_by_row()
             if not approved_html_by_row:
-                QMessageBox.information(self, "Автоправка", "Не выбрано ни одной строки для применения.")
+                QMessageBox.information(
+                    self, "Автоправка", cancel_note + "Не выбрано ни одной строки для применения."
+                )
                 page.request_back.emit()
                 return
 
             changed_rows = []
+            skipped_retargeted_rows = []
             for row, selected_html in approved_html_by_row.items():
                 data = self.results_data.get(row)
                 if not isinstance(data, dict):
+                    continue
+                expected_internal_path = expected_internal_path_by_row.get(row)
+                if expected_internal_path and data.get('internal_html_path') != expected_internal_path:
+                    # Строка row сейчас относится к другой главе, чем та,
+                    # для которой была построена правка, — таблицу успели
+                    # перестроить во время прохода. Применить правку по
+                    # такому индексу — значит молча испортить НЕ ту главу.
+                    skipped_retargeted_rows.append(row)
                     continue
                 current_html = self._ensure_row_translated_html_loaded(row)
                 if selected_html == current_html:
@@ -3821,12 +3981,17 @@ class TranslationValidatorPage(ShellPage):
                 self.reapply_filters()
                 self.update_comparison_view()
                 scope_text = "выделенных строках" if used_selection else "видимых строках"
-                message = (
+                message = cancel_note + (
                     f"Применено к главам: {len(changed_rows)} в {scope_text}.\n"
                     f"Глав с предложениями: {len(review_candidates)}.\n"
                     f"Без изменений: {unchanged_count}.\n\n"
                     "Проверьте результат справа и нажмите «Сохранить изменения»."
                 )
+                if skipped_retargeted_rows:
+                    message += (
+                        f"\n\nПропущено из-за перестройки таблицы во время прохода: "
+                        f"{len(skipped_retargeted_rows)}. Повторите автоправку для этих строк."
+                    )
                 if ambiguous_glued_words:
                     message += (
                         f"\n\nНеоднозначных склеек пропущено: {len(ambiguous_glued_words)}.\n"
@@ -3838,7 +4003,12 @@ class TranslationValidatorPage(ShellPage):
                         message += f"\n... и ещё {len(errors) - 5}."
                 QMessageBox.information(self, "Автоправка завершена", message)
             else:
-                message = "Подтверждённые строки не изменили текущий текст."
+                message = cancel_note + "Подтверждённые строки не изменили текущий текст."
+                if skipped_retargeted_rows:
+                    message += (
+                        f"\n\nПропущено из-за перестройки таблицы во время прохода: "
+                        f"{len(skipped_retargeted_rows)}. Повторите автоправку для этих строк."
+                    )
                 if errors:
                     message += "\n\nОшибки:\n" + "\n".join(errors[:5])
                 QMessageBox.information(self, "Автоправка", message)
@@ -5714,7 +5884,14 @@ class TranslationValidatorPage(ShellPage):
         self.translated_content_cache[file_path] = translated_html
         return translated_html
 
-    def _ensure_row_original_html_loaded(self, row_index):
+    def _ensure_row_original_html_loaded(self, row_index, epub_zip=None):
+        """Возвращает оригинальный HTML главы, читая архив EPUB при промахе кэша.
+
+        ``epub_zip`` — необязательный уже открытый ``zipfile.ZipFile``: пакетные
+        проходы по многим строкам (см. _repair_ai_artifacts_for_selection)
+        передают один и тот же открытый архив на весь проход вместо того,
+        чтобы открывать его заново на каждый промах ограниченного LRU-кэша.
+        """
         result_data = self.results_data.get(row_index)
         if not isinstance(result_data, dict):
             return ""
@@ -5729,10 +5906,16 @@ class TranslationValidatorPage(ShellPage):
 
         if internal_path in self.original_content_cache:
             original_html = self.original_content_cache[internal_path]
+        elif epub_zip is not None:
+            try:
+                original_html = epub_zip.read(internal_path).decode('utf-8', errors='ignore')
+            except Exception:
+                original_html = ""
+            self.original_content_cache[internal_path] = original_html
         elif self.original_epub_path and os.path.exists(self.original_epub_path):
             try:
-                with zipfile.ZipFile(self.original_epub_path, 'r') as epub_zip:
-                    original_html = epub_zip.read(internal_path).decode('utf-8', errors='ignore')
+                with zipfile.ZipFile(self.original_epub_path, 'r') as own_epub_zip:
+                    original_html = own_epub_zip.read(internal_path).decode('utf-8', errors='ignore')
             except Exception:
                 original_html = ""
             self.original_content_cache[internal_path] = original_html
@@ -6257,7 +6440,56 @@ class TranslationValidatorPage(ShellPage):
 
             wait_loop = QtCore.QEventLoop()
             dialog.finished.connect(wait_loop.quit)
+
+            # Watchdog на СТАРТ (см. AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS):
+            # без него команда старта, проигнорированная движком, оставляла бы
+            # этот цикл событий крутиться вечно без единого шанса продолжить
+            # или хотя бы завершить автопайплайн с ошибкой. Срабатывает,
+            # ТОЛЬКО если событие session_started так и не пришло к моменту
+            # тика — если сессия реально стартовала (dialog._owned_session_id
+            # уже выставлен), обработчик ничего не делает, и ждём
+            # dialog.finished дальше без верхней границы, чтобы не оборвать
+            # легитимный долгий перевод.
+            timed_out = {'flag': False}
+
+            def _on_auto_fixer_wait_timeout(timed_out=timed_out, wait_loop=wait_loop, dialog=dialog):
+                if getattr(dialog, '_owned_session_id', None) is not None:
+                    return
+                timed_out['flag'] = True
+                wait_loop.quit()
+
+            safety_timer = QtCore.QTimer()
+            safety_timer.setSingleShot(True)
+            safety_timer.timeout.connect(_on_auto_fixer_wait_timeout)
+            safety_timer.start(self.AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS)
+
             wait_loop.exec()
+            safety_timer.stop()
+
+            if timed_out['flag']:
+                # Страница так и не подтвердила старт — гасим её тем же
+                # путём, что и обычное «Прервать» (reject -> _check_can_close
+                # -> _abort_stuck_session_start), чтобы сбросить
+                # is_session_active и вернуть на место чужую очередь задач
+                # (_preserved_queue_snapshot), которую страница могла успеть
+                # отложить перед стартом. Голый deleteLater() эту очистку
+                # пропускал бы. reject() — метод боевой AITranslationPage;
+                # на минимальном тестовом дубле его может не быть.
+                try:
+                    dialog.reject()
+                except Exception:
+                    pass
+                dialog.deleteLater()
+                return {
+                    'success': False,
+                    'groups_found': len(data_for_dialog),
+                    'error': (
+                        "Сессия автофиксера недоперевода не стартовала за отведённое "
+                        "время (похоже, движок отклонил команду старта)."
+                    ),
+                    'request_details_text': request_details_text,
+                    'response_details_text': response_details_text,
+                }
 
             results = dialog.get_translated_results()
             response_details_text = self._format_auto_untranslated_trace_details(

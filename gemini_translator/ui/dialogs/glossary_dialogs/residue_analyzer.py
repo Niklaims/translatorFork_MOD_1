@@ -27,10 +27,22 @@ class ResidueAnalyzerPage(ShellPage):
     def __init__(self, residue_map, original_glossary_list, settings_manager, parent=None):
         super().__init__(parent)
         # --- Сохраняем полный, нефильтрованный результат ---
-        self.full_residue_map = residue_map 
+        self.full_residue_map = residue_map
         self.original_glossary_list = original_glossary_list
         self.settings_manager = settings_manager
-        
+
+        # Стабильная метка идентификации записи для _get_entry_id: id(entry)
+        # не годится — записи кладутся в ячейки через
+        # QTableWidgetItem.setData(UserRole, entry), PyQt6 конвертирует dict
+        # в QVariantMap, и .data(UserRole) при каждом чтении возвращает НОВЫЙ
+        # Python-объект с тем же содержимым (id() отличается). Поле лежит
+        # ВНУТРИ словаря, поэтому переживает этот round-trip. Проставляем его
+        # один раз, здесь; вызывающая сторона (glossary.py) не передаёт
+        # устойчивый _db_id, поэтому используем позицию в исходном списке.
+        for _i, _entry in enumerate(self.original_glossary_list):
+            if isinstance(_entry, dict) and '_residue_uid' not in _entry:
+                _entry['_residue_uid'] = f'residue-{_i}'
+
         self.patch_list = []
         self.view_mode = 'fragment_to_term'
         # --- Состояние режима анализа ---
@@ -59,7 +71,28 @@ class ResidueAnalyzerPage(ShellPage):
     def _get_entry_id(self, entry):
         if not isinstance(entry, dict):
             return str(entry)
-        return tuple(entry.get(k, '') for k in ['original', 'rus', 'note'])
+        # ВАЖНО: ключ не может быть ни id(entry), ни (original, rus, note).
+        # (original, rus, note) не уникальны — PRIMARY KEY в БД только id,
+        # поэтому две байт-в-байт одинаковые строки схлопывались в одну уже
+        # на этапе get_current_glossary_state(). id(entry) в свою очередь не
+        # переживает путь через таблицу: записи кладутся в ячейки через
+        # QTableWidgetItem.setData(UserRole, entry), PyQt6 конвертирует dict
+        # в QVariantMap, и .data(UserRole) при КАЖДОМ чтении возвращает
+        # НОВЫЙ Python-объект с тем же содержимым — id() у него другой уже
+        # при первой же правке ячейки. Поэтому идентификатор — строковое
+        # поле "_residue_uid" ВНУТРИ словаря: __init__ проставляет его
+        # исходным записям, а все места, что строят "after"-состояние для
+        # уже существующей записи, переносят его дальше (иначе после первой
+        # правки строки метка терялась бы и в патче накапливались бы
+        # несливающиеся дубликаты одной и той же строки).
+        uid = entry.get('_residue_uid')
+        if uid is not None:
+            return ('uid', uid)
+        # Фолбэк для записей без метки — только что созданные пользователем
+        # термины (before=None, метку переносить неоткуда). Коллизия здесь
+        # возможна лишь если пользователь создаст два байт-в-байт одинаковых
+        # новых термина, что вне сценария этой находки.
+        return (entry.get('original'), entry.get('rus'), entry.get('note'))
 
     def _apply_all_filters_and_update_view(self):
         """
@@ -402,7 +435,14 @@ class ResidueAnalyzerPage(ShellPage):
             'rus': table.item(row, 2).text(),
             'note': table.item(row, 3).text(),
         }
-        
+        # Переносим "_residue_uid" в новое состояние: без этого повторная
+        # правка той же строки после первой правки не найдёт метку в
+        # 'before' (см. _get_entry_id) и создаст в патче отдельный,
+        # несливающийся элемент вместо обновления существующего.
+        residue_uid = original_entry_data.get('_residue_uid')
+        if residue_uid is not None:
+            after_state['_residue_uid'] = residue_uid
+
         self._add_or_update_patch(original_entry_data, after_state)
     
     def _on_editor_item_changed(self, original_entry_data, original_edit, translation_edit, note_edit, is_new):
@@ -413,7 +453,14 @@ class ResidueAnalyzerPage(ShellPage):
             # Для нового термина 'before' всегда None - это операция "добавления"
             self._add_or_update_patch(None, after_state)
         else:
-            # Для существующего термина указываем 'before' - это операция "обновления"
+            # Для существующего термина указываем 'before' - это операция "обновления".
+            # Переносим "_residue_uid" в after_state по той же причине, что и
+            # в _on_sub_table_item_changed — иначе повторная правка через
+            # редактор потеряет идентификацию записи.
+            if isinstance(original_entry_data, dict):
+                residue_uid = original_entry_data.get('_residue_uid')
+                if residue_uid is not None:
+                    after_state['_residue_uid'] = residue_uid
             self._add_or_update_patch(original_entry_data, after_state)
 
     def _add_or_update_patch(self, before_state, after_state):

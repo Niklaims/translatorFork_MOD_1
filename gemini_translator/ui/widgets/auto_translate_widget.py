@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 
 from ...api import config as api_config
 from ...core.consistency_engine import FAST_PROOFREAD_MODE
-from ...utils.epub_tools import TASK_SIZE_UNIT_CHARS, TASK_SIZE_UNIT_TOKENS, normalize_task_size_unit
+from ...utils.epub_tools import TASK_SIZE_UNIT_TOKENS, normalize_task_size_unit
 from ...utils.helpers import format_thousands
 from ...utils.settings import SettingsManager
 from .common_widgets import NoScrollComboBox, NoScrollDoubleSpinBox, NoScrollSpinBox
@@ -848,21 +848,6 @@ class AutoTranslateWidget(QWidget):
         else:
             batch_text = "Лимит пакета: как в общих настройках."
 
-        if batch_tokens > 0:
-            batch_text = (
-                f"Batch limit: ~{format_thousands(batch_tokens)} input tokens "
-                f"(task limit: {format_thousands(estimated_chars)} Gemini tokens, profile: {profile_name})."
-            )
-        elif self._current_task_size_limit > 0:
-            inherited_unit = (
-                "символов"
-                if self._current_task_size_unit == TASK_SIZE_UNIT_CHARS
-                else "Gemini tokens"
-            )
-            batch_text = (
-                "Batch limit: inherited from common settings "
-                f"({format_thousands(self._current_task_size_limit)} {inherited_unit})."
-            )
         chapter_limit = int(self.batch_chapters_spin.value())
         if chapter_limit > 0:
             batch_text = f"{batch_text} Глав в одном запросе: не больше {chapter_limit}."
@@ -879,12 +864,6 @@ class AutoTranslateWidget(QWidget):
             notes.append("Перед сборкой задач токены будут автоматически переведены в символьный лимит.")
         else:
             notes.append("Если оставить 0, будет взят текущий размер задачи из общей вкладки.")
-        if batch_tokens > 0:
-            notes = [
-                note for note in notes
-                if "символ" not in note.lower() and "СЃРёРј" not in note
-            ]
-            notes.append("The token limit is used directly when building tasks.")
         self.translation_summary_note.setText(" ".join(notes))
 
     def _update_control_states(self):
