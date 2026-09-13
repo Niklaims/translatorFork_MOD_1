@@ -229,7 +229,9 @@ class QualityReportView(QWidget):
         self.chapter_layout.addWidget(self.pending_area, 1)
         self.pending_cards: list[SuggestionCard] = []
         self._pending_suggestions: tuple = ()
-        self.chapter_layout.addStretch(1)
+        # No stretch factor of its own: it holds the buttons down only while the
+        # list is hidden, and a visible list then takes all the room, not half.
+        self.chapter_layout.addStretch()
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)

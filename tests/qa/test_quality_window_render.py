@@ -169,3 +169,48 @@ def test_the_action_bar_keeps_its_height_when_a_pass_starts(qt_app, themed):
         dialog.deleteLater()
         qt_app.processEvents()
 
+
+def test_waiting_fixes_fill_the_chapter_card_down_to_its_buttons(qt_app, themed):
+    """Список правок делил свободное место с распоркой: вторая карточка обрезалась над пустотой."""
+    themed("light")
+    dialog = TranslationQualityDialog(book_title="AI")
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    try:
+        _show(dialog, qt_app)
+        dialog.select_chapter("chapter-2")
+        qt_app.processEvents()
+        view = dialog.report_view
+
+        gap = view.check_chapter_button.geometry().top() - view.pending_area.geometry().bottom()
+
+        assert view.pending_area.isVisible()
+        assert gap <= 2 * view.chapter_layout.spacing() + 1, f"пустота под списком правок: {gap} px"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_a_chapter_with_nothing_waiting_keeps_its_text_together(qt_app, themed):
+    """Пока списка правок нет, распорка держит кнопки внизу, а подписи не расползаются по карточке."""
+    themed("light")
+    dialog = TranslationQualityDialog(book_title="AI")
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    try:
+        _show(dialog, qt_app)
+        dialog.select_chapter("chapter-1")
+        qt_app.processEvents()
+        view = dialog.report_view
+
+        stretched = [
+            (label.text()[:20], label.height(), label.heightForWidth(label.width()))
+            for label in (view.chapter_title_label, view.chapter_meta_label)
+            if label.height() > label.heightForWidth(label.width()) + 1
+        ]
+
+        assert not view.pending_area.isVisible()
+        assert stretched == []
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
