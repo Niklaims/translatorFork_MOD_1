@@ -611,3 +611,18 @@ def test_a_model_name_from_the_network_is_shown_as_plain_text(qt_app):
 
     assert "<b>x</b>" in text
     assert dialog.cometkiwi_status_label.textFormat() == Qt.TextFormat.PlainText
+
+
+def test_check_survives_json_nested_past_the_recursion_limit(qt_app):
+    """json.loads raises RecursionError, not ValueError, for pathological nesting.
+
+    The check runs in a Qt slot, where an escaping exception reaches the global
+    excepthook and quits the application, so a body any service on the network
+    could send must end as a sentence in the label, never as a crash.
+    """
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"[" * 50_000)) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Ответ сервера не разобран."

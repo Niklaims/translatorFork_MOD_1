@@ -752,7 +752,11 @@ class TranslationQualityDialog(QDialog):
             return
         try:
             health = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # json raises RecursionError, not ValueError, for nesting past the
+            # recursion limit. This runs in a Qt slot, where an escaping
+            # exception quits the whole application, and the body comes from
+            # an unauthenticated service on the network.
             health = None
         if not isinstance(health, dict):
             self.cometkiwi_status_label.setText("Ответ сервера не разобран.")
