@@ -9,6 +9,7 @@ import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from ....qa.assembly import close_cached_source_archives
 from ....qa.report_snapshot import chapter_display_name
 from ....utils.text import escape_html, format_duration
 from .quality_widgets import chapters_caption
@@ -527,6 +528,15 @@ class TranslationQualityController(QObject):
         if self._busy == bool(busy):
             return
         self._busy = bool(busy)
+        if not self._busy:
+            # Проход или проверка главы закончились: исходный EPUB, который
+            # qa/assembly держит открытым в кэше на время работы, больше не
+            # нужен — отпускаем дескриптор, чтобы книгу можно было переместить
+            # или удалить, не закрывая приложение (особенно на Windows).
+            try:
+                close_cached_source_archives()
+            except Exception:  # noqa: BLE001 - закрытие кэша не должно ронять окно
+                pass
         self.busy_changed.emit(self._busy)
 
 

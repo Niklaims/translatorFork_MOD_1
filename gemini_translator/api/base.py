@@ -38,11 +38,28 @@ def _get_ssl_context_signature():
     return ("certifi", certifi.where(), None)
 
 
+# Кэш SSL-контекстов по сигнатуре источника сертификатов. Контекст ни один
+# потребитель не мутирует, поэтому его можно разделять между сессиями:
+# ssl.create_default_context() заново читает и разбирает CA-bundle (~9 мс),
+# и без кэша эта цена платилась на каждую aiohttp-сессию — в том числе на
+# каждую попытку multi-pass/parallel-provider оркестратора (perf:network/1).
+_SSL_CONTEXT_CACHE: dict[tuple, ssl.SSLContext] = {}
+_SSL_CONTEXT_CACHE_LOCK = threading.Lock()
+
+
 def _create_ssl_context():
-    source, cafile, _capath = _get_ssl_context_signature()
+    signature = _get_ssl_context_signature()
+    with _SSL_CONTEXT_CACHE_LOCK:
+        cached = _SSL_CONTEXT_CACHE.get(signature)
+        if cached is not None:
+            return cached
+    source, cafile, _capath = signature
     if source == "env":
-        return ssl.create_default_context()
-    return ssl.create_default_context(cafile=cafile)
+        context = ssl.create_default_context()
+    else:
+        context = ssl.create_default_context(cafile=cafile)
+    with _SSL_CONTEXT_CACHE_LOCK:
+        return _SSL_CONTEXT_CACHE.setdefault(signature, context)
 
 
 def create_ssl_context():

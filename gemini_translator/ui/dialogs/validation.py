@@ -6460,24 +6460,12 @@ class TranslationValidatorPage(ShellPage):
         request_details_text = ""
         response_details_text = ""
         try:
-            # getattr — чтобы не требовать этот метод (появился вместе с
-            # одноразовым кешем payload) от лёгких тестовых дублей, которые
-            # привязывают только тело run_auto_untranslated_fixer и
-            # определяют свой _collect_untranslated_fixer_payload напрямую
-            # (см. tests/test_fix_med_ui_dialogs_validation_c_auto_fixer_timeout.py).
-            # На боевой TranslationValidatorPage метод объявлен в этом же
-            # классе и есть всегда — ветка else здесь недостижима, это чисто
-            # тестовая совместимость, а не боевой путь.
-            collect_cached = getattr(self, '_collect_untranslated_fixer_payload_cached', None)
-            if callable(collect_cached):
-                data_for_dialog, soup_cache = collect_cached(
-                    target_internal_paths=target_internal_paths,
-                )
-            else:
-                data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
-                    target_internal_paths=target_internal_paths,
-                    show_feedback=False,
-                )
+            # Одноразовый кеш payload: build_auto_untranslated_request_details
+            # уже собрал его для текста трассировки, повторный полный сбор
+            # здесь не нужен (см. _collect_untranslated_fixer_payload_cached).
+            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload_cached(
+                target_internal_paths=target_internal_paths,
+            )
             if not data_for_dialog:
                 return {
                     'success': True,

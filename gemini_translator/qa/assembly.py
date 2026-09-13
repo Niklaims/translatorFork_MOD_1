@@ -734,7 +734,13 @@ def build_quality_estimator(qa_settings: QaSettings, paths: "ProjectQaPaths"):
 
 
 def detach_chapter_qa_coordinator(app) -> None:
-    """Stop and forget the coordinator attached to one application, if any."""
+    """Stop and forget the coordinator attached to one application, if any.
+
+    Заодно закрывает кэш открытых исходных EPUB (см.
+    close_cached_source_archives): без координатора читать главы некому, а
+    держать дескриптор книги дальше — значит блокировать её перемещение или
+    удаление на Windows до выхода из приложения.
+    """
     coordinator = getattr(app, "qa_coordinator", None)
     if coordinator is None:
         return
@@ -743,6 +749,7 @@ def detach_chapter_qa_coordinator(app) -> None:
     except Exception:  # noqa: BLE001 - shutdown must never raise into a session
         pass
     app.qa_coordinator = None
+    close_cached_source_archives()
 
 
 def _pending_qa_tasks(task_manager):

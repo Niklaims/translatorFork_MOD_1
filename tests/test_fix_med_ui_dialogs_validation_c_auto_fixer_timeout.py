@@ -81,6 +81,10 @@ class _Harness(QWidget):
     """Минимальный объект с настоящим телом run_auto_untranslated_fixer."""
 
     run_auto_untranslated_fixer = P.run_auto_untranslated_fixer
+    # Боевой run_auto_untranslated_fixer берёт payload через одноразовый кеш
+    # (validation.py::_collect_untranslated_fixer_payload_cached) — харнесс
+    # привязывает и его, а сам кеш держит пустым (см. __init__).
+    _collect_untranslated_fixer_payload_cached = P._collect_untranslated_fixer_payload_cached
     _get_auto_untranslated_prompt_text = P._get_auto_untranslated_prompt_text
     _format_auto_untranslated_trace_details = P._format_auto_untranslated_trace_details
     # P._truncate_auto_trace_text — обычный staticmethod; доступ через класс
@@ -96,6 +100,7 @@ class _Harness(QWidget):
         super().__init__()
         self.settings_manager = object()
         self._data_for_dialog = data_for_dialog
+        self._auto_untranslated_payload_cache = None
 
     def _collect_untranslated_fixer_payload(self, target_internal_paths=None, show_feedback=False):
         return list(self._data_for_dialog), {}
