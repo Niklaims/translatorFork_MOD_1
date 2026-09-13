@@ -683,3 +683,19 @@ def test_a_crash_while_applying_is_reported_and_releases_the_window(qt_app):
     assert busy == [True, False]
     assert "disk full" in statuses[-1]
 
+
+def test_the_windows_suggestion_buttons_reach_the_controller(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+    from gemini_translator.ui.dialogs.validation_dialogs import TranslationQualityDialog
+
+    coordinator = _SuggestionCoordinator(SuggestionOutcome("dismissed", "sg-1", "chapter-1"))
+    controller = _controller(coordinator)
+    dialog = TranslationQualityDialog()
+    controller.attach(dialog)
+
+    dialog.apply_suggestion_requested.emit("sg-1")
+    dialog.dismiss_suggestion_requested.emit("sg-2")
+
+    assert coordinator.applied == ["sg-1"]
+    assert coordinator.dismissed == ["sg-2"]
+

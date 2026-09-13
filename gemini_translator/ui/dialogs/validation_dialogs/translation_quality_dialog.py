@@ -76,6 +76,8 @@ class TranslationQualityDialog(QDialog):
     settings_changed = pyqtSignal(object)
     embedding_test_requested = pyqtSignal(object)
     export_requested = pyqtSignal(str)
+    apply_suggestion_requested = pyqtSignal(str)
+    dismiss_suggestion_requested = pyqtSignal(str)
 
     def __init__(
         self,
@@ -117,6 +119,16 @@ class TranslationQualityDialog(QDialog):
         self.report_view.undo_all_requested.connect(self._request_undo_all)
         self.report_view.open_suggestions_requested.connect(
             lambda: self.tabs.setCurrentWidget(self.suggestions_view)
+        )
+        self.report_view.apply_suggestion_requested.connect(
+            self.apply_suggestion_requested.emit
+        )
+        self.report_view.dismiss_suggestion_requested.connect(
+            self.dismiss_suggestion_requested.emit
+        )
+        self.suggestions_view.apply_requested.connect(self.apply_suggestion_requested.emit)
+        self.suggestions_view.dismiss_requested.connect(
+            self.dismiss_suggestion_requested.emit
         )
         self.settings_view.settings_changed.connect(self._on_settings_changed)
         self.settings_view.embedding_test_requested.connect(
@@ -227,6 +239,12 @@ class TranslationQualityDialog(QDialog):
             snapshot, scoring_enabled=self._settings.capabilities.cometkiwi_enabled
         )
         self._snapshot = snapshot
+        self.suggestions_view.set_suggestions(snapshot.suggestions)
+        waiting = len(snapshot.suggestions)
+        self.tabs.setTabText(
+            self.tabs.indexOf(self.suggestions_view),
+            f"Предложения ({waiting})" if waiting else "Предложения",
+        )
         self._refresh_header()
         self._update_action_state()
 
@@ -236,6 +254,7 @@ class TranslationQualityDialog(QDialog):
         self._stopping = False
         self.progress.setVisible(self._busy)
         self.report_view.set_busy(self._busy)
+        self.suggestions_view.set_busy(self._busy)
         self._refresh_header()
         self._update_action_state()
 

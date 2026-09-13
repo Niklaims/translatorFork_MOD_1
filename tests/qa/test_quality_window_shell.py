@@ -224,3 +224,89 @@ def test_stopping_says_so_until_the_pass_ends(qt_app):
     assert dialog.cancel_button.text() == "Остановить проверку"
     assert dialog.cancel_button.isEnabled()
 
+
+def _snapshot_with_suggestions():
+    from gemini_translator.qa.models import QaSuggestion
+
+    journal = QaJournal.empty(book_id="book-1")
+    suggestions = tuple(
+        QaSuggestion(
+            suggestion_id=QaSuggestion.identity("chapter-1", "n.1", before, after),
+            chapter_id="chapter-1",
+            block_id="n.1",
+            category="punctuation",
+            original_text=before,
+            replacement_text=after,
+            reason="validation_declined",
+        )
+        for before, after in (
+            ("— Спросил он.", "— спросил он."),
+            ("Он очень-очень устал.", "Он очень устал."),
+        )
+    )
+    journal.record_chapter_result(
+        state=QaChapterState(chapter_id="chapter-1", status="checked"),
+        suggestions=suggestions,
+    )
+    journal.record_chapter_state(QaChapterState(chapter_id="chapter-2", status="checked"))
+    return BookQaReportSnapshot.from_journal(journal), suggestions
+
+
+def test_the_tab_counts_the_suggestions_waiting(qt_app):
+    snapshot, _suggestions = _snapshot_with_suggestions()
+    dialog = TranslationQualityDialog()
+
+    dialog.set_report(snapshot)
+    assert dialog.tabs.tabText(1) == "Предложения (2)"
+    assert len(dialog.suggestions_view.cards) == 2
+
+    dialog.set_report(BookQaReportSnapshot())
+    assert dialog.tabs.tabText(1) == "Предложения"
+
+
+def test_the_chapter_card_lists_that_chapters_suggestions(qt_app):
+    snapshot, _suggestions = _snapshot_with_suggestions()
+    dialog = TranslationQualityDialog()
+    dialog.set_report(snapshot)
+
+    dialog.select_chapter("chapter-1")
+    assert dialog.report_view.pending_title_label.text() == "Ждут решения: 2"
+    assert len(dialog.report_view.pending_cards) == 2
+
+    dialog.select_chapter("chapter-2")
+    assert dialog.report_view.pending_title_label.isHidden()
+    assert dialog.report_view.pending_cards == []
+
+
+def test_both_tabs_ask_the_window_to_apply_or_dismiss(qt_app):
+    snapshot, suggestions = _snapshot_with_suggestions()
+    dialog = TranslationQualityDialog()
+    dialog.set_report(snapshot)
+    applied: list[str] = []
+    dismissed: list[str] = []
+    dialog.apply_suggestion_requested.connect(applied.append)
+    dialog.dismiss_suggestion_requested.connect(dismissed.append)
+
+    dialog.suggestions_view.cards[0].apply_button.click()
+    dialog.select_chapter("chapter-1")
+    dialog.report_view.pending_cards[1].dismiss_button.click()
+
+    assert applied == [dialog.suggestions_view.cards[0].suggestion.suggestion_id]
+    assert dismissed == [dialog.report_view.pending_cards[1].suggestion.suggestion_id]
+    assert set(applied + dismissed) <= {item.suggestion_id for item in suggestions}
+
+
+def test_a_running_pass_locks_every_suggestion_button(qt_app):
+    snapshot, _suggestions = _snapshot_with_suggestions()
+    dialog = TranslationQualityDialog()
+    dialog.set_report(snapshot)
+    dialog.select_chapter("chapter-1")
+
+    dialog.set_busy(True)
+
+    cards = dialog.suggestions_view.cards + dialog.report_view.pending_cards
+    assert cards
+    assert not any(
+        card.apply_button.isEnabled() or card.dismiss_button.isEnabled() for card in cards
+    )
+

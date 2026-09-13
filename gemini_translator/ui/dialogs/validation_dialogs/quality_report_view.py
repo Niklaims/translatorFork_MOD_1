@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QScrollArea,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -29,6 +30,7 @@ from .quality_widgets import (
     EmptyState,
     MetricCard,
     StatusChip,
+    SuggestionCard,
     chapters_caption,
     format_checked_at,
     make_button,
@@ -91,6 +93,8 @@ class QualityReportView(QWidget):
     undo_chapter_requested = pyqtSignal(str)
     undo_all_requested = pyqtSignal()
     open_suggestions_requested = pyqtSignal()
+    apply_suggestion_requested = pyqtSignal(str)
+    dismiss_suggestion_requested = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -207,6 +211,24 @@ class QualityReportView(QWidget):
         self.chapter_layout.addWidget(self.chapter_meta_label)
         self.chapter_layout.addLayout(block_row)
         self.chapter_layout.addWidget(self.chapter_details_label)
+        self.pending_title_label = make_label(
+            "", "projectCardTitle", parent=self.chapter_card
+        )
+        self.pending_title_label.setVisible(False)
+        self.chapter_layout.addWidget(self.pending_title_label)
+        self.pending_container = QWidget()
+        self.pending_layout = QVBoxLayout(self.pending_container)
+        self.pending_layout.setContentsMargins(0, 0, 0, 0)
+        self.pending_layout.setSpacing(8)
+        self.pending_layout.addStretch(1)
+        self.pending_area = QScrollArea(self.chapter_card)
+        self.pending_area.setWidgetResizable(True)
+        self.pending_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.pending_area.setWidget(self.pending_container)
+        self.pending_area.setVisible(False)
+        self.chapter_layout.addWidget(self.pending_area, 1)
+        self.pending_cards: list[SuggestionCard] = []
+        self._pending_suggestions: tuple = ()
         self.chapter_layout.addStretch(1)
 
         buttons = QHBoxLayout()
@@ -249,6 +271,8 @@ class QualityReportView(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
+        for card in self.pending_cards:
+            card.set_busy(self._busy)
         self._update_actions()
 
     def selected_chapter_id(self) -> str:
@@ -375,6 +399,7 @@ class QualityReportView(QWidget):
             self.chapter_block_chip.setVisible(False)
             self.chapter_details_label.clear()
             self.chapter_details_label.setVisible(False)
+            self._refresh_pending("")
             return
         name = self._display_names.get(row.chapter_id) or chapter_display_name(
             row.chapter_id
@@ -390,6 +415,29 @@ class QualityReportView(QWidget):
         )
         self.chapter_details_label.setText(details)
         self.chapter_details_label.setVisible(bool(details))
+        self._refresh_pending(row.chapter_id)
+
+    def _refresh_pending(self, chapter_id: str) -> None:
+        suggestions = self._snapshot.suggestions_for(chapter_id) if chapter_id else ()
+        if suggestions != self._pending_suggestions:
+            for card in self.pending_cards:
+                card.setParent(None)
+                card.deleteLater()
+            self.pending_cards = []
+            for suggestion in suggestions:
+                card = SuggestionCard(
+                    suggestion, show_chapter=False, parent=self.pending_container
+                )
+                card.apply_requested.connect(self.apply_suggestion_requested.emit)
+                card.dismiss_requested.connect(self.dismiss_suggestion_requested.emit)
+                self.pending_layout.insertWidget(self.pending_layout.count() - 1, card)
+                self.pending_cards.append(card)
+            self._pending_suggestions = suggestions
+        for card in self.pending_cards:
+            card.set_busy(self._busy)
+        self.pending_title_label.setText(f"Ждут решения: {len(suggestions)}")
+        self.pending_title_label.setVisible(bool(suggestions))
+        self.pending_area.setVisible(bool(suggestions))
 
     def _on_selection_changed(self) -> None:
         self._refresh_chapter_card()

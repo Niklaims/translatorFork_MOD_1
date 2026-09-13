@@ -63,6 +63,28 @@ def _journal() -> QaJournal:
             quality_score_status="scored",
         )
     )
+    from gemini_translator.qa.models import QaSuggestion
+
+    samples = (
+        ("— Спросил он, глядя в окно.", "— спросил он, глядя в окно.", "pending", "validation_declined"),
+        ("Он очень-очень устал после долгой дороги.", "", "pending", "no_replacement"),
+        ("Трое из них был ранены.", "Трое из них были ранены.", "stale", "low_confidence (0.62 < 0.85)"),
+    )
+    journal.suggestions.extend(
+        QaSuggestion(
+            suggestion_id=QaSuggestion.identity("chapter-2", "n.1", before, after),
+            chapter_id="chapter-2",
+            block_id="n.1",
+            category="punctuation",
+            original_text=before,
+            replacement_text=after,
+            reason=reason,
+            explanation="Модель считает правку спорной и оставляет решение человеку.",
+            status=status,
+            status_note="глава изменилась после проверки" if status == "stale" else "",
+        )
+        for before, after, status, reason in samples
+    )
     return journal
 
 
