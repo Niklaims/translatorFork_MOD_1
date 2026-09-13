@@ -213,6 +213,16 @@ def format_duration(seconds, *, round_minutes: bool = False,
     return f"{minutes}{sp}мин {secs:02d}{sp}сек"
 
 
+# Маскируем только то, что действительно начинается как тег: «</», «<!»
+# (комментарии/doctype), «<?» или «<» + буква. Голый «<» перед пробелом,
+# переносом строки, цифрой или кириллицей — это текст, а не тег; раньше
+# `<[^>]+>` тянул от него всё до ближайшего «>» (то есть до закрывающего
+# </p>), пряча настоящий текст от пунктуационных правил, из-за чего
+# initial_cleanup не была идемпотентной (регрессия
+# tests/test_fix_typography_stray_lt_idempotent.py).
+_MASKABLE_TAG_PATTERN = re.compile(r'</?[A-Za-z!?][^>]*>')
+
+
 def _mask_html_tags(text: str, token_prefix: str):
     tag_map = {}
 
@@ -221,7 +231,7 @@ def _mask_html_tags(text: str, token_prefix: str):
         tag_map[key] = match.group(0)
         return key
 
-    return re.sub(r'<[^>]+>', mask_callback, text), tag_map
+    return _MASKABLE_TAG_PATTERN.sub(mask_callback, text), tag_map
 
 
 # Ключи масок имеют вид "\0PREFIX_N\0" (TAG/B_TAG/TAG_INIT/TAG_FIN).
