@@ -105,6 +105,16 @@ A design review rendered the window on a real book's journal (484 chapters). Sta
 14. **Connection answers.** The embedding and PC check answers stay until their own settings change; before a check the cards say that nothing has been checked.
 15. **Lint.** Tasks 11 and 19 lint the changed files, not the `validation_dialogs/` directory, which holds older files with long-standing findings.
 
+### Found while verifying stage 3
+
+Applying suggestions to a copy of a chapter, and drawing the window on a book-like journal, showed the following. Stage 3 was changed before it was merged:
+
+16. **Room for waiting fixes.** The stretch under the chapter card's list of waiting fixes had the list's own stretch factor, so the list got half of the free room and cut its second card in two. The stretch now holds the buttons down only while the list is hidden.
+17. **Why a suggestion does not fit.** The spec's failure table says «устарело: глава изменилась после проверки» for every mismatch. A fragment that crosses inline formatting, or occurs twice in its paragraph, is refused while the chapter is unchanged, so that sentence was false. The note now names the obstacle: «Применить нельзя: фрагмент задевает оформление текста, например курсив.», «Применить нельзя: фрагмент встречается в абзаце не один раз.», and «Применить нельзя: глава изменилась после проверки.» only when the fragment is gone. The status line says «Правку применить нельзя: …. Файл главы не тронут.»
+18. **Fixes no click can place.** A fix refused as `ambiguous_span` or `paragraph_break` is not applicable: the first cannot be located exactly, and the second wants a paragraph break that a replacement inside one paragraph cannot hold. Its card disables «Применить» and says «Такую правку вносят вручную.»
+19. **Empty replacement.** «стало» reads «замена не предложена», not «удалить фрагмент»: in the language check an empty replacement means the model gave none. Only a `meta_comment` or a `hallucinated_addition`, whose fix is removing the fragment, reads «удалить фрагмент», with the fragment marked as removed. When the language check learns to write deletions, `QaSuggestion.applicable` has to accept an empty replacement for those two categories.
+20. **A replacement equal to its original** is not kept as a suggestion: there is nothing in it to apply or decline.
+
 ## File map
 
 | File | Stage | Responsibility |
