@@ -7,7 +7,7 @@ from pathlib import PurePosixPath
 
 from ..utils.text_sort import natural_sort_key
 from .book_metrics import BookMetricsAnalyzer, RelativeRisk
-from .models import ChapterMetrics, RiskLevel
+from .models import ChapterMetrics, QaSuggestion, RiskLevel
 
 
 RISK_LABELS = {
@@ -97,6 +97,9 @@ class BookQaReportSnapshot:
     decisions_by_chapter: dict[str, tuple[str, ...]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     limited_mode_chapters: tuple[str, ...] = ()
+    # Suggestions a person still has to decide on: pending, or stale because
+    # the chapter changed.  Decided ones stay in the journal, not in the report.
+    suggestions: tuple[QaSuggestion, ...] = ()
 
     @property
     def blocked_chapters(self) -> tuple[str, ...]:
@@ -150,6 +153,9 @@ class BookQaReportSnapshot:
         # One writer, one ISO format: the newest date is also the largest string.
         return max((row.checked_at for row in self.rows if row.checked_at), default="")
 
+    def suggestions_for(self, chapter_id: str) -> tuple[QaSuggestion, ...]:
+        return tuple(item for item in self.suggestions if item.chapter_id == chapter_id)
+
     @classmethod
     def from_journal(cls, journal, open_gates=()) -> "BookQaReportSnapshot":
         """Build the snapshot from a loaded journal and the queue's open gates."""
@@ -171,11 +177,24 @@ class BookQaReportSnapshot:
             chapter_id = str(repair.get("chapter_id", ""))
             if chapter_id:
                 repairs_by_chapter[chapter_id] = repairs_by_chapter.get(chapter_id, 0) + 1
+        waiting = [
+            item
+            for item in getattr(journal, "suggestions", ()) or ()
+            if getattr(item, "awaits_decision", False)
+        ]
+        pending_by_chapter: dict[str, int] = {}
+        for item in waiting:
+            pending_by_chapter[item.chapter_id] = (
+                pending_by_chapter.get(item.chapter_id, 0) + 1
+            )
 
         # A chapter belongs in the report once anything about it was recorded:
         # a language-only check leaves a state and repairs, never metrics.
         chapter_ids = sorted(
-            set(metrics_by_chapter) | set(states) | set(repairs_by_chapter),
+            set(metrics_by_chapter)
+            | set(states)
+            | set(repairs_by_chapter)
+            | set(pending_by_chapter),
             key=natural_sort_key,
         )
         metrics = [
@@ -193,6 +212,7 @@ class BookQaReportSnapshot:
                 repairs_by_chapter.get(chapter_id, 0),
                 positions.get(chapter_id, "нет книжной нормы"),
                 gate_reasons.get(chapter_id, ""),
+                pending_by_chapter.get(chapter_id, 0),
             )
             for chapter_id in chapter_ids
         )
@@ -203,6 +223,16 @@ class BookQaReportSnapshot:
             },
             limited_mode_chapters=tuple(
                 item.chapter_id for item in metrics if _checked_without_alignment(item)
+            ),
+            suggestions=tuple(
+                sorted(
+                    waiting,
+                    key=lambda item: (
+                        natural_sort_key(item.chapter_id),
+                        item.created_at,
+                        item.suggestion_id,
+                    ),
+                )
             ),
         )
 
@@ -253,6 +283,7 @@ def _row_for(
     applied_repairs: int,
     book_position: str,
     blocked_reason: str,
+    pending_suggestions: int,
 ) -> ChapterQaRow:
     confirmed_gaps = sum(
         1 for decision in decisions if decision in {"fixed", "repair_rejected"}
@@ -280,6 +311,7 @@ def _row_for(
             blocked_reason=blocked_reason,
             status=status,
             checked_at=checked_at,
+            pending_suggestions=pending_suggestions,
         )
     untranslated = metrics.untranslated_by_script or {}
     risk = RiskLevel(metrics.risk_level) if metrics.risk_level else RiskLevel.LOW
@@ -302,6 +334,7 @@ def _row_for(
         blocked_reason=blocked_reason,
         status=status,
         checked_at=checked_at,
+        pending_suggestions=pending_suggestions,
         has_completeness=True,
         quality_score=metrics.quality_score,
     )
