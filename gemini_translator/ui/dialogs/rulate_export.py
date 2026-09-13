@@ -47,8 +47,16 @@ class SimpleEpubReader:
     def __init__(self, filepath):
         self.filepath = filepath
         self.zf = zipfile.ZipFile(filepath, "r")
-        self.opf_path = find_opf_path(self.zf)
-        self.opf_dir = os.path.dirname(self.opf_path)
+        try:
+            self.opf_path = find_opf_path(self.zf)
+            self.opf_dir = os.path.dirname(self.opf_path)
+        except Exception:
+            # Если поиск OPF не удался (битый/нестандартный EPUB), self.zf
+            # уже открыт, но объект не будет присвоен переменной вызывающего
+            # кода — без явного close() дескриптор .epub утекает до
+            # ближайшего цикла сборщика мусора.
+            self.zf.close()
+            raise
 
     def get_ordered_html_files(self):
         return read_spine_html_order(self.zf)

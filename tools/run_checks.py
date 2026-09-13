@@ -119,21 +119,25 @@ def main(argv: list[str] | None = None) -> int:
         )
     ]
 
-    if not args.skip_tests:
-        checks.append(
-            (
-                "ruff runtime safety",
-                [
-                    sys.executable,
-                    "-m",
-                    "ruff",
-                    "check",
-                    ".",
-                    "--select",
-                    RUFF_RUNTIME_RULES,
-                ],
-            )
+    # "ruff runtime safety" — статический линт, pytest ему не нужен, поэтому
+    # он выполняется всегда; --skip-tests отключает только сам pytest, как и
+    # описано в help-тексте флага.
+    checks.append(
+        (
+            "ruff runtime safety",
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                ".",
+                "--select",
+                RUFF_RUNTIME_RULES,
+            ],
         )
+    )
+
+    if not args.skip_tests:
         pytest_args = list(args.pytest_args)
         if pytest_args[:1] == ["--"]:
             pytest_args = pytest_args[1:]

@@ -10,6 +10,15 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 BACKOFF_SCHEDULE_SECONDS = [3, 6, 12, 24, 60]
 
+# stop() вызывается синхронно из GUI-потока (GlobalProxyController._sync_tunnel
+# и .shutdown()). Раньше здесь стояло wait(timeout=3) дважды (после terminate()
+# и после kill()) — до ~6 секунд блокировки интерфейса, если ssh не реагирует
+# на SIGTERM мгновенно (недоступная сеть, зависший сервер). Короткие тайм-ауты
+# ограничивают эту блокировку: SIGTERM обычно обрабатывается почти мгновенно,
+# а SIGKILL после него завершает процесс практически сразу же.
+_TERMINATE_WAIT_TIMEOUT_SECONDS = 0.5
+_KILL_WAIT_TIMEOUT_SECONDS = 0.5
+
 _SSH_OPTIONS = [
     "-o", "StrictHostKeyChecking=yes",
     "-o", "ServerAliveInterval=15",
@@ -137,11 +146,11 @@ class SshTunnelManager(QObject):
                 self._process = None
                 return
             process.terminate()
-            process.wait(timeout=3)
+            process.wait(timeout=_TERMINATE_WAIT_TIMEOUT_SECONDS)
         except Exception:
             try:
                 process.kill()
-                process.wait(timeout=3)
+                process.wait(timeout=_KILL_WAIT_TIMEOUT_SECONDS)
             except Exception:
                 return
         self._process = None

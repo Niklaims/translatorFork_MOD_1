@@ -48,6 +48,7 @@ from ...utils.text import (
     repair_ai_html_artifacts,
 )
 from ...utils.glued_words import repair_glued_russian_words_in_html
+from ...utils.io_utils import atomic_write_text
 from ...utils.translation_versions import (
     VALIDATED_SUFFIX,
     select_target_translation_version,
@@ -5610,9 +5611,31 @@ class TranslationValidatorPage(ShellPage):
         for row, data in files_to_save:
             filepath = data['path']
             try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(data['translated_html'])
-                
+                # ui-dialogs-validation/runtime/12-non-atomic-chapter-and-glossar:
+                # прямой open(path, 'w') усекает файл сразу при открытии, так что
+                # сбой посреди записи (диск переполнен, процесс убит) оставляет
+                # на диске усечённую/пустую главу, хотя data['is_edited'] ниже
+                # уже сбрасывается. atomic_write_text пишет во временный файл и
+                # заменяет целевой только после успешной записи (os.replace).
+                #
+                # atomic_write_text (в отличие от прежнего open(path, 'w'))
+                # молча создаёт недостающие родительские папки (mkdir внутри
+                # atomic_write_bytes) — если папка главы пропала (проект
+                # перемещён/почищен при открытом окне), раньше пользователь
+                # получал громкую ошибку и правка не терялась (is_edited
+                # оставался True); молчаливое воссоздание папки увело бы файл
+                # мимо структуры проекта и тихо сбросило is_edited. Проверяем
+                # папку заранее, чтобы сохранить прежнее поведение отказа.
+                chapter_dir = os.path.dirname(filepath)
+                if chapter_dir and not os.path.isdir(chapter_dir):
+                    raise FileNotFoundError(f"Папка главы не найдена: {chapter_dir}")
+                # atomic_write_text кодирует текст без трансляции '\n' в
+                # os.linesep (как и chapter_editor.py) — на Windows содержимое
+                # глав, сохранённых отсюда, теперь LF вместо CRLF; это
+                # осознанное выравнивание с уже принятым в проекте хелпером,
+                # а не побочный эффект.
+                atomic_write_text(filepath, data['translated_html'])
+
                 data['is_edited'] = False
                 data['status'] = 'neutral'
                 self._invalidate_analysis_for_data(data)
@@ -6116,7 +6139,13 @@ class TranslationValidatorPage(ShellPage):
                         'target': target_object,
                         'is_orphan': is_orphan_flag,
                         'row_index': row_index,
-                        'soup_ref': soup,
+                        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me:
+                        # 'soup_ref' нигде не читается (soup и так доступен через
+                        # soup_cache[row_index]) — мёртвая лишняя ссылка на дерево
+                        # bs4, дословно упомянутая в находке как одна из живых
+                        # ссылок, удерживающих деревья в памяти. Убрана; сама по
+                        # себе память не освобождает (soup_cache всё ещё жив), но
+                        # больше не вводит в заблуждение и не плодит лишних ссылок.
                         'internal_html_path': internal_path,
                     })
 
@@ -6576,14 +6605,16 @@ class TranslationValidatorPage(ShellPage):
 
     def _open_untranslated_fixer(self, initial_source_filter='all'):
         try:
-            system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
-            user_items = self._build_user_problem_terms_payload()
-            data_for_dialog = system_items + user_items
-            if not data_for_dialog:
-                QMessageBox.information(self, "Все чисто", "Не найдено контекстов для исправления.")
-                return
-
-            # Быстро пересчитаем недопереводы для строк, отредактированных вручную
+            # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me:
+            # раньше payload сначала собирался целиком (полный BeautifulSoup-
+            # парсинг всех флагованных глав), а если находились stale-строки —
+            # пересчитывался И СОБИРАЛСЯ ЗАНОВО целиком ещё раз, отбрасывая
+            # первый результат. На книге с сотнями флагованных глав это
+            # двойной полный синхронный парсинг на GUI-потоке. Устаревшие
+            # строки вычисляются и пересчитываются здесь ДО сбора payload —
+            # это не требует парсинга (только просмотр results_data), так что
+            # сбор payload происходит ровно один раз, уже с актуальными
+            # untranslated_words.
             stale = list(self._fixer_stale_rows)
             # Добавляем строки с is_edited, если они ещё не в stale
             stale_set = set(stale)
@@ -6593,9 +6624,13 @@ class TranslationValidatorPage(ShellPage):
             if stale:
                 self._recalculate_untranslated_words_for_rows(stale)
                 self._fixer_stale_rows.clear()
-                # Повторно собираем данные с обновлёнными словами
-                system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
-                data_for_dialog = system_items + user_items
+
+            system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
+            user_items = self._build_user_problem_terms_payload()
+            data_for_dialog = system_items + user_items
+            if not data_for_dialog:
+                QMessageBox.information(self, "Все чисто", "Не найдено контекстов для исправления.")
+                return
 
             # Вычисить fingerprint для определения, изменились ли данные
             new_fp = self._compute_fixer_data_fingerprint(data_for_dialog)
@@ -6633,14 +6668,42 @@ class TranslationValidatorPage(ShellPage):
 
         self._fixer_data_fingerprint = new_fp
 
+        # ui-dialogs-validation/runtime/9-glossary-update-rescans-whole-:
+        # снимок действующих исключений детектора «до» открытия фиксера.
+        # _recalculate_untranslated_words_for_rows зависит ТОЛЬКО от этого
+        # набора (word_exceptions -> UntranslatedWordDetector, других входов
+        # у детектора нет) — если правка глоссария из фиксера (в т.ч. отмена
+        # или добавление и тут же удаление термина) не изменила итоговый
+        # набор, полный пересчёт по всем главам книги ниже можно безопасно
+        # пропустить. getattr — чтобы не требовать этот метод от лёгких
+        # тестовых дублей страницы (см. _ValidatorHarness в
+        # test_validator_nested_pages.py, где has_glossary_updates() всегда
+        # False и снимок не используется).
+        get_word_exceptions = getattr(self, '_get_effective_word_exceptions', None)
+        word_exceptions_before = (
+            frozenset(get_word_exceptions()) if callable(get_word_exceptions) else None
+        )
+
+        def _word_exceptions_actually_changed():
+            # Снимок недоступен (нет метода на self) -> не можем поручиться,
+            # что ничего не изменилось, поэтому ведём себя как раньше (всегда
+            # считаем изменённым и пересчитываем).
+            if word_exceptions_before is None:
+                return True
+            get_word_exceptions_after = getattr(self, '_get_effective_word_exceptions', None)
+            if not callable(get_word_exceptions_after):
+                return True
+            return frozenset(get_word_exceptions_after()) != word_exceptions_before
+
         def apply_fixer_result(accepted, page=page):
             try:
                 self._fixer_filter_state = page.save_filter_state()
 
                 glossary_updated = page.has_glossary_updates()
+                glossary_exceptions_changed = glossary_updated and _word_exceptions_actually_changed()
 
                 if not accepted:
-                    if glossary_updated:
+                    if glossary_exceptions_changed:
                         self._recalculate_untranslated_words_for_rows(list(self.results_data.keys()))
                         self.reapply_filters()
                         self._recalc_untranslated_stats_ui()
@@ -6657,7 +6720,7 @@ class TranslationValidatorPage(ShellPage):
                     )
                     self._fixer_data_fingerprint = None
 
-                if glossary_updated:
+                if glossary_exceptions_changed:
                     self._recalculate_untranslated_words_for_rows(list(self.results_data.keys()))
                     self.reapply_filters()
                     self._recalc_untranslated_stats_ui()
@@ -6666,11 +6729,13 @@ class TranslationValidatorPage(ShellPage):
 
                 if not changes:
                     if glossary_updated:
-                        QMessageBox.information(
-                            self,
-                            "Глоссарий обновлён",
+                        message = (
                             "Изменения в project_glossary.json сохранены. Список недопереводов пересчитан."
+                            if glossary_exceptions_changed
+                            else "Изменения в project_glossary.json сохранены. "
+                            "Набор исключений не изменился — пересчёт недопереводов не потребовался."
                         )
+                        QMessageBox.information(self, "Глоссарий обновлён", message)
                     return
 
                 if page.should_save_immediately():

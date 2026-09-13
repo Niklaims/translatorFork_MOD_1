@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QEventLoop, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -741,8 +741,84 @@ class QidianCreatorPage(ShellPage):
     def _on_translator_team_mode_changed(self, _index: int) -> None:
         self._save_ui_state()
 
+    def _prepare_for_close(self) -> bool:
+        # Хук MainShell.closeEvent (gemini_translator/ui/shell.py) — вызывается
+        # по hasattr при закрытии всего приложения, в обход
+        # NavigationController.pop()/can_leave(). Без него закрытие программы
+        # с открытым Rulate-браузером уничтожало QThread на ходу, не дав ему
+        # шанса на cancel(). Логика та же, что и при обычном уходе со
+        # страницы — переиспользуем can_leave() как есть.
+        return self.can_leave()
+
     def can_leave(self) -> bool:
-        if any(worker.isRunning() for worker in getattr(self, "_workers", [])):
+        # Реентрантная защита: пока идёт ожидание остановки ниже (вложенный
+        # QEventLoop прокачивает события), повторный клик "Назад" вызовет
+        # can_leave() ещё раз поверх ещё не завершившегося первого вызова —
+        # см. тот же приём в TranslationValidatorPage.can_leave.
+        if getattr(self, "_awaiting_worker_cancel", False):
+            return False
+
+        running = [worker for worker in list(getattr(self, "_workers", [])) if worker.isRunning()]
+        if not running:
+            return True
+
+        # RulateFillWorker/RulateLoginWorker (qidian_rulate/workers.py) держат
+        # видимый Chromium открытым, пока пользователь не закроет его сам, но
+        # умеют cancel() (qidian-tools/bugs/6-rulate-fill-worker-unstoppable).
+        # Отбираем по наличию cancel(), а не isinstance от конкретных
+        # классов: AiPrepareWorker формально тоже попадёт сюда, если запущен
+        # (обычно им управляет отдельная явная кнопка "Отменить генерацию",
+        # но не блокировать и этот путь безопаснее, чем расширять список
+        # классов вручную при каждом новом отменяемом воркере). cancel() у
+        # AiPrepareWorker и даже у RulateFillWorker/RulateLoginWorker не
+        # прерывает уже летящий сетевой запрос/goto с большим таймаутом —
+        # поэтому ниже даём пользователю обратную связь (лог + курсор
+        # ожидания) на время ожидания вместо тихого "зависания".
+        cancelable = [worker for worker in running if callable(getattr(worker, "cancel", None))]
+        if cancelable:
+            answer = QMessageBox.question(
+                self, "Выход",
+                "Операция ещё не завершена (например, открыт браузер Rulate). "
+                "Прервать и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            for worker in cancelable:
+                worker.cancel()
+            self._awaiting_worker_cancel = True
+            self._log("INFO", "Останавливаю операцию Rulate...")
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for worker in cancelable:
+                    if worker.isRunning() and not worker.wait(2000):
+                        # Не блокируем цикл событий вечно (закрытие
+                        # persistent-контекста Chromium может занять
+                        # время) — ждём штатного finished через вложенный
+                        # QEventLoop, как в TranslationValidatorPage. Пока
+                        # цикл крутится, страница остаётся интерактивной —
+                        # финальная проверка ниже поэтому обязана читать
+                        # self._workers заново, а не снимок running/cancelable.
+                        wait_loop = QEventLoop()
+                        worker.finished.connect(wait_loop.quit)
+                        if worker.isRunning():
+                            wait_loop.exec()
+            finally:
+                self._awaiting_worker_cancel = False
+                if app is not None:
+                    app.restoreOverrideCursor()
+
+        # ВАЖНО: перечитываем self._workers заново, а не переиспользуем
+        # снимок running, снятый в начале функции. Пока крутился вложенный
+        # QEventLoop выше, страница оставалась полностью интерактивной, и
+        # пользователь мог успеть запустить новый воркер (например, повторно
+        # нажать "Войти в Rulate" — кнопки заново включает _update_action_state
+        # из _worker_finished) — такой воркер не попал бы в старый снимок, и
+        # can_leave() ошибочно вернул бы True с живым QThread/браузером.
+        if any(worker.isRunning() for worker in list(getattr(self, "_workers", []))):
             QMessageBox.warning(
                 self, "Подождите",
                 "Сначала дождитесь завершения текущей операции.",

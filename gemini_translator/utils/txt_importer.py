@@ -2,6 +2,7 @@
 
 import html
 import os
+from pathlib import Path
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -13,6 +14,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QLineEdit, QGroupBox
 )
 from PyQt6.QtCore import Qt, QTimer
+from .document_importer import _read_text_with_fallbacks
 from .epub_tools import EpubCreator
 from .language_tools import LanguageDetector
 # NumericSortItem намеренно НЕ импортируется здесь на верхнем уровне:
@@ -707,8 +709,12 @@ class TxtImportWizardDialog(QDialog):
         self.generated_epub_path = None
         
         try:
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Многокодировочное чтение (BOM/UnicodeDammit/перебор
+            # cp1251-и-т.п.), как у .md/.html в общем импортёре документов —
+            # раньше здесь был единственный open(..., encoding='utf-8'),
+            # который сразу закрывал мастер на не-UTF-8 дампах
+            # (utils-io/bugs/3-txtimp-strict-utf8-read).
+            content = _read_text_with_fallbacks(Path(txt_path))
             self.analyzer = TxtChapterAnalyzer(content)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка чтения файла", f"Не удалось прочитать файл:\n{e}")

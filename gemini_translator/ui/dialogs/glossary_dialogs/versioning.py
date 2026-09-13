@@ -322,7 +322,11 @@ class TermVersioningDialog(QDialog):
         self.base_data = base_data
         self.project_manager = project_manager
         self.epub_path = epub_path
-        
+
+        # Взводится в _load_all_versions(), если карта версий не пуста на
+        # диске, но load_version_map() вернул {} (повреждённый JSON) —
+        # см. _load_all_versions/_save_all_versions.
+        self._versions_unreadable = False
         self.all_versions_data = self._load_all_versions()
         
         # Данные конкретно для этого термина (список правил)
@@ -404,9 +408,45 @@ class TermVersioningDialog(QDialog):
             self.list_widget.addItem(item)
 
     def _load_all_versions(self):
-        return self.project_manager.load_version_map()
+        versions = self.project_manager.load_version_map()
+        if not versions:
+            # load_version_map() глотает JSONDecodeError и возвращает {},
+            # неотличимо от честного "версий ещё не было". Различаем эти
+            # два случая сами: если файл на диске существует и не пуст, а
+            # карта всё равно пустая — значит, он не прочитан. Читаем файл
+            # напрямую только для этой проверки (не через project_manager,
+            # чтобы не менять его публичный контракт) и предупреждаем
+            # пользователя, вместо того чтобы молча подставить {}.
+            version_file = os.path.join(
+                self.project_manager.project_folder, 'glossary_versions.json'
+            )
+            try:
+                with open(version_file, 'r', encoding='utf-8') as f:
+                    has_content = bool(f.read().strip())
+            except OSError:
+                has_content = False
+            if has_content:
+                self._versions_unreadable = True
+                QMessageBox.warning(
+                    self,
+                    "Внимание",
+                    "Файл версий терминов повреждён и не прочитан. Сохранение "
+                    "версий отключено, чтобы не затереть существующие данные."
+                )
+        return versions
 
     def _save_all_versions(self):
+        if self._versions_unreadable:
+            # Карта на диске не прочитана (см. _load_all_versions) — любое
+            # сохранение сейчас перезапишет её нашим неполным self.term_rules
+            # и необратимо уничтожит версии всех остальных терминов.
+            QMessageBox.warning(
+                self,
+                "Внимание",
+                "Файл версий терминов повреждён и не прочитан. Сохранение "
+                "версий отключено, чтобы не затереть существующие данные."
+            )
+            return
         # update_term_versions делает read-modify-write под одним lock:
         # перечитывает актуальную карту и правит только self.term, поэтому
         # устаревший снимок self.all_versions_data (сделанный в конструкторе)

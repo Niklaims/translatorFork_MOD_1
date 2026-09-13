@@ -14,6 +14,7 @@ from gemini_translator.utils.epub_json import (
     render_document_html,
 )
 from gemini_translator.utils.batch_markers import find_boundary_markers
+from gemini_translator.utils.io_utils import atomic_write_text
 from gemini_translator.utils.text import (
     prettify_html,
     clean_html_content,
@@ -490,9 +491,10 @@ class ResponseParser:
         if use_prettify:
             final_html_to_write = prettify_html(final_html_to_write)
         
-        # 2. Записываем файл на диск
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(final_html_to_write)
+        # 2. Записываем файл на диск атомарно (temp-файл + os.replace):
+        # без этого сбой процесса/питания посреди записи оставляет главу
+        # усечённой/повреждённой (core-b/bugs/4-chapter-output-write-not-atomi).
+        atomic_write_text(output_path, final_html_to_write)
             
         # 3. Регистрируем в карте проекта
         if self.project_manager:

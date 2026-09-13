@@ -141,6 +141,23 @@ class SelectionSnapshot:
         except (ReferenceError, RuntimeError):
             return None
 
+    def window(self):
+        """Вернуть верхнее окно виджета или None, если он уже уничтожен.
+
+        weakref на PyQt-объект не бросает RuntimeError сам по себе — Python-
+        обёртка возвращается даже после удаления её C++-объекта; RuntimeError
+        'wrapped C/C++ object ... has been deleted' возникает только при
+        обращении к атрибуту/методу этой обёртки. Поэтому обращение к
+        .window() всегда должно идти через этот метод, а не напрямую.
+        """
+        widget = self.widget()
+        if widget is None:
+            return None
+        try:
+            return widget.window()
+        except RuntimeError:
+            return None
+
 
 @dataclass
 class _TranslationJob:
@@ -340,16 +357,16 @@ class SelectionTranslationController(QtCore.QObject):
         text = snapshot.text
         if not text.strip():
             return
+        parent = snapshot.window()
         if len(text) > MAX_SELECTION_CHARS:
             QtWidgets.QMessageBox.information(
-                snapshot.widget().window() if snapshot.widget() is not None else None,
+                parent,
                 "Слишком большое выделение",
                 f"За один раз можно перевести до {MAX_SELECTION_CHARS:,} символов."
                 .replace(",", " "),
             )
             return
 
-        parent = snapshot.widget().window() if snapshot.widget() is not None else None
         popup = TranslationPopup(text, can_replace=snapshot.editable, parent=parent)
         popup.replace_requested.connect(
             lambda translated, snap=snapshot, window=popup: self._replace_selection(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import copy
 import glob
 import html
 import json
@@ -1521,23 +1522,21 @@ def _run_ai_request(
     max_output_tokens: int = 4096,
     cancel_event: Event | None = None,
 ) -> str:
-    # api_providers()/all_models() уже возвращают deepcopy ВСЕГО реестра —
-    # извлечённая отсюда запись независима от общего кэша сама по себе,
-    # дополнительный deepcopy() поверх нее был избыточным двойным копированием.
-    provider_config = api_config.api_providers().get(provider_id) or {}
+    # api_providers_view()/all_models_view() — общий кэш БЕЗ копирования всего
+    # реестра (см. gemini_translator/api/config.py). Копируем точечно только
+    # извлечённую запись — тем же паттерном, что и в
+    # gemini_translator/core/worker.py:259-261 — вместо deepcopy всего
+    # реестра провайдеров/моделей ради одной записи.
+    provider_config = copy.deepcopy(api_config.api_providers_view().get(provider_id) or {})
     if not provider_config:
         raise ValueError(f"Провайдер '{provider_id}' не найден в конфиге.")
 
     model_name = model_settings.get("model") or api_config.default_model_name()
-    model_config = api_config.all_models().get(model_name) or {}
+    model_config = copy.deepcopy(api_config.all_models_view().get(model_name) or {})
     if not model_config:
-        # Внимание: эта запись — вложенный словарь САМОГО provider_config, а не
-        # независимая копия. Сегодня это безопасно, потому что provider_config
-        # выше получен из api_providers() (deepcopy всего реестра). Если этот
-        # callsite когда-нибудь перейдёт на api_providers_view() (без
-        # копирования, ради устранения двойного deepcopy реестра), setdefault()
-        # ниже начнёт дописывать ключи прямо в глобальный кэш конфигов —
-        # тогда здесь обязателен точечный deepcopy() этой записи.
+        # provider_config выше уже независимая копия (deepcopy), поэтому
+        # вложенный словарь модели из неё тоже независим — второй deepcopy
+        # здесь не нужен.
         provider_models = provider_config.get("models") or {}
         model_config = provider_models.get(model_name) or {}
     if not model_config:

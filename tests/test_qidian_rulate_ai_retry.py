@@ -41,12 +41,12 @@ def test_qidian_ai_request_retries_temporary_rate_limit(monkeypatch):
     _RetryOnceHandler.calls = 0
     monkeypatch.setattr(
         workers.api_config,
-        "api_providers",
+        "api_providers_view",
         lambda: {"gemini": {"handler_class": "RetryOnceHandler", "is_async": True}},
     )
     monkeypatch.setattr(
         workers.api_config,
-        "all_models",
+        "all_models_view",
         lambda: {"gemini-test": {"id": "gemini-test"}},
     )
     monkeypatch.setattr(workers.api_config, "default_model_name", lambda: "gemini-test")
@@ -93,8 +93,8 @@ def token_request(monkeypatch):
             type(self).closed += 1
 
     model = {"id": "test", "max_output_tokens": 32768}
-    monkeypatch.setattr(workers.api_config, "api_providers", lambda: {"gemini": {"handler_class": "GeminiApiHandler"}})
-    monkeypatch.setattr(workers.api_config, "all_models", lambda: {"test": model})
+    monkeypatch.setattr(workers.api_config, "api_providers_view", lambda: {"gemini": {"handler_class": "GeminiApiHandler"}})
+    monkeypatch.setattr(workers.api_config, "all_models_view", lambda: {"test": model})
     monkeypatch.setattr(workers, "get_api_handler_class", lambda _: Handler)
     logs = []
 

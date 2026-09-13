@@ -1031,7 +1031,7 @@ class ChapterListWidget(QWidget):
                 total_chunks = task_payload[5] if len(task_payload) > 5 else -1
 
                 original_filename = os.path.basename(epub_path)
-                display_text = f"쪼 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
+                display_text = f"🧩 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
                 char_suffix = self._char_suffix_for_chapters([chapter_path])
                 if char_suffix:
                     display_text += char_suffix
@@ -1085,7 +1085,7 @@ class ChapterListWidget(QWidget):
             'error_validation': ("📋 Невалидно!", "#F39C12"),
             'in_progress': ("🔄 В работе…", "#3498DB"),
             'pending': ("⏳ Ожидание…", self.palette().color(QtGui.QPalette.ColorRole.Text).name()),
-            'held': ("స్త Заморожено", "#7F8C8D"),
+            'held': ("❄️ Заморожено", "#7F8C8D"),
             'completion': ("✍️ До-генерация…", "#F39C12")
         }
 

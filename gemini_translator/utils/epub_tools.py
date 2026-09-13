@@ -14,6 +14,7 @@ import re
 import uuid
 import mimetypes
 import zipfile
+import zlib
 import html as html_lib
 from urllib.parse import unquote
 from xml.etree import ElementTree as ET
@@ -932,15 +933,30 @@ def get_epub_chapter_sizes_with_cache(
         
         # Получаем список файлов внутри
         with zipfile.ZipFile(epub_path, 'r') as zf:
-            # Собираем список файлов и их сжатых размеров для контрольной суммы
+            # Собираем список файлов, их размеров и CRC32 содержимого для контрольной суммы.
+            # CRC32 берём из самого ZipInfo (он уже посчитан для каждой записи архива),
+            # поэтому чтение полного содержимого файлов здесь не требуется.
             chapter_info_list = [
-                (info.filename, info.file_size)
-                for info in zf.infolist() 
+                (info.filename, info.file_size, info.CRC)
+                for info in zf.infolist()
                 if info.filename.lower().endswith(('.html', '.xhtml', '.htm'))
             ]
-        
-        # Считаем чексумму по размерам файлов внутри архива
-        current_content_checksum = sum(size for _, size in chapter_info_list)
+
+        # Чексумма по размерам файлов внутри архива — сохраняем как раньше, для
+        # совместимости со старыми кэшами (формата до появления отпечатка ниже).
+        current_content_checksum = sum(size for _, size, _ in chapter_info_list)
+
+        # Отпечаток, чувствительный к правкам без изменения суммарной длины байт:
+        # сумма размеров не заметит, например, замену части текста главы на другой
+        # алфавит того же байтового размера, а CRC32 каждого файла — заметит.
+        # Используется как дополнительное условие доверия кэшу (см. ЭТАП 1 ниже),
+        # отдельно от content_checksum, чтобы не ломать чтение старых кэшей.
+        current_content_fingerprint = zlib.crc32(
+            ';'.join(
+                f'{fname}:{size}:{crc}'
+                for fname, size, crc in sorted(chapter_info_list)
+            ).encode('utf-8')
+        )
 
     except (zipfile.BadZipFile, FileNotFoundError) as e:
         print(f"[ERROR] Не удалось прочитать EPUB для создания отпечатка: {e}")
@@ -961,8 +977,9 @@ def get_epub_chapter_sizes_with_cache(
         )
         if (is_epub_identity_match and
             metadata.get('metric') == cache_metric and
-            int(metadata.get('version', 0) or 0) >= CHAPTER_SIZE_CACHE_VERSION):
-            
+            int(metadata.get('version', 0) or 0) >= CHAPTER_SIZE_CACHE_VERSION and
+            metadata.get('content_fingerprint') == current_content_fingerprint):
+
             cached_sizes = cache_data.get('sizes', {})
             
             # --- ЭТАП 2: SANITY CHECK (Выборочная проверка контента) ---
@@ -1009,7 +1026,7 @@ def get_epub_chapter_sizes_with_cache(
     try:
         with zipfile.ZipFile(epub_path, 'r') as zf:
             # Перебираем сохраненный ранее список файлов
-            for fname, _ in chapter_info_list:
+            for fname, _, _ in chapter_info_list:
                 content_str = zf.read(fname).decode('utf-8', errors='ignore')
                 final_sizes[fname] = estimate_epub_chapter_input_size(content_str, task_size_unit)
     except Exception as e:
@@ -1021,6 +1038,7 @@ def get_epub_chapter_sizes_with_cache(
             'epub_name': current_epub_name,
             'epub_size': current_epub_size,
             'content_checksum': current_content_checksum,
+            'content_fingerprint': current_content_fingerprint,
             'metric': cache_metric,
             'version': CHAPTER_SIZE_CACHE_VERSION
         },

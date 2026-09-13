@@ -96,6 +96,11 @@ class McpActionWorker(QtCore.QObject):
         self.backend = backend
         self.action = action
         self.running = running
+        # Дублирует то, что уходит в finished.emit(): если результат нужен
+        # синхронно (_wait_for_worker) после того, как воркер уже мог
+        # self-удалиться, читать сигнал/эмит небезопасно, а этот атрибут —
+        # обычное поле Python-объекта, установленное до эмита.
+        self.last_snapshot: McpStatusSnapshot | None = None
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -110,6 +115,7 @@ class McpActionWorker(QtCore.QObject):
                 snapshot = McpStatusSnapshot(running=False, detail="Неизвестное действие", error=str(self.action))
         except Exception as exc:
             snapshot = McpStatusSnapshot(running=False, detail="ошибка MCP", error=str(exc))
+        self.last_snapshot = snapshot
         self.finished.emit(snapshot)
 
 
@@ -138,6 +144,12 @@ class McpControlWidget(QtWidgets.QFrame):
         self._worker_was_running = False
         self._pending_worker_result = None
         self._closing = False
+        # Растёт при каждом новом _dispatch_action; позволяет отличить
+        # доставку finished от воркера, которого мы уже принудительно
+        # разобрали в _wait_for_worker, от актуальной (см. комментарии там
+        # и в _on_worker_finished) — без обращения к самому C++-объекту
+        # воркера, который к моменту доставки мог уже self-удалиться.
+        self._worker_generation = 0
         self.setObjectName("mcpControlCard")
         self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Minimum)
 
@@ -280,9 +292,13 @@ class McpControlWidget(QtWidgets.QFrame):
         thread = QtCore.QThread()
         worker = McpActionWorker(self.backend, action, self._running)
         worker.moveToThread(thread)
+        self._worker_generation += 1
+        generation = self._worker_generation
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)
-        worker.finished.connect(self._on_worker_finished)
+        worker.finished.connect(
+            lambda snapshot, generation=generation: self._on_worker_finished_if_current(generation, snapshot)
+        )
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda thread=thread: self._on_worker_thread_finished(thread))
         thread.finished.connect(thread.deleteLater)
@@ -295,6 +311,16 @@ class McpControlWidget(QtWidgets.QFrame):
         self._pending_worker_result = None
         self._sync_status_timer()
         thread.start()
+
+    def _on_worker_finished_if_current(self, generation: int, snapshot: McpStatusSnapshot) -> None:
+        if generation != self._worker_generation:
+            # Запоздалая доставка сигнала от воркера, которого
+            # _wait_for_worker уже принудительно дождался и разобрал вручную
+            # (см. комментарий там) — применять результат второй раз не
+            # нужно, а сам объект воркера к этому моменту мог уже
+            # self-удалиться, так что и обращаться к нему не нужно.
+            return
+        self._on_worker_finished(snapshot)
 
     def _on_worker_finished(self, snapshot: McpStatusSnapshot) -> None:
         thread = self._worker_thread
@@ -343,11 +369,16 @@ class McpControlWidget(QtWidgets.QFrame):
         worker = self._worker
         if thread is None:
             return
-        if worker is not None:
-            try:
-                worker.finished.disconnect(self._on_worker_finished)
-            except TypeError:
-                pass
+        action = self._worker_action
+        was_running = self._worker_was_running
+        pending = self._pending_worker_result
+        # Инвалидируем поколение ДО принудительного ожидания: если сигнал
+        # finished воркера уже стоит в очереди главного потока (или встанет
+        # туда, когда поток ниже реально остановится), _on_worker_finished
+        # увидит несовпадение и не применит результат повторно — без нужды
+        # трогать сам C++-объект воркера (disconnect на нём — источник
+        # TOCTOU: воркер мог self-удалиться между проверкой и вызовом).
+        self._worker_generation += 1
         if thread.isRunning():
             thread.quit()
             thread.wait()
@@ -357,13 +388,60 @@ class McpControlWidget(QtWidgets.QFrame):
         self._worker_action = None
         self._worker_was_running = False
         self._pending_worker_result = None
+        if action == "toggle":
+            # thread.wait() выше гарантирует, что реальная работа воркера
+            # (например, ensure_daemon_process — реальный запуск демона)
+            # уже выполнена, но колбэк finished мог быть отключён (или
+            # ещё не доставлен главному потоку) до того, как успел
+            # применить _update_stop_on_quit_policy. Без этого демон,
+            # поднятый прямо перед закрытием, остаётся сиротой: флаг «мы
+            # его подняли — надо погасить» никогда не выставится.
+            if pending is not None:
+                _, _, snapshot = pending
+            else:
+                snapshot = None
+                if worker is not None:
+                    # Воркер сохраняет свой результат в last_snapshot до
+                    # эмита — читаем его напрямую вместо лишнего
+                    # синхронного backend.status(). Если C++-объект уже
+                    # удалён (self-delete в своём потоке), чтение любого
+                    # атрибута роняет RuntimeError — тихо уходим в запасной
+                    # путь ниже, поведение не меняется.
+                    try:
+                        snapshot = worker.last_snapshot
+                    except (RuntimeError, AttributeError):
+                        snapshot = None
+                if snapshot is None:
+                    try:
+                        snapshot = self.backend.status()
+                    except Exception as exc:
+                        snapshot = McpStatusSnapshot(running=False, detail="ошибка MCP", error=str(exc))
+            # apply_status здесь эмитит status_changed независимо от
+            # self._closing (в отличие от _finish_worker_action) — это
+            # сознательно: нужен побочный эффект на _running/
+            # _stop_on_app_quit ниже даже во время закрытия, чтобы демон,
+            # поднятый прямо перед выходом, было чем погасить в
+            # _on_app_about_to_quit. Расхождение с _finish_worker_action не
+            # регрессия: старый _on_app_about_to_quit тоже звал apply_status
+            # после backend.stop() при _closing=True.
+            self.apply_status(snapshot)
+            self._update_stop_on_quit_policy(action, was_running, snapshot)
         self.action_button.setEnabled(True)
         self._sync_status_timer()
 
     def _on_app_about_to_quit(self) -> None:
+        # Дожидаемся и улаживаем (см. _wait_for_worker) именно ту гонку, ради
+        # которой это ожидание добавлено: toggle запустил демон и почти
+        # сразу пришёл aboutToQuit, ещё до того как _finish_worker_action
+        # успел выставить _stop_on_app_quit. Действие "status" (фоновый
+        # опрос, тикающий каждые 2.5с, пока карточка видима и есть
+        # daemon-файл) к этой гонке отношения не имеет и ждать его не нужно:
+        # thread.wait() без таймаута заблокировал бы выход приложения на
+        # время сетевого backend.status() (до 5с) без всякой пользы.
+        if self._worker_thread is not None and self._worker_action == "toggle":
+            self._wait_for_worker()
         if not self._stop_on_app_quit:
             return
-        self._wait_for_worker()
         if not self._running:
             self._stop_on_app_quit = False
             return

@@ -179,8 +179,16 @@ class ContentFilterFallbackPanel(QtWidgets.QGroupBox):
     def _update_model_dependent_controls(self):
         model_cfg = self._current_model_config()
         thinking_levels = model_cfg.get("thinkingLevel")
+        # Поддержка thinking считается доказанной только при явном присутствии
+        # ключа min_thinking_budget со значением, отличным от False. Отсутствие
+        # ключа — это НЕ поддержка (fail-closed), а не "неизвестно → включено":
+        # у части моделей (openrouter/perplexica/omniroute) ключ вообще не
+        # объявлен, и thinking для них не реализован обработчиком провайдера.
+        has_min_budget_key = "min_thinking_budget" in model_cfg
         min_budget = model_cfg.get("min_thinking_budget")
-        supports_thinking = (thinking_levels is not None) or (min_budget is not False)
+        supports_thinking = (thinking_levels is not None) or (
+            has_min_budget_key and min_budget is not False
+        )
 
         self.thinking_checkbox.setEnabled(supports_thinking)
         if not supports_thinking:
