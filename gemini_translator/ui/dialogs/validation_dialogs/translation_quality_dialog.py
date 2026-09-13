@@ -38,6 +38,7 @@ from ....qa.estimators.cometkiwi_model_manager import describe_cometkiwi_setup
 from ....qa.language_validation import MAX_LANGUAGE_CHUNK_CHARS
 from ....qa.settings import QaSettings
 from .translation_quality_models import (
+    CHAPTER_STATUS_LABELS,
     BookQaReportSnapshot,
     ChapterQaTableModel,
     DECISION_LABELS,
@@ -467,9 +468,17 @@ class TranslationQualityDialog(QDialog):
     def set_report(self, snapshot: BookQaReportSnapshot) -> None:
         """Replace the report with an immutable snapshot from the journal."""
         self.table_model.set_snapshot(snapshot)
+        hidden = set(self.table_model.hidden_columns())
+        for column in range(self.table_model.columnCount()):
+            self.table.setColumnHidden(column, column in hidden)
         blocked = snapshot.blocked_chapters
         repaired = snapshot.repaired_chapters
-        parts = [f"Глав в отчёте: {len(snapshot.rows)}"]
+        parts = [
+            f"Глав в отчёте: {len(snapshot.rows)}",
+            f"проверено: {snapshot.checked_count}",
+        ]
+        if snapshot.deferred_count:
+            parts.append(f"отложено: {snapshot.deferred_count}")
         if repaired:
             parts.append(f"с автоматическими исправлениями: {len(repaired)}")
         if blocked:
@@ -820,17 +829,26 @@ class TranslationQualityDialog(QDialog):
             decisions = self.table_model.snapshot.decisions_by_chapter.get(chapter_id, ())
             lines = [
                 f"Глава: {row.chapter_id}",
-                f"Языковая пара: {row.language_pair}",
-                f"Коэффициент длины: {row.length_ratio:.2f} — {row.profile_status}",
-                f"Книжная норма: {row.book_position}",
-                f"Возможные пропуски: {row.possible_gaps}, "
-                f"подтверждённые: {row.confirmed_gaps}, "
-                f"исправлено: {row.applied_repairs}",
-                f"Конфликты терминов: {row.glossary_conflicts}, "
-                f"остатки исходника: {row.untranslated_fragments}, "
-                f"языковые дефекты: {row.language_issues}",
-                f"Риск: {row.risk_label}",
+                f"Статус: {CHAPTER_STATUS_LABELS.get(row.status, row.status)}",
             ]
+            if row.checked_at:
+                lines.append(f"Проверена: {row.checked_at}")
+            if row.has_completeness:
+                lines.extend(
+                    (
+                        f"Языковая пара: {row.language_pair}",
+                        f"Коэффициент длины: {row.length_ratio:.2f} — {row.profile_status}",
+                        f"Книжная норма: {row.book_position}",
+                        f"Возможные пропуски: {row.possible_gaps}, "
+                        f"подтверждённые: {row.confirmed_gaps}",
+                        f"Конфликты терминов: {row.glossary_conflicts}, "
+                        f"остатки исходника: {row.untranslated_fragments}, "
+                        f"языковые дефекты: {row.language_issues}",
+                    )
+                )
+            lines.append(f"Исправлено автоматически: {row.applied_repairs}")
+            if row.risk_label:
+                lines.append(f"Риск: {row.risk_label}")
             if row.blocked_reason:
                 lines.append(f"Перевод остановлен: {row.blocked_reason}")
             if decisions:

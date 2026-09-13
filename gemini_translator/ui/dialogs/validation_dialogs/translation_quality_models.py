@@ -6,6 +6,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QAbstractTableModel, QModelIndex, Qt
 
 from ....qa.report_snapshot import (
+    CHAPTER_STATUS_LABELS,
     RELATIVE_RISK_LABELS,
     RISK_LABELS,
     BookQaReportSnapshot,
@@ -30,6 +31,7 @@ DECISION_LABELS = {
 
 __all__ = (
     "BookQaReportSnapshot",
+    "CHAPTER_STATUS_LABELS",
     "ChapterQaRow",
     "ChapterQaTableModel",
     "DECISION_LABELS",
@@ -43,6 +45,7 @@ class ChapterQaTableModel(QAbstractTableModel):
 
     COLUMNS = (
         ("Глава", "chapter_id"),
+        ("Статус", "status"),
         ("Риск", "risk_label"),
         ("Языковая пара", "language_pair"),
         ("Коэффициент", "length_ratio"),
@@ -56,6 +59,23 @@ class ChapterQaTableModel(QAbstractTableModel):
         ("Исправлено", "applied_repairs"),
         ("Время, с", "duration_seconds"),
         ("Токены", "tokens"),
+    )
+    # Every field here comes from a completeness check.  A book checked for
+    # language only has none of them, and a table of zeros reads as a clean result.
+    COMPLETENESS_FIELDS = frozenset(
+        {
+            "language_pair",
+            "length_ratio",
+            "profile_status",
+            "book_position",
+            "glossary_conflicts",
+            "untranslated_fragments",
+            "possible_gaps",
+            "confirmed_gaps",
+            "language_issues",
+            "duration_seconds",
+            "tokens",
+        }
     )
 
     def __init__(self, parent=None) -> None:
@@ -85,6 +105,16 @@ class ChapterQaTableModel(QAbstractTableModel):
                 return index
         return -1
 
+    def hidden_columns(self) -> tuple[int, ...]:
+        """Columns that have nothing to show for the current report."""
+        if self._snapshot.has_completeness:
+            return ()
+        return tuple(
+            index
+            for index, (_title, field_name) in enumerate(self.COLUMNS)
+            if field_name in self.COMPLETENESS_FIELDS
+        )
+
     def rowCount(self, parent=QModelIndex()) -> int:  # noqa: N802 - Qt API
         return 0 if parent.isValid() else len(self._snapshot.rows)
 
@@ -106,6 +136,8 @@ class ChapterQaTableModel(QAbstractTableModel):
             return None
         field_name = self.COLUMNS[index.column()][1]
         if role == Qt.ItemDataRole.DisplayRole:
+            if field_name == "status":
+                return CHAPTER_STATUS_LABELS.get(row.status, row.status)
             if field_name == "risk_label" and row.blocked_reason:
                 # Colour is never the only signal: a blocked chapter says so.
                 return f"⛔ {row.risk_label} — перевод остановлен"

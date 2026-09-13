@@ -725,3 +725,52 @@ def test_check_survives_json_nested_past_the_recursion_limit(qt_app):
         text = _check(dialog, server.base_url)
 
     assert text == "Ответ сервера не разобран."
+
+
+def _language_only_snapshot() -> BookQaReportSnapshot:
+    from gemini_translator.qa.models import QaChapterState
+
+    journal = QaJournal.empty(book_id="book-1")
+    for chapter_id, status in (("chapter-1", "checked"), ("chapter-2", "deferred")):
+        journal.record_chapter_state(QaChapterState(chapter_id=chapter_id, status=status))
+    journal.append_repair({"patch_id": "lang-1", "chapter_id": "chapter-1"})
+    return BookQaReportSnapshot.from_journal(journal)
+
+
+def _column(name: str) -> int:
+    return [field for _title, field in ChapterQaTableModel.COLUMNS].index(name)
+
+
+def test_a_language_only_book_fills_the_table_with_statuses(qt_app):
+    """Без метрик полноты отчёт был пуст, хотя главы проверены и исправлены."""
+    dialog = TranslationQualityDialog()
+    dialog.set_report(_language_only_snapshot())
+
+    model = dialog.table_model
+    assert model.rowCount() == 2
+    assert model.index(0, _column("status")).data() == "Проверена"
+    assert model.index(1, _column("status")).data() == "Отложена"
+    assert model.index(0, _column("applied_repairs")).data() == "1"
+
+
+def test_completeness_columns_hide_until_a_chapter_has_metrics(qt_app):
+    dialog = TranslationQualityDialog()
+
+    dialog.set_report(_language_only_snapshot())
+    assert dialog.table.isColumnHidden(_column("possible_gaps"))
+    assert not dialog.table.isColumnHidden(_column("applied_repairs"))
+
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    assert not dialog.table.isColumnHidden(_column("possible_gaps"))
+
+
+def test_a_chapter_without_metrics_shows_its_status_not_zero_ratios(qt_app):
+    dialog = TranslationQualityDialog()
+    dialog.set_report(_language_only_snapshot())
+
+    dialog.select_chapter("chapter-1")
+    details = dialog.details.toPlainText()
+
+    assert "Статус: Проверена" in details
+    assert "Исправлено автоматически: 1" in details
+    assert "Коэффициент длины" not in details
