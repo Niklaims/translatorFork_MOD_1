@@ -14,6 +14,7 @@ from gemini_translator.ui.dialogs.validation_dialogs.quality_widgets import (
     EmptyState,
     MetricCard,
     StatusChip,
+    chapters_caption,
     format_checked_at,
 )
 
@@ -83,3 +84,20 @@ def test_an_unreadable_date_is_left_out(value):
 
 def test_a_date_reads_the_way_it_does_in_a_russian_sentence():
     assert format_checked_at("2026-09-09T10:05:00") == "9 сентября 2026, 10:05"
+
+
+@pytest.mark.parametrize(
+    ("count", "text"),
+    [
+        (1, "1 глава"),
+        (2, "2 главы"),
+        (5, "5 глав"),
+        (11, "11 глав"),
+        (21, "21 глава"),
+        (484, "484 главы"),
+    ],
+)
+def test_chapters_are_counted_the_russian_way(count, text):
+    """«484 глав(ы)» в журнале прохода."""
+    assert chapters_caption(count) == text
+

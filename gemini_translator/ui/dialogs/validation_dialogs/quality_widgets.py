@@ -36,6 +36,22 @@ _MONTHS = (
 EMPTY_STATE_TEXT_WIDTH = 560
 
 
+def plural(count: int, one: str, few: str, many: str) -> str:
+    """Pick the form a Russian noun takes after a number: 1 глава, 2 главы, 5 глав."""
+    tail = abs(int(count)) % 100
+    if 11 <= tail <= 19:
+        return many
+    if tail % 10 == 1:
+        return one
+    if 2 <= tail % 10 <= 4:
+        return few
+    return many
+
+
+def chapters_caption(count: int) -> str:
+    return f"{count} {plural(count, 'глава', 'главы', 'глав')}"
+
+
 def make_label(text: str = "", name: str = "", *, wrap: bool = False, parent=None) -> QLabel:
     """A label styled by its name that never renders its text as markup."""
     label = QLabel(text, parent)

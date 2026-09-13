@@ -9,7 +9,9 @@ import time
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from ....qa.report_snapshot import chapter_display_name
 from ....utils.text import escape_html, format_duration
+from .quality_widgets import chapters_caption
 from .translation_quality_models import BookQaReportSnapshot
 
 
@@ -68,6 +70,10 @@ class TranslationQualityController(QObject):
         self._event_builder = event_builder
         self._busy = False
         self._last_report_refresh = 0.0
+        # A stop is a request: the pass ends at its next safe point, and the
+        # window stays busy until it has, so no second pass starts over it.
+        self._stopping = False
+        self._last_progress = (0, 0)
 
     # -- wiring ------------------------------------------------------------
 
@@ -120,8 +126,12 @@ class TranslationQualityController(QObject):
         coordinator = self._coordinator()
         if coordinator is None:
             return
+        # A stopped pass leaves its cancellation set; without a fresh one this
+        # check would end before it started.
+        coordinator.reset_cancellation()
+        self._stopping = False
         self._set_busy(True)
-        self.progress_changed.emit(0, 1, chapter_id)
+        self.progress_changed.emit(0, 1, chapter_display_name(chapter_id))
         coordinator.run_background(
             lambda: coordinator.check_chapter_now(events[0]),
             lambda result, error: self._finish_check(result, error, 1, 1, chapter_id),
@@ -137,12 +147,14 @@ class TranslationQualityController(QObject):
         if coordinator is None:
             return
         coordinator.reset_cancellation()
+        self._stopping = False
+        self._last_progress = (0, len(events))
         self._set_busy(True)
         self.progress_changed.emit(0, len(events), "")
         self._pass_started = time.perf_counter()
         self._last_report_refresh = 0.0
         self.chapter_logged.emit(
-            f"<p><b>Проверка книги: {len(events)} глав(ы).</b></p>"
+            f"<p><b>Проверка книги: {chapters_caption(len(events))}.</b></p>"
         )
         coordinator.run_background(
             lambda: coordinator.check_all_now(
@@ -175,11 +187,13 @@ class TranslationQualityController(QObject):
             return
         if not selected:
             self.status_changed.emit(
-                f"Перепроверять нечего: все {len(events)} глав(ы) уже улажены."
+                f"Перепроверять нечего: улажены все главы ({len(events)})."
             )
             return
         pending = tuple(item.event for item in selected)
         coordinator.reset_cancellation()
+        self._stopping = False
+        self._last_progress = (0, len(pending))
         self._set_busy(True)
         self.progress_changed.emit(0, len(pending), "")
         self._pass_started = time.perf_counter()
@@ -208,7 +222,7 @@ class TranslationQualityController(QObject):
         settled = max(0, total - len(selected))
         tail = f" Пропущено как улаженные: {settled}." if settled else ""
         return (
-            f"<p><b>Продолжаем проверку: {len(selected)} глав(ы) из {total}.</b>"
+            f"<p><b>Продолжаем проверку: {chapters_caption(len(selected))} из {total}.</b>"
             f"{escape_html(tail)}<br>{escape_html(parts)}</p>"
         )
 
@@ -276,12 +290,23 @@ class TranslationQualityController(QObject):
         threading.Thread(target=run, name="qa-embedding-probe", daemon=True).start()
 
     def cancel(self) -> None:
-        """Ask the running pass to stop at its next safe point."""
+        """Ask the running pass to stop, and keep the window busy until it has.
+
+        The pass stops at its next safe point, not at once.  Releasing the
+        window here let a second pass start while the first was still running,
+        and a new pass resets the very cancellation the first one was obeying.
+        """
         coordinator = self._coordinator(quiet=True)
         if coordinator is not None:
             coordinator.cancel()
-        self.status_changed.emit("Проверка остановлена.")
-        self._set_busy(False)
+        if not self._busy:
+            return
+        if coordinator is None:
+            self.status_changed.emit("Проверка остановлена.")
+            self._set_busy(False)
+            return
+        self._stopping = True
+        self.status_changed.emit("Останавливаю проверку…")
 
     # -- internals ---------------------------------------------------------
 
@@ -349,30 +374,54 @@ class TranslationQualityController(QObject):
         one chapter's duration says little, so nothing is promised until two
         have finished.
         """
-        label = str(chapter_id or "")
+        self._last_progress = (done, total)
+        label = chapter_display_name(str(chapter_id or ""))
         elapsed = time.perf_counter() - getattr(self, "_pass_started", time.perf_counter())
         remaining = total - done
         if done >= 2 and remaining > 0 and elapsed > 0:
             seconds = int(remaining * elapsed / done)
-            label = f"{label} · осталось ~{_humanize_seconds(seconds)}" if label else (
-                f"осталось ~{_humanize_seconds(seconds)}"
-            )
+            # The estimate before the name: when the line is short of room,
+            # the chapter's name is what gets cut, never the numbers.
+            estimate = f"осталось ~{_humanize_seconds(seconds)}"
+            label = f"{estimate} · {label}" if label else estimate
         self.progress_changed.emit(done, total, label)
         self._refresh_report_throttled()
 
     def _finish_check(
         self, result, error, checked: int, total: int, chapter_id: str
     ) -> None:
+        name = chapter_display_name(chapter_id)
         if error is not None:
-            self.status_changed.emit(f"Проверка не удалась: {error}")
+            self.status_changed.emit(
+                f"Проверка главы «{name}» остановлена."
+                if self._stopping
+                else f"Проверка не удалась: {error}"
+            )
         else:
             self._log_chapter(result)
-            self.progress_changed.emit(checked, total, chapter_id)
-            self.status_changed.emit(f"Глава «{chapter_id}» проверена.")
+            self.progress_changed.emit(checked, total, name)
+            self.status_changed.emit(f"Глава «{name}» проверена.")
+        self._stopping = False
         self._set_busy(False)
         self.refresh_report()
 
     def _finish_book_pass(self, result, error, total: int) -> None:
+        if self._stopping:
+            # A stop that caught a chapter mid-check ends in an error; it is
+            # still the user's stop, not a failure of the check.
+            checked = (
+                len(getattr(result, "results", ()) or ())
+                if error is None
+                else self._last_progress[0]
+            )
+            self.progress_changed.emit(checked, total, "")
+            self.status_changed.emit(
+                f"Проверка остановлена: проверено {checked} из {total}."
+            )
+            self._stopping = False
+            self._set_busy(False)
+            self.refresh_report()
+            return
         if error is not None:
             self.status_changed.emit(f"Проверка книги не удалась: {error}")
         else:

@@ -171,8 +171,56 @@ def test_the_suggestions_tab_says_why_it_is_empty(qt_app):
     assert dialog.suggestions_view.empty_state.title_label.text() == "Непринятых правок нет"
 
 
-def test_the_log_sits_in_a_card_and_stays_bounded(qt_app):
+def test_the_log_starts_with_an_empty_state_and_then_shows_entries(qt_app):
+    """Журнал в рамке в рамке забирал фокус и обводил всю вкладку оранжевым."""
+    from PyQt6.QtCore import Qt
+
     dialog = TranslationQualityDialog()
 
-    assert dialog.log_view.parentWidget().objectName() == "projectPathCard"
+    assert dialog.log_stack.currentWidget() is dialog.log_empty_state
     assert dialog.log_view.document().maximumBlockCount() == 4000
+    assert dialog.log_view.focusPolicy() == Qt.FocusPolicy.ClickFocus
+
+    dialog.append_log("<p><b>chapter-1</b> — без изменений.</p>")
+    dialog.append_log("<p><b>chapter-2</b> — без изменений.</p>")
+
+    assert dialog.log_stack.currentWidget() is dialog.log_view
+    assert "<hr" not in dialog.log_view.toHtml()
+    lines = [line for line in dialog.log_view.toPlainText().splitlines() if line.strip()]
+    assert lines == ["chapter-1 — без изменений.", "chapter-2 — без изменений."]
+
+
+def test_a_running_pass_reports_progress_in_the_status_line(qt_app):
+    """Все часы прохода слева висело «Готово.», а числа прятались в узкой полосе."""
+    dialog = _dialog()
+
+    dialog.set_busy(True)
+    dialog.set_progress(12, 484, "осталось ~40 мин · chapter13")
+
+    assert dialog.status_label.text() == "Проход: 12 из 484 · осталось ~40 мин · chapter13"
+    assert dialog.progress.isTextVisible() is False
+    assert "Последний проход" not in dialog.subtitle_label.text()
+
+    dialog.set_busy(False)
+
+    assert "Последний проход" in dialog.subtitle_label.text()
+
+
+def test_stopping_says_so_until_the_pass_ends(qt_app):
+    dialog = _dialog()
+    stops: list[int] = []
+    dialog.cancel_requested.connect(lambda: stops.append(1))
+    dialog.set_busy(True)
+
+    dialog.cancel_button.click()
+
+    assert stops == [1]
+    assert dialog.cancel_button.text() == "Останавливаю…"
+    assert not dialog.cancel_button.isEnabled()
+
+    dialog.set_busy(False)
+    dialog.set_busy(True)
+
+    assert dialog.cancel_button.text() == "Остановить проверку"
+    assert dialog.cancel_button.isEnabled()
+

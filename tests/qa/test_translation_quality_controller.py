@@ -500,3 +500,102 @@ def test_the_probe_answer_also_goes_to_the_settings_card(qt_app):
     controller.test_embedding(QaSettings(embedding_provider="openai_compatible"))
 
     assert answers and "ключ" in answers[-1].lower()
+
+
+class _PendingCoordinator(_Coordinator):
+    """Starts a pass and keeps it running until the test finishes it."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.pending = None
+
+    def run_background(self, factory, on_done=None):
+        self.pending = (factory, on_done)
+
+    def finish(self):
+        factory, on_done = self.pending
+        self.pending = None
+        try:
+            result, error = asyncio.run(factory()), None
+        except BaseException as failure:  # noqa: BLE001 - mirrors the real callback
+            result, error = None, failure
+        if on_done is not None:
+            on_done(result, error)
+
+
+def test_stopping_keeps_the_window_busy_until_the_pass_really_stops(qt_app):
+    """«Остановить» снимал занятость сразу — поверх недоостановленного прохода запускался второй."""
+    coordinator = _PendingCoordinator()
+    controller = _controller(coordinator, events=("chapter-1", "chapter-2"))
+    statuses, busy = [], []
+    controller.status_changed.connect(statuses.append)
+    controller.busy_changed.connect(busy.append)
+
+    controller.check_all()
+    controller.cancel()
+
+    assert coordinator.cancelled is True
+    assert busy == [True]
+    assert statuses[-1] == "Останавливаю проверку…"
+
+    coordinator.finish()
+
+    assert busy == [True, False]
+    assert statuses[-1] == "Проверка остановлена: проверено 2 из 2."
+
+
+def test_a_stop_that_interrupts_a_chapter_is_not_reported_as_a_failure(qt_app):
+    import concurrent.futures
+
+    class _Interrupted(_PendingCoordinator):
+        async def check_all_now(self, events, options=None, on_progress=None, on_chapter=None):
+            if callable(on_progress):
+                on_progress(1, len(events), events[0].chapter_id)
+            raise concurrent.futures.CancelledError()
+
+    coordinator = _Interrupted()
+    controller = _controller(coordinator, events=("chapter-1", "chapter-2", "chapter-3"))
+    statuses = []
+    controller.status_changed.connect(statuses.append)
+
+    controller.check_all()
+    controller.cancel()
+    coordinator.finish()
+
+    assert statuses[-1] == "Проверка остановлена: проверено 1 из 3."
+
+
+def test_checking_one_chapter_clears_an_earlier_stop(qt_app):
+    """После остановленного прохода проверка одной главы отменялась, не начавшись."""
+    coordinator = _Coordinator()
+    controller = _controller(coordinator)
+
+    controller.check_chapter("chapter-1")
+
+    assert coordinator.reset_calls == 1
+
+
+def test_the_estimate_comes_first_and_the_chapter_is_named_by_its_file(qt_app):
+    """Полоса показывала «з 484 — OEBPS/chapter13.xhtml · ост»: число и оценка обрезались."""
+    coordinator = _Coordinator()
+    events = ("OEBPS/chapter1.xhtml", "OEBPS/chapter2.xhtml", "OEBPS/chapter3.xhtml")
+    controller = _controller(coordinator, events=events)
+    updates = []
+    controller.progress_changed.connect(lambda *args: updates.append(args))
+
+    controller.check_all()
+
+    assert updates[1][2] == "chapter1"
+    assert updates[2][2].startswith("осталось ~")
+    assert updates[2][2].endswith(" · chapter2")
+
+
+def test_the_pass_header_counts_chapters_the_russian_way(qt_app):
+    controller = _controller(_Coordinator(), events=("chapter-1", "chapter-2"))
+    logged = []
+    controller.chapter_logged.connect(logged.append)
+
+    controller.check_all()
+
+    assert "Проверка книги: 2 главы." in logged[0]
+

@@ -337,7 +337,7 @@ def test_continuing_says_how_much_is_left_and_why(qt_app):
 
     controller.resume()
 
-    assert "Продолжаем проверку: 2 глав(ы) из 3" in entries[0]
+    assert "Продолжаем проверку: 2 главы из 3" in entries[0]
     assert "проверка не завершилась" in entries[0]
     assert "ещё не проверялась" in entries[0]
 

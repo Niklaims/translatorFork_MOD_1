@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextBlockFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QMessageBox,
     QProgressBar,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -23,12 +24,30 @@ from ....qa.settings import QaSettings
 from .quality_report_view import QualityReportView
 from .quality_settings_view import QualitySettingsView
 from .quality_suggestions_view import QualitySuggestionsView
-from .quality_widgets import StatusChip, format_checked_at, make_button, make_label
+from .quality_widgets import (
+    EmptyState,
+    StatusChip,
+    format_checked_at,
+    make_button,
+    make_label,
+)
 
 
 # The log keeps the newest chapters; a six-hundred-chapter book would otherwise
 # grow one document until the window slows down.
 LOG_MAX_BLOCKS = 4000
+LOG_EMPTY_TITLE = "Журнал прохода пуст"
+LOG_EMPTY_TEXT = (
+    "Здесь появится каждая глава текущего прохода: что найдено, что исправлено "
+    "и что осталось предложением."
+)
+# Space between two chapters of the log, where a ruled line used to be.
+LOG_ENTRY_SPACING = 10
+# One height for every button of the action bar: «Остановить проверку» takes the
+# primary button's place without its padding, and the window jumped each time.
+ACTION_BUTTON_HEIGHT = 36
+STOP_TEXT = "Остановить проверку"
+STOPPING_TEXT = "Останавливаю…"
 
 
 def describe_checks(settings: QaSettings) -> str:
@@ -72,6 +91,8 @@ class TranslationQualityDialog(QDialog):
         self._settings = settings or QaSettings()
         self._snapshot = BookQaReportSnapshot()
         self._busy = False
+        # Set between «Остановить проверку» and the moment the pass has ended.
+        self._stopping = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -136,20 +157,19 @@ class TranslationQualityDialog(QDialog):
         page = QWidget(self)
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(0, 10, 0, 0)
-        card = QFrame(page)
-        card.setObjectName("projectPathCard")
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(12, 10, 12, 10)
-        self.log_view = QTextEdit(card)
+        self.log_stack = QStackedWidget(page)
+        self.log_empty_state = EmptyState(LOG_EMPTY_TITLE, LOG_EMPTY_TEXT, self.log_stack)
+        self.log_view = QTextEdit(self.log_stack)
         self.log_view.setReadOnly(True)
-        self.log_view.setPlaceholderText(
-            "Здесь появится каждая глава: что найдено, что исправлено и что "
-            "осталось предложением."
-        )
+        # Reading the log is looking, not typing: switching to the tab must not
+        # hand it the focus and draw the accent frame round the whole page.
+        self.log_view.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         # A long book would otherwise grow the document without limit.
         self.log_view.document().setMaximumBlockCount(LOG_MAX_BLOCKS)
-        card_layout.addWidget(self.log_view)
-        page_layout.addWidget(card)
+        self.log_stack.addWidget(self.log_empty_state)
+        self.log_stack.addWidget(self.log_view)
+        self.log_stack.setCurrentWidget(self.log_empty_state)
+        page_layout.addWidget(self.log_stack)
         return page
 
     def _build_action_bar(self) -> QFrame:
@@ -163,7 +183,10 @@ class TranslationQualityDialog(QDialog):
         self.progress = QProgressBar(bar)
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.progress.setMinimumWidth(220)
+        # The bar shows only how much is done; the numbers and the estimate
+        # are in the status line, where there is room for them.
+        self.progress.setTextVisible(False)
+        self.progress.setMinimumWidth(160)
         self.progress.setVisible(False)
         row.addWidget(self.progress)
 
@@ -177,13 +200,13 @@ class TranslationQualityDialog(QDialog):
         )
         # Takes the primary button's place while a pass runs: the one thing to
         # do then is stop it.
-        self.cancel_button = make_button("Остановить проверку", "dangerActionButton", bar)
+        self.cancel_button = make_button(STOP_TEXT, "dangerActionButton", bar)
         self.close_button = make_button("Закрыть", "ghostActionButton", bar)
 
         self.export_button.clicked.connect(self._request_export)
         self.check_all_button.clicked.connect(self.check_all_requested.emit)
         self.resume_button.clicked.connect(self.resume_requested.emit)
-        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        self.cancel_button.clicked.connect(self._request_cancel)
         self.close_button.clicked.connect(self.reject)
         for button in (
             self.export_button,
@@ -192,6 +215,7 @@ class TranslationQualityDialog(QDialog):
             self.cancel_button,
             self.close_button,
         ):
+            button.setMinimumHeight(ACTION_BUTTON_HEIGHT)
             row.addWidget(button)
         return bar
 
@@ -209,6 +233,7 @@ class TranslationQualityDialog(QDialog):
     def set_busy(self, busy: bool) -> None:
         """Disable everything a running check must own exclusively."""
         self._busy = bool(busy)
+        self._stopping = False
         self.progress.setVisible(self._busy)
         self.report_view.set_busy(self._busy)
         self._refresh_header()
@@ -217,21 +242,35 @@ class TranslationQualityDialog(QDialog):
     def set_progress(self, checked: int, total: int, chapter_id: str = "") -> None:
         """Show honest progress of a whole-book pass."""
         total = max(int(total), 0)
+        checked = min(int(checked), total) if total else 0
         self.progress.setVisible(True)
         self.progress.setRange(0, total or 0)
-        self.progress.setValue(min(int(checked), total) if total else 0)
+        self.progress.setValue(checked)
         suffix = f" — {chapter_id}" if chapter_id else ""
-        self.progress.setFormat(f"Проверено %v из %m{suffix}")
+        self.progress.setFormat(f"Проход: %v из %m{suffix}")
+        # Numbers first: if the line runs short of room, the chapter's name is
+        # what gets cut.
+        parts = [f"Проход: {checked} из {total}"]
+        if chapter_id:
+            parts.append(str(chapter_id))
+        self.status_label.setText(" · ".join(parts))
 
     def append_log(self, html: str) -> None:
         """Add one finished chapter to the log and keep the newest in view."""
         text = str(html or "").strip()
         if not text:
             return
+        self.log_stack.setCurrentWidget(self.log_view)
         cursor = self.log_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.log_view.document().isEmpty():
+            # Each chapter in a paragraph of its own: inserted HTML otherwise
+            # runs on into the paragraph before it.
+            spacing = QTextBlockFormat()
+            spacing.setTopMargin(LOG_ENTRY_SPACING)
+            cursor.insertBlock(spacing)
+        cursor.insertHtml(text)
         self.log_view.setTextCursor(cursor)
-        self.log_view.insertHtml(text + "<hr>")
         scrollbar = self.log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
@@ -268,7 +307,8 @@ class TranslationQualityDialog(QDialog):
     def _refresh_header(self) -> None:
         parts = [describe_checks(self._settings)]
         last_pass = format_checked_at(self._snapshot.last_checked_at)
-        if last_pass:
+        # While a pass runs, the last one is no longer the news.
+        if last_pass and not self._busy:
             parts.append(f"Последний проход: {last_pass}.")
         self.subtitle_label.setText(" ".join(parts))
         if self._busy:
@@ -282,8 +322,16 @@ class TranslationQualityDialog(QDialog):
         self.check_all_button.setEnabled(not busy)
         self.resume_button.setEnabled(not busy)
         self.resume_button.setVisible(not busy)
-        self.cancel_button.setEnabled(busy)
+        self.cancel_button.setText(STOPPING_TEXT if self._stopping else STOP_TEXT)
+        self.cancel_button.setEnabled(busy and not self._stopping)
         self.cancel_button.setVisible(busy)
+
+    def _request_cancel(self) -> None:
+        if not self._busy or self._stopping:
+            return
+        self._stopping = True
+        self._update_action_state()
+        self.cancel_requested.emit()
 
     def _request_export(self) -> None:
         """Ask where to write the report bundle, then hand the path over."""

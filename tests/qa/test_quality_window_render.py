@@ -127,3 +127,23 @@ def test_no_wrapped_caption_is_cut_in_an_empty_window(qt_app, themed, mode):
         dialog.close()
         dialog.deleteLater()
         qt_app.processEvents()
+
+
+def test_the_action_bar_keeps_its_height_when_a_pass_starts(qt_app, themed):
+    """«Остановить» без отступов главной кнопки сдвигало всё окно на 4 px при каждом старте."""
+    themed("light")
+    dialog = TranslationQualityDialog()
+    try:
+        _show(dialog, qt_app)
+        bar = dialog.cancel_button.parentWidget()
+        idle = bar.height()
+
+        dialog.set_busy(True)
+        qt_app.processEvents()
+
+        assert bar.height() == idle
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
