@@ -447,6 +447,13 @@ class InitialSetupPage(ShellPage):
         self.output_folder = None
         self.project_manager = None
         self.is_session_active = False
+        # True только когда is_session_active был принудительно взведён
+        # _check_and_sync_active_session (ветка «сессия ЕСТЬ, а мы спим»),
+        # а не обычным событием 'session_started'. Нужен, чтобы автосброс
+        # залипшего флага в той же функции не срабатывал в штатном окне
+        # завершения легитимной сессии (движок уже снял active_session,
+        # а _finalize_session_state ещё не доставлен через QueuedConnection).
+        self._session_active_forced_by_sync = False
         self.current_project_folder_loaded = None # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
         self.is_settings_dirty = False
         self.is_glossary_dirty = False
@@ -464,6 +471,11 @@ class InitialSetupPage(ShellPage):
         self._snapshot_restore_in_progress = False
         self._snapshot_prompted_projects = set()
         self._snapshot_save_requested = False
+        # Взводится, когда принудительный (force=True) запрос сохранения снимка
+        # очереди (например, финальный при завершении сессии) пришёл, пока уже
+        # шло фоновое сохранение — иначе он тихо терялся вместе с последними
+        # task_state_changed (см. _on_snapshot_autosave_finished).
+        self._snapshot_force_save_pending = False
         self._base_glossary_prompt_seen_projects = set()
         self._pending_old_project_cleanup_offer = False
         self._returning_to_main_menu = False
@@ -798,6 +810,19 @@ class InitialSetupPage(ShellPage):
     def _on_translation_options_changed(self):
         self._refresh_auto_translate_runtime_context()
         self._mark_settings_as_dirty()
+        if getattr(self, '_snapshot_restore_in_progress', False):
+            # Восстановление снимка очереди само пересобирает список задач
+            # (_on_project_data_changed(rebuild_tasks=False) в _restore_queue_snapshot);
+            # settings_changed, случайно пришедший в этот момент от
+            # translation_options_widget (например, из-за автоматического
+            # снятия batch_checkbox при одной главе), не должен стирать
+            # восстановленные статусы/историю ошибок пересборкой очереди.
+            # Проверка стоит ДО взведения _task_queue_needs_rebuild: иначе
+            # флаг защёлкивается здесь, а следующее нажатие «Старт»
+            # (_ensure_pending_tasks_for_start) увидит его и всё равно
+            # вызовет деструктивный clean_rebuild, стерев восстановленные
+            # статусы/историю ошибок отложенно.
+            return
         self._task_queue_needs_rebuild = True
         if getattr(self, 'is_session_active', False):
             return
@@ -1185,6 +1210,10 @@ class InitialSetupPage(ShellPage):
         if not checked and hasattr(self, '_snapshot_save_timer'):
             self._snapshot_save_timer.stop()
             self._snapshot_save_requested = False
+            # Отключение автосохранения снимает и отложенный форс-запрос —
+            # иначе он переживёт выключенный тумблер и сработает позже
+            # вне сессии/по чужому проекту (см. _on_snapshot_autosave_finished).
+            self._snapshot_force_save_pending = False
         self._mark_settings_as_dirty()
 
     def _is_queue_autosave_enabled(self) -> bool:
@@ -1714,6 +1743,7 @@ class InitialSetupPage(ShellPage):
         # Этот виджет теперь реагирует только на старт и финиш сессии
         if event_name == 'session_started':
             self.is_session_active = True
+            self._session_active_forced_by_sync = False
             # total_tasks теперь обрабатывается в StatusBarWidget
             self._set_controls_enabled(False)
             self._save_snapshot_async(force=True)
@@ -2644,6 +2674,21 @@ class InitialSetupPage(ShellPage):
         ):
             self._write_snapshot_ui_settings(snapshot_path, self._get_full_ui_settings())
         self._snapshot_autosave_worker = None
+        if self._snapshot_force_save_pending:
+            self._snapshot_force_save_pending = False
+            if self._snapshot_restore_in_progress:
+                # Восстановление снимка уже идёт (например, форс-запрос повис,
+                # пока пользователь успел открыть другой снимок): переигровка
+                # писала бы уже по новому _get_snapshot_path()/task_manager,
+                # вне какой-либо сессии. По аналогии с гейтом в
+                # _schedule_snapshot_save — не переигрываем.
+                return
+            # Пока воркер был занят, пришёл принудительный запрос (например,
+            # финальный снимок при завершении сессии). is_session_active к
+            # этому моменту уже может быть False — это не повод его терять,
+            # поэтому сохраняем немедленно, а не через отложенный таймер.
+            self._save_snapshot_async(force=True)
+            return
         if self._snapshot_save_requested and self.is_session_active and self._is_queue_autosave_enabled():
             self._snapshot_save_timer.start()
 
@@ -2660,6 +2705,8 @@ class InitialSetupPage(ShellPage):
             return
         if self._snapshot_autosave_worker and self._snapshot_autosave_worker.isRunning():
             self._snapshot_save_requested = True
+            if force:
+                self._snapshot_force_save_pending = True
             return
         self._snapshot_save_requested = False
 
@@ -5072,6 +5119,13 @@ class InitialSetupPage(ShellPage):
             self._auto_log("Автоглоссарий прерван. Основной перевод не был запущен.", force=True)
 
         self._auto_glossary_completed = False
+        # Пока авто-глоссарий шёл, is_blocked_by_child_dialog мог глушить
+        # session_finished чужой/дочерней сессии в on_event, из-за чего
+        # is_session_active остаётся ложно взведённым _check_and_sync_active_session
+        # (см. её же комментарий про _session_active_forced_by_sync). Синхронизируемся
+        # здесь детерминированно, а не полагаясь на следующий произвольный
+        # check_ready()/on_enter().
+        self._check_and_sync_active_session()
         if not self.is_session_active:
             self._set_controls_enabled(True)
             self.check_ready()
@@ -6843,6 +6897,7 @@ class InitialSetupPage(ShellPage):
         if active_session_id and not self.is_session_active:
             print(f"[UI RECOVERY] ⚠️ Обнаружена рассинхронизация! Сессия {active_session_id} работает, а диалог спит. Блокирую интерфейс.")
             self.is_session_active = True
+            self._session_active_forced_by_sync = True
 
             # Принудительно переводим UI в режим "Сессия идет" (блокируем инпуты, включаем Стоп)
             self._set_controls_enabled(False)
@@ -6865,7 +6920,24 @@ class InitialSetupPage(ShellPage):
             self._set_controls_enabled(False)
             return True
 
-        # Сессии нет
+        # Сессии нет. Если is_session_active остался True, потому что был
+        # ложно взведён этим же методом по чужой/дочерней сессии (чей
+        # session_finished был проигнорирован из-за is_blocked_by_child_dialog),
+        # сбрасываем его здесь — иначе флаг застревает навсегда и блокирует
+        # check_ready/_mark_settings_as_dirty/_on_glossary_changed и т.д.
+        #
+        # Ограничено случаем _session_active_forced_by_sync: флаг, взведённый
+        # обычным событием 'session_started', НЕ сбрасываем здесь — в штатном
+        # окне завершения сессии движок уже снял current_active_session, а
+        # _finalize_session_state (который сам сбросит is_session_active и
+        # вызовет stop_session) ещё не доставлен через QueuedConnection;
+        # ранний сброс отсюда дублировал бы stop_session/enable-controls
+        # раньше штатного пути.
+        if self.is_session_active and getattr(self, '_session_active_forced_by_sync', False):
+            self.is_session_active = False
+            self._session_active_forced_by_sync = False
+            if self.status_bar:
+                self.status_bar.stop_session()
         self._set_controls_enabled(True)
         return False
 

@@ -19,10 +19,36 @@ from .model_config_schema import sanitize_model_config
 # лога, см. gemini_translator/utils/user_log.py.
 _logger = logging.getLogger(__name__)
 
-try:
-    import requests
-except Exception:
-    requests = None
+
+# requests нужен только для discovery локальных LM Studio/Ollama-совместимых
+# моделей (редкий, не всегда включённый сценарий) — импортируем лениво при
+# первом реальном обращении, а не на каждом старте приложения.
+requests = None
+_requests_import_attempted = False
+
+
+def _ensure_requests_module():
+    """Возвращает модуль requests, импортируя его не раньше первого вызова.
+
+    Если атрибут requests уже установлен (например, тестом через
+    patch.object(api_config, "requests", ...)), лениво-импорт не выполняется —
+    подмена уважается как есть. Важно: подмена значением None НЕ означает
+    «requests не установлен» — загрузчик всё равно попробует реальный импорт
+    заново (requests is None ничем не отличается от исходного состояния).
+    Чтобы смоделировать отсутствие модуля, выставляйте
+    _requests_import_attempted = True вместе с requests = None."""
+    global requests, _requests_import_attempted
+    if requests is not None:
+        return requests
+    if _requests_import_attempted:
+        return requests
+    _requests_import_attempted = True
+    try:
+        import requests as _requests_module
+    except Exception:
+        _requests_module = None
+    requests = _requests_module
+    return requests
 
 
 # [ARCH] URI для общей базы данных в оперативной памяти.
@@ -405,12 +431,42 @@ ALPHABETIC_EXPANSION_FACTOR = 1.6
 CJK_EXPANSION_FACTOR = 3.5
 
 
+# Пары (имя_модели, provider_1, provider_2), для которых уже залогировано
+# предупреждение о коллизии — чтобы не спамить лог при каждом all_models(),
+# но снова предупредить, если та же модель столкнётся с ДРУГИМ провайдером.
+# Сбрасывается вместе с _COMPOSED_PROVIDERS_CACHE/_ALL_MODELS_VIEW_CACHE в
+# _invalidate_composed_providers() — после изменения реестра коллизия имеет
+# шанс попасть в лог заново.
+_MODEL_NAME_COLLISION_WARNED = set()
+
+
 def _build_all_models(providers_config: dict) -> dict:
-    return {
-        model_name: {**model_config, 'provider': provider_id}
-        for provider_id, provider_data in providers_config.items()
-        for model_name, model_config in provider_data.get("models", {}).items()
-    }
+    """Строит плоскую карту {display_name: {...,'provider':...}} по всем провайдерам.
+
+    Ключ — только отображаемое имя модели: при совпадении имени у двух
+    провайдеров запись, обработанная позже в порядке providers_config.items(),
+    молча перезаписывала бы предыдущую. Это унаследованное поведение
+    сохранено (менять формат ключа нельзя — от него зависит резолв модели по
+    имени во множестве мест за пределами этого модуля), но коллизия больше не
+    остаётся незамеченной: каждая пара провайдеров, столкнувшаяся на одном
+    имени модели, один раз попадает в лог с указанием обоих провайдеров."""
+    combined = {}
+    for provider_id, provider_data in providers_config.items():
+        for model_name, model_config in provider_data.get("models", {}).items():
+            existing = combined.get(model_name)
+            if existing is not None and existing.get('provider') != provider_id:
+                warn_key = (model_name, existing.get('provider'), provider_id)
+                if warn_key not in _MODEL_NAME_COLLISION_WARNED:
+                    _MODEL_NAME_COLLISION_WARNED.add(warn_key)
+                    _logger.warning(
+                        "Модель '%s' объявлена у нескольких провайдеров ('%s' и '%s'); "
+                        "в all_models()/all_models_view() останется только последняя "
+                        "по порядку обхода — резолв по имени для другого провайдера "
+                        "станет недоступен.",
+                        model_name, existing.get('provider'), provider_id,
+                    )
+            combined[model_name] = {**model_config, 'provider': provider_id}
+    return combined
 
 
 def custom_model_validation_errors():
@@ -498,6 +554,7 @@ def _invalidate_composed_providers():
     global _COMPOSED_PROVIDERS_CACHE, _ALL_MODELS_VIEW_CACHE
     _COMPOSED_PROVIDERS_CACHE = None
     _ALL_MODELS_VIEW_CACHE = None
+    _MODEL_NAME_COLLISION_WARNED.clear()
 
 
 def set_custom_provider_models(custom_provider_models):
@@ -657,7 +714,7 @@ def _index_static_local_models(static_models: dict, provider_base_url: str | Non
 
 
 def _fetch_local_models_json(url: str) -> tuple[bool, object | None]:
-    if requests is None:
+    if _ensure_requests_module() is None:
         return False, None
 
     try:
@@ -675,7 +732,7 @@ def _fetch_local_models_json(url: str) -> tuple[bool, object | None]:
 
 
 def _post_local_models_json(url: str, payload: dict) -> tuple[bool, object | None]:
-    if requests is None:
+    if _ensure_requests_module() is None:
         return False, None
 
     try:
@@ -1073,7 +1130,7 @@ def _discover_local_provider_models(
     include_details: bool = True,
 ) -> dict:
     static_models = deepcopy(provider_config.get("models", {}))
-    if not _local_model_discovery_enabled() or requests is None:
+    if not _local_model_discovery_enabled() or _ensure_requests_module() is None:
         return static_models
 
     discovery_sources = _iter_local_discovery_sources(provider_config)
@@ -1274,7 +1331,7 @@ def provider_needs_dynamic_model_refresh(provider_id: str | None) -> bool:
     normalized_provider = str(provider_id or "").strip()
     if not normalized_provider or not _provider_uses_dynamic_model_discovery(normalized_provider):
         return False
-    if not _local_model_discovery_enabled() or requests is None:
+    if not _local_model_discovery_enabled() or _ensure_requests_module() is None:
         return False
     with _DYNAMIC_PROVIDER_MODELS_LOCK:
         if _DYNAMIC_PROVIDER_MODELS.get(normalized_provider) is None:

@@ -3629,6 +3629,10 @@ class GeminiWorker(QThread):
         self._last_live_mp3_autosave_at = 0.0
         self._last_live_mp3_autosave_step = 0
         self._finished_emitted = False
+        # Кэш сегментов текущей главы: без него main_loop дважды за итерацию
+        # перечитывал/переразбирал TTS-сценарий или все абзацы главы (см. bugs/6).
+        self._segments_cache_chapter_idx = None
+        self._segments_cache = None
 
     def _emit_finished(self):
         if self._finished_emitted:
@@ -3712,6 +3716,24 @@ class GeminiWorker(QThread):
             raw_text = (chapter.raw_text or "").strip()
             return [raw_text] if raw_text else []
         return [part.strip() for part in chapter.flat_sentences if (part or "").strip()]
+
+    def _invalidate_chapter_segments_cache(self):
+        self._segments_cache_chapter_idx = None
+        self._segments_cache = None
+
+    def _cached_chapter_segments(self, chapter_index):
+        """Как _chapter_segments, но пересчитывает список только при смене главы.
+
+        main_loop раньше вызывал _chapter_segments дважды за каждую итерацию
+        внешнего цикла (для total_sent и отдельно для нарезки батча); для
+        voice_mode == 'author_gender' это означало повторное чтение TTS-сценария
+        с диска и его повторный разбор, а для segment_mode == 'paragraphs' —
+        повторный регэксп-разбор всех абзацев главы на каждый запрос (см. bugs/6).
+        """
+        if self._segments_cache_chapter_idx != chapter_index or self._segments_cache is None:
+            self._segments_cache = self._chapter_segments(chapter_index)
+            self._segments_cache_chapter_idx = chapter_index
+        return self._segments_cache
 
     def _join_segments_for_request(self, segments):
         return _join_live_request_segments(
@@ -4220,17 +4242,33 @@ class GeminiWorker(QThread):
         gemini_retry_count = 0 # Счетчик для повторных попыток пробиться к Gemini (одиночные)
         batch_retry_count = 0  # НОВЫЙ СЧЕТЧИК: для повторных попыток целого батча
 
-        while self._is_running:
-            if self.c_idx == -1:
-                try:
-                    self.c_idx = self.manager_chapter_queue.get_nowait()
-                    self.s_idx = 0 
-                    self._reset_live_mp3_autosave()
-                    single_sentence_mode_remaining = 0
-                    fail_count = 0
-                    gemini_retry_count = 0
-                    batch_retry_count = 0
-                    total_sent = len(self._chapter_segments(self.c_idx))
+        try:
+            while self._is_running:
+                if self.c_idx == -1:
+                    try:
+                        self.c_idx = self.manager_chapter_queue.get_nowait()
+                        self.s_idx = 0
+                        self._reset_live_mp3_autosave()
+                        self._invalidate_chapter_segments_cache()
+                        single_sentence_mode_remaining = 0
+                        fail_count = 0
+                        gemini_retry_count = 0
+                        batch_retry_count = 0
+                        total_sent = len(self._cached_chapter_segments(self.c_idx))
+                        if self.voice_mode == "author_gender" and total_sent == 0:
+                            self.error_signal.emit(
+                                self.worker_id,
+                                f"Глава {self.c_idx + 1}: нет корректного AI-сценария Author/Male/Female. Сначала подготовьте AI-сценарий.",
+                            )
+                            self.c_idx = -1
+                            continue
+                        segment_label = "абз." if self.segment_mode == "paragraphs" else "предл."
+                        logger.info(f"Воркер {self.worker_id} взял Главу {self.c_idx + 1} ({total_sent} {segment_label})")
+                    except queue.Empty:
+                        self._emit_finished()
+                        break
+                else:
+                    total_sent = len(self._cached_chapter_segments(self.c_idx))
                     if self.voice_mode == "author_gender" and total_sent == 0:
                         self.error_signal.emit(
                             self.worker_id,
@@ -4238,177 +4276,168 @@ class GeminiWorker(QThread):
                         )
                         self.c_idx = -1
                         continue
-                    segment_label = "абз." if self.segment_mode == "paragraphs" else "предл."
-                    logger.info(f"Воркер {self.worker_id} взял Главу {self.c_idx + 1} ({total_sent} {segment_label})")
-                except queue.Empty:
-                    self._emit_finished()
-                    break
-            else:
-                total_sent = len(self._chapter_segments(self.c_idx))
-                if self.voice_mode == "author_gender" and total_sent == 0:
-                    self.error_signal.emit(
-                        self.worker_id,
-                        f"Глава {self.c_idx + 1}: нет корректного AI-сценария Author/Male/Female. Сначала подготовьте AI-сценарий.",
-                    )
+
+                if self.bm.is_chapter_done(self.c_idx):
+                    self.chapter_done_ui_signal.emit(self.c_idx)
                     self.c_idx = -1
                     continue
 
-            if self.bm.is_chapter_done(self.c_idx):
-                self.chapter_done_ui_signal.emit(self.c_idx)
-                self.c_idx = -1
-                continue
+                if self.s_idx >= total_sent:
+                    logger.info(f"Воркер {self.worker_id} сохраняет и завершает Главу {self.c_idx + 1}")
+                    await self.save_file(final=True)
+                    self.bm.mark_chapter_done(self.c_idx)
+                    self.chapter_done_ui_signal.emit(self.c_idx)
+                    if self.worker_id == 0: 
+                        self.change_chapter_signal.emit(self.c_idx)
+                    self.c_idx = -1
+                    continue
 
-            if self.s_idx >= total_sent:
-                logger.info(f"Воркер {self.worker_id} сохраняет и завершает Главу {self.c_idx + 1}")
-                await self.save_file(final=True)
-                self.bm.mark_chapter_done(self.c_idx)
-                self.chapter_done_ui_signal.emit(self.c_idx)
-                if self.worker_id == 0: 
-                    self.change_chapter_signal.emit(self.c_idx)
-                self.c_idx = -1
-                continue
+                if total_sent > 0:
+                    self._emit_worker_progress(self.c_idx, self.s_idx, total_sent)
 
-            if total_sent > 0:
-                self._emit_worker_progress(self.c_idx, self.s_idx, total_sent)
-
-            current_chunk_size = 1 if single_sentence_mode_remaining > 0 else self.chunk
+                current_chunk_size = 1 if single_sentence_mode_remaining > 0 else self.chunk
             
-            segments = self._chapter_segments(self.c_idx)
-            text_parts = []
-            actual_count = 0
-            end_range = min(self.s_idx + current_chunk_size, total_sent)
+                segments = self._cached_chapter_segments(self.c_idx)
+                text_parts = []
+                actual_count = 0
+                end_range = min(self.s_idx + current_chunk_size, total_sent)
             
-            for i in range(self.s_idx, end_range):
-                text_parts.append(segments[i])
-                actual_count += 1
+                for i in range(self.s_idx, end_range):
+                    text_parts.append(segments[i])
+                    actual_count += 1
             
-            request_payload = self._build_live_request_payload(self._join_segments_for_request(text_parts))
-            payload_preview = ""
-            if request_payload:
-                if request_payload.get("mode") == "author_gender":
-                    payload_preview = " | ".join(
-                        item.get("text", "")[:20] for item in request_payload.get("plan", [])[:2]
-                    )
-                else:
-                    payload_preview = request_payload.get("text", "")[:30]
-            if not request_payload:
-                self.s_idx += 1
-                if single_sentence_mode_remaining > 0:
-                    single_sentence_mode_remaining -= 1
-                continue
-
-            data_received = False
-            request_budget_acquired = False
-            try:
-                if request_payload.get("mode") == "author_gender":
-                    audio_bytes = await self._collect_live_payload_audio(client, request_payload)
-                    data_received = self._commit_live_audio_bytes(audio_bytes)
-                else:
-                    text_to_send = request_payload["text"]
-                    config = request_payload["config"]
-                    request_audio = bytearray()
-
-                    def _on_live_chunk(data):
-                        request_audio.extend(data)
-                        if self.audio_queue and not self.fast:
-                            self._enqueue_live_audio((data, self.c_idx, self.s_idx, False))
-
-                    raw_audio = await self._collect_live_request_raw_audio(
-                        client,
-                        config,
-                        text_to_send,
-                        on_chunk=_on_live_chunk,
-                    )
-                    data_received = bool(raw_audio)
-                    if self.record and request_audio:
-                        trimmed_audio = _trim_raw_pcm_boundaries(bytes(request_audio))
-                        with self.buffer_lock:
-                            self.audio_chunks.append(trimmed_audio)
-            except Exception as e:
-                if isinstance(e, ReaderWorkerStopped):
-                    break
-                if isinstance(e, ProjectRateLimitReachedError):
-                    self._abort_for_project_quota(str(e), e.model_id or self.model_id)
-                    break
-                if isinstance(e, RateLimitBudgetError):
-                    self._abort_for_quota_key(str(e), e.model_id or self.model_id)
-                    break
-                if _is_invalid_api_key_error(e):
-                    self._abort_for_invalid_key(str(e))
-                    break
-                if _is_rate_limited_error(e):
-                    self._abort_for_quota_key(str(e), self.model_id)
-                    break
-                # Ошибки сети или внезапные разрывы логируем, чтобы не было "тихих" провалов
-                logger.debug(f"[W{self.worker_id}] Внутренняя ошибка сессии Gemini: {e}")
-
-            if not data_received and self._is_running:
-                if current_chunk_size > 1:
-                    # ДАЕМ БАТЧУ 3 ПОПЫТКИ ПЕРЕД ДРОБЛЕНИЕМ НА ОДИНОЧНЫЕ ПРЕДЛОЖЕНИЯ
-                    if batch_retry_count < 3:
-                        batch_retry_count += 1
-                        logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (батч). Попытка {batch_retry_count}/3 для батча: '{payload_preview}...'")
-                        if not await self._sleep_interruptibly(2):
-                            break
-                        continue # Возвращаемся в начало и пробуем этот же батч целиком
+                request_payload = self._build_live_request_payload(self._join_segments_for_request(text_parts))
+                payload_preview = ""
+                if request_payload:
+                    if request_payload.get("mode") == "author_gender":
+                        payload_preview = " | ".join(
+                            item.get("text", "")[:20] for item in request_payload.get("plan", [])[:2]
+                        )
                     else:
-                        logger.warning(f"[W{self.worker_id}] Батч не прошел после 3 попыток! Дробим {actual_count} предл. по одному...")
-                        single_sentence_mode_remaining = actual_count
-                        fail_count = 0 
-                        gemini_retry_count = 0 
-                        batch_retry_count = 0
-                        continue
-                else:
-                    # ДАЕМ ОДИНОЧНОМУ ПРЕДЛОЖЕНИЮ 3 ПОПЫТКИ ПЕРЕД EDGE TTS
-                    if gemini_retry_count < 3:
-                        gemini_retry_count += 1
-                        logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (одиночное). Попытка {gemini_retry_count}/3 для: '{payload_preview}...'")
-                        if not await self._sleep_interruptibly(2):
-                            break
-                        continue
-                    else:
-                        fallback_source_text = request_payload.get("text", "") if request_payload else ""
-                        if request_payload and request_payload.get("mode") == "author_gender":
-                            fallback_source_text = "\n\n".join(
-                                item.get("text", "") for item in request_payload.get("plan", [])
-                            )
-                        logger.warning(f"[W{self.worker_id}] Gemini сдался после 3 попыток. Озвучка Edge TTS: '{payload_preview}...'")
-                        fallback_data = await self.get_edge_tts_fallback(fallback_source_text)
-                        if fallback_data:
-                            data_received = self._commit_live_audio_bytes(fallback_data)
+                        payload_preview = request_payload.get("text", "")[:30]
+                if not request_payload:
+                    self.s_idx += 1
+                    if single_sentence_mode_remaining > 0:
+                        single_sentence_mode_remaining -= 1
+                    continue
 
-            # УСПЕХ ИЛИ ПРОПУСК
-            if data_received:
-                fail_count = 0 
-                gemini_retry_count = 0 
-                batch_retry_count = 0 # Сбрасываем все счетчики ошибок при успехе
-                self.s_idx = min(self.s_idx + actual_count, total_sent)
-                
-                if single_sentence_mode_remaining > 0:
-                    single_sentence_mode_remaining -= actual_count
-                    
-                self._emit_worker_progress(self.c_idx, self.s_idx, total_sent, force=self.s_idx >= total_sent)
-                
-                if self.worker_id == 0:
-                    self.bm.save_progress(self.c_idx, self.s_idx, force=self.s_idx >= total_sent)
-                
-                if self.record:
-                    await self._autosave_live_mp3_if_due(total_sent)
-            else:
-                # Сюда программа дойдет только если даже Edge TTS не смог сгенерировать звук
-                fail_count += 1
-                if fail_count >= 3:
-                    logger.error(f"[W{self.worker_id}] Пропуск предложения после неудач Edge TTS: '{payload_preview}...'")
+                data_received = False
+                request_budget_acquired = False
+                try:
+                    if request_payload.get("mode") == "author_gender":
+                        audio_bytes = await self._collect_live_payload_audio(client, request_payload)
+                        data_received = self._commit_live_audio_bytes(audio_bytes)
+                    else:
+                        text_to_send = request_payload["text"]
+                        config = request_payload["config"]
+                        request_audio = bytearray()
+
+                        def _on_live_chunk(data):
+                            request_audio.extend(data)
+                            if self.audio_queue and not self.fast:
+                                self._enqueue_live_audio((data, self.c_idx, self.s_idx, False))
+
+                        raw_audio = await self._collect_live_request_raw_audio(
+                            client,
+                            config,
+                            text_to_send,
+                            on_chunk=_on_live_chunk,
+                        )
+                        data_received = bool(raw_audio)
+                        if self.record and request_audio:
+                            trimmed_audio = _trim_raw_pcm_boundaries(bytes(request_audio))
+                            with self.buffer_lock:
+                                self.audio_chunks.append(trimmed_audio)
+                except Exception as e:
+                    if isinstance(e, ReaderWorkerStopped):
+                        break
+                    if isinstance(e, ProjectRateLimitReachedError):
+                        self._abort_for_project_quota(str(e), e.model_id or self.model_id)
+                        break
+                    if isinstance(e, RateLimitBudgetError):
+                        self._abort_for_quota_key(str(e), e.model_id or self.model_id)
+                        break
+                    if _is_invalid_api_key_error(e):
+                        self._abort_for_invalid_key(str(e))
+                        break
+                    if _is_rate_limited_error(e):
+                        self._abort_for_quota_key(str(e), self.model_id)
+                        break
+                    # Ошибки сети или внезапные разрывы логируем, чтобы не было "тихих" провалов
+                    logger.debug(f"[W{self.worker_id}] Внутренняя ошибка сессии Gemini: {e}")
+
+                if not data_received and self._is_running:
+                    if current_chunk_size > 1:
+                        # ДАЕМ БАТЧУ 3 ПОПЫТКИ ПЕРЕД ДРОБЛЕНИЕМ НА ОДИНОЧНЫЕ ПРЕДЛОЖЕНИЯ
+                        if batch_retry_count < 3:
+                            batch_retry_count += 1
+                            logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (батч). Попытка {batch_retry_count}/3 для батча: '{payload_preview}...'")
+                            if not await self._sleep_interruptibly(2):
+                                break
+                            continue # Возвращаемся в начало и пробуем этот же батч целиком
+                        else:
+                            logger.warning(f"[W{self.worker_id}] Батч не прошел после 3 попыток! Дробим {actual_count} предл. по одному...")
+                            single_sentence_mode_remaining = actual_count
+                            fail_count = 0 
+                            gemini_retry_count = 0 
+                            batch_retry_count = 0
+                            continue
+                    else:
+                        # ДАЕМ ОДИНОЧНОМУ ПРЕДЛОЖЕНИЮ 3 ПОПЫТКИ ПЕРЕД EDGE TTS
+                        if gemini_retry_count < 3:
+                            gemini_retry_count += 1
+                            logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (одиночное). Попытка {gemini_retry_count}/3 для: '{payload_preview}...'")
+                            if not await self._sleep_interruptibly(2):
+                                break
+                            continue
+                        else:
+                            fallback_source_text = request_payload.get("text", "") if request_payload else ""
+                            if request_payload and request_payload.get("mode") == "author_gender":
+                                fallback_source_text = "\n\n".join(
+                                    item.get("text", "") for item in request_payload.get("plan", [])
+                                )
+                            logger.warning(f"[W{self.worker_id}] Gemini сдался после 3 попыток. Озвучка Edge TTS: '{payload_preview}...'")
+                            fallback_data = await self.get_edge_tts_fallback(fallback_source_text)
+                            if fallback_data:
+                                data_received = self._commit_live_audio_bytes(fallback_data)
+
+                # УСПЕХ ИЛИ ПРОПУСК
+                if data_received:
+                    fail_count = 0 
+                    gemini_retry_count = 0 
+                    batch_retry_count = 0 # Сбрасываем все счетчики ошибок при успехе
                     self.s_idx = min(self.s_idx + actual_count, total_sent)
-                    fail_count = 0
-                    gemini_retry_count = 0
-                    batch_retry_count = 0
+                
                     if single_sentence_mode_remaining > 0:
                         single_sentence_mode_remaining -= actual_count
+                    
+                    self._emit_worker_progress(self.c_idx, self.s_idx, total_sent, force=self.s_idx >= total_sent)
+                
+                    if self.worker_id == 0:
+                        self.bm.save_progress(self.c_idx, self.s_idx, force=self.s_idx >= total_sent)
+                
+                    if self.record:
+                        await self._autosave_live_mp3_if_due(total_sent)
                 else:
-                    logger.error(f"[W{self.worker_id}] Ошибка Edge TTS. Попытка {fail_count}/3. Пауза 5 сек...")
-                    if not await self._sleep_interruptibly(5):
-                        break
+                    # Сюда программа дойдет только если даже Edge TTS не смог сгенерировать звук
+                    fail_count += 1
+                    if fail_count >= 3:
+                        logger.error(f"[W{self.worker_id}] Пропуск предложения после неудач Edge TTS: '{payload_preview}...'")
+                        self.s_idx = min(self.s_idx + actual_count, total_sent)
+                        fail_count = 0
+                        gemini_retry_count = 0
+                        batch_retry_count = 0
+                        if single_sentence_mode_remaining > 0:
+                            single_sentence_mode_remaining -= actual_count
+                    else:
+                        logger.error(f"[W{self.worker_id}] Ошибка Edge TTS. Попытка {fail_count}/3. Пауза 5 сек...")
+                        if not await self._sleep_interruptibly(5):
+                            break
+        finally:
+            # Гарантируем запись последней достигнутой позиции при остановке посреди главы:
+            # без этого двухсекундный throttle save_progress мог не долететь до диска (см. bugs/5).
+            if self.worker_id == 0 and self.c_idx != -1:
+                self.bm.save_progress(self.c_idx, self.s_idx, force=True)
 
 
 

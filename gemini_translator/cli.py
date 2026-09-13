@@ -678,7 +678,10 @@ class CliSessionObserver:
         self.timed_out = True
         self.reason = f"timeout after {self.timeout_sec}s"
         try:
-            self.app.event_bus.event_posted.emit({
+            # Через emit_event, а не напрямую в event_posted: manual_stop_requested
+            # входит в STOP_EVENTS, и только emit_event снимает зависшие MCP-запросы
+            # (inflight.cancel_all()) до того, как приложение завершится.
+            self.app.event_bus.emit_event({
                 "event": "manual_stop_requested",
                 "source": "cli",
                 "data": {"reason": self.reason},
@@ -1584,112 +1587,115 @@ def command_build_epub(args) -> dict:
 
 def command_generate(args) -> dict:
     runtime = HeadlessRuntime()
-    app = runtime.bootstrap(include_engine=True)
-    _settings_with_single_task_mode(args)
+    try:
+        app = runtime.bootstrap(include_engine=True)
+        _settings_with_single_task_mode(args)
 
-    prompt_text = getattr(args, "prompt", None)
-    if prompt_text is None:
-        prompt_text = _load_text_file(getattr(args, "prompt_file", None))
+        prompt_text = getattr(args, "prompt", None)
+        if prompt_text is None:
+            prompt_text = _load_text_file(getattr(args, "prompt_file", None))
 
-    input_text = getattr(args, "text", None)
-    if input_text is None:
-        input_text = _load_text_file(getattr(args, "input", None))
-    if input_text is None and not sys.stdin.isatty():
-        input_text = sys.stdin.read()
-    input_text = input_text if input_text is not None else ""
+        input_text = getattr(args, "text", None)
+        if input_text is None:
+            input_text = _load_text_file(getattr(args, "input", None))
+        if input_text is None and not sys.stdin.isatty():
+            input_text = sys.stdin.read()
+        input_text = input_text if input_text is not None else ""
 
-    settings = build_session_settings(app.settings_manager, None, [], args)
-    payload = ("raw_text_translation", input_text, prompt_text, getattr(args, "label", None) or "CLI generation")
-    result, task_results = _run_task_session(
-        app,
-        runtime,
-        settings,
-        [payload],
-        verbose=bool(args.verbose),
-        timeout=args.timeout,
-        capture_results=True,
-    )
-    successful = [item for item in task_results if item.get("success")]
-    runtime.shutdown()
-    return {
-        "ok": bool(_session_completed_ok(result) and successful),
-        "status": "finished" if result["finished"] else "stopped",
-        "provider": settings.get("provider"),
-        "model": settings.get("model"),
-        "text": successful[0].get("result_data") if successful else "",
-        "result": result,
-    }
+        settings = build_session_settings(app.settings_manager, None, [], args)
+        payload = ("raw_text_translation", input_text, prompt_text, getattr(args, "label", None) or "CLI generation")
+        result, task_results = _run_task_session(
+            app,
+            runtime,
+            settings,
+            [payload],
+            verbose=bool(args.verbose),
+            timeout=args.timeout,
+            capture_results=True,
+        )
+        successful = [item for item in task_results if item.get("success")]
+        return {
+            "ok": bool(_session_completed_ok(result) and successful),
+            "status": "finished" if result["finished"] else "stopped",
+            "provider": settings.get("provider"),
+            "model": settings.get("model"),
+            "text": successful[0].get("result_data") if successful else "",
+            "result": result,
+        }
+    finally:
+        runtime.shutdown()
 
 
 def command_glossary_generate(args) -> dict:
     runtime = HeadlessRuntime()
-    app = runtime.bootstrap(include_engine=True)
-    _settings_with_single_task_mode(args)
-
-    project_folder = _abs_path(args.project)
-    epub_path = _abs_path(args.epub)
-    pm = _project_manager(project_folder)
-    chapters = select_chapters(
-        epub_path,
-        pm,
-        mode=args.chapters,
-        patterns=args.chapter or [],
-        offset=args.offset,
-        limit=args.limit,
-    )
-    if not chapters:
-        runtime.shutdown()
-        return {"ok": True, "status": "no_chapters", "epub": epub_path, "project": project_folder}
-
-    settings = build_session_settings(app.settings_manager, pm, chapters, args)
-    glossary_prompt = _load_text_file(getattr(args, "glossary_prompt_file", None))
-    if glossary_prompt is not None:
-        settings["glossary_generation_prompt"] = glossary_prompt
-    else:
-        settings.setdefault("glossary_generation_prompt", _ensure_api_config_initialized().default_glossary_prompt())
-    settings["glossary_merge_mode"] = args.merge_mode
-    settings["initial_glossary_list"] = _glossary_dict_to_list(load_project_glossary(project_folder, getattr(args, "glossary", None)))
-    if getattr(args, "new_terms_limit", None) is not None:
-        settings["new_terms_limit"] = int(args.new_terms_limit)
-
-    batch_size = max(1, int(args.batch_size or 1))
-    payloads = [
-        ("glossary_batch_task", epub_path, tuple(chapters[index:index + batch_size]))
-        for index in range(0, len(chapters), batch_size)
-    ]
-    result, _ = _run_task_session(
-        app,
-        runtime,
-        settings,
-        payloads,
-        verbose=bool(args.verbose),
-        timeout=args.timeout,
-    )
-
-    glossary_rows = 0
-    unique_terms = 0
     try:
-        with app.task_manager._light_read_conn() as conn:
-            glossary_rows = int(conn.execute("SELECT COUNT(*) FROM glossary_results").fetchone()[0] or 0)
-            unique_terms = int(conn.execute("SELECT COUNT(DISTINCT LOWER(TRIM(original))) FROM glossary_results").fetchone()[0] or 0)
-    except Exception:
-        pass
+        app = runtime.bootstrap(include_engine=True)
+        _settings_with_single_task_mode(args)
 
-    runtime.shutdown()
-    return {
-        "ok": _session_completed_ok(result),
-        "status": "finished" if result["finished"] else "stopped",
-        "epub": epub_path,
-        "project": project_folder,
-        "chapters": chapters,
-        "task_count": len(payloads),
-        "merge_mode": args.merge_mode,
-        "glossary_results": {
-            "rows": glossary_rows,
-            "unique_terms": unique_terms,
-        },
-        "result": result,
-    }
+        project_folder = _abs_path(args.project)
+        epub_path = _abs_path(args.epub)
+        pm = _project_manager(project_folder)
+        chapters = select_chapters(
+            epub_path,
+            pm,
+            mode=args.chapters,
+            patterns=args.chapter or [],
+            offset=args.offset,
+            limit=args.limit,
+        )
+        if not chapters:
+            return {"ok": True, "status": "no_chapters", "epub": epub_path, "project": project_folder}
+
+        settings = build_session_settings(app.settings_manager, pm, chapters, args)
+        glossary_prompt = _load_text_file(getattr(args, "glossary_prompt_file", None))
+        if glossary_prompt is not None:
+            settings["glossary_generation_prompt"] = glossary_prompt
+        else:
+            settings.setdefault("glossary_generation_prompt", _ensure_api_config_initialized().default_glossary_prompt())
+        settings["glossary_merge_mode"] = args.merge_mode
+        settings["initial_glossary_list"] = _glossary_dict_to_list(load_project_glossary(project_folder, getattr(args, "glossary", None)))
+        if getattr(args, "new_terms_limit", None) is not None:
+            settings["new_terms_limit"] = int(args.new_terms_limit)
+
+        batch_size = max(1, int(args.batch_size or 1))
+        payloads = [
+            ("glossary_batch_task", epub_path, tuple(chapters[index:index + batch_size]))
+            for index in range(0, len(chapters), batch_size)
+        ]
+        result, _ = _run_task_session(
+            app,
+            runtime,
+            settings,
+            payloads,
+            verbose=bool(args.verbose),
+            timeout=args.timeout,
+        )
+
+        glossary_rows = 0
+        unique_terms = 0
+        try:
+            with app.task_manager._light_read_conn() as conn:
+                glossary_rows = int(conn.execute("SELECT COUNT(*) FROM glossary_results").fetchone()[0] or 0)
+                unique_terms = int(conn.execute("SELECT COUNT(DISTINCT LOWER(TRIM(original))) FROM glossary_results").fetchone()[0] or 0)
+        except Exception:
+            pass
+
+        return {
+            "ok": _session_completed_ok(result),
+            "status": "finished" if result["finished"] else "stopped",
+            "epub": epub_path,
+            "project": project_folder,
+            "chapters": chapters,
+            "task_count": len(payloads),
+            "merge_mode": args.merge_mode,
+            "glossary_results": {
+                "rows": glossary_rows,
+                "unique_terms": unique_terms,
+            },
+            "result": result,
+        }
+    finally:
+        runtime.shutdown()
 
 
 def command_consistency(args) -> dict:
@@ -1813,80 +1819,81 @@ def command_untranslated_scan(args) -> dict:
 
 def command_untranslated_fix(args) -> dict:
     runtime = HeadlessRuntime()
-    app = runtime.bootstrap(include_engine=True)
-    _settings_with_single_task_mode(args)
+    try:
+        app = runtime.bootstrap(include_engine=True)
+        _settings_with_single_task_mode(args)
 
-    project_folder = _abs_path(args.project)
-    epub_path = _abs_path(args.epub)
-    pm = _project_manager(project_folder)
-    suffix = getattr(args, "suffix", None)
-    chapters = select_chapters(
-        epub_path,
-        pm,
-        mode=args.chapters,
-        patterns=args.chapter or [],
-        offset=args.offset,
-        limit=args.limit,
-    )
-    records, missing = _load_translated_chapter_records(epub_path, project_folder, pm, chapters, suffix=suffix)
-    exceptions = _word_exceptions_from_project(app.settings_manager, project_folder, getattr(args, "exceptions", None))
-    data_items, soup_cache, scan_issues = _collect_untranslated_fix_items(
-        records,
-        word_exceptions=exceptions,
-        max_context_chars=int(args.max_context_chars or 2000),
-    )
-    if not data_items:
-        runtime.shutdown()
+        project_folder = _abs_path(args.project)
+        epub_path = _abs_path(args.epub)
+        pm = _project_manager(project_folder)
+        suffix = getattr(args, "suffix", None)
+        chapters = select_chapters(
+            epub_path,
+            pm,
+            mode=args.chapters,
+            patterns=args.chapter or [],
+            offset=args.offset,
+            limit=args.limit,
+        )
+        records, missing = _load_translated_chapter_records(epub_path, project_folder, pm, chapters, suffix=suffix)
+        exceptions = _word_exceptions_from_project(app.settings_manager, project_folder, getattr(args, "exceptions", None))
+        data_items, soup_cache, scan_issues = _collect_untranslated_fix_items(
+            records,
+            word_exceptions=exceptions,
+            max_context_chars=int(args.max_context_chars or 2000),
+        )
+        if not data_items:
+            return {
+                "ok": True,
+                "status": "no_untranslated_contexts",
+                "epub": epub_path,
+                "project": project_folder,
+                "checked_chapters": len(records),
+                "missing_translations": missing[:50],
+                "issues": scan_issues,
+            }
+
+        settings = build_session_settings(app.settings_manager, pm, chapters, args)
+        prompt_text = _untranslated_fix_prompt(app.settings_manager, getattr(args, "fix_prompt_file", None))
+        request_payloads = _build_untranslated_fix_payloads(data_items, batch_size=args.batch_size)
+        task_payloads = [
+            ("raw_text_translation", payload, prompt_text, f"Untranslated fixer {index + 1}/{len(request_payloads)}")
+            for index, payload in enumerate(request_payloads)
+        ]
+        result, task_results = _run_task_session(
+            app,
+            runtime,
+            settings,
+            task_payloads,
+            verbose=bool(args.verbose),
+            timeout=args.timeout,
+            capture_results=True,
+        )
+
+        changes, translated_groups = _parse_untranslated_fix_changes(task_results, data_items)
+        apply_info = _apply_untranslated_fix_changes(changes, soup_cache, dry_run=bool(args.dry_run)) if changes else {
+            "groups_changed": 0,
+            "replacements": 0,
+            "affected_files": [],
+            "saved_count": 0,
+            "dry_run": bool(args.dry_run),
+        }
+
         return {
-            "ok": True,
-            "status": "no_untranslated_contexts",
+            "ok": _session_completed_ok(result),
+            "status": "finished" if result["finished"] else "stopped",
             "epub": epub_path,
             "project": project_folder,
             "checked_chapters": len(records),
             "missing_translations": missing[:50],
+            "groups_found": len(data_items),
+            "translated_groups": translated_groups,
             "issues": scan_issues,
+            "apply": apply_info,
+            "result": result,
         }
-
-    settings = build_session_settings(app.settings_manager, pm, chapters, args)
-    prompt_text = _untranslated_fix_prompt(app.settings_manager, getattr(args, "fix_prompt_file", None))
-    request_payloads = _build_untranslated_fix_payloads(data_items, batch_size=args.batch_size)
-    task_payloads = [
-        ("raw_text_translation", payload, prompt_text, f"Untranslated fixer {index + 1}/{len(request_payloads)}")
-        for index, payload in enumerate(request_payloads)
-    ]
-    result, task_results = _run_task_session(
-        app,
-        runtime,
-        settings,
-        task_payloads,
-        verbose=bool(args.verbose),
-        timeout=args.timeout,
-        capture_results=True,
-    )
-
-    changes, translated_groups = _parse_untranslated_fix_changes(task_results, data_items)
-    apply_info = _apply_untranslated_fix_changes(changes, soup_cache, dry_run=bool(args.dry_run)) if changes else {
-        "groups_changed": 0,
-        "replacements": 0,
-        "affected_files": [],
-        "saved_count": 0,
-        "dry_run": bool(args.dry_run),
-    }
-
-    runtime.shutdown()
-    return {
-        "ok": _session_completed_ok(result),
-        "status": "finished" if result["finished"] else "stopped",
-        "epub": epub_path,
-        "project": project_folder,
-        "checked_chapters": len(records),
-        "missing_translations": missing[:50],
-        "groups_found": len(data_items),
-        "translated_groups": translated_groups,
-        "issues": scan_issues,
-        "apply": apply_info,
-        "result": result,
-    }
+    finally:
+        runtime.shutdown()
 
 
 def _add_common_project_args(parser: argparse.ArgumentParser) -> None:

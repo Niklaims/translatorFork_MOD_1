@@ -249,8 +249,14 @@ class FilterPackagingDialog(QDialog):
             
             for filtered_chapter in self.filtered_chapters:
                 batch = [filtered_chapter]
-                num_needed_to_pad = chapters_per_batch - 1
-                
+                # Ограничиваем количеством уникальных успешных глав: если их
+                # меньше, чем запрошено в спинбоксе, `itertools.cycle` иначе
+                # вернул бы одну и ту же главу несколько раз в ЭТОТ ЖЕ batch
+                # (главу «за одну попытку» модель бы переводила повторно и
+                # впустую тратила вызов API). Между разными batch-ами глава
+                # по-прежнему может повторяться — это ожидаемое разбавление.
+                num_needed_to_pad = min(chapters_per_batch - 1, len(self.successful_chapters))
+
                 if num_needed_to_pad > 0:
                     for _ in range(num_needed_to_pad):
                         batch.append(next(successful_cycler))

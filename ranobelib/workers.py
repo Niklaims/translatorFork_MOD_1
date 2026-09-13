@@ -97,6 +97,26 @@ RANOBELIB_TAGS = (
 # main.py/api_upload.py, обращающимися к ним по имени через модуль workers.
 _RANOBELIB_EXTRA_CHROMIUM_GLOBS = (
     "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+    # ranobelib/bugs/6-cached-chromium-finder-windows: канонический
+    # _BASE_CHROMIUM_GLOB в playwright_launcher ищет только Windows-раскладку
+    # ("chrome-win*/chrome.exe"), поэтому на macOS/Linux фолбэк на уже
+    # забандленный кэш Chromium в playwright_runtime/ms-playwright никогда не
+    # находил исполняемый файл. Реальные имена каталогов/бинарников для
+    # обычного (headed) Chromium и chrome-headless-shell подтверждены по
+    # EXECUTABLE_PATHS установленного в .venv playwright (driver/package/lib/
+    # coreBundle.js): headed-сборка на macOS называется не "Chromium.app", а
+    # "Google Chrome for Testing.app" (для обоих mac-x64/mac-arm64); имя файла
+    # headless-shell на mac и linux-x64 - всегда "chrome-headless-shell", а на
+    # linux-arm64 (non-cft сборка) каталог называется "chrome-linux", а файл -
+    # "headless_shell". Старый Chromium.app-шаблон оставлен как легаси для
+    # уже существующих у пользователей старых кэшей с такой раскладкой.
+    "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+    "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "chromium-*/chrome-linux*/chrome",
+    "chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell",
+    "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell",
+    "chromium_headless_shell-*/chrome-headless-shell-linux*/headless_shell",
+    "chromium_headless_shell-*/chrome-linux*/headless_shell",
 )
 
 

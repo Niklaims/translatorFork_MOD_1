@@ -1,5 +1,6 @@
 import re
 import ipaddress
+import socket
 from datetime import timedelta
 from urllib.parse import urlsplit
 
@@ -37,7 +38,30 @@ def is_safe_remote_http_url(url: str) -> bool:
         try:
             return ipaddress.ip_address(hostname).is_global
         except ValueError:
+            pass
+
+        # hostname — не IP-литерал: резолвим DNS и проверяем КАЖДЫЙ
+        # полученный адрес. Раньше функция просто возвращала True для любого
+        # доменного имени, так что домен, специально указывающий на
+        # приватный/loopback/link-local адрес (DNS rebinding либо скрытый
+        # внутренний сервис), проходил гейт перед urllib.request в workers.py.
+        try:
+            addr_infos = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
+            # Хост вообще не резолвится - реальный запрос всё равно упадёт
+            # на резолве, SSRF-риска здесь нет, поэтому не блокируем по
+            # этой причине (сохраняем прежнее поведение для мёртвых хостов).
             return True
+        if not addr_infos:
+            return True
+        for info in addr_infos:
+            ip_str = info[4][0]
+            try:
+                if not ipaddress.ip_address(ip_str).is_global:
+                    return False
+            except ValueError:
+                return False
+        return True
     except (TypeError, ValueError):
         return False
 

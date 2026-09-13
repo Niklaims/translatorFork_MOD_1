@@ -2065,6 +2065,18 @@ class TranslationValidatorPage(ShellPage):
         self._fixer_filter_state = None
         self._fixer_data_fingerprint = None
         self._fixer_stale_rows: set = set()  # строки, требующие пересчёта untranslated_words
+
+        # Контроллер окна «Качество перевода» переживает закрытие самого
+        # диалога: проход по книге идёт в фоне и после закрытия окна, и
+        # обратные вызовы из QA-потока не должны попадать в удалённый
+        # Qt-объект (ui-dialogs-validation/runtime/17-qa-dialog-closed-mid-pass-call).
+        self._quality_controller = None
+        self._quality_pass_running = False
+        # Отпечаток настроек (модель/ключи/прокси), с которым в последний раз
+        # был собран РУЧНОЙ координатор проверки (не координатор активной
+        # сессии перевода — тот никогда не пересобирается этой страницей).
+        self._manual_quality_coordinator = None
+        self._manual_quality_snapshot = None
         
         app = QtWidgets.QApplication.instance()
         self.settings_manager = app.get_settings_manager() if hasattr(app, 'settings_manager') else None
@@ -2970,9 +2982,6 @@ class TranslationValidatorPage(ShellPage):
 
     def open_translation_quality_dialog(self):
         """Open the translation quality report for the current project."""
-        from .validation_dialogs.translation_quality_controller import (
-            TranslationQualityController,
-        )
         from .validation_dialogs.translation_quality_dialog import (
             TranslationQualityDialog,
         )
@@ -2994,14 +3003,11 @@ class TranslationValidatorPage(ShellPage):
         )
         dialog.settings_changed.connect(settings_manager.save_qa_settings)
         dialog.set_status(qa_settings.embedding_setup_problem() or "Готово.")
-        controller = TranslationQualityController(
-            coordinator_provider=self._quality_coordinator,
-            journal_loader=self._quality_journal,
-            gates_provider=self._quality_open_gates,
-            event_builder=self._quality_events,
-            parent=dialog,
-        )
+        controller = self._quality_controller_instance()
         controller.attach(dialog)
+        # Проход, начатый из прошлого открытия окна, мог не завершиться:
+        # отражаем это сразу, а не только когда придёт следующий сигнал.
+        dialog.set_busy(self._quality_pass_running)
         # Build the runtime now, so the window can say at once whether a pass
         # is possible instead of letting a button do nothing.
         self._quality_setup_problem = ""
@@ -3011,6 +3017,44 @@ class TranslationValidatorPage(ShellPage):
                 or "Проверка сейчас недоступна."
             )
         exec_dialog(self, dialog)
+
+    def _quality_controller_instance(self):
+        """Return the page's one quality controller, building it on first use.
+
+        The QA runtime keeps working on a book long after the dialog that
+        started it is closed — that continuation is intentional. Parenting
+        the controller to the *dialog* used to make Qt destroy it the moment
+        the window closed, so the pass's next progress callback (arriving
+        later, from the QA thread) reached into a deleted C++ object and
+        raised RuntimeError instead of updating a report
+        (ui-dialogs-validation/runtime/17-qa-dialog-closed-mid-pass-call).
+        Parenting it to this page — which outlives any single quality
+        dialog — and reusing that same instance across re-opens keeps it
+        alive for as long as the pass runs, and lets a freshly reopened
+        window learn a pass is still going instead of showing "не занят"
+        for one that is quietly still spending API keys in the background.
+        """
+        controller = self._quality_controller
+        if controller is not None:
+            return controller
+        from .validation_dialogs.translation_quality_controller import (
+            TranslationQualityController,
+        )
+
+        controller = TranslationQualityController(
+            coordinator_provider=self._quality_coordinator,
+            journal_loader=self._quality_journal,
+            gates_provider=self._quality_open_gates,
+            event_builder=self._quality_events,
+            parent=self,
+        )
+        controller.busy_changed.connect(self._on_quality_pass_busy_changed)
+        self._quality_controller = controller
+        return controller
+
+    def _on_quality_pass_busy_changed(self, busy: bool) -> None:
+        """Track whether a pass is running independently of any open dialog."""
+        self._quality_pass_running = bool(busy)
 
     def _quality_settings_manager(self):
         app = QApplication.instance()
@@ -3042,12 +3086,135 @@ class TranslationValidatorPage(ShellPage):
         report, and there is no session to borrow a runtime from.  A session's
         own coordinator is never replaced: it knows the model and keys that
         session is running on.
+
+        A coordinator *this window* built manually is a different matter: it
+        used to be kept forever, so changing the checking model, keys or
+        proxy in settings and reopening the window silently kept using the
+        stale runtime built before the change
+        (ui-dialogs-validation/runtime/13-manual-qa-coordinator-stale). That
+        one — and only that one, never a live session's — is rebuilt when its
+        settings snapshot no longer matches what is configured now.
+
+        Two review corrections on that rebuild, both about not destroying a
+        coordinator that is still doing real work:
+
+        * A pass in flight is never torn down out from under itself. Whether
+          settings changed or not, a coordinator this page still considers
+          busy (``_quality_pass_running``) or that still has scheduled checks
+          (``_pending``) is returned as-is; the rebuild — if settings really
+          did change — happens on the next call, once the pass has ended.
+        * The replacement is built *before* anything happens to the one that
+          works. Detaching first and asking questions later meant a build
+          that failed after the old coordinator was already gone (all keys of
+          the new model briefly red, say) left the window with nothing —
+          exactly the moment the user reaches for "Остановить". Nothing here
+          calls ``detach_chapter_qa_coordinator`` directly any more; that is
+          ``attach_chapter_qa_coordinator``'s job, and it only runs once
+          ``_build_manual_quality_coordinator`` is convinced a replacement is
+          possible at all.
         """
         app = QApplication.instance()
         existing = getattr(app, "qa_coordinator", None)
-        if existing is not None:
+        manual = getattr(self, "_manual_quality_coordinator", None)
+        if existing is not None and existing is not manual:
             return existing
+        if existing is not None and existing is manual:
+            if self._quality_pass_running or self._coordinator_is_busy(existing):
+                return existing
+            settings_manager = self._quality_settings_manager()
+            current_snapshot = self._manual_quality_settings_snapshot(settings_manager)
+            if current_snapshot is not None and current_snapshot == getattr(
+                self, "_manual_quality_snapshot", None
+            ):
+                return existing
+            rebuilt = self._build_manual_quality_coordinator(app)
+            if rebuilt is not None:
+                return rebuilt
+            # Couldn't build the replacement. If nothing detached the coordinator
+            # we already had (attach_chapter_qa_coordinator only does that once it
+            # is sure the new one will exist), it is still there and still works.
+            if getattr(app, "qa_coordinator", None) is existing:
+                return existing
+            return None
         return self._build_manual_quality_coordinator(app)
+
+    @staticmethod
+    def _coordinator_is_busy(coordinator) -> bool:
+        """Best-effort peek at whether a coordinator still has work scheduled.
+
+        ``_pending`` is a private detail of ``ChapterQaCoordinator``, read
+        here only as an extra safety net alongside ``_quality_pass_running``
+        (which already tracks busy/idle through the controller's own signal).
+        A coordinator that does not expose it — a test double, say — is
+        simply never treated as busy by this particular check.
+        """
+        try:
+            return bool(getattr(coordinator, "_pending", None))
+        except Exception:  # noqa: BLE001 - an unreadable pending set is not proof of work
+            return False
+
+    def _manual_quality_settings_snapshot(self, settings_manager):
+        """A comparable fingerprint of what a manual coordinator would run on.
+
+        Deliberately NOT ``green_keys()``: that answers which of the
+        configured keys currently have quota left, which is runtime health,
+        not a setting.  A key tripping its daily limit mid-pass used to
+        change this fingerprint with nothing the user touched, so the very
+        next call to :meth:`_quality_coordinator` read it as "settings
+        changed" and tore down the live pass that key belonged to
+        (ui-dialogs-validation/runtime/13-manual-qa-coordinator-stale,
+        review correction). The fingerprint instead covers everything a
+        manual build actually freezes into the coordinator: provider, model,
+        every key *configured* for that provider (healthy or not), the
+        proxy, the project's own epub, and the rest of the QA settings.
+
+        Not the keys themselves (no reason to keep a second copy of secrets
+        around) — a digest, so two builds with the same keys compare equal
+        without this attribute holding anything sensitive.
+        """
+        from ...qa.assembly import resolve_manual_qa_model
+
+        project_manager = getattr(self, "project_manager", None)
+        if settings_manager is None or project_manager is None:
+            return None
+        qa_settings = settings_manager.get_qa_settings()
+        provider, model_name = resolve_manual_qa_model(settings_manager, qa_settings)
+        if not provider or not model_name:
+            return None
+        keys = self._configured_keys_for_provider(settings_manager, provider)
+        keys_digest = hashlib.sha256(
+            "\n".join(sorted(str(key) for key in keys)).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        proxy_settings = settings_manager.load_proxy_settings()
+        try:
+            proxy_marker = json.dumps(proxy_settings, sort_keys=True, default=str)
+        except TypeError:
+            proxy_marker = repr(proxy_settings)
+        epub_path = str(getattr(self, "original_epub_path", "") or "")
+        return (provider, model_name, keys_digest, proxy_marker, epub_path, qa_settings)
+
+    @staticmethod
+    def _configured_keys_for_provider(settings_manager, provider_id: str) -> tuple[str, ...]:
+        """Every key configured for a provider, healthy or not.
+
+        Unlike ``qa.assembly.green_keys`` this never asks
+        ``is_key_limit_active`` — a settings fingerprint must move only when
+        the user actually changes something, not when a key's quota does.
+        """
+        if settings_manager is None or not provider_id:
+            return ()
+        try:
+            statuses = settings_manager.load_key_statuses() or ()
+        except Exception:  # noqa: BLE001 - unreadable statuses mean no fingerprint
+            return ()
+        keys: list[str] = []
+        for key_info in statuses:
+            if str(key_info.get("provider") or "") != str(provider_id):
+                continue
+            key = str(key_info.get("key") or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        return tuple(keys)
 
     def _build_manual_quality_coordinator(self, app):
         from ...qa.assembly import (
@@ -3115,6 +3282,11 @@ class TranslationValidatorPage(ShellPage):
         if coordinator is None:
             self._quality_setup_problem = (
                 "Проверка выключена целиком в настройках проверки."
+            )
+        else:
+            self._manual_quality_coordinator = coordinator
+            self._manual_quality_snapshot = self._manual_quality_settings_snapshot(
+                settings_manager
             )
         return coordinator
 
@@ -3834,12 +4006,16 @@ class TranslationValidatorPage(ShellPage):
             if not versions:
                 continue
                 
-            # Выбираем версию. Приоритет: пустой суффикс (основная) -> первый попавшийся
-            # TODO: Можно добавить выбор версии
-            rel_path = versions.get('')
-            if not rel_path and versions:
-                rel_path = next(iter(versions.values()))
-                
+            # Выбираем ту же версию, что показана в таблице валидатора и уйдёт
+            # в сборку EPUB: приоритет _validated, иначе лучшая по mtime,
+            # с исключением IGNORED_VERSION_SUFFIXES (см. select_target_translation_version).
+            # База пути — та же project_folder, от которой чуть ниже строится
+            # full_path: разные базы для выбора версии и для чтения файла
+            # молча выбрали бы не ту версию, если они когда-нибудь разойдутся.
+            rel_path, _is_validated_present = select_target_translation_version(
+                versions, project_folder
+            )
+
             if not rel_path:
                 continue
                 
@@ -6367,6 +6543,32 @@ class TranslationValidatorPage(ShellPage):
                         wait_loop.exec()
                 finally:
                     self._awaiting_analysis_thread_stop = False
+        if getattr(self, "_quality_pass_running", False):
+            # Уйти со страницы валидатора обычно означает её удаление
+            # (NavigationController.pop() -> deleteLater()) — а контроллер
+            # ручной проверки качества висит на НЕЙ (см.
+            # _quality_controller_instance), не на диалоге. Если проход всё
+            # ещё идёт, следующий callback из QA-потока обратится к уже
+            # уничтоженному Qt-объекту и упадёт RuntimeError — то же самое,
+            # из-за чего появился _quality_controller_instance, только на
+            # уровень выше (ui-dialogs-validation/runtime/17). Полноценная
+            # защита — try/except вокруг повторного on_done в
+            # core/chapter_qa_coordinator.py (вне зоны этой правки); здесь —
+            # минимум: спросить пользователя и, если он согласен уйти,
+            # попросить проход остановиться, а не удалять страницу молча.
+            answer = QMessageBox.question(
+                self, "Выход",
+                "Ручная проверка качества перевода ещё не завершена. "
+                "Прервать и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            controller = getattr(self, "_quality_controller", None)
+            cancel = getattr(controller, "cancel", None)
+            if callable(cancel):
+                cancel()
         return True
 
 

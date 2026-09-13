@@ -15,7 +15,6 @@ import subprocess
 import sys
 import time
 import traceback
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
@@ -1511,15 +1510,25 @@ def _run_ai_request(
     max_output_tokens: int = 4096,
     cancel_event: Event | None = None,
 ) -> str:
-    provider_config = deepcopy(api_config.api_providers().get(provider_id) or {})
+    # api_providers()/all_models() уже возвращают deepcopy ВСЕГО реестра —
+    # извлечённая отсюда запись независима от общего кэша сама по себе,
+    # дополнительный deepcopy() поверх нее был избыточным двойным копированием.
+    provider_config = api_config.api_providers().get(provider_id) or {}
     if not provider_config:
         raise ValueError(f"Провайдер '{provider_id}' не найден в конфиге.")
 
     model_name = model_settings.get("model") or api_config.default_model_name()
-    model_config = deepcopy(api_config.all_models().get(model_name) or {})
+    model_config = api_config.all_models().get(model_name) or {}
     if not model_config:
+        # Внимание: эта запись — вложенный словарь САМОГО provider_config, а не
+        # независимая копия. Сегодня это безопасно, потому что provider_config
+        # выше получен из api_providers() (deepcopy всего реестра). Если этот
+        # callsite когда-нибудь перейдёт на api_providers_view() (без
+        # копирования, ради устранения двойного deepcopy реестра), setdefault()
+        # ниже начнёт дописывать ключи прямо в глобальный кэш конфигов —
+        # тогда здесь обязателен точечный deepcopy() этой записи.
         provider_models = provider_config.get("models") or {}
-        model_config = deepcopy(provider_models.get(model_name) or {})
+        model_config = provider_models.get(model_name) or {}
     if not model_config:
         raise ValueError(f"Модель '{model_name}' не найдена в конфиге провайдера.")
 
