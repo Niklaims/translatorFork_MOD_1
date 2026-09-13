@@ -61,7 +61,10 @@ class CorruptVersionMapGuardTests(unittest.TestCase):
         truncated = valid_content[: len(valid_content) // 2]
         with open(self.version_file, "w", encoding="utf-8") as f:
             f.write(truncated)
-        self.original_bytes = truncated.encode("utf-8")
+        # Эталон — ровно те байты, что легли на диск: текстовый режим на
+        # Windows пишет \r\n, и truncated.encode() с ним не совпал бы.
+        with open(self.version_file, "rb") as f:
+            self.original_bytes = f.read()
 
         # Убеждаемся, что порча действительно воспроизводит «молчаливый {}»
         # на уровне project_manager (иначе тест был бы про другой дефект).
