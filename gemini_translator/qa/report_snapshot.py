@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..utils.text_sort import natural_sort_key
 from .book_metrics import BookMetricsAnalyzer, RelativeRisk
 from .models import ChapterMetrics, RiskLevel
 
@@ -19,6 +20,15 @@ RELATIVE_RISK_LABELS = {
     RelativeRisk.LOW: "в норме книги",
     RelativeRisk.MEDIUM: "отклонение",
     RelativeRisk.HIGH: "сильное отклонение",
+}
+# What each recorded chapter status means to the person reading the report.
+# The empty status belongs to a chapter known only from its repairs: a journal
+# written before chapter states were recorded.
+CHAPTER_STATUS_LABELS = {
+    "checked": "Проверена",
+    "deferred": "Отложена",
+    "blocked": "Блокирует",
+    "": "Нет данных",
 }
 
 
@@ -42,6 +52,12 @@ class ChapterQaRow:
     duration_seconds: float
     tokens: int
     blocked_reason: str = ""
+    status: str = ""
+    checked_at: str = ""
+    pending_suggestions: int = 0
+    # Only a completeness check produces metrics; without them every field
+    # above that describes length, gaps or the book norm is a placeholder.
+    has_completeness: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +77,36 @@ class BookQaReportSnapshot:
     def repaired_chapters(self) -> tuple[str, ...]:
         return tuple(row.chapter_id for row in self.rows if row.applied_repairs)
 
+    @property
+    def has_completeness(self) -> bool:
+        return any(row.has_completeness for row in self.rows)
+
+    @property
+    def checked_count(self) -> int:
+        return sum(1 for row in self.rows if row.status == "checked")
+
+    @property
+    def deferred_count(self) -> int:
+        return sum(1 for row in self.rows if row.status == "deferred")
+
+    @property
+    def blocking_count(self) -> int:
+        return sum(
+            1 for row in self.rows if row.status == "blocked" or row.blocked_reason
+        )
+
+    @property
+    def repair_count(self) -> int:
+        return sum(row.applied_repairs for row in self.rows)
+
+    @property
+    def pending_suggestion_count(self) -> int:
+        return sum(row.pending_suggestions for row in self.rows)
+
+    @property
+    def pending_suggestion_chapters(self) -> tuple[str, ...]:
+        return tuple(row.chapter_id for row in self.rows if row.pending_suggestions)
+
     @classmethod
     def from_journal(cls, journal, open_gates=()) -> "BookQaReportSnapshot":
         """Build the snapshot from a loaded journal and the queue's open gates."""
@@ -69,9 +115,8 @@ class BookQaReportSnapshot:
             or "неустранённый риск"
             for gate in open_gates or ()
         }
-        metrics = [
-            journal.metrics[chapter_id] for chapter_id in sorted(journal.metrics)
-        ]
+        metrics_by_chapter = dict(getattr(journal, "metrics", None) or {})
+        states = dict(getattr(journal, "chapter_states", None) or {})
         decisions: dict[str, list[str]] = {}
         for entry in getattr(journal, "candidates", ()):
             chapter_id = str(entry.get("chapter_id", ""))
@@ -84,16 +129,29 @@ class BookQaReportSnapshot:
             if chapter_id:
                 repairs_by_chapter[chapter_id] = repairs_by_chapter.get(chapter_id, 0) + 1
 
+        # A chapter belongs in the report once anything about it was recorded:
+        # a language-only check leaves a state and repairs, never metrics.
+        chapter_ids = sorted(
+            set(metrics_by_chapter) | set(states) | set(repairs_by_chapter),
+            key=natural_sort_key,
+        )
+        metrics = [
+            metrics_by_chapter[chapter_id]
+            for chapter_id in chapter_ids
+            if chapter_id in metrics_by_chapter
+        ]
         positions = _book_positions(metrics)
         rows = tuple(
             _row_for(
-                item,
-                decisions.get(item.chapter_id, ()),
-                repairs_by_chapter.get(item.chapter_id, 0),
-                positions.get(item.chapter_id, "нет книжной нормы"),
-                gate_reasons.get(item.chapter_id, ""),
+                chapter_id,
+                metrics_by_chapter.get(chapter_id),
+                states.get(chapter_id),
+                tuple(decisions.get(chapter_id, ())),
+                repairs_by_chapter.get(chapter_id, 0),
+                positions.get(chapter_id, "нет книжной нормы"),
+                gate_reasons.get(chapter_id, ""),
             )
-            for item in metrics
+            for chapter_id in chapter_ids
         )
         return cls(
             rows=rows,
@@ -145,12 +203,41 @@ def _book_positions(metrics: list[ChapterMetrics]) -> dict[str, str]:
 
 
 def _row_for(
-    metrics: ChapterMetrics,
+    chapter_id: str,
+    metrics: ChapterMetrics | None,
+    state,
     decisions: tuple[str, ...],
     applied_repairs: int,
     book_position: str,
     blocked_reason: str,
 ) -> ChapterQaRow:
+    confirmed_gaps = sum(
+        1 for decision in decisions if decision in {"fixed", "repair_rejected"}
+    )
+    status = str(getattr(state, "status", "") or "")
+    checked_at = str(getattr(state, "updated_at", "") or "")
+    if metrics is None:
+        risk = _state_risk(state)
+        return ChapterQaRow(
+            chapter_id=chapter_id,
+            language_pair="",
+            length_ratio=0.0,
+            profile_status="",
+            book_position="",
+            glossary_conflicts=0,
+            untranslated_fragments=0,
+            possible_gaps=0,
+            confirmed_gaps=confirmed_gaps,
+            language_issues=0,
+            applied_repairs=applied_repairs,
+            risk_label=RISK_LABELS.get(risk, "") if risk is not None else "",
+            risk_level=str(risk) if risk is not None else "",
+            duration_seconds=0.0,
+            tokens=0,
+            blocked_reason=blocked_reason,
+            status=status,
+            checked_at=checked_at,
+        )
     untranslated = metrics.untranslated_by_script or {}
     risk = RiskLevel(metrics.risk_level) if metrics.risk_level else RiskLevel.LOW
     return ChapterQaRow(
@@ -162,9 +249,7 @@ def _row_for(
         glossary_conflicts=metrics.glossary_conflicts,
         untranslated_fragments=sum(int(value) for value in untranslated.values()),
         possible_gaps=metrics.possible_gaps,
-        confirmed_gaps=sum(
-            1 for decision in decisions if decision in {"fixed", "repair_rejected"}
-        ),
+        confirmed_gaps=confirmed_gaps,
         language_issues=metrics.language_tool_issues,
         applied_repairs=applied_repairs,
         risk_label=RISK_LABELS.get(risk, str(risk)),
@@ -172,7 +257,21 @@ def _row_for(
         duration_seconds=metrics.duration_seconds,
         tokens=metrics.input_tokens + metrics.output_tokens,
         blocked_reason=blocked_reason,
+        status=status,
+        checked_at=checked_at,
+        has_completeness=True,
     )
+
+
+def _state_risk(state) -> RiskLevel | None:
+    """The risk a chapter state recorded, or None when there is no usable one."""
+    value = getattr(state, "risk_level", None)
+    if not value:
+        return None
+    try:
+        return RiskLevel(value)
+    except ValueError:
+        return None
 
 
 def _profile_status(metrics: ChapterMetrics) -> str:
@@ -185,5 +284,3 @@ def _profile_status(metrics: ChapterMetrics) -> str:
     inside = profile.contains(metrics.length_ratio)
     bounds = f"{profile.minimum:.2f}–{profile.maximum:.2f}"
     return f"{'в профиле' if inside else 'вне профиля'} {bounds}"
-
-
