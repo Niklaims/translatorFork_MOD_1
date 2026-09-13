@@ -98,6 +98,10 @@ class BookQaResult:
     results: tuple[ChapterQaResult, ...] = ()
     skipped: tuple[str, ...] = ()
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    # The skipped chapters the pass never offered to the service because no QA
+    # key would ever be available again; the rest of ``skipped`` could not be
+    # read. Kept apart so a report can say which of the two happened.
+    stopped: tuple[str, ...] = ()
 
     @property
     def blocking_chapters(self) -> tuple[str, ...]:
@@ -406,6 +410,7 @@ class ChapterQaCoordinator:
         total = len(events)
         done = 0
         attempted = False
+        stopped: set[int] = set()
 
         def report_progress(chapter_id: str) -> None:
             safe_call(on_progress, done, total, chapter_id)
@@ -436,6 +441,7 @@ class ChapterQaCoordinator:
                 # why the provider is unavailable.
                 if request is not None:
                     if attempted and self._should_stop():
+                        stopped.add(index)
                         return
                     attempted = True
                     result = await self._check_one(
@@ -459,7 +465,14 @@ class ChapterQaCoordinator:
             for index, event in enumerate(events)
             if index not in outcomes
         )
-        return BookQaResult(results, tuple(dict.fromkeys(skipped)))
+        stopped_ids = tuple(
+            event.chapter_id for index, event in enumerate(events) if index in stopped
+        )
+        return BookQaResult(
+            results,
+            tuple(dict.fromkeys(skipped)),
+            stopped=tuple(dict.fromkeys(stopped_ids)),
+        )
 
     def _should_stop(self) -> bool:
         stop_requested = getattr(self, "_stop_requested", None)

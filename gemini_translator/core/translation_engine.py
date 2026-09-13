@@ -972,7 +972,14 @@ class TranslationEngine(EventBusMixin, QObject):
         else:
             blocking = tuple(getattr(result, 'blocking_chapters', ()) or ())
             checked = len(getattr(result, 'results', ()) or ())
+            stopped = tuple(getattr(result, 'stopped', ()) or ())
             message = f"[QA] Итоговый проход завершён, проверено глав: {checked}."
+            if stopped:
+                message += (
+                    " Ключи для проверки больше недоступны, не проверено глав: "
+                    f"{len(stopped)}. Продолжите проверку в окне «Качество перевода», "
+                    "когда ключи восстановятся."
+                )
             if blocking:
                 message += " Требуют решения: " + ", ".join(blocking[:5])
             self._post_event('log_message', {'message': message})

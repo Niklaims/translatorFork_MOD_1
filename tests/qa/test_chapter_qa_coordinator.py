@@ -159,6 +159,36 @@ def test_book_pass_attempts_one_chapter_when_provider_was_already_terminal():
     assert outcome.skipped == ("chapter-1", "chapter-3")
 
 
+def test_book_pass_names_the_chapters_the_key_pool_stopped():
+    """«Пропущено: N» lumped unreadable chapters with ones no key was left for."""
+    terminal = False
+
+    class _TerminalService(_ServiceStub):
+        async def check_chapter(self, request, options, cancellation):
+            nonlocal terminal
+            result = await super().check_chapter(request, options, cancellation)
+            terminal = True
+            return result
+
+    coordinator = ChapterQaCoordinator(
+        service=_TerminalService(),
+        task_manager=None,
+        request_builder=lambda event: (
+            None if event.chapter_id == "chapter-3" else event.chapter_id
+        ),
+        stop_requested=lambda: terminal,
+    )
+
+    outcome = asyncio.run(
+        coordinator.check_all_now(
+            tuple(_event(f"chapter-{index}") for index in range(1, 5))
+        )
+    )
+
+    assert outcome.skipped == ("chapter-2", "chapter-3", "chapter-4")
+    assert outcome.stopped == ("chapter-2", "chapter-4")
+
+
 def test_infrastructure_warnings_defer_instead_of_blocking():
     """An embedding outage must never stop a translation session."""
     service = _ServiceStub(

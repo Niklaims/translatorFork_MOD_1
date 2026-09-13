@@ -211,6 +211,54 @@ def test_book_pass_reports_counts_and_blocked_chapters(qt_app):
     assert "chapter-1" in statuses[-1]
 
 
+def test_book_pass_says_the_rest_of_the_book_waits_for_keys(qt_app):
+    """Главы, до которых не дошли из-за ключей, раньше тонули в «Пропущено: N»."""
+    coordinator = _Coordinator(
+        book_result=BookQaResult(
+            results=(
+                ChapterQaResult(
+                    chapter_id="chapter-1",
+                    risk_level=RiskLevel.LOW,
+                    may_continue_translation=True,
+                    coverage_mode="semantic_alignment",
+                ),
+            ),
+            skipped=("chapter-2", "chapter-3"),
+            stopped=("chapter-2", "chapter-3"),
+        )
+    )
+    controller = _controller(
+        coordinator, events=("chapter-1", "chapter-2", "chapter-3")
+    )
+    statuses, logged = [], []
+    controller.status_changed.connect(statuses.append)
+    controller.chapter_logged.connect(logged.append)
+
+    controller.check_all()
+
+    assert "Ключи для проверки больше недоступны" in statuses[-1]
+    assert "продолжите проверку" in statuses[-1]
+    notes = [line for line in logged if "Ключи для проверки больше недоступны" in line]
+    assert len(notes) == 1
+    assert "не проверено глав: 2" in notes[0]
+
+
+def test_unreadable_chapters_are_not_blamed_on_the_keys(qt_app):
+    coordinator = _Coordinator(
+        book_result=BookQaResult(results=(), skipped=("chapter-1",))
+    )
+    controller = _controller(coordinator)
+    statuses, logged = [], []
+    controller.status_changed.connect(statuses.append)
+    controller.chapter_logged.connect(logged.append)
+
+    controller.check_all()
+
+    assert "Пропущено: 1" in statuses[-1]
+    assert "Ключи" not in statuses[-1]
+    assert not any("Ключи" in line for line in logged)
+
+
 def test_a_failing_pass_is_reported_and_clears_busy(qt_app):
     """A crash inside QA must release the interface and say what happened."""
     controller = _controller(_Coordinator(error=RuntimeError("boom")))

@@ -370,11 +370,24 @@ class TranslationQualityController(QObject):
         else:
             checked = len(getattr(result, "results", ()) or ())
             skipped = getattr(result, "skipped", ()) or ()
+            stopped = getattr(result, "stopped", ()) or ()
             blocking = getattr(result, "blocking_chapters", ()) or ()
             self.progress_changed.emit(checked, total, "")
             message = f"Проверено глав: {checked} из {total}."
             if skipped:
                 message += f" Пропущено: {len(skipped)}."
+            if stopped:
+                # The log is what stays in view during a pass, and the count
+                # alone reads as if those chapters could not be opened.
+                self.chapter_logged.emit(
+                    "<p><b>Ключи для проверки больше недоступны, не проверено глав: "
+                    f"{len(stopped)}. Продолжите проверку, когда ключи "
+                    "восстановятся.</b></p>"
+                )
+                message += (
+                    " Ключи для проверки больше недоступны — продолжите проверку, "
+                    "когда они восстановятся."
+                )
             if blocking:
                 message += " Требуют решения: " + ", ".join(blocking[:5])
             self.status_changed.emit(message)
