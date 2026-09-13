@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import datetime
 import json
 import os
@@ -15,6 +16,7 @@ from .models import (
     QaChapterState,
     QaJournalEntry,
     QaModelValidationError,
+    QaSuggestion,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import kept out of the startup path
@@ -34,7 +36,7 @@ class QaJournalUnsupportedVersionError(QaJournalError):
 
 
 class QaJournal:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     _V1_ROOT_KEYS = frozenset(
         {
             "schema_version",
@@ -47,8 +49,10 @@ class QaJournal:
         }
     )
     # v2 adds the per-chapter check state the final book pass selects on.
-    _ROOT_KEYS = _V1_ROOT_KEYS | {"chapter_states"}
-    _ROOT_KEYS_BY_VERSION = {1: _V1_ROOT_KEYS, 2: _ROOT_KEYS}
+    _V2_ROOT_KEYS = _V1_ROOT_KEYS | {"chapter_states"}
+    # v3 keeps the language fixes a check refused, for a person to decide.
+    _ROOT_KEYS = _V2_ROOT_KEYS | {"suggestions"}
+    _ROOT_KEYS_BY_VERSION = {1: _V1_ROOT_KEYS, 2: _V2_ROOT_KEYS, 3: _ROOT_KEYS}
 
     def __init__(
         self,
@@ -60,6 +64,7 @@ class QaJournal:
         repairs: list[dict[str, Any]] | None = None,
         glossary_observations: Iterable[GlossaryObservation] | None = None,
         chapter_states: Mapping[str, QaChapterState] | None = None,
+        suggestions: Iterable[QaSuggestion] | None = None,
     ) -> None:
         self.book_id = book_id
         self.updated_at = updated_at
@@ -67,6 +72,9 @@ class QaJournal:
         self.candidates = list(candidates or [])
         self.repairs = list(repairs or [])
         self.chapter_states = dict(chapter_states or {})
+        self.suggestions = list(suggestions or [])
+        if any(not isinstance(item, QaSuggestion) for item in self.suggestions):
+            raise QaJournalError("suggestions must use the typed schema")
         self.glossary_observations = list(glossary_observations or [])
         if any(
             not isinstance(observation, GlossaryObservation)
@@ -103,7 +111,9 @@ class QaJournal:
         if set(payload) != expected_keys:
             raise QaJournalCorruptedError("QA journal has an invalid root schema")
 
-        required_lists = ("metrics", "candidates", "repairs", "glossary_observations")
+        required_lists = ["metrics", "candidates", "repairs", "glossary_observations"]
+        if version >= 3:
+            required_lists.append("suggestions")
         if not isinstance(payload.get("book_id"), str) or not isinstance(
             payload.get("updated_at"), str
         ):
@@ -131,6 +141,10 @@ class QaJournal:
                 QaChapterState.from_dict(item)
                 for item in payload.get("chapter_states", [])
             ]
+            # Versions 1 and 2 kept no suggestions; they simply start empty.
+            suggestions = [
+                QaSuggestion.from_dict(item) for item in payload.get("suggestions", [])
+            ]
         except (KeyError, ValueError, QaModelValidationError) as exc:
             raise QaJournalCorruptedError("QA journal metrics are invalid") from exc
 
@@ -142,6 +156,7 @@ class QaJournal:
             repairs=repairs,
             glossary_observations=glossary_observations,
             chapter_states={state.chapter_id: state for state in states},
+            suggestions=suggestions,
         )
 
     def append(self, entry: QaJournalEntry) -> None:
@@ -177,6 +192,58 @@ class QaJournal:
         self.chapter_states[state.chapter_id] = state
         self._mark_updated()
 
+    def suggestion(self, suggestion_id: str) -> QaSuggestion | None:
+        """Find one suggestion by its id, whatever its state."""
+        return next(
+            (item for item in self.suggestions if item.suggestion_id == suggestion_id),
+            None,
+        )
+
+    def replace_suggestions(
+        self, chapter_id: str, suggestions: Iterable[QaSuggestion]
+    ) -> None:
+        """Swap a chapter's undecided suggestions for a new pass's own.
+
+        What a person already decided stays decided: an applied or dismissed
+        suggestion never comes back, even when the new pass proposes it again.
+        """
+        fresh = list(suggestions)
+        if any(
+            not isinstance(item, QaSuggestion) or item.chapter_id != chapter_id
+            for item in fresh
+        ):
+            raise QaJournalError("suggestions must be typed and belong to the chapter")
+        decided = {
+            item.suggestion_id
+            for item in self.suggestions
+            if item.chapter_id == chapter_id and not item.awaits_decision
+        }
+        kept = [
+            item
+            for item in self.suggestions
+            if item.chapter_id != chapter_id or not item.awaits_decision
+        ]
+        seen: set[str] = set()
+        for item in fresh:
+            if item.suggestion_id in decided or item.suggestion_id in seen:
+                continue
+            seen.add(item.suggestion_id)
+            kept.append(item)
+        self.suggestions = kept
+        self._mark_updated()
+
+    def set_suggestion_status(
+        self, suggestion_id: str, status: str, note: str = ""
+    ) -> QaSuggestion:
+        """Record a person's decision, or why a suggestion no longer applies."""
+        for index, item in enumerate(self.suggestions):
+            if item.suggestion_id == suggestion_id:
+                updated = replace(item, status=status, status_note=note)
+                self.suggestions[index] = updated
+                self._mark_updated()
+                return updated
+        raise QaJournalError(f"unknown suggestion: {suggestion_id}")
+
     def record_chapter_result(
         self,
         *,
@@ -184,8 +251,19 @@ class QaJournal:
         entries: Iterable[QaJournalEntry] = (),
         repairs: Iterable[Mapping[str, Any]] = (),
         state: QaChapterState | None = None,
+        suggestions: Iterable[QaSuggestion] | None = None,
     ) -> None:
-        """Fold one chapter QA pass into the journal in a single step."""
+        """Fold one chapter QA pass into the journal in a single step.
+
+        ``suggestions=None`` means the pass produced no verdict on them, so the
+        chapter keeps what it had; any other value replaces its undecided ones.
+        """
+        if suggestions is not None:
+            if state is None:
+                raise QaJournalError("suggestions are recorded with the chapter state")
+            suggestions = tuple(suggestions)
+            if any(not isinstance(item, QaSuggestion) for item in suggestions):
+                raise QaJournalError("suggestions must use the typed schema")
         if metrics is not None:
             self.upsert_metrics(metrics)
         if state is not None:
@@ -196,6 +274,8 @@ class QaJournal:
             self.append(entry)
         for repair in repairs:
             self.append_repair(repair)
+        if suggestions is not None:
+            self.replace_suggestions(state.chapter_id, suggestions)
 
     def metrics_frame(self) -> pd.DataFrame:
         # Imported lazily: a session that never exports a metrics report
@@ -246,6 +326,13 @@ class QaJournal:
                 for chapter_id in sorted(self.chapter_states)
             ],
             "repairs": deepcopy(self.repairs),
+            "suggestions": [
+                item.to_dict()
+                for item in sorted(
+                    self.suggestions,
+                    key=lambda item: (item.chapter_id, item.created_at, item.suggestion_id),
+                )
+            ],
             "glossary_observations": [
                 observation.to_dict() for observation in self.glossary_observations
             ],

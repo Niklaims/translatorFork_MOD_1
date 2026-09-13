@@ -172,6 +172,7 @@ def test_a_saved_version_1_journal_still_builds_a_report(tmp_path):
     journal.save(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     payload.pop("chapter_states")
+    payload.pop("suggestions")
     payload["schema_version"] = 1
     path.write_text(json.dumps(payload), encoding="utf-8")
 
