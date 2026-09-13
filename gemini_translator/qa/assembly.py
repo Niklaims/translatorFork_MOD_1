@@ -881,6 +881,31 @@ def green_embedding_keys(
     return green_keys(settings_manager, provider_id, model_id)
 
 
+def embedding_key_counts(
+    settings_manager, provider_id: str, model_id: str
+) -> tuple[int, int]:
+    """How many of a provider's keys can embed right now, out of how many it has.
+
+    The quality window shows this instead of a list of keys: semantic checking
+    draws on every healthy key of the provider, so the count is what the user
+    actually decides on.
+    """
+    if settings_manager is None or not provider_id:
+        return (0, 0)
+    try:
+        statuses = settings_manager.load_key_statuses() or ()
+    except Exception:  # noqa: BLE001 - unreadable statuses mean no key
+        return (0, 0)
+    provider_keys = {
+        str(key_info.get("key") or "").strip()
+        for key_info in statuses
+        if str(key_info.get("provider") or "") == str(provider_id)
+    }
+    provider_keys.discard("")
+    working = green_embedding_keys(settings_manager, provider_id, model_id)
+    return (len(working), len(provider_keys))
+
+
 class SettingsEmbeddingKeyHealth:
     """Track embedding quota per key against the embedding model, not the translation one.
 
