@@ -29,6 +29,17 @@ RECHECK_REASONS = {
     "analysis_version_changed": "правила проверки изменились",
     "baseline_now_available": "появилась норма книги",
 }
+# What the user reads after acting on one suggestion.
+SUGGESTION_MESSAGES = {
+    "applied": (
+        "Правка применена в главе «{chapter}». Откатить её можно кнопкой "
+        "«Отменить исправления главы»."
+    ),
+    "dismissed": "Правка отклонена.",
+    "stale": "Правка устарела: {detail}. Файл главы не тронут.",
+    "failed": "Правка не применена: {detail}.",
+    "missing": "Правка уже решена или не найдена.",
+}
 
 
 class TranslationQualityController(QObject):
@@ -96,6 +107,10 @@ class TranslationQualityController(QObject):
             self.chapter_logged.connect(dialog.append_log)
         if hasattr(dialog, "set_embedding_result"):
             self.embedding_checked.connect(dialog.set_embedding_result)
+        if hasattr(dialog, "apply_suggestion_requested"):
+            dialog.apply_suggestion_requested.connect(self.apply_suggestion)
+        if hasattr(dialog, "dismiss_suggestion_requested"):
+            dialog.dismiss_suggestion_requested.connect(self.dismiss_suggestion)
         self.refresh_report()
 
     # -- actions -----------------------------------------------------------
@@ -246,6 +261,28 @@ class TranslationQualityController(QObject):
         coordinator.run_background(
             lambda: coordinator.undo_all(),
             lambda result, error: self._finish_undo(result, error),
+        )
+
+    def apply_suggestion(self, suggestion_id: str) -> None:
+        """Write one accepted suggestion into its chapter, off the interface thread."""
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return
+        self._set_busy(True)
+        coordinator.run_background(
+            lambda: coordinator.apply_suggestion(suggestion_id),
+            lambda result, error: self._finish_suggestion(result, error),
+        )
+
+    def dismiss_suggestion(self, suggestion_id: str) -> None:
+        """Take one suggestion off the list."""
+        coordinator = self._coordinator()
+        if coordinator is None:
+            return
+        self._set_busy(True)
+        coordinator.run_background(
+            lambda: coordinator.dismiss_suggestion(suggestion_id),
+            lambda result, error: self._finish_suggestion(result, error),
         )
 
     def export_report(self, directory: str) -> None:
@@ -468,6 +505,21 @@ class TranslationQualityController(QObject):
                 )
             else:
                 self.status_changed.emit("Отменять нечего.")
+        self._set_busy(False)
+        self.refresh_report()
+
+    def _finish_suggestion(self, result, error) -> None:
+        if error is not None:
+            self.status_changed.emit(f"Не удалось обработать правку: {error}")
+        else:
+            status = str(getattr(result, "status", "") or "")
+            template = SUGGESTION_MESSAGES.get(status, "Правка обработана.")
+            self.status_changed.emit(
+                template.format(
+                    chapter=chapter_display_name(str(getattr(result, "chapter_id", "") or "")),
+                    detail=getattr(result, "detail", ""),
+                )
+            )
         self._set_busy(False)
         self.refresh_report()
 

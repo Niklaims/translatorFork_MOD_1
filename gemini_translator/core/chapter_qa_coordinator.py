@@ -491,6 +491,28 @@ class ChapterQaCoordinator:
         """Revert every automatic repair this service recorded."""
         return await self._service.undo_session(self._service.session_id)
 
+    async def apply_suggestion(self, suggestion_id: str):
+        """Write one suggestion the user accepted into its chapter's translation."""
+        suggestion = self._service.suggestion(suggestion_id)
+        chapter_id = str(getattr(suggestion, "chapter_id", "") or "")
+        translated_path = (
+            next(
+                (
+                    event.translated_path
+                    for event in self._book_events()
+                    if event.chapter_id == chapter_id
+                ),
+                None,
+            )
+            if chapter_id
+            else None
+        )
+        return await self._service.apply_suggestion(suggestion_id, translated_path)
+
+    async def dismiss_suggestion(self, suggestion_id: str):
+        """Take one suggestion off the list without touching the chapter."""
+        return await self._service.dismiss_suggestion(suggestion_id)
+
     async def _check_one(
         self,
         event: TranslationReadyEvent,

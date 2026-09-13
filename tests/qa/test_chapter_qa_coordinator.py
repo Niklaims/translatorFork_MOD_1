@@ -649,3 +649,40 @@ def test_details_html_escapes_the_book_text():
     assert "&lt;" in html
     assert "<b>жирный</b>" not in html
     assert "<i>курсив</i>" not in html
+
+
+def test_a_suggestion_is_applied_to_its_chapters_translation():
+    class _Suggestion:
+        chapter_id = "chapter-2"
+
+    class _Service(_ServiceStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.applied: list[tuple[str, object]] = []
+            self.dismissed: list[str] = []
+
+        def suggestion(self, suggestion_id):
+            return _Suggestion() if suggestion_id == "sg-1" else None
+
+        async def apply_suggestion(self, suggestion_id, translated_path):
+            self.applied.append((suggestion_id, translated_path))
+            return "applied"
+
+        async def dismiss_suggestion(self, suggestion_id):
+            self.dismissed.append(suggestion_id)
+            return "dismissed"
+
+    service = _Service()
+    coordinator = ChapterQaCoordinator(
+        service=service,
+        task_manager=None,
+        request_builder=lambda event: event.chapter_id,
+        book_events_provider=lambda: (_event("chapter-1"), _event("chapter-2")),
+    )
+
+    assert asyncio.run(coordinator.apply_suggestion("sg-1")) == "applied"
+    assert asyncio.run(coordinator.apply_suggestion("sg-404")) == "applied"
+    assert asyncio.run(coordinator.dismiss_suggestion("sg-1")) == "dismissed"
+    assert service.applied == [("sg-1", "/tmp/chapter-2"), ("sg-404", None)]
+    assert service.dismissed == ["sg-1"]
+

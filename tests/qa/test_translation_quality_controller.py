@@ -599,3 +599,87 @@ def test_the_pass_header_counts_chapters_the_russian_way(qt_app):
 
     assert "Проверка книги: 2 главы." in logged[0]
 
+
+class _SuggestionCoordinator(_Coordinator):
+    def __init__(self, outcome) -> None:
+        super().__init__()
+        self.outcome = outcome
+        self.applied: list[str] = []
+        self.dismissed: list[str] = []
+
+    async def apply_suggestion(self, suggestion_id):
+        self.applied.append(suggestion_id)
+        return self.outcome
+
+    async def dismiss_suggestion(self, suggestion_id):
+        self.dismissed.append(suggestion_id)
+        return self.outcome
+
+
+def test_applying_a_suggestion_says_what_happened_and_refreshes(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    coordinator = _SuggestionCoordinator(SuggestionOutcome("applied", "sg-1", "chapter-1"))
+    controller = _controller(coordinator)
+    statuses, busy, reports = [], [], []
+    controller.status_changed.connect(statuses.append)
+    controller.busy_changed.connect(busy.append)
+    controller.report_ready.connect(reports.append)
+
+    controller.apply_suggestion("sg-1")
+
+    assert coordinator.applied == ["sg-1"]
+    assert busy == [True, False]
+    assert statuses[-1] == (
+        "Правка применена в главе «chapter-1». Откатить её можно кнопкой "
+        "«Отменить исправления главы»."
+    )
+    assert reports
+
+
+def test_a_stale_suggestion_says_the_chapter_was_not_touched(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    coordinator = _SuggestionCoordinator(
+        SuggestionOutcome("stale", "sg-1", "chapter-1", "глава изменилась после проверки")
+    )
+    controller = _controller(coordinator)
+    statuses = []
+    controller.status_changed.connect(statuses.append)
+
+    controller.apply_suggestion("sg-1")
+
+    assert statuses[-1] == (
+        "Правка устарела: глава изменилась после проверки. Файл главы не тронут."
+    )
+
+
+def test_dismissing_a_suggestion_goes_through_the_coordinator(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    coordinator = _SuggestionCoordinator(SuggestionOutcome("dismissed", "sg-1", "chapter-1"))
+    controller = _controller(coordinator)
+    statuses = []
+    controller.status_changed.connect(statuses.append)
+
+    controller.dismiss_suggestion("sg-1")
+
+    assert coordinator.dismissed == ["sg-1"]
+    assert statuses[-1] == "Правка отклонена."
+
+
+def test_a_crash_while_applying_is_reported_and_releases_the_window(qt_app):
+    class _Crashing(_Coordinator):
+        async def apply_suggestion(self, suggestion_id):
+            raise RuntimeError("disk full")
+
+    controller = _controller(_Crashing())
+    statuses, busy = [], []
+    controller.status_changed.connect(statuses.append)
+    controller.busy_changed.connect(busy.append)
+
+    controller.apply_suggestion("sg-1")
+
+    assert busy == [True, False]
+    assert "disk full" in statuses[-1]
+
