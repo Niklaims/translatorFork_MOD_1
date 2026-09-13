@@ -21,6 +21,8 @@ from ....qa.report_snapshot import (
     CHAPTER_STATUS_LABELS,
     BookQaReportSnapshot,
     ChapterQaRow,
+    chapter_display_name,
+    chapter_display_names,
 )
 from ... import theme_manager
 from .quality_widgets import (
@@ -40,13 +42,15 @@ BASE_COLUMNS = (
     ("Исправлено", "applied_repairs"),
     ("Ждут решения", "pending_suggestions"),
 )
+# Only the short numbers a list has room for.  The book norm and the confirmed
+# gaps are sentences; the chapter card shows them in full.
 COMPLETENESS_COLUMNS = (
     ("Длина", "length_ratio"),
     ("Пропуски", "possible_gaps"),
-    ("Подтверждённые", "confirmed_gaps"),
-    ("Книжная норма", "book_position"),
 )
 SCORE_COLUMNS = (("Оценка", "quality_score"),)
+# Text reads from the left edge; numbers sit centred under their headers.
+TEXT_FIELDS = frozenset({"chapter_id", "status"})
 REPORT_EMPTY_TITLE = "Отчёт пока пуст"
 REPORT_EMPTY_TEXT = (
     "Проверенные главы появятся здесь после первого прохода. Проверка идёт после "
@@ -79,6 +83,7 @@ class QualityReportView(QWidget):
         self._snapshot = BookQaReportSnapshot()
         self._busy = False
         self._scoring_enabled = False
+        self._display_names: dict[str, str] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 10, 0, 0)
@@ -136,8 +141,7 @@ class QualityReportView(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setHorizontalHeaderLabels([title for title, _field in BASE_COLUMNS])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._set_columns(BASE_COLUMNS)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.table, 1)
 
@@ -163,6 +167,12 @@ class QualityReportView(QWidget):
         self.chapter_title_label = make_label(
             NO_CHAPTER_TITLE, "heroTitle", wrap=True, parent=self.chapter_card
         )
+        # The chapter's full path inside the book, when the title is only its
+        # file name: two books can name a file alike, a path tells them apart.
+        self.chapter_path_label = make_label(
+            "", "mutedLabel", wrap=True, parent=self.chapter_card
+        )
+        self.chapter_path_label.setVisible(False)
         self.chapter_meta_label = make_label(
             NO_CHAPTER_TEXT, "heroSubtitle", wrap=True, parent=self.chapter_card
         )
@@ -171,6 +181,7 @@ class QualityReportView(QWidget):
         )
         self.chapter_details_label.setVisible(False)
         self.chapter_layout.addWidget(self.chapter_title_label)
+        self.chapter_layout.addWidget(self.chapter_path_label)
         self.chapter_layout.addWidget(self.chapter_meta_label)
         self.chapter_layout.addWidget(self.chapter_details_label)
         self.chapter_layout.addStretch(1)
@@ -229,21 +240,41 @@ class QualityReportView(QWidget):
 
     # -- internals ---------------------------------------------------------
 
+    def _set_columns(self, columns) -> None:
+        """Only the chapter column stretches; every other one is as wide as its values."""
+        table = self.table
+        table.setColumnCount(len(columns))
+        header = table.horizontalHeader()
+        for index, (title, field_name) in enumerate(columns):
+            item = QTableWidgetItem(title)
+            item.setTextAlignment(_alignment(field_name))
+            table.setHorizontalHeaderItem(index, item)
+            header.setSectionResizeMode(
+                index,
+                QHeaderView.ResizeMode.Stretch
+                if field_name == "chapter_id"
+                else QHeaderView.ResizeMode.ResizeToContents,
+            )
+
     def _rebuild_table(self) -> None:
         selected = self.selected_chapter_id()
         columns = report_columns(self._snapshot)
         rows = self._snapshot.rows
+        self._display_names = chapter_display_names(row.chapter_id for row in rows)
         table = self.table
         table.setUpdatesEnabled(False)
         table.blockSignals(True)
         try:
             table.clearContents()
-            table.setColumnCount(len(columns))
-            table.setHorizontalHeaderLabels([title for title, _field in columns])
+            self._set_columns(columns)
             table.setRowCount(len(rows))
             for row_index, row in enumerate(rows):
                 for column_index, (_title, field_name) in enumerate(columns):
-                    table.setItem(row_index, column_index, _item(row, field_name))
+                    table.setItem(
+                        row_index,
+                        column_index,
+                        _item(row, field_name, self._display_names),
+                    )
         finally:
             table.blockSignals(False)
             table.setUpdatesEnabled(True)
@@ -282,11 +313,19 @@ class QualityReportView(QWidget):
         row = self._selected_row()
         if row is None:
             self.chapter_title_label.setText(NO_CHAPTER_TITLE)
+            self.chapter_path_label.clear()
+            self.chapter_path_label.setVisible(False)
             self.chapter_meta_label.setText(NO_CHAPTER_TEXT)
             self.chapter_details_label.clear()
             self.chapter_details_label.setVisible(False)
             return
-        self.chapter_title_label.setText(row.chapter_id)
+        name = self._display_names.get(row.chapter_id) or chapter_display_name(
+            row.chapter_id
+        )
+        self.chapter_title_label.setText(name)
+        shows_path = name != row.chapter_id
+        self.chapter_path_label.setText(row.chapter_id if shows_path else "")
+        self.chapter_path_label.setVisible(shows_path)
         self.chapter_meta_label.setText(_chapter_meta(row))
         details = _chapter_details(
             row, self._snapshot.decisions_by_chapter.get(row.chapter_id, ())
@@ -322,24 +361,31 @@ class QualityReportView(QWidget):
             self.undo_chapter_requested.emit(chapter_id)
 
 
-def _item(row: ChapterQaRow, field_name: str) -> QTableWidgetItem:
-    item = QTableWidgetItem(_cell_text(row, field_name))
+def _alignment(field_name: str) -> Qt.AlignmentFlag:
+    if field_name in TEXT_FIELDS:
+        return Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+    return Qt.AlignmentFlag.AlignCenter
+
+
+def _item(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> QTableWidgetItem:
+    item = QTableWidgetItem(_cell_text(row, field_name, names))
+    item.setTextAlignment(_alignment(field_name))
     if field_name == "chapter_id":
         item.setData(Qt.ItemDataRole.UserRole, row.chapter_id)
+        if item.text() != row.chapter_id:
+            item.setToolTip(row.chapter_id)
     elif field_name == "status":
         tone = STATUS_TONES.get(row.status)
         if tone:
             item.setForeground(QBrush(QColor(theme_manager.color(f"{tone}_text"))))
         if row.blocked_reason:
             item.setToolTip(f"Перевод остановлен: {row.blocked_reason}")
-    else:
-        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
     return item
 
 
-def _cell_text(row: ChapterQaRow, field_name: str) -> str:
+def _cell_text(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> str:
     if field_name == "chapter_id":
-        return row.chapter_id
+        return names.get(row.chapter_id) or chapter_display_name(row.chapter_id)
     if field_name == "status":
         label = CHAPTER_STATUS_LABELS.get(row.status, row.status)
         # Colour is never the only signal: a blocked chapter says so in words.

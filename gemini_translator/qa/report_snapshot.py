@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from ..utils.text_sort import natural_sort_key
 from .book_metrics import BookMetricsAnalyzer, RelativeRisk
@@ -30,6 +31,33 @@ CHAPTER_STATUS_LABELS = {
     "blocked": "Блокирует",
     "": "Нет данных",
 }
+
+
+def chapter_display_name(chapter_id: str) -> str:
+    """Name a chapter the way a person reads it: by its file name, not its path.
+
+    A chapter id is the chapter's path inside the book, such as
+    ``OEBPS/chapter12.xhtml``; in a narrow list every row began «OEBPS/chapt…».
+    """
+    text = str(chapter_id or "")
+    stem = PurePosixPath(text).stem if text else ""
+    return stem or text
+
+
+def chapter_display_names(chapter_ids) -> dict[str, str]:
+    """Display names for a whole book, keeping the folders where two files share a name."""
+    ids = list(dict.fromkeys(str(item) for item in chapter_ids))
+    names = {chapter_id: chapter_display_name(chapter_id) for chapter_id in ids}
+    counts: dict[str, int] = {}
+    for name in names.values():
+        counts[name] = counts.get(name, 0) + 1
+    for chapter_id, name in names.items():
+        if counts[name] > 1:
+            try:
+                names[chapter_id] = str(PurePosixPath(chapter_id).with_suffix("")) or chapter_id
+            except ValueError:
+                names[chapter_id] = chapter_id
+    return names
 
 
 @dataclass(frozen=True, slots=True)

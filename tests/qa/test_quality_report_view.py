@@ -95,12 +95,10 @@ def test_completeness_and_score_columns_appear_only_with_their_data(qt_app):
         "Ждут решения",
         "Длина",
         "Пропуски",
-        "Подтверждённые",
-        "Книжная норма",
         "Оценка",
     ]
     assert view.table.item(0, 4).text() == "2.90"
-    assert view.table.item(0, 8).text() == "0.83"
+    assert view.table.item(0, 6).text() == "0.83"
     assert view.table.item(1, 4).text() == "—"
 
 
@@ -260,3 +258,46 @@ def test_only_a_snapshot_reaches_the_table(qt_app):
     """A live DataFrame from a background thread must never reach the table."""
     with pytest.raises(TypeError):
         QualityReportView().set_report({"rows": []})
+
+
+def test_a_chapter_path_is_shown_by_its_file_name(qt_app):
+    """Настоящие главы — пути вида OEBPS/chapter12.xhtml, и все 484 строки выглядели одинаково."""
+    journal = QaJournal.empty(book_id="book-1")
+    for chapter_id in ("OEBPS/chapter12.xhtml", "OEBPS/chapter2.xhtml"):
+        journal.record_chapter_state(QaChapterState(chapter_id=chapter_id, status="checked"))
+    view = QualityReportView()
+
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    first = view.table.item(0, 0)
+    assert first.text() == "chapter2"
+    assert first.toolTip() == "OEBPS/chapter2.xhtml"
+    assert view.select_chapter("OEBPS/chapter12.xhtml")
+    assert view.selected_chapter_id() == "OEBPS/chapter12.xhtml"
+    assert view.chapter_title_label.text() == "chapter12"
+    assert view.chapter_path_label.text() == "OEBPS/chapter12.xhtml"
+    assert not view.chapter_path_label.isHidden()
+
+
+def test_a_chapter_without_a_folder_shows_no_path_line(qt_app):
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+
+    view.select_chapter("chapter-1")
+
+    assert view.chapter_path_label.isHidden()
+
+
+def test_the_chapter_column_takes_the_spare_width(qt_app):
+    from PyQt6.QtWidgets import QHeaderView
+
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    header = view.table.horizontalHeader()
+
+    assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
+    assert all(
+        header.sectionResizeMode(column) == QHeaderView.ResizeMode.ResizeToContents
+        for column in range(1, view.table.columnCount())
+    )
+
