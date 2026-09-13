@@ -40,6 +40,7 @@ from .models import (
     QaChapterState,
     QaJournalEntry,
     QaModelValidationError,
+    QaSuggestion,
     RiskLevel,
     SemanticUnit,
     VerifiedCandidate,
@@ -1141,6 +1142,7 @@ class TranslationQualityService:
                 fingerprint=fingerprint,
                 updated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             ),
+            suggestions=_suggestions_for(result),
         )
         self._save_journal()
 
@@ -1203,6 +1205,40 @@ def _chapter_status(result: ChapterQaResult) -> str:
     if any(warning in DEFERRED_WARNINGS for warning in result.warnings):
         return "deferred"
     return "checked"
+
+
+def _suggestions_for(result: ChapterQaResult) -> tuple[QaSuggestion, ...] | None:
+    """The language fixes this pass refused, in the form the journal keeps.
+
+    None when the language check did not run for the chapter: whatever an
+    earlier pass left for the user then stays exactly as it was.
+    """
+    language = result.language
+    if language is None:
+        return None
+    refusals = dict(getattr(language, "refusals", {}) or {})
+    created_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    suggestions: dict[str, QaSuggestion] = {}
+    for issue in getattr(language, "suggestions", ()) or ():
+        replacement = issue.replacement_text or ""
+        suggestion_id = QaSuggestion.identity(
+            result.chapter_id, issue.block_id, issue.original_text, replacement
+        )
+        suggestions.setdefault(
+            suggestion_id,
+            QaSuggestion(
+                suggestion_id=suggestion_id,
+                chapter_id=result.chapter_id,
+                block_id=issue.block_id,
+                category=issue.category,
+                original_text=issue.original_text,
+                replacement_text=replacement,
+                reason=str(refusals.get(issue.issue_id, "")),
+                explanation=issue.explanation,
+                created_at=created_at,
+            ),
+        )
+    return tuple(suggestions.values())
 
 
 # How much already-translated prose the repairer may see on each side of a gap.

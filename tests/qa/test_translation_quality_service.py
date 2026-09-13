@@ -658,3 +658,81 @@ def test_the_pass_size_reaches_the_language_request(tmp_path, chapter):
     _check(service, _request(chapter), QaOptions(language_chunk_chars=25000))
 
     assert seen == [25000]
+
+
+def test_refused_language_fixes_are_kept_for_a_person_to_decide(tmp_path, chapter):
+    """Отвергнутые правки видели только в живом журнале прохода и теряли навсегда."""
+    from gemini_translator.qa.language_validation import LanguageQaResult
+    from gemini_translator.qa.llm.schemas import LanguageIssue
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            blocks = build_translation_payload(request.document_model)["blocks"]
+            calque = LanguageIssue(
+                issue_id="issue-1",
+                category="calque",
+                block_id=blocks[-1]["id"],
+                original_text="сразу ушёл",
+                replacement_text="тут же ушёл",
+                objective=False,
+                confidence=0.9,
+                explanation="Калька с английского.",
+            )
+            deletion = LanguageIssue(
+                issue_id="issue-2",
+                category="repetition",
+                block_id=blocks[0]["id"],
+                original_text="открыл",
+                replacement_text=None,
+                objective=False,
+                confidence=0.9,
+                explanation="Повтор.",
+            )
+            return LanguageQaResult(
+                chapter_id=request.chapter_id,
+                issues=(calque, deletion),
+                suggestions=(calque, deletion),
+                refusals={"issue-1": "validation_declined", "issue-2": "no_replacement"},
+            )
+
+    service, _journal, journal_path = _service(
+        tmp_path, aligner=_CleanAligner(), language=_Language()
+    )
+
+    _check(service, _request(chapter))
+
+    saved = {
+        item["original_text"]: item
+        for item in json.loads(journal_path.read_text(encoding="utf-8"))["suggestions"]
+    }
+    assert saved["сразу ушёл"]["replacement_text"] == "тут же ушёл"
+    assert saved["сразу ушёл"]["reason"] == "validation_declined"
+    assert saved["сразу ушёл"]["category"] == "calque"
+    assert saved["сразу ушёл"]["explanation"] == "Калька с английского."
+    assert saved["сразу ушёл"]["status"] == "pending"
+    assert saved["открыл"]["replacement_text"] == ""
+    assert saved["открыл"]["reason"] == "no_replacement"
+    assert chapter.read_text(encoding="utf-8") == _CHAPTER_HTML
+
+
+def test_a_pass_without_the_language_check_leaves_suggestions_alone(tmp_path, chapter):
+    from gemini_translator.qa.models import QaChapterState, QaSuggestion
+
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    existing = QaSuggestion(
+        suggestion_id=QaSuggestion.identity("chapter-1", "n.1", "сразу ушёл", "тут же ушёл"),
+        chapter_id="chapter-1",
+        block_id="n.1",
+        category="calque",
+        original_text="сразу ушёл",
+        replacement_text="тут же ушёл",
+    )
+    journal.record_chapter_result(
+        state=QaChapterState(chapter_id="chapter-1", status="checked"),
+        suggestions=(existing,),
+    )
+
+    _check(service, _request(chapter))
+
+    assert journal.suggestions == [existing]
+
