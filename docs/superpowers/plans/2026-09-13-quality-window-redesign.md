@@ -91,6 +91,20 @@
 5. **`quality_score` on the row.** `ChapterQaRow` gets a fifth new field, `quality_score`, in stage 2. The score column and the score card need it.
 6. **`embedding_checked(str)`.** The controller gets this signal so the connection probe's result lands in the settings card's result line, not only in the window's status line.
 
+### Found while executing stage 2
+
+A design review rendered the window on a real book's journal (484 chapters). Stage 2 was changed as follows before it was merged:
+
+7. **Chapter names.** Real chapter ids are paths such as `OEBPS/chapter12.xhtml`, and every row of the list read «OEBPS/chapt…». The list shows the file name, with the path in the tooltip and under the chapter card's title. Two files with one name keep their folders.
+8. **Completeness columns.** Only «Длина» and «Пропуски» stay in the list; the book norm and the confirmed gaps are shown in the chapter card. Nine equal columns made the list unreadable. Only the chapter column stretches.
+9. **Stopping.** «Остановить проверку» keeps the window busy until the pass has really ended and says «Останавливаю…». Releasing it at once let a second pass start, and a new pass resets the cancellation the first one obeyed. A stop that interrupts a chapter is reported as a stop, not a failure. Checking one chapter resets an earlier stop.
+10. **Progress.** The status line reads «Проход: 12 из 484 · осталось ~40 мин · chapter13»; the bar shows no text. The header drops «Последний проход» while a pass runs.
+11. **Status colours.** Only «Отложена» and «Блокирует» are coloured, and they are repainted when the theme changes while the window is open.
+12. **Report.** It opens on the chapter that needs attention; totals are sentences that agree with their numbers; «Открыть предложения» is always available; a blocked chapter carries a «Перевод остановлен» chip.
+13. **Log.** No card around it, no ruled lines, an empty state, and it takes the focus only when clicked.
+14. **Connection answers.** The embedding and PC check answers stay until their own settings change; before a check the cards say that nothing has been checked.
+15. **Lint.** Tasks 11 and 19 lint the changed files, not the `validation_dialogs/` directory, which holds older files with long-standing findings.
+
 ## File map
 
 | File | Stage | Responsibility |
