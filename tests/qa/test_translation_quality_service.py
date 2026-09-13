@@ -736,3 +736,138 @@ def test_a_pass_without_the_language_check_leaves_suggestions_alone(tmp_path, ch
 
     assert journal.suggestions == [existing]
 
+
+def _pending_suggestion(journal, *, block_id="n.1", original="сразу ушёл", replacement="тут же ушёл"):
+    """A suggestion recorded for the chapter fixture, as a language check leaves it."""
+    from gemini_translator.qa.models import QaChapterState, QaSuggestion
+
+    suggestion = QaSuggestion(
+        suggestion_id=QaSuggestion.identity("chapter-1", block_id, original, replacement),
+        chapter_id="chapter-1",
+        block_id=block_id,
+        category="calque",
+        original_text=original,
+        replacement_text=replacement,
+        reason="validation_declined",
+    )
+    journal.record_chapter_result(
+        state=QaChapterState(chapter_id="chapter-1", status="checked", fingerprint="sha256:old"),
+        suggestions=(suggestion,),
+    )
+    return suggestion
+
+
+def test_an_applied_suggestion_is_written_and_undo_brings_the_chapter_back(tmp_path, chapter):
+    """Применённая вручную правка откатывается той же кнопкой, что и автоисправления."""
+    original = chapter.read_bytes()
+    service, journal, journal_path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+
+    assert (outcome.status, outcome.chapter_id) == ("applied", "chapter-1")
+    assert "тут же ушёл" in chapter.read_text(encoding="utf-8")
+    assert journal.suggestion(suggestion.suggestion_id).status == "applied"
+    saved = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert any(entry["candidate_id"] == "suggestion" for entry in saved["repairs"])
+    assert journal.chapter_states["chapter-1"].fingerprint == (
+        "sha256:" + hashlib.sha256(chapter.read_bytes()).hexdigest()
+    )
+
+    undo = asyncio.run(service.undo_chapter("chapter-1"))
+
+    assert undo.status == "restored"
+    assert chapter.read_bytes() == original
+
+
+def test_a_chapter_that_changed_is_left_alone_and_the_suggestion_goes_stale(tmp_path, chapter):
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+    chapter.write_text("<p>Он открыл дверь.</p><p>Он ушёл.</p>", encoding="utf-8")
+    edited = chapter.read_bytes()
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+
+    assert (outcome.status, outcome.detail) == ("stale", "глава изменилась после проверки")
+    assert chapter.read_bytes() == edited
+    recorded = journal.suggestion(suggestion.suggestion_id)
+    assert (recorded.status, recorded.status_note) == ("stale", "глава изменилась после проверки")
+
+
+def test_a_missing_translation_makes_the_suggestion_stale(tmp_path, chapter):
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, tmp_path / "gone.html"))
+
+    assert (outcome.status, outcome.detail) == ("stale", "перевод главы не найден")
+
+
+def test_no_translation_path_at_all_makes_the_suggestion_stale(tmp_path, chapter):
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, None))
+
+    assert (outcome.status, outcome.detail) == ("stale", "перевод главы не найден")
+    assert chapter.read_text(encoding="utf-8") == _CHAPTER_HTML
+
+
+def test_a_fix_the_repair_store_cannot_record_is_rolled_back(tmp_path, chapter):
+    """Правка, которую нельзя откатить, хуже, чем никакой правки."""
+    original = chapter.read_bytes()
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+
+    def broken(applied):
+        raise OSError("repair store is not writable")
+
+    service._store.record_applied = broken  # noqa: SLF001 - exercising the failure
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+
+    assert outcome.status == "failed"
+    assert chapter.read_bytes() == original
+    assert journal.suggestion(suggestion.suggestion_id).status == "pending"
+
+
+def test_a_suggestion_without_a_replacement_is_never_written(tmp_path, chapter):
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal, block_id="n.0", original="открыл", replacement="")
+
+    outcome = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+
+    assert outcome.status == "failed"
+    assert chapter.read_text(encoding="utf-8") == _CHAPTER_HTML
+    assert journal.suggestion(suggestion.suggestion_id).status == "pending"
+
+
+def test_a_decision_is_made_once(tmp_path, chapter):
+    service, journal, journal_path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+
+    first = asyncio.run(service.dismiss_suggestion(suggestion.suggestion_id))
+    again = asyncio.run(service.dismiss_suggestion(suggestion.suggestion_id))
+    applied_after = asyncio.run(service.apply_suggestion(suggestion.suggestion_id, chapter))
+    unknown = asyncio.run(service.dismiss_suggestion("sg-unknown"))
+
+    assert (first.status, again.status, applied_after.status, unknown.status) == (
+        "dismissed",
+        "missing",
+        "missing",
+        "missing",
+    )
+    assert chapter.read_text(encoding="utf-8") == _CHAPTER_HTML
+    saved = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert saved["suggestions"][0]["status"] == "dismissed"
+
+
+def test_a_stale_suggestion_can_still_be_taken_off_the_list(tmp_path, chapter):
+    service, journal, _path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+    journal.set_suggestion_status(suggestion.suggestion_id, "stale", "глава изменилась после проверки")
+
+    outcome = asyncio.run(service.dismiss_suggestion(suggestion.suggestion_id))
+
+    assert outcome.status == "dismissed"
+

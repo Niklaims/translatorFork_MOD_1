@@ -24,8 +24,11 @@ from .language_validation import (
     DEFAULT_LANGUAGE_CHUNK_CHARS,
     LanguageQaRequest,
     LanguageQaResult,
+    LanguageRepairConflict,
+    LanguageReplacement,
     LanguageRuleIssue,
     RussianNlpAnalysis,
+    apply_language_replacements,
 )
 from .llm.completion import CancellationToken, QaModelSelection
 from .llm.omission_repairer import OmissionRepairError, RepairContext
@@ -484,6 +487,19 @@ class ChapterQaResult:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SuggestionOutcome:
+    """What became of one suggestion a person chose to apply or dismiss."""
+
+    status: str
+    suggestion_id: str
+    chapter_id: str = ""
+    detail: str = ""
+
+
+_SUGGESTION_ALREADY_DECIDED = "правка уже решена или не найдена"
+
+
 class TranslationQualityService:
     """Run the whole QA cascade for one chapter without touching the queue.
 
@@ -705,6 +721,130 @@ class TranslationQualityService:
     async def undo_session(self, session_id: str) -> UndoResult:
         """Revert every automatic repair of one session, newest chapter first."""
         return self._store.undo_session(session_id)
+
+    def suggestion(self, suggestion_id: str) -> QaSuggestion | None:
+        """Find one recorded suggestion, whatever its state."""
+        return self._journal.suggestion(suggestion_id)
+
+    async def apply_suggestion(
+        self, suggestion_id: str, translated_path: Path | str | None
+    ) -> SuggestionOutcome:
+        """Write one suggestion into its chapter the way an automatic fix is written.
+
+        It is backed up first and recorded in the repair store, so «Отменить
+        исправления главы» reverts it like any other fix.  A chapter that has
+        changed since the check is left untouched and the suggestion goes stale.
+        """
+        suggestion = self._journal.suggestion(suggestion_id)
+        if suggestion is None or suggestion.status != "pending":
+            return SuggestionOutcome(
+                "missing",
+                suggestion_id,
+                getattr(suggestion, "chapter_id", ""),
+                _SUGGESTION_ALREADY_DECIDED,
+            )
+        chapter_id = suggestion.chapter_id
+        if not suggestion.applicable:
+            return SuggestionOutcome(
+                "failed",
+                suggestion_id,
+                chapter_id,
+                "нет текста замены: такую правку вносит человек",
+            )
+        path = Path(translated_path) if translated_path else None
+        try:
+            if path is None:
+                raise FileNotFoundError(chapter_id)
+            before = path.read_bytes()
+        except OSError:
+            return self._suggestion_went_stale(suggestion, "перевод главы не найден")
+        try:
+            model = build_html_document_model(before.decode("utf-8"), document_id=chapter_id)
+            edited = apply_language_replacements(
+                model,
+                (
+                    LanguageReplacement(
+                        issue_id=suggestion_id,
+                        block_id=suggestion.block_id,
+                        original_text=suggestion.original_text,
+                        replacement_text=suggestion.replacement_text,
+                    ),
+                ),
+            )
+        except (LanguageRepairConflict, ValueError):
+            return self._suggestion_went_stale(suggestion, "глава изменилась после проверки")
+        payload = render_document_html(edited).encode("utf-8")
+        try:
+            backup = self._store.backup_chapter(chapter_id, path)
+            atomic_write_bytes(path, payload)
+        except (OSError, RepairStoreError) as error:
+            return SuggestionOutcome(
+                "failed", suggestion_id, chapter_id, f"не удалось записать главу: {error}"
+            )
+        patch_id = "sug" + hashlib.sha256(suggestion_id.encode("utf-8")).hexdigest()[:20]
+        applied = AppliedRepair(
+            patch_id=patch_id,
+            chapter_id=chapter_id,
+            session_id=self._store.session_id,
+            chapter_path=path,
+            backup_path=backup.path,
+            before_sha256=content_digest(before),
+            after_sha256=content_digest(payload),
+            inserted_text=suggestion.replacement_text[:500],
+        )
+        try:
+            self._store.record_applied(applied)
+        except Exception as error:  # noqa: BLE001 - a written fix must stay recorded or undone
+            try:
+                atomic_write_bytes(path, before)
+            except OSError:
+                pass
+            return SuggestionOutcome(
+                "failed",
+                suggestion_id,
+                chapter_id,
+                f"исправление не записано в хранилище правок: {error}",
+            )
+        self._journal.append_repair(
+            {
+                "patch_id": patch_id,
+                "chapter_id": chapter_id,
+                "candidate_id": "suggestion",
+                "session_id": self._store.session_id,
+                "fragment": applied.inserted_text,
+            }
+        )
+        self._journal.set_suggestion_status(suggestion_id, "applied")
+        state = self._journal.chapter_states.get(chapter_id)
+        if state is not None:
+            # The chapter changed on purpose: «Продолжить проверку» must not
+            # take this one accepted edit as a reason to check it again.
+            self._journal.record_chapter_state(
+                replace(state, fingerprint=chapter_fingerprint(path))
+            )
+        self._save_journal()
+        return SuggestionOutcome("applied", suggestion_id, chapter_id)
+
+    async def dismiss_suggestion(self, suggestion_id: str) -> SuggestionOutcome:
+        """Take one suggestion off the list; the chapter is not touched."""
+        suggestion = self._journal.suggestion(suggestion_id)
+        if suggestion is None or not suggestion.awaits_decision:
+            return SuggestionOutcome(
+                "missing",
+                suggestion_id,
+                getattr(suggestion, "chapter_id", ""),
+                _SUGGESTION_ALREADY_DECIDED,
+            )
+        self._journal.set_suggestion_status(suggestion_id, "dismissed")
+        self._save_journal()
+        return SuggestionOutcome("dismissed", suggestion_id, suggestion.chapter_id)
+
+    def _suggestion_went_stale(
+        self, suggestion: QaSuggestion, note: str
+    ) -> SuggestionOutcome:
+        self._journal.set_suggestion_status(suggestion.suggestion_id, "stale", note)
+        self._save_journal()
+        return SuggestionOutcome("stale", suggestion.suggestion_id, suggestion.chapter_id, note)
 
     async def _verify_candidates(
         self,
