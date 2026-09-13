@@ -25,6 +25,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from unittest.mock import patch
 
 from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, QEvent
 from PyQt6.QtWidgets import QApplication, QDialog
 
 from gemini_translator.ui.dialogs.validation import TranslationValidatorPage
@@ -46,6 +47,26 @@ class _FakeSettingsManager:
         self._qa_settings = settings
 
 
+def _quiesce_page(page):
+    """Гасит отложенную работу, которую конструктор страницы ставит на таймер.
+
+    TranslationValidatorPage.__init__ запускает одноразовый QTimer (150 мс) на
+    _populate_initial_table; в тесте страница живёт без реального проекта, и
+    таймер сработал бы уже в чужом тесте того же процесса, уронив его
+    исключением из Qt-слота (pytest-qt ловит их на любом тесте).
+    """
+    timer = getattr(page, "_populate_initial_table_timer", None)
+    if timer is not None:
+        timer.stop()
+
+
+def _dispose_page(page):
+    """deleteLater + доставка DeferredDelete: без этого QObject доживает до
+    следующего оборота цикла событий уже в чужом тесте."""
+    page.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 class QualityControllerOutlivesDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -59,7 +80,8 @@ class QualityControllerOutlivesDialogTests(unittest.TestCase):
                 "/tmp/nonexistent-book.epub",
                 project_manager=None,
             )
-        self.addCleanup(page.deleteLater)
+        _quiesce_page(page)
+        self.addCleanup(_dispose_page, page)
         return page
 
     def _open_dialog_capturing_it(self, page):

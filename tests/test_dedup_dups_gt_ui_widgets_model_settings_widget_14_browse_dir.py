@@ -24,6 +24,20 @@ from gemini_translator.ui.widgets.model_settings_widget import (
 )
 
 
+
+_MISSING = object()
+
+
+def _restore_attr(obj, name, previous):
+    """Возвращает атрибут общего QApplication в состояние до теста
+    (подменённый get_settings_manager иначе утекает в другие тесты процесса)."""
+    if previous is _MISSING:
+        if hasattr(obj, name):
+            delattr(obj, name)
+    else:
+        setattr(obj, name, previous)
+
+
 class _DummyBus(QtCore.QObject):
     event_posted = QtCore.pyqtSignal(dict)
 
@@ -154,7 +168,9 @@ class BrowseDirRoutingTests(unittest.TestCase):
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
         settings = _WidgetSettingsStub(temp_dir.name)
+        previous_getter = getattr(self.app, "get_settings_manager", _MISSING)
         self.app.get_settings_manager = lambda settings=settings: settings
+        self.addCleanup(_restore_attr, self.app, "get_settings_manager", previous_getter)
         widget = ModelSettingsWidget(settings_manager=settings)
         self.addCleanup(widget.close)
         return widget

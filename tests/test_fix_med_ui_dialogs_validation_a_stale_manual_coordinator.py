@@ -40,6 +40,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from unittest.mock import patch
 
+from PyQt6.QtCore import QCoreApplication, QEvent
 from PyQt6.QtWidgets import QApplication
 
 from gemini_translator.ui.dialogs.validation import TranslationValidatorPage
@@ -81,6 +82,26 @@ class _ProjectManagerStub:
     project_folder = "/tmp/project"
 
 
+def _quiesce_page(page):
+    """Гасит отложенную работу, которую конструктор страницы ставит на таймер.
+
+    TranslationValidatorPage.__init__ запускает одноразовый QTimer (150 мс) на
+    _populate_initial_table; в тесте страница живёт без реального проекта, и
+    таймер сработал бы уже в чужом тесте того же процесса, уронив его
+    исключением из Qt-слота (pytest-qt ловит их на любом тесте).
+    """
+    timer = getattr(page, "_populate_initial_table_timer", None)
+    if timer is not None:
+        timer.stop()
+
+
+def _dispose_page(page):
+    """deleteLater + доставка DeferredDelete: без этого QObject доживает до
+    следующего оборота цикла событий уже в чужом тесте."""
+    page.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def _make_page():
     with patch.object(TranslationValidatorPage, "_perform_initial_cjk_scan"):
         page = TranslationValidatorPage(
@@ -88,6 +109,7 @@ def _make_page():
             "/tmp/nonexistent-book.epub",
             project_manager=_ProjectManagerStub(),
         )
+    _quiesce_page(page)
     return page
 
 
@@ -152,6 +174,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
 
     def test_unchanged_settings_keep_the_same_coordinator(self):
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -167,6 +190,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
 
     def test_changed_manual_settings_rebuild_the_coordinator(self):
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -192,6 +216,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
 
     def test_changed_model_rebuilds_the_coordinator(self):
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -211,6 +236,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
     def test_a_live_translation_sessions_coordinator_is_never_touched(self):
         """Координатор активной сессии перевода — не наш, его не трогаем."""
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -240,6 +266,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
         как «настройки изменились» и валил живой координатор.
         """
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager(
             "gemini", "gemini-model", ["key-1", "key-2"]
@@ -271,6 +298,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
     def test_rebuild_is_deferred_while_a_pass_is_running(self):
         """Идущий проход не пересобирается, даже если настройки реально сменились."""
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -295,6 +323,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
     def test_rebuild_resumes_once_the_pass_ends(self):
         """Отложенная пересборка происходит сразу, как только проход закончился."""
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
@@ -324,6 +353,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
         был уничтожен, а взамен не появлялось ничего.
         """
         page = _make_page()
+        self.addCleanup(_dispose_page, page)
         self.addCleanup(page.deleteLater)
         settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
         page._quality_settings_manager = lambda: settings_manager
