@@ -28,7 +28,9 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
+import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -320,6 +322,39 @@ class ScoringHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class, bind_and_activate)
 
 
+# The one setting that keeps a load whose every file is on disk off the network.
+# Both Hub libraries read it once, when they are imported: without it an SSL or
+# proxy failure is re-raised instead of being answered from the cache, and
+# transformers' Mistral-regex check asks the Hub for model info whatever
+# local_files_only says. An antivirus that inspects HTTPS, a proxy that is down
+# or an outage at huggingface.co then failed loads that needed nothing from it.
+_OFFLINE_SWITCH = "HF_HUB_OFFLINE"
+_SWITCH_ON = frozenset({"1", "ON", "YES", "TRUE"})
+
+
+def _encoder_repo(model_dir: Path) -> str:
+    """The Hub repository COMET builds the encoder from, or "" when none is named.
+
+    COMET reads hparams.yaml from the directory above the checkpoint's own, and
+    its first load fetches this repository's tokenizer and config.
+    """
+    try:
+        text = (model_dir.parent / "hparams.yaml").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    found = re.search(r"^pretrained_model:[ \t]*(\S+)", text, flags=re.MULTILINE)
+    return found.group(1) if found else ""
+
+
+def _encoder_cached(repo: str) -> bool:
+    """Report whether an offline load would find the encoder in the Hub cache."""
+    # Imported only now, after main() has set the switch the library reads.
+    from huggingface_hub import try_to_load_from_cache  # noqa: PLC0415
+
+    # The config is the last file COMET's encoders fetch, after the tokenizer.
+    return isinstance(try_to_load_from_cache(repo, "config.json"), str)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", required=True, help="каталог с весами")
@@ -328,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args(argv)
+    # Before anything imports the Hub libraries: see _OFFLINE_SWITCH.
+    os.environ.setdefault(_OFFLINE_SWITCH, "1")
 
     if not Path(args.model_dir).is_dir():
         sys.stderr.write(f"Каталог весов не найден: {args.model_dir}\n")
@@ -336,7 +373,7 @@ def main(argv: list[str] | None = None) -> int:
         # The lookup load_model() makes on the first request, made up front:
         # a directory it finds no checkpoint in would otherwise start a server
         # that passes the connection check and then fails every chapter.
-        _RUNNER._checkpoint_path(Path(args.model_dir))
+        checkpoint = _RUNNER._checkpoint_path(Path(args.model_dir))
     except RequestError:
         sys.stderr.write(
             f"В каталоге весов нет файла .ckpt: {args.model_dir}\n"
@@ -345,6 +382,20 @@ def main(argv: list[str] | None = None) -> int:
             "не перемещайте.\n"
         )
         return 2
+
+    if os.environ[_OFFLINE_SWITCH].upper() in _SWITCH_ON:
+        # Like the checkpoint lookup above: offline, a tokenizer that was never
+        # fetched would pass the connection check and then fail every chapter.
+        encoder = _encoder_repo(Path(args.model_dir))
+        if encoder and not _encoder_cached(encoder):
+            sys.stderr.write(
+                f"В кэше Hugging Face нет файлов энкодера {encoder}: сервер "
+                "работает без интернета и без них модель не загрузит.\n"
+                "Один раз, с интернетом, выполните в командной строке:\n"
+                f'"{sys.executable}" -c "from comet import load_from_checkpoint; '
+                f"load_from_checkpoint(r'{checkpoint}')\"\n"
+            )
+            return 2
 
     service = ScoringService(args.model_dir, args.device, args.model)
     server = ScoringHTTPServer((args.host, args.port), build_handler(service))

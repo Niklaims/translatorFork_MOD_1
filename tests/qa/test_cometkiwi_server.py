@@ -6,11 +6,13 @@ import http.client
 from http.server import ThreadingHTTPServer
 import importlib.util
 import json
+import os
 from pathlib import Path
 import socket
 import sys
 import threading
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -29,6 +31,13 @@ def _load(name: str):
 @pytest.fixture
 def server_module():
     return _load("translation_qa_cometkiwi_server")
+
+
+@pytest.fixture(autouse=True)
+def _offline_switch_left_as_found(monkeypatch):
+    # main() turns the Hub libraries offline for its own process; restored
+    # after each test so that none hands the setting on to the next.
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
 
 
 class _Model:
@@ -644,6 +653,157 @@ def test_main_still_refuses_a_weights_directory_that_does_not_exist(
 
     assert code == 2
     assert capsys.readouterr().err == f"Каталог весов не найден: {missing}\n"
+
+
+# --- a model load that needs nothing from the internet ------------------------
+
+# hparams.yaml exactly as Unbabel/wmt22-cometkiwi-da ships it.
+_KIWI_HPARAMS = """\
+activations: Tanh
+batch_size: 4
+class_identifier: unified_metric
+dropout: 0.1
+encoder_learning_rate: 1.0e-06
+encoder_model: XLM-RoBERTa
+final_activation: null
+hidden_sizes:
+- 3072
+- 1024
+input_segments:
+- mt
+- src
+keep_embeddings_frozen: true
+layer: mix
+layer_norm: false
+layer_transformation: sparsemax_patch
+layerwise_decay: 0.95
+learning_rate: 1.5e-05
+loss: mse
+loss_lambda: 0.65
+nr_frozen_epochs: 0.3
+optimizer: AdamW
+pool: avg
+pretrained_model: microsoft/infoxlm-large
+sent_layer: mix
+train_data:
+- data/1720-da.mlqe-src.csv
+validation_data:
+- data/wmt-ende-newstest2021.csv
+- data/wmt-enru-newstest2021.csv
+- data/wmt-zhen-newstest2021.csv
+word_layer: 24
+word_level_training: false
+word_weights:
+- 0.15
+- 0.85
+"""
+
+
+def _downloaded_model(root: Path) -> Path:
+    """Lay a model out as Hugging Face downloads it; return the checkpoint's directory."""
+    (root / "hparams.yaml").write_text(_KIWI_HPARAMS, encoding="utf-8")
+    checkpoints = root / "checkpoints"
+    checkpoints.mkdir()
+    (checkpoints / "model.ckpt").write_bytes(b"")
+    return checkpoints
+
+
+def _hub_cache(monkeypatch, *on_disk: tuple[str, str]) -> None:
+    """Stand in for huggingface_hub, which this environment lacks: its cache lookup only.
+
+    Answers as the real try_to_load_from_cache does, a path for a cached file and
+    None for one it knows nothing of, and only for the (repo, file) pairs given.
+    """
+    hub = types.ModuleType("huggingface_hub")
+
+    def try_to_load_from_cache(repo_id, filename, cache_dir=None, revision=None, repo_type=None):
+        if (repo_id, filename) in on_disk:
+            return f"/hub/models--{repo_id.replace('/', '--')}/snapshots/0/{filename}"
+        return None
+
+    hub.try_to_load_from_cache = try_to_load_from_cache
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+
+def _server_recording_the_offline_switch(seen: list):
+    class _Server:
+        def __init__(self, address, handler_class):
+            return
+
+        def serve_forever(self):
+            # What the process holds while serving is what the first request's
+            # import of COMET, and with it of the Hub libraries, reads.
+            seen.append(os.environ.get("HF_HUB_OFFLINE"))
+
+        def server_close(self):
+            return
+
+    return _Server
+
+
+def test_main_serves_with_the_hub_libraries_offline(server_module, monkeypatch, tmp_path):
+    """Every file was on disk, and an antivirus inspecting HTTPS still failed the load.
+
+    huggingface_hub re-raises an SSL or proxy failure instead of answering from
+    its cache, and transformers' Mistral-regex check asks the Hub for model info
+    whatever local_files_only says. Only HF_HUB_OFFLINE, which both libraries
+    read once at import, keeps a fully cached load off the network.
+    """
+    checkpoints = _downloaded_model(tmp_path)
+    _hub_cache(monkeypatch, ("microsoft/infoxlm-large", "config.json"))
+    seen = []
+    monkeypatch.setattr(
+        server_module, "ScoringHTTPServer", _server_recording_the_offline_switch(seen)
+    )
+
+    code = server_module.main(
+        ["--model-dir", str(checkpoints), "--model", "wmt22-cometkiwi-da"]
+    )
+
+    assert code == 0
+    assert seen == ["1"]
+
+
+def test_main_leaves_a_switch_the_user_set_alone(server_module, monkeypatch, tmp_path):
+    """Asked to stay online, the first load fetches the encoder itself: nothing to check."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "0")
+    checkpoints = _downloaded_model(tmp_path)
+    _hub_cache(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        server_module, "ScoringHTTPServer", _server_recording_the_offline_switch(seen)
+    )
+
+    code = server_module.main(
+        ["--model-dir", str(checkpoints), "--model", "wmt22-cometkiwi-da"]
+    )
+
+    assert code == 0
+    assert seen == ["0"]
+
+
+def test_main_refuses_to_start_offline_without_the_encoder_in_the_cache(
+    server_module, monkeypatch, capsys, tmp_path
+):
+    """COMET builds the encoder from the tokenizer and config hparams.yaml names.
+
+    Offline and never fetched, they failed every chapter with attributeerror
+    while the connection check stayed green. Refused up front instead, naming
+    the command that fetches them with this very interpreter.
+    """
+    checkpoints = _downloaded_model(tmp_path)
+    _hub_cache(monkeypatch)
+    monkeypatch.setattr(server_module, "ScoringHTTPServer", _refuse_to_serve)
+
+    code = server_module.main(
+        ["--model-dir", str(checkpoints), "--model", "wmt22-cometkiwi-da"]
+    )
+
+    message = capsys.readouterr().err
+    assert code == 2
+    assert "microsoft/infoxlm-large" in message
+    assert sys.executable in message
+    assert str(checkpoints / "model.ckpt") in message
 
 
 # --- the batch file that starts it on the PC ---------------------------------
