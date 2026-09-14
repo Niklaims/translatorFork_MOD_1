@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 
 from ..utils.text_sort import natural_sort_key
 from .book_metrics import BookMetricsAnalyzer, RelativeRisk
+from .estimators.cometkiwi_model_manager import describe_quality_score_status
 from .models import ChapterMetrics, QaSuggestion, RiskLevel
 
 
@@ -87,6 +88,8 @@ class ChapterQaRow:
     # above that describes length, gaps or the book norm is a placeholder.
     has_completeness: bool = False
     quality_score: float | None = None
+    # Why the chapter has no score, in words; empty when nothing failed.
+    quality_score_problem: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +340,9 @@ def _row_for(
         pending_suggestions=pending_suggestions,
         has_completeness=True,
         quality_score=metrics.quality_score,
+        quality_score_problem=describe_quality_score_status(
+            metrics.quality_score_status
+        ),
     )
 
 

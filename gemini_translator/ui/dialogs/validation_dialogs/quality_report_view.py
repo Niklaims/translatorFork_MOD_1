@@ -617,6 +617,8 @@ def _chapter_details(row: ChapterQaRow, decisions) -> str:
         )
     if row.quality_score is not None:
         lines.append(f"Оценка CometKiwi: {row.quality_score:.2f}")
+    elif row.quality_score_problem:
+        lines.append(f"Оценка CometKiwi не получена: {row.quality_score_problem}.")
     if decisions:
         lines.append(
             "Решения проверки: "

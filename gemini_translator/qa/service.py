@@ -21,6 +21,7 @@ from ..utils.text import escape_html
 from .addition_detector import AdditionCandidate, ChapterContext
 from .capabilities import QaCapabilitySettings
 from .coverage_service import SEMANTIC_ALIGNMENT_MODE, CoverageAnalysis, CoverageRequest
+from .estimators.base import SourceTranslationWindow
 from .glossary_context import GlossaryContextSelector, GlossaryTerm
 from .journal import QaJournal
 from .language_validation import (
@@ -241,6 +242,10 @@ class ChapterQaResult:
     language: LanguageQaResult | None = None
     metrics: ChapterMetrics | None = None
     warnings: tuple[str, ...] = ()
+    # One source ↔ translation passage per aligned span, for the CometKiwi
+    # chapter score. Empty without the completeness check; the coordinator
+    # drops it once the score is taken, since it holds the chapter's text.
+    quality_windows: tuple[SourceTranslationWindow, ...] = ()
 
     def changes(self) -> tuple["ChapterChange", ...]:
         """List every change and refusal this pass produced, in reading order."""
@@ -635,6 +640,7 @@ class TranslationQualityService:
             language=language,
             metrics=metrics,
             warnings=tuple(dict.fromkeys(warnings)),
+            quality_windows=_quality_windows(coverage),
         )
         self._record(result, chapter_fingerprint(request.translated_path))
         return result
@@ -1343,6 +1349,44 @@ def _quality_score_status(estimate) -> str:
     if not _REASON_PATTERN.fullmatch(reason):
         reason = "invalid_reason"
     return f"{status}:{reason}"
+
+
+def _quality_windows(
+    coverage: CoverageAnalysis | None,
+) -> tuple[SourceTranslationWindow, ...]:
+    """Turn the completeness alignment into the passages CometKiwi scores.
+
+    Every span with text on both sides is one window: up to three sentences of
+    the source and the translation the alignment matched to them. A gap has
+    nothing to compare and stays with the omission check. Without an alignment
+    - the check switched off, or limited mode - there is nothing to score.
+    """
+    alignment = coverage.alignment if coverage is not None else None
+    if alignment is None:
+        return ()
+    source = {unit.unit_id: unit.text for unit in coverage.source_units}
+    target = {unit.unit_id: unit.text for unit in coverage.target_units}
+    windows: list[SourceTranslationWindow] = []
+    for index, span in enumerate(alignment.spans):
+        source_text = _joined_units(span.source_unit_ids, source)
+        translation = _joined_units(span.target_unit_ids, target)
+        visible = sum(1 for character in translation if not character.isspace())
+        if not source_text or visible <= 0:
+            continue
+        windows.append(
+            SourceTranslationWindow(
+                window_id=f"span-{index}",
+                source=source_text,
+                translation=translation,
+                visible_chars=visible,
+            )
+        )
+    return tuple(windows)
+
+
+def _joined_units(unit_ids: Sequence[str], texts: Mapping[str, str]) -> str:
+    parts = (texts.get(unit_id, "").strip() for unit_id in unit_ids)
+    return " ".join(part for part in parts if part)
 
 
 def _chapter_status(result: ChapterQaResult) -> str:

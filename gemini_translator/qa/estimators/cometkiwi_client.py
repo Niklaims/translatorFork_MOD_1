@@ -27,8 +27,8 @@ from .base import (
 
 ESTIMATOR_NAME = "cometkiwi"
 SCHEMA_VERSION = 1
-# One answer for one chapter's disputed windows: a megabyte is already far more
-# than a list of floats needs, and an unbounded read is a way to be hanged.
+# One answer for at most 512 windows of one chapter: a megabyte is already far
+# more than a list of floats needs, and an unbounded read is a way to be hanged.
 MAX_RESPONSE_BYTES = 1_000_000
 DEFAULT_TIMEOUT_SECONDS = 900.0
 # The transport's own bound on the TCP handshake alone, separate from the
@@ -122,7 +122,7 @@ def usable_endpoint(url: str) -> bool:
 
 
 class CometKiwiEstimator:
-    """Score disputed windows with a reference-free model, or say why it could not."""
+    """Score a chapter's windows with a reference-free model, or say why it could not."""
 
     def __init__(
         self,

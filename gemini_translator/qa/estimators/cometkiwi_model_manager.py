@@ -28,6 +28,7 @@ CometKiwiModelFile = ModelBundleFile
 __all__ = (
     "MANIFEST_NAME",
     "describe_cometkiwi_setup",
+    "describe_quality_score_status",
     "CometKiwiLicenseNotAccepted",
     "CometKiwiModelFile",
     "CometKiwiModelManager",
@@ -220,6 +221,85 @@ def describe_cometkiwi_setup(
     if last_duration_seconds is not None:
         parts.append(f"последний запуск {last_duration_seconds:.1f} c")
     return " · ".join(part for part in parts if part) + "."
+
+
+# What a stored reason means to the person reading the chapter card. The
+# codes come from the client, the PC server and the runner (spec 2026-09-12,
+# «Отказы и деградация»); a code missing here is still shown, by its name.
+QUALITY_SCORE_REASONS = {
+    "model_missing": "не указана модель",
+    "endpoint_invalid": "адрес ПК записан неверно",
+    "runner_missing": "не указан путь к программе оценки",
+    "runner_not_found": "не найдена программа оценки",
+    "weights_missing": "не найдены веса модели",
+    "endpoint_unreachable": "ПК не отвечает",
+    "timeout": "оценка не уложилась в отведённое время",
+    "runner_not_started": "программа оценки не запустилась",
+    "out_of_memory": "не хватило памяти",
+    "runner_crashed": "программа оценки аварийно завершилась",
+    "response_too_large": "ответ оценки слишком большой",
+    "runner_failed": "запрос на оценку не удалось отправить",
+    "invalid_response": "ответ оценки не разобран",
+    "unsupported_schema_version": "версии приложения и программы оценки не совпадают",
+    "request_id_mismatch": "ответ пришёл на другой запрос",
+    "runner_error": "программа оценки сообщила об ошибке",
+    "score_count_mismatch": "оценок пришло не столько, сколько фрагментов",
+    "invalid_scores": "пришли негодные оценки",
+    "invalid_reason": "причина сбоя не распознана",
+    "capability_disabled": "оценка выключена",
+    "license_not_accepted": "не принята лицензия модели",
+}
+# What the server or the runner itself names after "runner_error:".
+RUNNER_ERROR_DETAILS = {
+    "invalid_request": "программа оценки не приняла запрос",
+    "unexpected_segment_field": "программа оценки не приняла запрос",
+    "unsupported_schema_version": "версии приложения и программы оценки не совпадают",
+    "too_many_segments": "в запросе слишком много фрагментов",
+    "request_too_large": "запрос слишком большой",
+    "score_count_mismatch": "оценок пришло не столько, сколько фрагментов",
+    "checkpoint_missing": "не найдены веса модели",
+    "weights_missing": "не найдены веса модели",
+    "invalid_model_output": "модель вернула негодный ответ",
+    "runner_environment_incomplete": "не установлены пакеты для оценки",
+    "out_of_memory": "не хватило памяти",
+    # The local runner's name for running out of video memory.
+    "outofmemoryerror": "не хватило видеопамяти",
+}
+_NUMBERED_REASONS = (
+    ("endpoint_status_", "ПК ответил ошибкой {}"),
+    ("runner_exit_", "программа оценки завершилась с кодом {}"),
+    ("runner_signal_", "программа оценки прервана сигналом {}"),
+)
+_STATUS_WITHOUT_REASON = {
+    "unavailable": "оценка недоступна",
+    "disabled": "оценка выключена",
+}
+
+
+def describe_quality_score_status(status: str) -> str:
+    """Say why a chapter has no CometKiwi score, or nothing when there is no failure.
+
+    The stored value is ``<status>:<reason>``, split on the first colon only:
+    a failure the runner names itself keeps a second one,
+    ``runner_error:<detail>``.
+    """
+    state, _, reason = str(status or "").partition(":")
+    if state not in _STATUS_WITHOUT_REASON:
+        return ""
+    if not reason:
+        return _STATUS_WITHOUT_REASON[state]
+    if reason.startswith("runner_error:"):
+        detail = reason.removeprefix("runner_error:")
+        return RUNNER_ERROR_DETAILS.get(detail) or (
+            f"{QUALITY_SCORE_REASONS['runner_error']} ({detail})"
+        )
+    if reason in QUALITY_SCORE_REASONS:
+        return QUALITY_SCORE_REASONS[reason]
+    for prefix, text in _NUMBERED_REASONS:
+        number = reason.removeprefix(prefix)
+        if number != reason and number.isdigit():
+            return text.format(number)
+    return f"{_STATUS_WITHOUT_REASON[state]} ({reason})"
 
 
 def _size_text(size_bytes: int | None) -> str:

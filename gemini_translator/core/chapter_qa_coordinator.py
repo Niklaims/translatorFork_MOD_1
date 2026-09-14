@@ -5,18 +5,19 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import threading
 import time
 
 from ..qa.book_metrics import MIN_BASELINE_SAMPLE_SIZE, eligible_baseline_size
 from ..qa.coverage_service import SEMANTIC_ALIGNMENT_MODE
 from ..qa.estimators.base import (
+    QualityEstimate,
     QualityEstimateRequest,
-    SourceTranslationWindow,
+    aggregate,
 )
 from ..qa.llm.completion import CancellationToken
-from ..qa.models import Decision, QaChapterState, RiskLevel
+from ..qa.models import QaChapterState, RiskLevel
 from ..qa.service import (
     DEFERRED_WARNINGS,
     ChapterQaResult,
@@ -34,6 +35,9 @@ from .task_manager import QaQueueOutcome
 # is told.  One is noise; a run of three is a broken setup.
 LIMITED_MODE_ALERT_STREAK = 3
 _REQUEST_NOT_BUILT = object()
+# The PC server and the local runner refuse a request of more passages
+# than this (MAX_SEGMENTS in tools/translation_qa_cometkiwi_runner.py).
+MAX_WINDOWS_PER_ESTIMATE = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,6 +570,10 @@ class ChapterQaCoordinator:
                 self._report(f"[QA] Проверка главы '{event.chapter_id}' не удалась: {error}")
                 return None
             result = await self._estimate_quality(event, result)
+            if getattr(result, "quality_windows", ()):
+                # The windows hold the chapter's whole text, and a book
+                # pass keeps every result until it ends.
+                result = replace(result, quality_windows=())
             self._note_limited_mode(result)
             self._report_chapter(event, result)
             return result
@@ -647,17 +655,17 @@ class ChapterQaCoordinator:
     async def _estimate_quality(
         self, event: TranslationReadyEvent, result: ChapterQaResult
     ) -> ChapterQaResult:
-        """Score the windows still in dispute, and only those.
+        """Score every passage the completeness check aligned.
 
-        A chapter the checks agreed on is never worth a heavy model: the
-        estimator process is not started at all unless something is unresolved,
-        and whatever it answers is evidence only — risk and repairs are already
-        decided by the alignment and the model that read the text.
+        Scoring only what the checks disputed left CometKiwi idle through a
+        whole pass of clean chapters. Whatever it answers is evidence only —
+        risk and repairs are already decided by the alignment and the model
+        that read the text.
         """
         estimator = self._quality_estimator
         if estimator is None:
             return result
-        windows = _disputed_windows(result)
+        windows = tuple(getattr(result, "quality_windows", ()) or ())
         if not windows:
             return result
         attach = getattr(self._service, "attach_quality_estimate", None)
@@ -670,7 +678,7 @@ class ChapterQaCoordinator:
             target_language=event.target_language or "ru",
         )
         try:
-            estimate = await estimator.estimate(request, self._cancellation)
+            estimate = await self._estimate_in_parts(estimator, request)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - an estimate never breaks QA
@@ -683,6 +691,30 @@ class ChapterQaCoordinator:
         except Exception as error:  # noqa: BLE001 - nor does recording one
             self._report(f"[QA] Оценку качества не удалось записать: {error}")
             return result
+
+    async def _estimate_in_parts(
+        self, estimator, request: QualityEstimateRequest
+    ) -> QualityEstimate:
+        """Send a long chapter in requests the estimator accepts, and score it once.
+
+        The first part that fails answers for the whole chapter: a score over
+        some of its passages would read as the score of all of them.
+        """
+        windows = request.windows
+        if len(windows) <= MAX_WINDOWS_PER_ESTIMATE:
+            return await estimator.estimate(request, self._cancellation)
+        scores: list[float] = []
+        for start in range(0, len(windows), MAX_WINDOWS_PER_ESTIMATE):
+            part = replace(
+                request, windows=windows[start : start + MAX_WINDOWS_PER_ESTIMATE]
+            )
+            estimate = await estimator.estimate(part, self._cancellation)
+            if estimate.status != "completed":
+                return estimate
+            scores.extend(estimate.window_scores)
+        return aggregate(
+            estimate.estimator, estimate.model, request, scores, estimate.metadata
+        )
 
     def _report_chapter(self, event: TranslationReadyEvent, result) -> None:
         """Log what the check changed, with the text before and after each edit."""
@@ -830,51 +862,6 @@ class ChapterQaCoordinator:
     def _discard_future(self, future: asyncio.Future) -> None:
         with self._pending_lock:
             self._pending.discard(future)
-
-
-def _disputed_windows(
-    result: ChapterQaResult,
-) -> tuple[SourceTranslationWindow, ...]:
-    """Build one window per candidate the checks could not settle.
-
-    A settled candidate — covered by the model, or fixed and confirmed by the
-    post-check — is not in dispute and costs nothing to skip.
-    """
-    fixed = {
-        repair.candidate_id
-        for repair in result.repairs
-        if repair.decision is Decision.FIXED
-    }
-    windows: list[SourceTranslationWindow] = []
-    for item in result.verified:
-        verdict = item.verdict
-        if verdict is None or verdict.decision == "covered":
-            continue
-        if item.candidate.candidate_id in fixed:
-            continue
-        context = item.context
-        source = " ".join(
-            part.strip()
-            for part in (context.source_before, context.source_text, context.source_after)
-            if part.strip()
-        )
-        translation = " ".join(
-            part.strip()
-            for part in (context.target_before, context.target_text, context.target_after)
-            if part.strip()
-        )
-        visible = sum(1 for character in translation if not character.isspace())
-        if not source or not translation or visible <= 0:
-            continue
-        windows.append(
-            SourceTranslationWindow(
-                window_id=item.candidate.candidate_id,
-                source=source,
-                translation=translation,
-                visible_chars=visible,
-            )
-        )
-    return tuple(windows)
 
 
 def _text_unchanged(

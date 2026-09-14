@@ -218,7 +218,7 @@ def test_an_estimate_never_carries_a_score_it_did_not_measure():
 
 
 def test_a_percentile_of_one_score_is_that_score():
-    """p10 must be defined for the common case of a single disputed window."""
+    """p10 must be defined for a chapter of a single passage."""
     assert percentile_score((0.42,), 0.10) == 0.42
     assert percentile_score((0.9, 0.1, 0.5), 0.10) == 0.1
     assert not math.isnan(percentile_score((0.9, 0.1), 1.0))
@@ -335,50 +335,108 @@ class _CountingEstimator:
         return aggregate("cometkiwi", "wmt22-cometkiwi-da", request, (0.7,) * len(request.windows))
 
 
-def test_a_clean_interchapter_check_never_starts_the_runner():
-    """The estimator is heavy; a chapter nothing disputes must not pay for it."""
-    estimator = _CountingEstimator()
-    coordinator, service, event = _coordinator_with(estimator, _chapter_result())
+def _windowed_result(count: int):
+    """A checked chapter whose completeness check aligned ``count`` passages."""
+    from gemini_translator.qa.models import RiskLevel
+    from gemini_translator.qa.service import ChapterQaResult
 
-    asyncio.run(coordinator._check_one(event, __import__(
-        "gemini_translator.qa.service", fromlist=["QaOptions"]
-    ).QaOptions()))
-
-    assert estimator.starts == 0
-    assert service.attached == []
-
-
-def test_a_covered_candidate_is_settled_and_costs_nothing():
-    """A model that said the text is there has already answered the question."""
-    estimator = _CountingEstimator()
-    coordinator, _, event = _coordinator_with(
-        estimator, _chapter_result(_verified_candidate("covered"))
+    return ChapterQaResult(
+        chapter_id="chapter-1",
+        risk_level=RiskLevel.LOW,
+        may_continue_translation=True,
+        coverage_mode="semantic_alignment",
+        quality_windows=tuple(
+            SourceTranslationWindow(
+                window_id=f"span-{index}",
+                source=f"原文{index}",
+                translation=f"Перевод {index}",
+                visible_chars=8,
+            )
+            for index in range(count)
+        ),
     )
 
-    asyncio.run(coordinator._check_one(event, __import__(
-        "gemini_translator.qa.service", fromlist=["QaOptions"]
-    ).QaOptions()))
 
-    assert estimator.starts == 0
+def _run_check(coordinator, event):
+    from gemini_translator.qa.service import QaOptions
+
+    return asyncio.run(coordinator._check_one(event, QaOptions()))
 
 
-def test_a_disputed_candidate_is_scored_once_with_its_own_window():
-    """One unresolved candidate is exactly the case the estimate exists for."""
+def test_a_clean_chapter_is_scored_over_every_aligned_passage():
+    """Оценка шла только по спорным местам, и на чистой главе CometKiwi молчал."""
+    estimator = _CountingEstimator()
+    coordinator, service, event = _coordinator_with(estimator, _windowed_result(3))
+
+    _run_check(coordinator, event)
+
+    assert estimator.starts == 1
+    assert [window.window_id for window in estimator.requests[0].windows] == [
+        "span-0",
+        "span-1",
+        "span-2",
+    ]
+    assert service.attached[0].status == "completed"
+
+
+def test_a_chapter_with_nothing_aligned_starts_nothing():
+    """Без проверки полноты окон нет, и ПК не получает пустых запросов."""
     estimator = _CountingEstimator()
     coordinator, service, event = _coordinator_with(
         estimator, _chapter_result(_verified_candidate("ambiguous"))
     )
 
-    asyncio.run(coordinator._check_one(event, __import__(
-        "gemini_translator.qa.service", fromlist=["QaOptions"]
-    ).QaOptions()))
+    _run_check(coordinator, event)
+
+    assert estimator.starts == 0
+    assert service.attached == []
+
+
+def test_a_long_chapter_is_scored_in_requests_the_server_accepts():
+    """Сервер на ПК принимает до 512 фрагментов: длинная глава идёт частями, а оценка у неё одна."""
+    estimator = _CountingEstimator()
+    coordinator, service, event = _coordinator_with(estimator, _windowed_result(1100))
+
+    _run_check(coordinator, event)
+
+    assert [len(request.windows) for request in estimator.requests] == [512, 512, 76]
+    assert len(service.attached) == 1
+    assert len(service.attached[0].window_scores) == 1100
+    assert service.attached[0].status == "completed"
+
+
+def test_a_long_chapter_whose_part_fails_gets_no_score_but_keeps_the_reason():
+    """Оценка по части фрагментов выглядела бы оценкой всей главы."""
+    from gemini_translator.qa.estimators.base import unavailable
+
+    class _FailsSecondPart(_CountingEstimator):
+        async def estimate(self, request, cancellation=None):
+            if self.starts == 1:
+                self.starts += 1
+                self.requests.append(request)
+                return unavailable("cometkiwi", "wmt22-cometkiwi-da", "timeout")
+            return await super().estimate(request, cancellation)
+
+    estimator = _FailsSecondPart()
+    coordinator, service, event = _coordinator_with(estimator, _windowed_result(1100))
+
+    _run_check(coordinator, event)
+
+    assert [len(request.windows) for request in estimator.requests] == [512, 512]
+    assert len(service.attached) == 1
+    assert service.attached[0].status == "unavailable"
+    assert service.attached[0].metadata["reason"] == "timeout"
+
+
+def test_a_scored_chapter_lets_go_of_its_text():
+    """Проход держит результаты всех глав до конца, а окна несут весь текст главы."""
+    estimator = _CountingEstimator()
+    coordinator, _service, event = _coordinator_with(estimator, _windowed_result(3))
+
+    result = _run_check(coordinator, event)
 
     assert estimator.starts == 1
-    request = estimator.requests[0]
-    assert len(request.windows) == 1
-    assert "原文二" in request.windows[0].source
-    assert "Первый перевод" in request.windows[0].translation
-    assert service.attached[0].status == "completed"
+    assert result.quality_windows == ()
 
 
 def test_an_estimator_failure_never_breaks_the_chapter_check():
@@ -390,9 +448,7 @@ def test_an_estimator_failure_never_breaks_the_chapter_check():
         async def estimate(self, request, cancellation=None):
             raise RuntimeError("runner exploded")
 
-    coordinator, service, event = _coordinator_with(
-        _Broken(), _chapter_result(_verified_candidate("ambiguous"))
-    )
+    coordinator, service, event = _coordinator_with(_Broken(), _windowed_result(2))
 
     result = asyncio.run(coordinator._check_one(event, __import__(
         "gemini_translator.qa.service", fromlist=["QaOptions"]

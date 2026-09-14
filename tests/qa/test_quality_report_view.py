@@ -457,3 +457,25 @@ def test_actions_follow_the_selection_and_the_busy_state(qt_app):
     assert not view.undo_chapter_button.isEnabled()
     assert not view.undo_all_button.isEnabled()
 
+
+def test_a_chapter_without_a_score_says_why(qt_app):
+    """Оценка не получилась, а карточка главы молчала, как будто её и не просили."""
+    journal = QaJournal.empty(book_id="book-1")
+    journal.record_chapter_state(
+        QaChapterState(chapter_id="chapter-1", status="checked", updated_at="2026-09-14T10:05:00")
+    )
+    journal.upsert_metrics(
+        ChapterMetrics(
+            chapter_id="chapter-1",
+            source_language="zh",
+            target_language="ru",
+            source_chars=1000,
+            translated_chars=3000,
+            quality_score_status="unavailable:endpoint_unreachable",
+        )
+    )
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+    view.select_chapter("chapter-1")
+
+    assert "Оценка CometKiwi не получена: ПК не отвечает." in view.chapter_details_label.text()

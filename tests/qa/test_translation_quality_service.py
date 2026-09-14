@@ -936,3 +936,23 @@ def test_a_stale_suggestion_can_still_be_taken_off_the_list(tmp_path, chapter):
 
     assert outcome.status == "dismissed"
 
+
+def test_a_checked_chapter_hands_every_aligned_passage_to_the_estimate(tmp_path, chapter):
+    """CometKiwi оценивал только спорные места и молчал на чистых главах."""
+    service, _journal, _path = _service(tmp_path, aligner=_CleanAligner())
+
+    result = _check(service, _request(chapter))
+
+    assert [(window.source, window.translation) for window in result.quality_windows] == [
+        ("He opened the door.", "Он открыл дверь."),
+        ("The room was empty. He left at once.", "Он сразу ушёл."),
+    ]
+    assert all(window.visible_chars > 0 for window in result.quality_windows)
+
+
+def test_without_the_completeness_check_there_is_nothing_to_score(tmp_path, chapter):
+    service, _journal, _path = _service(tmp_path, aligner=_CleanAligner())
+
+    result = _check(service, _request(chapter), QaOptions(check_completeness=False))
+
+    assert result.quality_windows == ()
