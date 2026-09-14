@@ -91,6 +91,17 @@ class ChapterQaRow:
     # Why the chapter has no score, in words; empty when nothing failed.
     quality_score_problem: str = ""
 
+    @property
+    def has_remarks(self) -> bool:
+        """Report whether the chapter wants a look: anything but a clean «Проверена»."""
+        return (
+            self.status != "checked"
+            or bool(self.blocked_reason)
+            or self.applied_repairs > 0
+            or self.pending_suggestions > 0
+            or self.possible_gaps > 0
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class BookQaReportSnapshot:
@@ -141,6 +152,10 @@ class BookQaReportSnapshot:
     @property
     def pending_suggestion_chapters(self) -> tuple[str, ...]:
         return tuple(row.chapter_id for row in self.rows if row.pending_suggestions)
+
+    @property
+    def remark_count(self) -> int:
+        return sum(1 for row in self.rows if row.has_remarks)
 
     @property
     def has_scores(self) -> bool:

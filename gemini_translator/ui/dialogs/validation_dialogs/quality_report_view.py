@@ -7,6 +7,7 @@ from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -76,6 +77,11 @@ REPORT_EMPTY_TEXT = (
 )
 NO_CHAPTER_TITLE = "Глава не выбрана"
 NO_CHAPTER_TEXT = "Выберите главу в списке слева."
+NO_REMARKS_TITLE = "Замечаний нет"
+NO_REMARKS_TEXT = (
+    "У всех глав статус «Проверена», нет автоисправлений, правок, "
+    "ждущих решения, и возможных пропусков."
+)
 
 
 def report_columns(snapshot: BookQaReportSnapshot) -> tuple[tuple[str, str], ...]:
@@ -155,7 +161,17 @@ class QualityReportView(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
-        layout.addWidget(make_label("Главы", "projectCardTitle", parent=card))
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(make_label("Главы", "projectCardTitle", parent=card))
+        header.addStretch(1)
+        # Off whenever the window opens: a filter left on from another day
+        # would hide chapters from someone who forgot switching it on.
+        self._remarks_only = False
+        self.remarks_only_check = QCheckBox(remarks_caption(0), card)
+        self.remarks_only_check.toggled.connect(self._on_remarks_only_toggled)
+        header.addWidget(self.remarks_only_check)
+        layout.addLayout(header)
 
         self.table = QTableWidget(0, len(BASE_COLUMNS), card)
         self.table.setObjectName("qualityChapterTable")
@@ -170,6 +186,11 @@ class QualityReportView(QWidget):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.viewport().installEventFilter(self)
         layout.addWidget(self.table, 1)
+        self.no_remarks_state = EmptyState(NO_REMARKS_TITLE, NO_REMARKS_TEXT, card)
+        # Inside the list's own card, not a second card of its own.
+        self.no_remarks_state.setObjectName("chapterListEmptyState")
+        self.no_remarks_state.setVisible(False)
+        layout.addWidget(self.no_remarks_state, 1)
 
         undo_row = QHBoxLayout()
         self.undo_all_button = make_button(
@@ -278,12 +299,16 @@ class QualityReportView(QWidget):
         self._scoring_enabled = bool(scoring_enabled)
         self.stack.setCurrentWidget(self.content if snapshot.rows else self.empty_state)
         self._refresh_totals()
-        if snapshot.rows != previous.rows or self.table.rowCount() != len(snapshot.rows):
+        self.remarks_only_check.setText(remarks_caption(snapshot.remark_count))
+        if snapshot.rows != previous.rows or self.table.rowCount() != len(
+            self._visible_rows()
+        ):
             self._rebuild_table()
         if snapshot.rows and not self.selected_chapter_id():
             # Opening on nothing left half the tab empty; the chapter that most
             # needs a look is the natural place to start.
-            self.select_chapter(_attention_chapter(snapshot))
+            if not self.select_chapter(_attention_chapter(snapshot)):
+                self._select_first_visible()
         self._refresh_chapter_card()
         self._update_actions()
 
@@ -305,7 +330,7 @@ class QualityReportView(QWidget):
         return str(item.data(Qt.ItemDataRole.UserRole) or "") if item else ""
 
     def select_chapter(self, chapter_id: str) -> bool:
-        for index, row in enumerate(self._snapshot.rows):
+        for index, row in enumerate(self._visible_rows()):
             if row.chapter_id == chapter_id:
                 self.table.selectRow(index)
                 return True
@@ -347,8 +372,11 @@ class QualityReportView(QWidget):
     def _rebuild_table(self) -> None:
         selected = self.selected_chapter_id()
         columns = report_columns(self._snapshot)
-        rows = self._snapshot.rows
-        self._display_names = chapter_display_names(row.chapter_id for row in rows)
+        rows = self._visible_rows()
+        # Names are told apart across the whole book, not only what is shown.
+        self._display_names = chapter_display_names(
+            row.chapter_id for row in self._snapshot.rows
+        )
         table = self.table
         table.setUpdatesEnabled(False)
         table.blockSignals(True)
@@ -376,6 +404,9 @@ class QualityReportView(QWidget):
         )
         if selected:
             self.select_chapter(selected)
+        filtered_empty = self._remarks_only and bool(self._snapshot.rows) and not rows
+        self.table.setVisible(not filtered_empty)
+        self.no_remarks_state.setVisible(filtered_empty)
         QTimer.singleShot(0, self._fit_chapter_column)
 
     def _fit_chapter_column(self) -> None:
@@ -405,12 +436,34 @@ class QualityReportView(QWidget):
             (index for index, (_title, name) in enumerate(columns) if name == "status"),
             None,
         )
-        if column is None or self.table.rowCount() != len(self._snapshot.rows):
+        rows = self._visible_rows()
+        if column is None or self.table.rowCount() != len(rows):
             return
-        for row_index, row in enumerate(self._snapshot.rows):
+        for row_index, row in enumerate(rows):
             item = self.table.item(row_index, column)
             if item is not None:
                 _paint_status(item, row)
+
+    def _visible_rows(self) -> tuple[ChapterQaRow, ...]:
+        """The chapters the list shows: all of them, or only those with remarks."""
+        rows = self._snapshot.rows
+        if not self._remarks_only:
+            return rows
+        return tuple(row for row in rows if row.has_remarks)
+
+    def _on_remarks_only_toggled(self, checked: bool) -> None:
+        self._remarks_only = bool(checked)
+        self._rebuild_table()
+        if not self.selected_chapter_id():
+            # The chosen chapter was hidden: the first one left takes its place.
+            self._select_first_visible()
+        self._refresh_chapter_card()
+        self._update_actions()
+
+    def _select_first_visible(self) -> None:
+        rows = self._visible_rows()
+        if rows:
+            self.select_chapter(rows[0].chapter_id)
 
     def _refresh_totals(self) -> None:
         snapshot = self._snapshot
@@ -504,6 +557,10 @@ class QualityReportView(QWidget):
         chapter_id = self.selected_chapter_id()
         if chapter_id:
             self.undo_chapter_requested.emit(chapter_id)
+
+
+def remarks_caption(count: int) -> str:
+    return f"Только с замечаниями ({count})"
 
 
 def _attention_chapter(snapshot: BookQaReportSnapshot) -> str:

@@ -479,3 +479,181 @@ def test_a_chapter_without_a_score_says_why(qt_app):
     view.select_chapter("chapter-1")
 
     assert "Оценка CometKiwi не получена: ПК не отвечает." in view.chapter_details_label.text()
+
+
+def _remarks_journal() -> QaJournal:
+    """Five chapters: two clean, one deferred, one with a waiting fix, one with possible gaps."""
+    from gemini_translator.qa.models import QaSuggestion
+
+    journal = QaJournal.empty(book_id="book-1")
+    for chapter_id, status in (
+        ("chapter-1", "checked"),
+        ("chapter-2", "checked"),
+        ("chapter-3", "deferred"),
+        ("chapter-4", "checked"),
+        ("chapter-5", "checked"),
+    ):
+        journal.record_chapter_state(
+            QaChapterState(chapter_id=chapter_id, status=status, updated_at="2026-09-14T10:05:00")
+        )
+    journal.suggestions.append(
+        QaSuggestion(
+            suggestion_id=QaSuggestion.identity("chapter-2", "n.1", "сразу ушёл", "тут же ушёл"),
+            chapter_id="chapter-2",
+            block_id="n.1",
+            category="calque",
+            original_text="сразу ушёл",
+            replacement_text="тут же ушёл",
+        )
+    )
+    journal.upsert_metrics(
+        ChapterMetrics(
+            chapter_id="chapter-4",
+            source_language="zh",
+            target_language="ru",
+            source_chars=1000,
+            translated_chars=3000,
+            possible_gaps=2,
+        )
+    )
+    return journal
+
+
+def _visible_chapters(view: QualityReportView) -> list[str]:
+    from PyQt6.QtCore import Qt
+
+    return [
+        view.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        for row in range(view.table.rowCount())
+    ]
+
+
+def test_the_remarks_toggle_leaves_only_the_chapters_that_want_a_look(qt_app):
+    """Среди сотен чистых глав терялись те немногие, что требуют внимания."""
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_remarks_journal()))
+
+    assert view.remarks_only_check.isChecked() is False
+    assert view.remarks_only_check.text() == "Только с замечаниями (3)"
+    assert _visible_chapters(view) == [
+        "chapter-1",
+        "chapter-2",
+        "chapter-3",
+        "chapter-4",
+        "chapter-5",
+    ]
+
+    view.remarks_only_check.setChecked(True)
+
+    assert _visible_chapters(view) == ["chapter-2", "chapter-3", "chapter-4"]
+
+    view.remarks_only_check.setChecked(False)
+
+    assert len(_visible_chapters(view)) == 5
+
+
+def test_auto_fixes_and_a_held_translation_are_remarks_too(qt_app):
+    class _Gate:
+        chapter_id = "chapter-5"
+        reason = "подтверждённый пропуск"
+
+    journal = _remarks_journal()
+    journal.append_repair({"patch_id": "lang-1", "chapter_id": "chapter-1"})
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(journal, [_Gate()]))
+
+    view.remarks_only_check.setChecked(True)
+
+    assert view.remarks_only_check.text() == "Только с замечаниями (5)"
+    assert _visible_chapters(view) == [
+        "chapter-1",
+        "chapter-2",
+        "chapter-3",
+        "chapter-4",
+        "chapter-5",
+    ]
+
+
+def test_a_hidden_selection_moves_to_the_first_visible_chapter(qt_app):
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_remarks_journal()))
+    view.select_chapter("chapter-1")
+
+    view.remarks_only_check.setChecked(True)
+
+    assert view.selected_chapter_id() == "chapter-2"
+    assert view.chapter_title_label.text() == "chapter-2"
+
+    view.select_chapter("chapter-4")
+    view.remarks_only_check.setChecked(False)
+    view.remarks_only_check.setChecked(True)
+
+    assert view.selected_chapter_id() == "chapter-4"
+
+
+def test_a_book_without_remarks_says_so_instead_of_an_empty_list(qt_app):
+    journal = QaJournal.empty(book_id="book-1")
+    for chapter_id in ("chapter-1", "chapter-2"):
+        journal.record_chapter_state(QaChapterState(chapter_id=chapter_id, status="checked"))
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    view.remarks_only_check.setChecked(True)
+
+    assert view.remarks_only_check.text() == "Только с замечаниями (0)"
+    assert view.table.isHidden()
+    assert not view.no_remarks_state.isHidden()
+    assert view.no_remarks_state.title_label.text() == "Замечаний нет"
+    assert view.selected_chapter_id() == ""
+    assert view.chapter_title_label.text() == "Глава не выбрана"
+
+    view.remarks_only_check.setChecked(False)
+
+    assert not view.table.isHidden()
+    assert view.no_remarks_state.isHidden()
+    assert view.selected_chapter_id() == "chapter-1"
+
+
+def test_the_filter_stays_on_as_the_pass_reports_each_chapter(qt_app):
+    """Отчёт обновляется после каждой главы, и переключатель не должен сбрасываться."""
+    view = QualityReportView()
+    view.set_report(BookQaReportSnapshot.from_journal(_remarks_journal()))
+    view.remarks_only_check.setChecked(True)
+    journal = _remarks_journal()
+    journal.append_repair({"patch_id": "lang-9", "chapter_id": "chapter-5"})
+
+    view.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    assert view.remarks_only_check.isChecked() is True
+    assert view.remarks_only_check.text() == "Только с замечаниями (4)"
+    assert _visible_chapters(view) == ["chapter-2", "chapter-3", "chapter-4", "chapter-5"]
+
+
+def test_status_colours_follow_a_theme_switch_in_a_filtered_list(qt_app):
+    """С фильтром в таблице меньше строк, чем глав, и перекраска не должна на этом сдаваться."""
+    from gemini_translator.ui import theme_manager
+
+    theme_manager.apply(qt_app, mode="light", manual_colors={"accent": "#d87a3a"})
+    view = QualityReportView()
+    try:
+        view.set_report(BookQaReportSnapshot.from_journal(_remarks_journal()))
+        view.remarks_only_check.setChecked(True)
+        view.show()
+        qt_app.processEvents()
+        deferred = _visible_chapters(view).index("chapter-3")
+        light = view.table.item(deferred, 1).foreground().color().name()
+
+        theme_manager.apply(qt_app, mode="dark", manual_colors={"accent": "#d87a3a"})
+        qt_app.processEvents()
+
+        dark = view.table.item(deferred, 1).foreground().color().name()
+        assert dark != light
+        assert dark == theme_manager.color("warning_text")
+    finally:
+        view.close()
+        view.deleteLater()
+        qt_app.setStyleSheet("")
+        for name in ("_theme_palette", "_active_theme_mode", "_glass_active"):
+            if hasattr(qt_app, name):
+                delattr(qt_app, name)
+        qt_app.processEvents()
