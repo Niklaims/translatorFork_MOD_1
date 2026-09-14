@@ -412,4 +412,7 @@ def test_the_cometkiwi_card_says_it_also_weighs_the_refused_fixes(qt_app):
     """CometKiwi подсказывает и по отклонённым правкам, в том числе без проверки полноты."""
     view = QualitySettingsView(QaSettings())
 
-    assert "отклонённой правки" in view.cometkiwi_scope_label.text()
+    text = view.cometkiwi_scope_label.text()
+
+    assert "отклонённой правки" in text
+    assert "орфографию и грамматику CometKiwi не судит" in text

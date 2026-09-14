@@ -67,8 +67,8 @@ COMETKIWI_MODEL_NAME_CHARS = 80
 EMBEDDING_NOT_CHECKED_TEXT = "Подключение ещё не проверялось."
 COMETKIWI_NOT_CHECKED_TEXT = "Связь с ПК ещё не проверялась."
 COMETKIWI_SCOPE_TEXT = (
-    "Оценивает главы вместе с проверкой полноты и подсказывает, какой вариант "
-    "отклонённой правки ближе к оригиналу."
+    "Оценивает главы вместе с проверкой полноты. У отклонённой правки отмечает "
+    "только заметную разницу по смыслу: орфографию и грамматику CometKiwi не судит."
 )
 # An analyzer's description starts under its switch's text, not under the box:
 # the indicator and the gap after it.

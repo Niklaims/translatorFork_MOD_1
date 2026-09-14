@@ -216,23 +216,27 @@ MANUAL_FIX_NOTE = "Такую правку вносят вручную."
 CHECKING_NOTE = "Глава сейчас проверяется."
 
 
-# Below this difference CometKiwi's two scores do not say which text is closer.
-SCORE_TIE = 0.02
+# CometKiwi barely tells a paragraph before and after a small fix apart: on the
+# PC the right «нетрудно» scored 0.047 below the wrong «не трудно». A smaller
+# difference than this says nothing about the fix.
+NOTICEABLE_DIFFERENCE = 0.05
+# In floating point 0.85 - 0.80 falls a hair short of 0.05.
+_FLOAT_SLACK = 1e-9
 
 
 def describe_fix_scores(before: float | None, after: float | None) -> str:
-    """Say in words which version of the paragraph CometKiwi finds closer to the source."""
+    """Name the version CometKiwi finds closer in meaning, if the difference is noticeable."""
     if before is None or after is None:
         return ""
-    if abs(after - before) < SCORE_TIE:
-        return f"CometKiwi: разницы почти нет — {_score_text(before)} и {_score_text(after)}"
+    if abs(after - before) + _FLOAT_SLACK < NOTICEABLE_DIFFERENCE:
+        return ""
     if after > before:
         return (
-            f"CometKiwi: ближе к оригиналу «стало» — {_score_text(after)} "
+            f"CometKiwi: по смыслу ближе к оригиналу «стало» — {_score_text(after)} "
             f"против {_score_text(before)}"
         )
     return (
-        f"CometKiwi: ближе к оригиналу «было» — {_score_text(before)} "
+        f"CometKiwi: по смыслу ближе к оригиналу «было» — {_score_text(before)} "
         f"против {_score_text(after)}"
     )
 
