@@ -398,3 +398,11 @@ def test_the_languagetool_address_sits_under_its_own_switch(qt_app):
         view.close()
         view.deleteLater()
 
+
+def test_the_cometkiwi_card_says_what_it_scores(qt_app):
+    """Без этой строки казалось, что CometKiwi оценивает главы и без проверки полноты."""
+    view = QualitySettingsView(QaSettings())
+
+    text = view.cometkiwi_scope_label.text()
+
+    assert "проверкой полноты" in text

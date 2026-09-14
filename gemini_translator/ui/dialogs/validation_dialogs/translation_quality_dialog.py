@@ -57,11 +57,20 @@ def describe_checks(settings: QaSettings) -> str:
         checks.append("язык")
     if settings.check_completeness_after_chapter:
         checks.append("полнота")
-    if settings.capabilities.cometkiwi_enabled:
-        checks.append("оценка CometKiwi")
+        # CometKiwi scores what the completeness check aligned: without that
+        # check it never starts, so the header must not promise a score.
+        if settings.capabilities.cometkiwi_enabled:
+            checks.append("оценка CometKiwi")
     if not checks:
         return "Проверки после глав выключены."
     return "После каждой главы: " + ", ".join(checks) + "."
+
+
+def _scores_expected(settings: QaSettings, snapshot: BookQaReportSnapshot) -> bool:
+    """Whether the score card has a score to show now or one to wait for."""
+    return settings.capabilities.cometkiwi_enabled and (
+        settings.check_completeness_after_chapter or snapshot.has_scores
+    )
 
 
 class TranslationQualityDialog(QDialog):
@@ -236,7 +245,7 @@ class TranslationQualityDialog(QDialog):
     def set_report(self, snapshot: BookQaReportSnapshot) -> None:
         """Replace the report with an immutable snapshot from the journal."""
         self.report_view.set_report(
-            snapshot, scoring_enabled=self._settings.capabilities.cometkiwi_enabled
+            snapshot, scoring_enabled=_scores_expected(self._settings, snapshot)
         )
         self._snapshot = snapshot
         self.suggestions_view.set_suggestions(snapshot.suggestions)
@@ -318,7 +327,7 @@ class TranslationQualityDialog(QDialog):
     def _on_settings_changed(self, settings: QaSettings) -> None:
         self._settings = settings
         self.report_view.set_report(
-            self._snapshot, scoring_enabled=settings.capabilities.cometkiwi_enabled
+            self._snapshot, scoring_enabled=_scores_expected(settings, self._snapshot)
         )
         self._refresh_header()
         self.settings_changed.emit(settings)

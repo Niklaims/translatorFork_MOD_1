@@ -10,11 +10,15 @@ import pytest
 from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import QMessageBox
 
+from gemini_translator.qa.capabilities import QaCapabilitySettings
 from gemini_translator.qa.journal import QaJournal
-from gemini_translator.qa.models import QaChapterState
+from gemini_translator.qa.models import ChapterMetrics, QaChapterState
 from gemini_translator.qa.report_snapshot import BookQaReportSnapshot
 from gemini_translator.qa.settings import QaSettings
 from gemini_translator.ui.dialogs.validation_dialogs import TranslationQualityDialog
+from gemini_translator.ui.dialogs.validation_dialogs.translation_quality_dialog import (
+    describe_checks,
+)
 
 
 @pytest.fixture(scope="module")
@@ -310,3 +314,55 @@ def test_a_running_pass_locks_every_suggestion_button(qt_app):
         card.apply_button.isEnabled() or card.dismiss_button.isEnabled() for card in cards
     )
 
+
+@pytest.mark.parametrize(
+    ("completeness", "text"),
+    [
+        (False, "После каждой главы: язык."),
+        (True, "После каждой главы: язык, полнота, оценка CometKiwi."),
+    ],
+)
+def test_the_header_promises_cometkiwi_only_where_it_runs(completeness, text):
+    """CometKiwi оценивает то, что сопоставила проверка полноты, и без неё не запускается."""
+    settings = QaSettings(
+        check_language_after_chapter=True,
+        check_completeness_after_chapter=completeness,
+        capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+    )
+
+    assert describe_checks(settings) == text
+
+
+def test_the_score_card_waits_for_the_completeness_check(qt_app):
+    """Без проверки полноты «Оценок пока нет» висело бы в карточке вечно."""
+    kiwi = QaCapabilitySettings(cometkiwi_enabled=True)
+    journal = QaJournal.empty(book_id="book-1")
+    journal.record_chapter_state(
+        QaChapterState(chapter_id="chapter-1", status="checked", updated_at="2026-09-09T10:05:00")
+    )
+    journal.upsert_metrics(
+        ChapterMetrics(
+            chapter_id="chapter-1",
+            source_language="zh",
+            target_language="ru",
+            source_chars=1000,
+            translated_chars=2900,
+            quality_score=0.81,
+            quality_score_status="scored",
+        )
+    )
+
+    without_completeness = _dialog(
+        settings=QaSettings(check_completeness_after_chapter=False, capabilities=kiwi)
+    )
+    with_completeness = _dialog(
+        settings=QaSettings(check_completeness_after_chapter=True, capabilities=kiwi)
+    )
+    with_old_scores = TranslationQualityDialog(
+        settings=QaSettings(check_completeness_after_chapter=False, capabilities=kiwi)
+    )
+    with_old_scores.set_report(BookQaReportSnapshot.from_journal(journal))
+
+    assert without_completeness.report_view.score_card.isHidden()
+    assert not with_completeness.report_view.score_card.isHidden()
+    assert not with_old_scores.report_view.score_card.isHidden()

@@ -66,6 +66,7 @@ COMETKIWI_MODEL_NAME_CHARS = 80
 # embedding setup the card currently shows.
 EMBEDDING_NOT_CHECKED_TEXT = "Подключение ещё не проверялось."
 COMETKIWI_NOT_CHECKED_TEXT = "Связь с ПК ещё не проверялась."
+COMETKIWI_SCOPE_TEXT = "Оценивает главы вместе с проверкой полноты и без неё не запускается."
 # An analyzer's description starts under its switch's text, not under the box:
 # the indicator and the gap after it.
 ANALYZER_DETAIL_INDENT = 24
@@ -264,7 +265,19 @@ class QualitySettingsView(QWidget):
             _capability_tooltip(CAPABILITY_DESCRIPTIONS[QaCapabilityKey.COMETKIWI])
         )
         self.cometkiwi_enabled_check.toggled.connect(self._on_settings_edited)
-        layout.addWidget(self.cometkiwi_enabled_check)
+        # What it scores sits right under the switch, as for the analyzers:
+        # without it the card read as if every chapter got a score regardless.
+        switch = QVBoxLayout()
+        switch.setSpacing(2)
+        switch.addWidget(self.cometkiwi_enabled_check)
+        scope = QVBoxLayout()
+        scope.setContentsMargins(ANALYZER_DETAIL_INDENT, 0, 0, 0)
+        self.cometkiwi_scope_label = make_label(
+            COMETKIWI_SCOPE_TEXT, "mutedLabel", wrap=True, parent=card
+        )
+        scope.addWidget(self.cometkiwi_scope_label)
+        switch.addLayout(scope)
+        layout.addLayout(switch)
 
         grid = self._form()
         address_row = QHBoxLayout()
