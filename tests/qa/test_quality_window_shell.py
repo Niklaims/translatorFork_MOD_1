@@ -44,6 +44,18 @@ def _dialog(**kwargs) -> TranslationQualityDialog:
     return dialog
 
 
+def test_the_window_asks_for_more_room_than_its_minimum(qt_app):
+    """Окно открывалось почти на минимуме: список глав и карточка правки теснились."""
+    dialog = TranslationQualityDialog()
+
+    hint = dialog.sizeHint()
+
+    assert hint.width() >= 1400
+    assert hint.height() >= 960
+    assert hint.width() > dialog.minimumWidth()
+    assert hint.height() > dialog.minimumHeight()
+
+
 def test_the_window_offers_its_actions_and_tabs_by_name(qt_app):
     dialog = TranslationQualityDialog()
 
@@ -275,11 +287,11 @@ def test_the_chapter_card_lists_that_chapters_suggestions(qt_app):
 
     dialog.select_chapter("chapter-1")
     assert dialog.report_view.pending_title_label.text() == "Ждут решения: 2"
-    assert len(dialog.report_view.pending_cards) == 2
+    assert len(dialog.report_view.pending_carousel.cards) == 2
 
     dialog.select_chapter("chapter-2")
     assert dialog.report_view.pending_title_label.isHidden()
-    assert dialog.report_view.pending_cards == []
+    assert dialog.report_view.pending_carousel.cards == []
 
 
 def test_both_tabs_ask_the_window_to_apply_or_dismiss(qt_app):
@@ -293,10 +305,12 @@ def test_both_tabs_ask_the_window_to_apply_or_dismiss(qt_app):
 
     dialog.suggestions_view.cards[0].apply_button.click()
     dialog.select_chapter("chapter-1")
-    dialog.report_view.pending_cards[1].dismiss_button.click()
+    carousel = dialog.report_view.pending_carousel
+    carousel.show_next()
+    carousel.current_card().dismiss_button.click()
 
     assert applied == [dialog.suggestions_view.cards[0].suggestion.suggestion_id]
-    assert dismissed == [dialog.report_view.pending_cards[1].suggestion.suggestion_id]
+    assert dismissed == [carousel.current_suggestion_id()]
     assert set(applied + dismissed) <= {item.suggestion_id for item in suggestions}
 
 
@@ -308,7 +322,7 @@ def test_a_running_pass_locks_every_suggestion_button(qt_app):
 
     dialog.set_busy(True)
 
-    cards = dialog.suggestions_view.cards + dialog.report_view.pending_cards
+    cards = dialog.suggestions_view.cards + dialog.report_view.pending_carousel.cards
     assert cards
     assert not any(
         card.apply_button.isEnabled() or card.dismiss_button.isEnabled() for card in cards

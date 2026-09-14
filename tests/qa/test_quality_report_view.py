@@ -213,13 +213,67 @@ def test_the_chapter_column_takes_the_spare_width(qt_app):
 
     view = QualityReportView()
     view.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    view.resize(1400, 700)
+    view.show()
+    qt_app.processEvents()
     header = view.table.horizontalHeader()
 
-    assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
-    assert all(
-        header.sectionResizeMode(column) == QHeaderView.ResizeMode.ResizeToContents
-        for column in range(1, view.table.columnCount())
-    )
+    try:
+        assert header.sectionResizeMode(0) == QHeaderView.ResizeMode.Stretch
+        assert all(
+            header.sectionResizeMode(column) == QHeaderView.ResizeMode.ResizeToContents
+            for column in range(1, view.table.columnCount())
+        )
+    finally:
+        view.close()
+
+
+def _completeness_snapshot() -> BookQaReportSnapshot:
+    journal = QaJournal.empty(book_id="book-1")
+    for index in range(1010, 1020):
+        chapter_id = f"OEBPS/chapter{index}.xhtml"
+        journal.record_chapter_state(
+            QaChapterState(chapter_id=chapter_id, status="checked", updated_at="2026-09-14T10:05:00")
+        )
+        journal.upsert_metrics(
+            ChapterMetrics(
+                chapter_id=chapter_id,
+                source_language="zh",
+                target_language="ru",
+                source_chars=1000,
+                translated_chars=3300,
+                possible_gaps=2,
+            )
+        )
+    return BookQaReportSnapshot.from_journal(journal)
+
+
+def _settle(qt_app) -> None:
+    # Column widths settle a turn after the resize that changed them.
+    for _ in range(3):
+        qt_app.processEvents()
+
+
+def test_a_list_just_wider_than_its_numbers_keeps_the_chapter_names(qt_app):
+    """Растянутая колонка «Глава» получала остаток ширины и сжималась до 16 пикселей."""
+    view = QualityReportView()
+    view.set_report(_completeness_snapshot())
+    view.resize(1100, 600)
+    view.show()
+    _settle(qt_app)
+    table = view.table
+    header = table.horizontalHeader()
+    others = sum(header.sectionSize(column) for column in range(1, table.columnCount()))
+    name_width = table.fontMetrics().horizontalAdvance("chapter1019")
+    frame = table.width() - table.viewport().width()
+
+    table.setFixedWidth(others + name_width // 2 + frame)
+    _settle(qt_app)
+
+    try:
+        assert header.sectionSize(0) >= name_width
+    finally:
+        view.close()
 
 
 def test_the_totals_match_the_snapshot(qt_app):

@@ -30,7 +30,7 @@ from .quality_widgets import (
     EmptyState,
     MetricCard,
     StatusChip,
-    SuggestionCard,
+    SuggestionCarousel,
     chapters_caption,
     format_checked_at,
     make_button,
@@ -65,6 +65,8 @@ COMPLETENESS_COLUMNS = (
     ("Пропуски", "possible_gaps"),
 )
 SCORE_COLUMNS = (("Оценка", "quality_score"),)
+# Cell padding and the rounded selection around a chapter name.
+CHAPTER_COLUMN_PADDING = 36
 # Text reads from the left edge; numbers sit centred under their headers.
 TEXT_FIELDS = frozenset({"chapter_id", "status"})
 REPORT_EMPTY_TITLE = "Отчёт пока пуст"
@@ -102,6 +104,7 @@ class QualityReportView(QWidget):
         self._busy = False
         self._scoring_enabled = False
         self._display_names: dict[str, str] = {}
+        self._chapter_names_width = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 10, 0, 0)
@@ -163,6 +166,7 @@ class QualityReportView(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._set_columns(BASE_COLUMNS)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.viewport().installEventFilter(self)
         layout.addWidget(self.table, 1)
 
         undo_row = QHBoxLayout()
@@ -178,9 +182,24 @@ class QualityReportView(QWidget):
     def _build_chapter_card(self) -> QFrame:
         self.chapter_card = QFrame(self.content)
         self.chapter_card.setObjectName("projectHeaderCard")
-        self.chapter_layout = QVBoxLayout(self.chapter_card)
-        self.chapter_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout = QVBoxLayout(self.chapter_card)
+        card_layout.setContentsMargins(14, 12, 14, 12)
+        card_layout.setSpacing(8)
+        # Everything above the buttons scrolls as one when the window is short.
+        # Squeezed instead, the norm lines ran over each other and a waiting fix
+        # shrank to an empty outline.
+        self.chapter_body = QWidget(self.chapter_card)
+        self.chapter_layout = QVBoxLayout(self.chapter_body)
+        self.chapter_layout.setContentsMargins(0, 0, 0, 0)
         self.chapter_layout.setSpacing(8)
+        self.chapter_scroll = QScrollArea(self.chapter_card)
+        self.chapter_scroll.setWidgetResizable(True)
+        self.chapter_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chapter_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.chapter_scroll.setWidget(self.chapter_body)
+        card_layout.addWidget(self.chapter_scroll, 1)
         self.chapter_layout.addWidget(
             make_label("Глава", "sectionEyebrow", parent=self.chapter_card)
         )
@@ -216,22 +235,17 @@ class QualityReportView(QWidget):
         )
         self.pending_title_label.setVisible(False)
         self.chapter_layout.addWidget(self.pending_title_label)
-        self.pending_container = QWidget()
-        self.pending_layout = QVBoxLayout(self.pending_container)
-        self.pending_layout.setContentsMargins(0, 0, 0, 0)
-        self.pending_layout.setSpacing(8)
-        self.pending_layout.addStretch(1)
-        self.pending_area = QScrollArea(self.chapter_card)
-        self.pending_area.setWidgetResizable(True)
-        self.pending_area.setFrameShape(QFrame.Shape.NoFrame)
-        self.pending_area.setWidget(self.pending_container)
-        self.pending_area.setVisible(False)
-        self.chapter_layout.addWidget(self.pending_area, 1)
-        self.pending_cards: list[SuggestionCard] = []
-        self._pending_suggestions: tuple = ()
-        # No stretch factor of its own: it holds the buttons down only while the
-        # list is hidden, and a visible list then takes all the room, not half.
-        self.chapter_layout.addStretch()
+        # One waiting fix at a time: a column of them scrolled inside a box
+        # a few lines tall, and only the first was ever read.
+        self.pending_carousel = SuggestionCarousel(self.chapter_card)
+        self.pending_carousel.apply_requested.connect(self.apply_suggestion_requested.emit)
+        self.pending_carousel.dismiss_requested.connect(
+            self.dismiss_suggestion_requested.emit
+        )
+        self.pending_carousel.setVisible(False)
+        self.chapter_layout.addWidget(self.pending_carousel)
+        # Holds the buttons at the bottom of the card whatever is shown above.
+        self.chapter_layout.addStretch(1)
 
         buttons = QHBoxLayout()
         buttons.setSpacing(8)
@@ -246,7 +260,7 @@ class QualityReportView(QWidget):
         buttons.addWidget(self.check_chapter_button)
         buttons.addWidget(self.undo_chapter_button)
         buttons.addStretch(1)
-        self.chapter_layout.addLayout(buttons)
+        card_layout.addLayout(buttons)
         return self.chapter_card
 
     # -- public API --------------------------------------------------------
@@ -273,8 +287,7 @@ class QualityReportView(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
-        for card in self.pending_cards:
-            card.set_busy(self._busy)
+        self.pending_carousel.set_busy(self._busy)
         self._update_actions()
 
     def selected_chapter_id(self) -> str:
@@ -292,6 +305,12 @@ class QualityReportView(QWidget):
         return False
 
     # -- Qt events ---------------------------------------------------------
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
+        if watched is self.table.viewport() and event.type() == QEvent.Type.Resize:
+            # Section widths settle after the resize itself is delivered.
+            QTimer.singleShot(0, self._fit_chapter_column)
+        return super().eventFilter(watched, event)
 
     def changeEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().changeEvent(event)
@@ -340,8 +359,37 @@ class QualityReportView(QWidget):
         finally:
             table.blockSignals(False)
             table.setUpdatesEnabled(True)
+        metrics = table.fontMetrics()
+        widest = max(
+            (metrics.horizontalAdvance(name) for name in self._display_names.values()),
+            default=0,
+        )
+        self._chapter_names_width = (
+            max(widest, metrics.horizontalAdvance(columns[0][0])) + CHAPTER_COLUMN_PADDING
+        )
         if selected:
             self.select_chapter(selected)
+        QTimer.singleShot(0, self._fit_chapter_column)
+
+    def _fit_chapter_column(self) -> None:
+        """Give the chapter column the spare width, but never less than its names.
+
+        Stretched, it was the first to shrink: with «Длина» and «Пропуски» in a
+        narrow list it went down to nothing and no chapter could be told apart.
+        """
+        table = self.table
+        if table.columnCount() == 0:
+            return
+        header = table.horizontalHeader()
+        needed = self._chapter_names_width
+        others = header.length() - header.sectionSize(0)
+        if table.viewport().width() - others >= needed:
+            if header.sectionResizeMode(0) != QHeaderView.ResizeMode.Stretch:
+                header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            return
+        if header.sectionResizeMode(0) != QHeaderView.ResizeMode.Fixed:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(0, needed)
 
     def _recolor_statuses(self) -> None:
         """Repaint the coloured statuses in the palette that is current now."""
@@ -421,25 +469,11 @@ class QualityReportView(QWidget):
 
     def _refresh_pending(self, chapter_id: str) -> None:
         suggestions = self._snapshot.suggestions_for(chapter_id) if chapter_id else ()
-        if suggestions != self._pending_suggestions:
-            for card in self.pending_cards:
-                card.setParent(None)
-                card.deleteLater()
-            self.pending_cards = []
-            for suggestion in suggestions:
-                card = SuggestionCard(
-                    suggestion, show_chapter=False, parent=self.pending_container
-                )
-                card.apply_requested.connect(self.apply_suggestion_requested.emit)
-                card.dismiss_requested.connect(self.dismiss_suggestion_requested.emit)
-                self.pending_layout.insertWidget(self.pending_layout.count() - 1, card)
-                self.pending_cards.append(card)
-            self._pending_suggestions = suggestions
-        for card in self.pending_cards:
-            card.set_busy(self._busy)
+        self.pending_carousel.set_suggestions(suggestions)
+        self.pending_carousel.set_busy(self._busy)
         self.pending_title_label.setText(f"Ждут решения: {len(suggestions)}")
         self.pending_title_label.setVisible(bool(suggestions))
-        self.pending_area.setVisible(bool(suggestions))
+        self.pending_carousel.setVisible(bool(suggestions))
 
     def _on_selection_changed(self) -> None:
         self._refresh_chapter_card()

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QTextBlockFormat, QTextCursor
 from PyQt6.QtWidgets import (
     QDialog,
@@ -71,6 +71,11 @@ def _scores_expected(settings: QaSettings, snapshot: BookQaReportSnapshot) -> bo
     return settings.capabilities.cometkiwi_enabled and (
         settings.check_completeness_after_chapter or snapshot.has_scores
     )
+
+
+# The overlay card opens at this size, never beyond nine tenths of the main
+# window: near the bare minimum the chapter list and a fix card crowded each other.
+PREFERRED_SIZE = QSize(1440, 980)
 
 
 class TranslationQualityDialog(QDialog):
@@ -241,6 +246,9 @@ class TranslationQualityDialog(QDialog):
         return bar
 
     # -- public API --------------------------------------------------------
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt API
+        return PREFERRED_SIZE.expandedTo(self.minimumSize())
 
     def set_report(self, snapshot: BookQaReportSnapshot) -> None:
         """Replace the report with an immutable snapshot from the journal."""

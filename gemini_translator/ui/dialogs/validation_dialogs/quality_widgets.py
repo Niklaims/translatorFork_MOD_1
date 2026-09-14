@@ -317,3 +317,144 @@ class SuggestionCard(QFrame):
         row.addWidget(text_label, 1)
         layout.addLayout(row)
         return text_label
+
+
+# A trackpad gesture arrives as dozens of small events: this much sideways
+# travel turns one card, and the rest of that gesture is ignored.
+SWIPE_PIXELS = 60
+# One notch of a wheel, the unit Qt reports angle deltas in.
+WHEEL_NOTCH = 120
+
+
+class SuggestionCarousel(QWidget):
+    """A chapter's waiting fixes one at a time: arrows, a count, a sideways swipe."""
+
+    apply_requested = pyqtSignal(str)
+    dismiss_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.cards: list[SuggestionCard] = []
+        self._suggestions: tuple[QaSuggestion, ...] = ()
+        self._index = 0
+        self._busy = False
+        self._swipe = 0
+        self._swiped = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.previous_button = make_button("‹", "ghostActionButton", self)
+        self.previous_button.setToolTip("Предыдущая правка")
+        self.previous_button.setAccessibleName("Предыдущая правка")
+        self.previous_button.clicked.connect(self.show_previous)
+        self.next_button = make_button("›", "ghostActionButton", self)
+        self.next_button.setToolTip("Следующая правка")
+        self.next_button.setAccessibleName("Следующая правка")
+        self.next_button.clicked.connect(self.show_next)
+        # Not a stacked widget: a stack is as tall as its tallest page even
+        # through heightForWidth, and a short fix then sat above an empty band.
+        # Hidden cards take no part in a layout at all.
+        self.cards_box = QWidget(self)
+        self._cards_layout = QVBoxLayout(self.cards_box)
+        self._cards_layout.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.previous_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.cards_box, 1)
+        row.addWidget(self.next_button, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(row)
+        self.counter_label = make_label("", "helperLabel", parent=self)
+        self.counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.counter_label)
+        self._show(0)
+
+    def set_suggestions(self, suggestions) -> None:
+        """Show these fixes; the one on screen stays on screen while it still waits."""
+        suggestions = tuple(suggestions)
+        if suggestions == self._suggestions:
+            return
+        shown = self.current_suggestion_id()
+        for card in self.cards:
+            self._cards_layout.removeWidget(card)
+            card.setParent(None)
+            card.deleteLater()
+        self.cards = []
+        for suggestion in suggestions:
+            card = SuggestionCard(suggestion, show_chapter=False, parent=self.cards_box)
+            card.apply_requested.connect(self.apply_requested.emit)
+            card.dismiss_requested.connect(self.dismiss_requested.emit)
+            card.set_busy(self._busy)
+            self._cards_layout.addWidget(card)
+            self.cards.append(card)
+        self._suggestions = suggestions
+        ids = [item.suggestion_id for item in suggestions]
+        self._show(ids.index(shown) if shown in ids else self._index)
+
+    def set_busy(self, busy: bool) -> None:
+        self._busy = bool(busy)
+        for card in self.cards:
+            card.set_busy(self._busy)
+
+    def current_card(self) -> SuggestionCard | None:
+        return self.cards[self._index] if self.cards else None
+
+    def current_suggestion_id(self) -> str:
+        card = self.current_card()
+        return card.suggestion.suggestion_id if card is not None else ""
+
+    def show_next(self) -> None:
+        self._show(self._index + 1)
+
+    def show_previous(self) -> None:
+        self._show(self._index - 1)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
+        phase = event.phase()
+        if phase == Qt.ScrollPhase.ScrollBegin:
+            self._swipe = 0
+            self._swiped = False
+        pixels = event.pixelDelta()
+        angle = event.angleDelta()
+        horizontal = pixels.x() or angle.x()
+        vertical = pixels.y() or angle.y()
+        if abs(horizontal) <= abs(vertical):
+            # Up and down belong to whatever scrolls around the carousel.
+            event.ignore()
+            return
+        event.accept()
+        if len(self.cards) < 2 or self._swiped:
+            return
+        self._swipe += horizontal
+        gesture = phase != Qt.ScrollPhase.NoScrollPhase
+        if abs(self._swipe) < (SWIPE_PIXELS if gesture else WHEEL_NOTCH):
+            return
+        # Leftward travel brings in what lies to the right, as a horizontal
+        # scroll bar would move under the same gesture.
+        step = 1 if self._swipe < 0 else -1
+        self._swipe = 0
+        self._swiped = gesture
+        self._show(self._index + step)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.key() == Qt.Key.Key_Right:
+            self.show_next()
+        elif event.key() == Qt.Key.Key_Left:
+            self.show_previous()
+        else:
+            super().keyPressEvent(event)
+
+    def _show(self, index: int) -> None:
+        count = len(self.cards)
+        self._index = min(max(index, 0), max(count - 1, 0))
+        for position, card in enumerate(self.cards):
+            card.setVisible(position == self._index)
+        several = count > 1
+        self.previous_button.setVisible(several)
+        self.next_button.setVisible(several)
+        self.counter_label.setVisible(several)
+        self.previous_button.setEnabled(self._index > 0)
+        self.next_button.setEnabled(self._index < count - 1)
+        self.counter_label.setText(f"{self._index + 1} из {count}" if count else "")
+        self.cards_box.updateGeometry()

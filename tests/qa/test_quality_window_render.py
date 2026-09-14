@@ -170,8 +170,8 @@ def test_the_action_bar_keeps_its_height_when_a_pass_starts(qt_app, themed):
         qt_app.processEvents()
 
 
-def test_waiting_fixes_fill_the_chapter_card_down_to_its_buttons(qt_app, themed):
-    """Список правок делил свободное место с распоркой: вторая карточка обрезалась над пустотой."""
+def test_waiting_fixes_are_shown_one_at_a_time(qt_app, themed):
+    """Правки главы листаются по одной, а не прокручиваются столбиком в узком окне."""
     themed("light")
     dialog = TranslationQualityDialog(book_title="AI")
     dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
@@ -180,11 +180,11 @@ def test_waiting_fixes_fill_the_chapter_card_down_to_its_buttons(qt_app, themed)
         dialog.select_chapter("chapter-2")
         qt_app.processEvents()
         view = dialog.report_view
+        carousel = view.pending_carousel
 
-        gap = view.check_chapter_button.geometry().top() - view.pending_area.geometry().bottom()
-
-        assert view.pending_area.isVisible()
-        assert gap <= 2 * view.chapter_layout.spacing() + 1, f"пустота под списком правок: {gap} px"
+        assert carousel.isVisible()
+        assert carousel.counter_label.text() == "1 из 3"
+        assert carousel.geometry().bottom() < view.check_chapter_button.geometry().top()
     finally:
         dialog.close()
         dialog.deleteLater()
@@ -208,8 +208,42 @@ def test_a_chapter_with_nothing_waiting_keeps_its_text_together(qt_app, themed):
             if label.height() > label.heightForWidth(label.width()) + 1
         ]
 
-        assert not view.pending_area.isVisible()
+        assert not view.pending_carousel.isVisible()
         assert stretched == []
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
+
+
+def test_the_chapter_card_scrolls_rather_than_squeezes_in_a_short_window(qt_app, themed):
+    """В окне минимального размера строки нормы наезжали друг на друга, а правка сжималась в пустую рамку."""
+    themed("light")
+    dialog = TranslationQualityDialog(book_title="AI")
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    try:
+        dialog.resize(dialog.minimumSize())
+        dialog.show()
+        dialog.select_chapter("chapter-2")
+        # Heights settle a turn after the resize that changed them.
+        for _ in range(3):
+            qt_app.processEvents()
+        view = dialog.report_view
+        cut = [
+            (label.text()[:30], label.height(), label.heightForWidth(label.width()))
+            for label in view.chapter_card.findChildren(QtWidgets.QLabel)
+            if label.wordWrap()
+            and label.isVisible()
+            and label.text()
+            and label.height() < label.heightForWidth(label.width())
+        ]
+        card = view.pending_carousel.current_card()
+        needed = (
+            card.heightForWidth(card.width()) if card.hasHeightForWidth() else card.sizeHint().height()
+        )
+
+        assert cut == []
+        assert card.height() >= needed
     finally:
         dialog.close()
         dialog.deleteLater()
