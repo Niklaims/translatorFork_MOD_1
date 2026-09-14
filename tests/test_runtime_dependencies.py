@@ -69,3 +69,19 @@ def test_requirements_exclude_pyasn1_versions_with_known_advisories():
     for requirement in (pinned[0], generated):
         assert not requirement.specifier.contains("0.6.3")
         assert requirement.specifier.contains("0.6.4")
+
+
+def test_ci_upgrades_setuptools_before_auditing_the_environment():
+    """pip-audit checks the whole interpreter, not only what requirements install.
+
+    actions/setup-python brings Python 3.11 with setuptools 65.5.0, whose
+    advisories are fixed as late as 83.0.0 (PYSEC-2026-3447), and no requirement
+    ever upgrades it: without this the audit step fails on a tool, not on the app.
+    """
+    workflow = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    upgrade = "python -m pip install --upgrade pip setuptools"
+    audit = "python -m pip_audit"
+
+    assert upgrade in workflow
+    assert audit in workflow
+    assert workflow.index(upgrade) < workflow.index(audit)

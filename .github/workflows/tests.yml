@@ -26,8 +26,10 @@ jobs:
             requirements-dev.txt
 
       - name: Install dependencies
+        # setup-python brings setuptools 65.5.0 and no requirement upgrades it,
+        # while the audit step below checks the whole interpreter.
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install --upgrade pip setuptools
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-dev.txt
 
