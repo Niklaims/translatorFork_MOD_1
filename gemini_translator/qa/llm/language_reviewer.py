@@ -48,7 +48,7 @@ class LanguageQualityReviewer:
         # found, so its length follows the number of defects, not the size of
         # the text — and a truncated answer costs a whole chunk.
         self._config = config or OmissionRepairerConfig(
-            max_output_tokens=4096, prompt_version="language_diagnosis_v1"
+            max_output_tokens=4096, prompt_version="language_diagnosis_v2"
         )
         # Diagnosis is the one QA request that is asked again about text nobody
         # touched: a deferred chapter retried, a manual re-check, a resumed
@@ -146,26 +146,51 @@ class LanguageQualityReviewer:
 # Retrying is part of the contract, not a nicety.  Measured on a live book: one
 # 429 on the diagnosis request left 33 of 40 chapters unchecked, and a chapter
 # nobody could check reports no defects — exactly what a clean chapter reports.
-RETRY_ATTEMPTS = 4
+# A transient failure therefore keeps the current request in work until it
+# succeeds or the user cancels QA, just as translation keeps its current chunk.
 RETRY_BASE_DELAY_SECONDS = 1.5
 RETRY_MAX_DELAY_SECONDS = 20.0
 # The longest a single pause may be when the service names its own delay.  An
 # overloaded server asks for twenty seconds; asking again after one and a half
-# only got the same answer, and the chapter was deferred after four of those.
+# only gets the same answer.
 RETRY_MAX_WAIT_SECONDS = 90.0
 
 
 def retry_delay(attempt: int) -> float:
     """Grow the pause with each attempt, up to a fixed ceiling."""
-    return min(RETRY_BASE_DELAY_SECONDS * (2**attempt), RETRY_MAX_DELAY_SECONDS)
+    delay = RETRY_BASE_DELAY_SECONDS
+    for _ in range(max(0, attempt)):
+        delay = min(delay * 2, RETRY_MAX_DELAY_SECONDS)
+        if delay >= RETRY_MAX_DELAY_SECONDS:
+            break
+    return delay
+
+
+def requested_delay(error: BaseException | None) -> float:
+    """The longest pause anyone in the error's chain asked for, or zero."""
+    longest = 0.0
+    seen: set[int] = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        value = getattr(current, "delay_seconds", None)
+        if not isinstance(value, bool) and isinstance(value, (int, float)):
+            longest = max(longest, float(value))
+        current = current.__cause__ or current.__context__
+    return longest
 
 
 def pause_before_retry(attempt: int, error: BaseException | None) -> float:
     """The backoff, or the delay the service itself asked for when it is longer."""
-    requested = getattr(error, "delay_seconds", None)
-    if isinstance(requested, bool) or not isinstance(requested, (int, float)):
-        requested = 0.0
-    return min(max(retry_delay(attempt), float(requested)), RETRY_MAX_WAIT_SECONDS)
+    requested = requested_delay(error)
+    return min(max(retry_delay(attempt), requested), RETRY_MAX_WAIT_SECONDS)
+
+
+def _asks_for_a_pause(error: BaseException) -> bool:
+    delay = getattr(error, "delay_seconds", None)
+    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+        return False
+    return delay > 0
 
 
 def is_transient(error: BaseException) -> bool:
@@ -175,13 +200,25 @@ def is_transient(error: BaseException) -> bool:
     dropped connection say ``delay_seconds``, an exhausted quota, a refused
     prompt and an unknown model do not.  Reading that attribute keeps this layer
     free of the handler exception hierarchy while still following its rules.
+
+    The whole chain is read, not just the top error.  Measured on two finished
+    books: a key pool that has run out of ready keys reports «сервис просит
+    ждать дольше, чем может одна проверка» as its own error and keeps the
+    original — which does carry the 59 seconds the service asked for — only as
+    the cause.  Reading the top object alone called that permanent and threw
+    away every edit of the batch, for a pause this layer would gladly have
+    waited out.
     """
     if isinstance(error, TimeoutError):
         return True
-    delay = getattr(error, "delay_seconds", None)
-    if isinstance(delay, bool) or not isinstance(delay, (int, float)):
-        return False
-    return delay > 0
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, TimeoutError) or _asks_for_a_pause(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 async def request_qa_json(
@@ -193,9 +230,9 @@ async def request_qa_json(
     *,
     sleep=asyncio.sleep,
 ) -> object:
-    """Send one QA request, retrying what is transient, refusing what is not."""
-    failure: BaseException | None = None
-    for attempt in range(RETRY_ATTEMPTS):
+    """Send one QA request, keeping transient work queued until success or cancel."""
+    attempt = 0
+    while True:
         try:
             return await client.complete_json(
                 prompt,
@@ -209,16 +246,14 @@ async def request_qa_json(
         except QaResponseSchemaError:
             raise LanguageReviewError(f"{purpose}_invalid_response") from None
         except Exception as error:  # noqa: BLE001 - classified just below
+            if not is_transient(error):
+                detail = f"{type(error).__name__}: {error}"
+                raise LanguageReviewError(f"{purpose}_failed", detail) from None
             failure = error
-            if not is_transient(error) or attempt == RETRY_ATTEMPTS - 1:
-                break
         # A cancelled check must not spend its last seconds sleeping.
         request.cancellation.raise_if_cancelled()
         await sleep(pause_before_retry(attempt, failure))
-    detail = f"{type(failure).__name__}: {failure}" if failure is not None else ""
-    if isinstance(failure, TimeoutError):
-        raise LanguageReviewError(f"{purpose}_timeout", detail) from None
-    raise LanguageReviewError(f"{purpose}_failed", detail) from None
+        attempt += 1
 
 
 def _diagnosis_lines(

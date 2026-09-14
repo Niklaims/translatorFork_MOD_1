@@ -46,6 +46,10 @@ _LANGUAGE_ISSUE_CATEGORIES = {
     "hallucinated_addition",
     "style_suggestion",
 }
+# The categories whose whole purpose is removal, and so the only ones that may
+# answer with an empty replacement.  Kept here rather than imported so the
+# schema layer stays free of the policy layer.
+_DELETION_CATEGORIES = {"meta_comment", "hallucinated_addition"}
 
 
 def _empty_metadata() -> Mapping[str, object]:
@@ -459,11 +463,20 @@ class LanguageIssue:
             _nonempty_string(self.original_text, "original_text"),
         )
         if self.replacement_text is not None:
-            object.__setattr__(
-                self,
-                "replacement_text",
-                _nonempty_string(self.replacement_text, "replacement_text"),
-            )
+            if not isinstance(self.replacement_text, str):
+                raise QaResponseSchemaError("replacement_text must be a string")
+            # An empty replacement is how «remove this» is said.  It is allowed
+            # only where removal is the whole point — a neural aside left inside
+            # the book, an invented explanation — so that an empty answer
+            # elsewhere stays the malformed response it is.
+            if not self.replacement_text and self.category not in _DELETION_CATEGORIES:
+                raise QaResponseSchemaError("replacement_text must be a nonempty string")
+            if self.replacement_text:
+                object.__setattr__(
+                    self,
+                    "replacement_text",
+                    _nonempty_string(self.replacement_text, "replacement_text"),
+                )
         if not isinstance(self.objective, bool):
             raise QaResponseSchemaError("objective must be a boolean")
         if self.category == "style_suggestion" and self.objective:

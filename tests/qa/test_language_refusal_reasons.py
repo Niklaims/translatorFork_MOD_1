@@ -108,8 +108,8 @@ def test_a_local_refusal_names_its_gate_and_the_numbers_behind_it():
     assert result.refusals["issue-2"] == "category_not_auto_fixable"
 
 
-def test_a_correction_stage_failure_marks_every_eligible_issue():
-    """Сбой запроса — не молчаливое исчезновение правок, а имя сбоя у каждой."""
+def test_a_permanent_correction_stage_failure_marks_every_eligible_issue():
+    """Постоянный отказ — не исчезновение правок, а имя сбоя у каждой."""
     model = _model()
     blocks = _block_ids(model)
     client = _Client(
@@ -117,16 +117,16 @@ def test_a_correction_stage_failure_marks_every_eligible_issue():
             "language_diagnosis": {
                 "issues": [_issue(1, blocks[0], "взял себе решение", "принял решение")]
             },
-            "language_batch_correction": TimeoutError("slow"),
+            "language_batch_correction": RuntimeError("rejected"),
         }
     )
 
     result = _run(client, _request(model))
 
-    assert result.refusals["issue-1"] == "language_batch_correction_timeout"
+    assert result.refusals["issue-1"] == "language_batch_correction_failed"
     # The per-issue code stays a stable identity; the warning carries the cause.
-    assert result.warnings[0].startswith("language_batch_correction_timeout")
-    assert "slow" in result.warnings[0]
+    assert result.warnings[0].startswith("language_batch_correction_failed")
+    assert "rejected" in result.warnings[0]
 
 
 def test_a_validator_veto_is_recorded_per_issue():

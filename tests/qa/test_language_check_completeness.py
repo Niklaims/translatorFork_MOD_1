@@ -13,6 +13,7 @@ from copy import deepcopy
 
 import pytest
 
+from gemini_translator.api.errors import NetworkError
 from gemini_translator.qa.language_validation import (
     LanguageQaRequest,
     LanguageQaResult,
@@ -21,7 +22,6 @@ from gemini_translator.qa.language_validation import (
 )
 from gemini_translator.qa.llm import CancellationToken, QaModelSelection
 from gemini_translator.qa.llm.language_reviewer import (
-    RETRY_ATTEMPTS,
     RETRY_MAX_WAIT_SECONDS,
     is_transient,
     request_qa_json,
@@ -73,7 +73,12 @@ def _request(**overrides) -> LanguageQaRequest:
     return LanguageQaRequest(**values)  # type: ignore[arg-type]
 
 
-def _ask(client: _Client, request: LanguageQaRequest | None = None) -> tuple[object, list[float]]:
+def _ask(
+    client: _Client,
+    request: LanguageQaRequest | None = None,
+    *,
+    purpose: str = "language_diagnosis",
+) -> tuple[object, list[float]]:
     """Run one request, recording the pauses instead of living through them."""
     pauses: list[float] = []
 
@@ -82,7 +87,12 @@ def _ask(client: _Client, request: LanguageQaRequest | None = None) -> tuple[obj
 
     payload = asyncio.run(
         request_qa_json(
-            client, "prompt", request or _request(), 1024, "language_diagnosis", sleep=sleep
+            client,
+            "prompt",
+            request or _request(),
+            1024,
+            purpose,
+            sleep=sleep,
         )
     )
     return payload, pauses
@@ -95,22 +105,41 @@ def test_a_busy_service_is_asked_again():
     """429 — это «спроси позже», а не «в главе всё хорошо»."""
     client = _Client(_Busy(), _Busy(), {"issues": []})
 
-    payload, pauses = _ask(client)
+    payload, pauses = _ask(client, purpose="language_batch_correction")
 
     assert payload == {"issues": []}
     assert client.calls == 3
     assert len(pauses) == 2
 
 
-def test_a_service_that_stays_busy_ends_as_one_honest_refusal():
-    """Попытки не бесконечны: отказ должен наступить и быть назван."""
-    client = _Client(_Busy())
+def test_a_transient_failure_keeps_retrying_past_the_old_attempt_limit():
+    """503 не должен выбрасывать пакет из QA после четырёх попыток."""
+    overloaded = NetworkError("Сервер Gemini перегружен (503).", delay_seconds=20)
+    client = _Client(*([overloaded] * 4), {"replacements": []})
 
-    with pytest.raises(LanguageReviewError) as error:
-        _ask(client)
+    payload, pauses = _ask(client, purpose="language_batch_correction")
 
-    assert error.value.reason == "language_diagnosis_failed"
-    assert client.calls == RETRY_ATTEMPTS
+    assert payload == {"replacements": []}
+    assert client.calls == 5
+    assert pauses == [pytest.approx(20)] * 4
+
+
+def test_a_service_that_stays_busy_stops_only_when_the_check_is_cancelled():
+    """Временный сбой не теряет пакет, но пользователь всё ещё может остановить QA."""
+    request = _request()
+
+    class _CancellingClient(_Client):
+        async def complete_json(self, *args, **kwargs):
+            if self.calls == 4:
+                request.cancellation.cancel()
+            return await super().complete_json(*args, **kwargs)
+
+    client = _CancellingClient(_Busy())
+
+    with pytest.raises(asyncio.CancelledError):
+        _ask(client, request)
+
+    assert client.calls == 5
 
 
 def test_a_refusal_that_asking_again_cannot_fix_is_not_repeated():
@@ -123,15 +152,14 @@ def test_a_refusal_that_asking_again_cannot_fix_is_not_repeated():
     assert client.calls == 1
 
 
-def test_a_timeout_is_retried_and_keeps_its_own_reason():
-    """Медленный ответ — тоже временный сбой, но в логе он остаётся таймаутом."""
-    client = _Client(TimeoutError("slow"))
+def test_a_timeout_is_retried_until_it_succeeds():
+    """Таймаут — временный сбой, поэтому он не теряет текущий пакет."""
+    client = _Client(TimeoutError("slow"), {"issues": []})
 
-    with pytest.raises(LanguageReviewError) as error:
-        _ask(client)
+    payload, _pauses = _ask(client)
 
-    assert error.value.reason == "language_diagnosis_timeout"
-    assert client.calls == RETRY_ATTEMPTS
+    assert payload == {"issues": []}
+    assert client.calls == 2
 
 
 def test_only_an_error_that_names_a_delay_is_worth_repeating():
@@ -150,6 +178,11 @@ def test_the_pauses_grow_and_then_stop_growing():
     assert delays == sorted(delays)
     assert delays[0] < delays[1]
     assert max(delays) <= 20.0
+
+
+def test_retry_delay_stays_capped_for_a_very_long_outage():
+    """Бесконечный возврат пакета не должен переполнить формулу задержки."""
+    assert retry_delay(10_000) == pytest.approx(20.0)
 
 
 def test_a_pause_is_never_shorter_than_what_the_service_asked_for():

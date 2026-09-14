@@ -29,6 +29,10 @@ LANGUAGE_ISSUE_CATEGORIES = (
     "meta_comment",
     "hallucinated_addition",
 )
+# What a check may remove outright rather than rewrite.  Measured on two
+# finished books: every one of the 78 «(Конец главы)» the diagnosis found died
+# as «нет текста замены», because a deletion had no way to be written down.
+DELETION_CATEGORIES = ("meta_comment", "hallucinated_addition")
 DEFAULT_MAX_CHUNK_CHARS = 4000
 # How much text one language-check request may carry when the project's own
 # translation limit cannot be read as characters.  Far above the 4000 above:
@@ -195,15 +199,13 @@ class LanguageReplacement:
     replacement_text: str
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "issue_id",
-            "block_id",
-            "original_text",
-            "replacement_text",
-        ):
+        for field_name in ("issue_id", "block_id", "original_text"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise QaModelValidationError(f"{field_name} must be a nonempty string")
+        # Empty is how a removal is written down; only a non-string is wrong.
+        if not isinstance(self.replacement_text, str):
+            raise QaModelValidationError("replacement_text must be a string")
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +260,8 @@ REFUSAL_DESCRIPTIONS: Mapping[str, str] = {
     "low_confidence": "уверенность ниже порога",
     "ambiguous_span": "фрагмент встречается в абзаце не один раз",
     "no_change": "замена совпадает с исходным текстом",
+    "yo_spelling": "буква ё — единое написание книги, а не правка",
+    "correction_omitted": "модель не вернула замену для этой правки",
     "protected_entity": "правка затрагивает защищённое имя",
     "glossary_term_dropped": "правка теряет термин глоссария",
     "category_not_auto_fixable": "категория не входит в список автоправки",
@@ -274,6 +278,11 @@ REFUSAL_DESCRIPTIONS: Mapping[str, str] = {
     "language_batch_validation_failed": "проверка пакета исправлений не удалась",
     "language_batch_validation_timeout": "проверка пакета исправлений превысила время",
     "language_batch_validation_invalid_response": "модель вернула непригодный ответ проверки",
+    "language_mechanical_validation_failed": "проверка типографских правок не удалась",
+    "language_mechanical_validation_timeout": "проверка типографских правок превысила время",
+    "language_mechanical_validation_invalid_response": (
+        "модель вернула непригодный ответ проверки типографики"
+    ),
 }
 
 
@@ -371,6 +380,70 @@ def _rewrites_punctuation(original: str, replacement: str) -> bool:
     )
 
 
+_WORD = re.compile(r"\w+", re.UNICODE)
+
+
+def _words(text: str) -> tuple[str, ...]:
+    return tuple(match.group().casefold() for match in _WORD.finditer(str(text or "")))
+
+
+def _shape(text: str) -> str:
+    """Everything that is not a word, with dashes levelled and spacing dropped."""
+    return "".join(
+        "\u2014" if character in _DASHES else character
+        for character in str(text or "")
+        if not character.isspace() and not (character.isalnum() or character == "_")
+    )
+
+
+def is_mechanical_edit(original: str, replacement: str) -> bool:
+    """Report whether the two spell the same words the same way but for typography.
+
+    Measured on two finished books: \u00ab\u2013\u00bb became \u00ab\u2014\u00bb once and was refused 56
+    times, and \u00ab\u2014 \u0421\u043f\u0440\u043e\u0441\u0438\u043b\u00bb became \u00ab\u2014 \u0441\u043f\u0440\u043e\u0441\u0438\u043b\u00bb 495 times while the very same
+    edit was refused 78 times.  Neither is a question about Russian \u2014 the words
+    are untouched \u2014 so neither belongs in front of a validator told to confirm
+    only what is impossible.  Requiring the word sequence to be identical is
+    what keeps \u00ab\u043d\u0435 \u0441\u043c\u043e\u0442\u0440\u044f\u00bb \u2192 \u00ab\u043d\u0435\u0441\u043c\u043e\u0442\u0440\u044f\u00bb out: that one moves a boundary between
+    letters and changes the meaning, so it stays a judgement.
+    """
+    if original == replacement:
+        return False
+    if _words(original) != _words(replacement):
+        return False
+    return _shape(original) == _shape(replacement)
+
+
+def only_yo_differs(original: str, replacement: str) -> bool:
+    """Report whether the edit is nothing but the letter \u0451."""
+    if original == replacement:
+        return False
+    flattened = (
+        str(text or "").replace("\u0451", "\u0435").replace("\u0401", "\u0415")
+        for text in (original, replacement)
+    )
+    first, second = flattened
+    return first == second
+
+
+def drops_adjacent_duplicate(original: str, replacement: str) -> bool:
+    """Report whether the edit only removes a word that was typed twice running.
+
+    \u00ab\u043f\u0435\u0440\u0432\u044b\u043c \u043f\u0435\u0440\u0432\u044b\u043c \u0434\u0435\u043b\u043e\u043c\u00bb is a slip of the keyboard, not the author's rhythm,
+    and it is the one repetition a machine can recognise without an opinion.
+    """
+    before = str(original or "").split()
+    after = str(replacement or "").split()
+    if len(after) != len(before) - 1:
+        return False
+    for index in range(1, len(before)):
+        if before[index].casefold() != before[index - 1].casefold():
+            continue
+        if before[:index] + before[index + 1 :] == after:
+            return True
+    return False
+
+
 _BREAK = re.compile(r"[\n\r\u2028\u2029]")
 
 
@@ -404,16 +477,21 @@ def auto_fix_refusal(
 
     if issue.category == "style_suggestion":
         return "style_suggestion"
-    if not issue.objective:
-        return "subjective"
     if issue.replacement_text is None:
         return "no_replacement"
+    # Before any judgement is reported: an edit that changes nothing is not an
+    # opinion the model held, and «модель не считает правку объективной» next
+    # to «было: X предложено: X» reads as a verdict where there was none.
+    if issue.replacement_text == issue.original_text:
+        return "no_change"
+    if only_yo_differs(issue.original_text, issue.replacement_text):
+        return "yo_spelling"
+    if not issue.objective:
+        return "subjective"
     if issue.confidence < min_confidence:
         return "low_confidence"
     if block_text.count(issue.original_text) != 1:
         return "ambiguous_span"
-    if issue.replacement_text == issue.original_text:
-        return "no_change"
     if _asks_for_a_new_paragraph(issue.original_text, issue.replacement_text):
         return "paragraph_break"
     if issue.category == "punctuation" and _rewrites_punctuation(
@@ -435,6 +513,15 @@ def auto_fix_refusal(
             return "glossary_term_dropped"
     # The policy check comes last: an issue that could never be applied anyway
     # should say why in its own terms.
+    if issue.category in DELETION_CATEGORIES:
+        # A neural aside inside the book is removed, never rewritten: giving
+        # these categories a free hand would let «(Конец главы)» be replaced by
+        # whatever sentence the model liked instead.
+        return "" if issue.replacement_text == "" else "category_not_auto_fixable"
+    if issue.category == "repetition" and drops_adjacent_duplicate(
+        issue.original_text, issue.replacement_text
+    ):
+        return ""
     if auto_fix_categories and issue.category not in auto_fix_categories:
         return "category_not_auto_fixable"
     return ""
@@ -522,12 +609,17 @@ class LanguageQualityPipeline:
         reviewer: object | None = None,
         repairer: object | None = None,
         validator: object | None = None,
+        mechanical_validator: object | None = None,
         diagnosis_cache=None,
     ) -> None:
         if not callable(getattr(client, "complete_json", None)):
             raise TypeError("client must implement complete_json")
         # Imported here so the request stages may depend on these contracts.
-        from .llm.language_repairer import LanguageBatchRepairer, LanguageRepairValidator
+        from .llm.language_repairer import (
+            MECHANICAL_VALIDATION_PURPOSE,
+            LanguageBatchRepairer,
+            LanguageRepairValidator,
+        )
         from .llm.language_reviewer import LanguageQualityReviewer
 
         self._reviewer = reviewer or LanguageQualityReviewer(
@@ -535,6 +627,42 @@ class LanguageQualityPipeline:
         )
         self._repairer = repairer or LanguageBatchRepairer(client)
         self._validator = validator or LanguageRepairValidator(client)
+        self._mechanical_validator = mechanical_validator or LanguageRepairValidator(
+            client, purpose=MECHANICAL_VALIDATION_PURPOSE
+        )
+
+    def _validation_groups(self, batch: LanguageRepairBatch) -> list[tuple]:
+        """Put each replacement to the validator that can actually judge it.
+
+        A respelling and a rewrite are different questions.  Asking both under
+        one instruction — confirm only what is impossible in Russian — is what
+        made «–» → «—» a coin flip; each batch now carries only edits its
+        prompt was written for.
+        """
+        mechanical: list[LanguageReplacement] = []
+        judgement: list[LanguageReplacement] = []
+        for replacement in batch.replacements:
+            target = (
+                mechanical
+                if is_mechanical_edit(
+                    replacement.original_text, replacement.replacement_text
+                )
+                else judgement
+            )
+            target.append(replacement)
+        groups: list[tuple] = []
+        if mechanical:
+            groups.append(
+                (
+                    self._mechanical_validator,
+                    LanguageRepairBatch(batch.chapter_id, tuple(mechanical)),
+                )
+            )
+        if judgement:
+            groups.append(
+                (self._validator, LanguageRepairBatch(batch.chapter_id, tuple(judgement)))
+            )
+        return groups
 
     async def check_chapter(
         self,
@@ -630,35 +758,48 @@ class LanguageQualityPipeline:
                     defer(issue, error.reason)
                 continue
 
+            # An issue the repairer never answered about used to fall between
+            # the stages: absent from the batch, it was neither applied nor
+            # refused, and the log a person reads showed no trace of it at all.
+            answered = {item.issue_id for item in batch.replacements}
+            for issue in eligible:
+                if issue.issue_id not in answered:
+                    defer(issue, "correction_omitted")
+            eligible = [issue for issue in eligible if issue.issue_id in answered]
+
             preview = _apply_or_warn(current_model, batch.replacements, warnings)
             if preview is None:
                 for issue in eligible:
                     defer(issue, "apply_conflict")
                 continue
 
-            try:
-                validation = await self._validator.validate_batch(
-                    request, chunk, batch, preview
-                )
-            except LanguageReviewError as error:
-                warnings.append(error.described)
-                for issue in eligible:
-                    defer(issue, error.reason)
-                continue
+            by_issue_id = {issue.issue_id: issue for issue in eligible}
+            approved: set[str] = set()
+            for validator, group in self._validation_groups(batch):
+                try:
+                    validation = await validator.validate_batch(
+                        request, chunk, group, preview
+                    )
+                except LanguageReviewError as error:
+                    # One question failing must not cost the other its answers.
+                    warnings.append(error.described)
+                    for item in group.replacements:
+                        issue = by_issue_id.get(item.issue_id)
+                        if issue is not None:
+                            defer(issue, error.reason)
+                    continue
+                confirmed_here = set(validation.confirmed_issue_ids)
+                approved |= confirmed_here
+                for item in group.replacements:
+                    issue = by_issue_id.get(item.issue_id)
+                    if issue is not None and item.issue_id not in confirmed_here:
+                        defer(issue, "validation_declined")
 
             confirmed = tuple(
                 replacement
                 for replacement in batch.replacements
-                if replacement.issue_id in set(validation.confirmed_issue_ids)
+                if replacement.issue_id in approved
             )
-            refused_ids = {
-                replacement.issue_id
-                for replacement in batch.replacements
-                if replacement not in confirmed
-            }
-            for issue in eligible:
-                if issue.issue_id in refused_ids:
-                    defer(issue, "validation_declined")
             if not confirmed:
                 continue
             if len(confirmed) != len(batch.replacements):

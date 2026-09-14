@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from ..language_validation import (
+    DELETION_CATEGORIES,
     LanguageBatchValidation,
     LanguageBlock,
     LanguageQaRequest,
@@ -28,6 +29,11 @@ from .schemas import LanguageIssue
 
 CORRECTION_PURPOSE = "language_batch_correction"
 VALIDATION_PURPOSE = "language_batch_validation"
+MECHANICAL_VALIDATION_PURPOSE = "language_mechanical_validation"
+_VALIDATION_PROMPTS = {
+    VALIDATION_PURPOSE: "language_batch_validation_v3",
+    MECHANICAL_VALIDATION_PURPOSE: "language_mechanical_validation_v1",
+}
 
 
 class LanguageBatchRepairer:
@@ -89,11 +95,15 @@ class LanguageBatchRepairer:
                 or issue_id not in by_id
                 or issue_id in seen
                 or not isinstance(replacement_text, str)
-                or not replacement_text.strip()
+            ):
+                raise LanguageReviewError("correction_invalid_response")
+            issue = by_id[issue_id]
+            # Empty means «remove the span», which only a removal may ask for.
+            if not replacement_text.strip() and (
+                replacement_text != "" or issue.category not in DELETION_CATEGORIES
             ):
                 raise LanguageReviewError("correction_invalid_response")
             seen.add(issue_id)
-            issue = by_id[issue_id]
             replacements.append(
                 LanguageReplacement(
                     issue_id=issue_id,
@@ -108,18 +118,32 @@ class LanguageBatchRepairer:
 
 
 class LanguageRepairValidator:
-    """Confirm or refuse a whole batch of replacements in one request."""
+    """Confirm or refuse a whole batch of replacements in one request.
+
+    ``purpose`` chooses which question the batch is put to.  The strict prompt
+    asks whether the original is impossible in Russian, which is the right bar
+    for a rewrite and the wrong one for a respelling: measured on two finished
+    books it confirmed «–» → «—» once and refused it 56 times.  Typographic
+    batches therefore go to a validator of their own, told what it is looking
+    at, and a failure on one of the two never costs the other its edits.
+    """
 
     def __init__(
         self,
         client: QaCompletionClient,
         config: OmissionRepairerConfig | None = None,
+        *,
+        purpose: str = VALIDATION_PURPOSE,
     ) -> None:
         if not callable(getattr(client, "complete_json", None)):
             raise TypeError("client must implement complete_json")
         self._client = client
+        self._purpose = str(purpose or VALIDATION_PURPOSE)
         self._config = config or OmissionRepairerConfig(
-            max_output_tokens=1024, prompt_version="language_batch_validation_v3"
+            max_output_tokens=1024,
+            prompt_version=_VALIDATION_PROMPTS.get(
+                self._purpose, "language_batch_validation_v3"
+            ),
         )
 
     async def validate_batch(
@@ -148,22 +172,24 @@ class LanguageRepairValidator:
             prompt,
             request,
             self._config.max_output_tokens,
-            VALIDATION_PURPOSE,
+            self._purpose,
         )
         if not isinstance(payload, Mapping):
-            raise LanguageReviewError("validation_invalid_response")
+            raise LanguageReviewError(f"{self._purpose}_invalid_response")
         unknown = set(payload) - {
             "confirmed_issue_ids",
             "rejected_issue_ids",
             "metadata",
         }
         if unknown:
-            raise LanguageReviewError("validation_invalid_response")
+            raise LanguageReviewError(f"{self._purpose}_invalid_response")
         known = {replacement.issue_id for replacement in batch.replacements}
-        confirmed = _id_tuple(payload.get("confirmed_issue_ids"), known)
-        rejected = _id_tuple(payload.get("rejected_issue_ids"), known)
+        confirmed = _id_tuple(
+            payload.get("confirmed_issue_ids"), known, self._purpose
+        )
+        rejected = _id_tuple(payload.get("rejected_issue_ids"), known, self._purpose)
         if set(confirmed) & set(rejected):
-            raise LanguageReviewError("validation_invalid_response")
+            raise LanguageReviewError(f"{self._purpose}_invalid_response")
         return LanguageBatchValidation(confirmed, rejected)
 
 
@@ -178,15 +204,17 @@ def _entries(payload: object, key: str, purpose: str) -> Sequence[object]:
     return entries
 
 
-def _id_tuple(value: object, known: set[str]) -> tuple[str, ...]:
+def _id_tuple(
+    value: object, known: set[str], purpose: str = VALIDATION_PURPOSE
+) -> tuple[str, ...]:
     if value is None:
         return ()
     if not isinstance(value, (list, tuple)):
-        raise LanguageReviewError("validation_invalid_response")
+        raise LanguageReviewError(f"{purpose}_invalid_response")
     result: list[str] = []
     for item in value:
         if not isinstance(item, str) or item not in known or item in result:
-            raise LanguageReviewError("validation_invalid_response")
+            raise LanguageReviewError(f"{purpose}_invalid_response")
         result.append(item)
     return tuple(result)
 
