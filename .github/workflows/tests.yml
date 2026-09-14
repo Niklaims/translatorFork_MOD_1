@@ -63,3 +63,12 @@ jobs:
           name: ${{ env.RUN_CHECKS_ARTIFACT_NAME }}
           path: run_checks.log
           if-no-files-found: ignore
+
+      - name: Audit installed dependencies for known vulnerabilities
+        # Runs after the checks, so a new advisory never hides test results:
+        # it fails the job on its own step, which lists the advisory.
+        if: always()
+        shell: pwsh
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit --progress-spinner off --desc on

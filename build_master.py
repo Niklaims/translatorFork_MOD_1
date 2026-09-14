@@ -125,6 +125,7 @@ FORCED_VERSIONS = {
     'cryptography': '>=48.0.1',
     'defusedxml': '>=0.7.1',
     'idna': '>=3.15',
+    'pyasn1': '>=0.6.4',
     'pydantic': '>=2.0.0',
     'qoder-agent-sdk': '>=1.0.8',
     'soupsieve': '>=2.8.4',

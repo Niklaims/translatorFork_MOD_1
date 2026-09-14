@@ -19,6 +19,7 @@ num2words
 opencc-python-reimplemented
 orjson
 playwright
+pyasn1>=0.6.4
 PyAudio
 pydantic>=2.0.0
 pandas>=3.0,<4

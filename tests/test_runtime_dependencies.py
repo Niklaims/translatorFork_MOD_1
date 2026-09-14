@@ -47,3 +47,25 @@ def test_every_shipped_prompt_declares_its_data_boundary():
     for name, template in payload.items():
         assert template.count("__QA_DATA_TAG__") == 2, name
         assert template.count("__QA_DATA_PAYLOAD__") == 1, name
+
+
+def test_requirements_exclude_pyasn1_versions_with_known_advisories():
+    """pyasn1 0.6.3 has three advisories fixed in 0.6.4 (PYSEC-2026-3455..3457).
+
+    It arrives through google-auth, so nothing pins it unless the manifest does,
+    and an existing virtualenv keeps the vulnerable version forever.
+    """
+    from packaging.requirements import Requirement
+
+    lines = [
+        line.strip()
+        for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    pinned = [Requirement(line) for line in lines if Requirement(line).name.lower() == "pyasn1"]
+    generated = Requirement("pyasn1" + build_master.FORCED_VERSIONS.get("pyasn1", ""))
+
+    assert len(pinned) == 1
+    for requirement in (pinned[0], generated):
+        assert not requirement.specifier.contains("0.6.3")
+        assert requirement.specifier.contains("0.6.4")
