@@ -356,7 +356,7 @@ def test_the_journal_records_every_decision_it_made(tmp_path, chapter):
     )
     saved = json.loads((tmp_path / "translation_qa.json").read_text(encoding="utf-8"))
 
-    assert saved["schema_version"] == 3
+    assert saved["schema_version"] == 4
     assert len(saved["repairs"]) == 1
     assert any(entry["decision"] == "fixed" for entry in saved["candidates"])
     assert saved["chapter_states"][0]["chapter_id"] == "chapter-1"

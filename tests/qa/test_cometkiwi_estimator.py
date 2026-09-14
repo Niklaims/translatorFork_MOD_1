@@ -303,8 +303,13 @@ def _coordinator_with(estimator, result):
             self.attached.append(estimate)
             return chapter_result
 
+        def attach_suggestion_scores(self, chapter_id, scores):
+            self.scored.append((chapter_id, dict(scores)))
+            return len(scores)
+
     service = _Service()
     service.attached = []
+    service.scored = []
     coordinator = ChapterQaCoordinator(
         service=service,
         task_manager=None,
@@ -437,6 +442,99 @@ def test_a_scored_chapter_lets_go_of_its_text():
 
     assert estimator.starts == 1
     assert result.quality_windows == ()
+
+
+def _fix_windows(*suggestion_ids):
+    from gemini_translator.qa.service import SuggestionWindows
+
+    return tuple(
+        SuggestionWindows(
+            suggestion_id=suggestion_id,
+            before=SourceTranslationWindow(f"{suggestion_id}:before", "原文", "Было так.", 8),
+            after=SourceTranslationWindow(f"{suggestion_id}:after", "原文", "Стало так.", 9),
+        )
+        for suggestion_id in suggestion_ids
+    )
+
+
+class _ScoresByWindow:
+    """Answer each window with the score its id asks for, as a runner scores each segment."""
+
+    def __init__(self, score_for) -> None:
+        self.score_for = score_for
+        self.requests = []
+
+    async def estimate(self, request, cancellation=None):
+        from gemini_translator.qa.estimators.base import aggregate
+
+        self.requests.append(request)
+        return aggregate(
+            "cometkiwi",
+            "wmt22-cometkiwi-da",
+            request,
+            tuple(self.score_for(window.window_id) for window in request.windows),
+        )
+
+
+def _fix_score(before: float, after: float, chapter: float = 0.6):
+    def score_for(window_id: str) -> float:
+        if window_id.endswith(":before"):
+            return before
+        if window_id.endswith(":after"):
+            return after
+        return chapter
+
+    return score_for
+
+
+def test_refused_fixes_ride_with_the_chapter_but_stay_out_of_its_score():
+    """Окна правок уходят тем же запросом, но в оценку главы не входят."""
+    from dataclasses import replace
+
+    estimator = _ScoresByWindow(_fix_score(0.2, 0.9))
+    result = replace(_windowed_result(2), suggestion_windows=_fix_windows("sg-1"))
+    coordinator, service, event = _coordinator_with(estimator, result)
+
+    checked = _run_check(coordinator, event)
+
+    assert [len(request.windows) for request in estimator.requests] == [4]
+    assert service.attached[0].chapter_score == pytest.approx(0.6)
+    assert service.scored == [("chapter-1", {"sg-1": (0.2, 0.9)})]
+    assert checked.suggestion_windows == ()
+
+
+def test_fixes_are_scored_without_the_completeness_check():
+    """Без проверки полноты окон главы нет, но у правки есть свой абзац и оригинал."""
+    from dataclasses import replace
+
+    estimator = _ScoresByWindow(_fix_score(0.4, 0.7))
+    result = replace(_chapter_result(), suggestion_windows=_fix_windows("sg-1", "sg-2"))
+    coordinator, service, event = _coordinator_with(estimator, result)
+
+    checked = _run_check(coordinator, event)
+
+    assert [len(request.windows) for request in estimator.requests] == [4]
+    assert service.attached == []
+    assert service.scored == [("chapter-1", {"sg-1": (0.4, 0.7), "sg-2": (0.4, 0.7)})]
+    assert checked.suggestion_windows == ()
+
+
+def test_a_failed_estimate_leaves_the_fixes_without_scores():
+    from dataclasses import replace
+
+    from gemini_translator.qa.estimators.base import unavailable
+
+    class _Unreachable:
+        async def estimate(self, request, cancellation=None):
+            return unavailable("cometkiwi", "wmt22-cometkiwi-da", "endpoint_unreachable")
+
+    result = replace(_windowed_result(2), suggestion_windows=_fix_windows("sg-1"))
+    coordinator, service, event = _coordinator_with(_Unreachable(), result)
+
+    _run_check(coordinator, event)
+
+    assert service.attached[0].metadata["reason"] == "endpoint_unreachable"
+    assert service.scored == []
 
 
 def test_an_estimator_failure_never_breaks_the_chapter_check():

@@ -956,3 +956,121 @@ def test_without_the_completeness_check_there_is_nothing_to_score(tmp_path, chap
     result = _check(service, _request(chapter), QaOptions(check_completeness=False))
 
     assert result.quality_windows == ()
+
+
+def _refusing_language(*issues):
+    """A language check that refuses every issue it is given, on the chapter's own blocks."""
+    from gemini_translator.qa.language_validation import LanguageQaResult
+    from gemini_translator.qa.llm.schemas import LanguageIssue
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            blocks = build_translation_payload(request.document_model)["blocks"]
+            found = tuple(
+                LanguageIssue(
+                    issue_id=f"issue-{index}",
+                    category="calque",
+                    block_id=blocks[block]["id"],
+                    original_text=original,
+                    replacement_text=replacement,
+                    objective=False,
+                    confidence=0.9,
+                    explanation="Калька.",
+                )
+                for index, (block, original, replacement) in enumerate(issues)
+            )
+            return LanguageQaResult(
+                chapter_id=request.chapter_id,
+                issues=found,
+                suggestions=found,
+                refusals={issue.issue_id: "validation_declined" for issue in found},
+            )
+
+    return _Language()
+
+
+def _block_ids(html: str) -> list[str]:
+    model = build_html_document_model(html, document_id="chapter-1")
+    return [block["id"] for block in build_translation_payload(model)["blocks"]]
+
+
+def test_a_refused_fix_is_scored_as_its_paragraph_before_and_after(tmp_path, chapter):
+    """CometKiwi сравнивает с оригиналом абзац как есть и абзац с правкой."""
+    ids = _block_ids(_CHAPTER_HTML)
+    service, _journal, _path = _service(
+        tmp_path,
+        aligner=_CleanAligner(),
+        language=_refusing_language((1, "сразу ушёл", "тут же ушёл"), (0, "открыл", None)),
+    )
+    request = replace(
+        _request(chapter), source_text_by_block={ids[0]: _SOURCE[0], ids[1]: _SOURCE[2]}
+    )
+
+    result = _check(service, request)
+
+    assert [
+        (pair.before.source, pair.before.translation, pair.after.translation)
+        for pair in result.suggestion_windows
+    ] == [("He left at once.", "Он сразу ушёл.", "Он тут же ушёл.")]
+
+
+@pytest.mark.parametrize(
+    ("html", "with_sources"),
+    [
+        # No source paragraph for the block the fix is in.
+        (_CHAPTER_HTML, False),
+        # The fragment is in its paragraph twice: which one the fix means is unknown.
+        ("<p>Он открыл дверь.</p><p>Он сразу ушёл, сразу ушёл.</p>", True),
+    ],
+)
+def test_a_fix_a_score_would_mislead_about_is_not_scored(tmp_path, html, with_sources):
+    path = tmp_path / "chapter-1.html"
+    path.write_text(html, encoding="utf-8")
+    ids = _block_ids(html)
+    service, _journal, _path = _service(
+        tmp_path,
+        aligner=_CleanAligner(),
+        language=_refusing_language((1, "сразу ушёл", "тут же ушёл")),
+    )
+    # Without it the source of the other paragraph is all there is.
+    sources = {ids[0]: _SOURCE[0], ids[1]: _SOURCE[2]} if with_sources else {ids[0]: _SOURCE[0]}
+
+    result = _check(service, replace(_request(path), source_text_by_block=sources))
+
+    assert result.suggestion_windows == ()
+
+
+def test_a_fix_already_decided_is_not_scored_again(tmp_path, chapter):
+    ids = _block_ids(_CHAPTER_HTML)
+    service, journal, _path = _service(
+        tmp_path,
+        aligner=_CleanAligner(),
+        language=_refusing_language((1, "сразу ушёл", "тут же ушёл")),
+    )
+    request = replace(
+        _request(chapter), source_text_by_block={ids[0]: _SOURCE[0], ids[1]: _SOURCE[2]}
+    )
+    first = _check(service, request)
+    journal.set_suggestion_status(first.suggestion_windows[0].suggestion_id, "dismissed")
+
+    second = _check(service, request)
+
+    assert second.suggestion_windows == ()
+
+
+def test_scores_are_written_into_a_fix_and_its_decision_stays(tmp_path, chapter):
+    service, journal, journal_path = _service(tmp_path, aligner=_CleanAligner())
+    suggestion = _pending_suggestion(journal)
+    journal.set_suggestion_status(suggestion.suggestion_id, "dismissed")
+
+    written = service.attach_suggestion_scores(
+        "chapter-1", {suggestion.suggestion_id: (0.71, 0.78)}
+    )
+
+    recorded = journal.suggestion(suggestion.suggestion_id)
+    assert written == 1
+    assert (recorded.status, recorded.score_before, recorded.score_after) == ("dismissed", 0.71, 0.78)
+    saved = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert saved["suggestions"][0]["score_after"] == 0.78
+    assert service.attach_suggestion_scores("chapter-2", {suggestion.suggestion_id: (0.1, 0.2)}) == 0
+    assert journal.suggestion(suggestion.suggestion_id).score_after == 0.78

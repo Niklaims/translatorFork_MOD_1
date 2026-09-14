@@ -36,7 +36,7 @@ class QaJournalUnsupportedVersionError(QaJournalError):
 
 
 class QaJournal:
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     _V1_ROOT_KEYS = frozenset(
         {
             "schema_version",
@@ -52,7 +52,13 @@ class QaJournal:
     _V2_ROOT_KEYS = _V1_ROOT_KEYS | {"chapter_states"}
     # v3 keeps the language fixes a check refused, for a person to decide.
     _ROOT_KEYS = _V2_ROOT_KEYS | {"suggestions"}
-    _ROOT_KEYS_BY_VERSION = {1: _V1_ROOT_KEYS, 2: _V2_ROOT_KEYS, 3: _ROOT_KEYS}
+    # v4 keeps v3's root; each suggestion gains CometKiwi's two scores.
+    _ROOT_KEYS_BY_VERSION = {
+        1: _V1_ROOT_KEYS,
+        2: _V2_ROOT_KEYS,
+        3: _ROOT_KEYS,
+        4: _ROOT_KEYS,
+    }
 
     def __init__(
         self,
@@ -142,8 +148,14 @@ class QaJournal:
                 for item in payload.get("chapter_states", [])
             ]
             # Versions 1 and 2 kept no suggestions; they simply start empty.
+            # Version 3 kept them without scores, and they come back unscored.
+            read_suggestion = (
+                QaSuggestion.from_dict
+                if version >= 4
+                else QaSuggestion.from_version_3_dict
+            )
             suggestions = [
-                QaSuggestion.from_dict(item) for item in payload.get("suggestions", [])
+                read_suggestion(item) for item in payload.get("suggestions", [])
             ]
         except (KeyError, ValueError, QaModelValidationError) as exc:
             raise QaJournalCorruptedError("QA journal metrics are invalid") from exc
@@ -243,6 +255,22 @@ class QaJournal:
                 self._mark_updated()
                 return updated
         raise QaJournalError(f"unknown suggestion: {suggestion_id}")
+
+    def set_suggestion_scores(
+        self, suggestion_id: str, before: float, after: float
+    ) -> QaSuggestion | None:
+        """Add CometKiwi's two scores to a fix, whatever has been decided about it since.
+
+        The scores arrive after the pass recorded the fix. A new pass may have
+        replaced it meanwhile, and then there is nothing to add them to.
+        """
+        for index, item in enumerate(self.suggestions):
+            if item.suggestion_id == suggestion_id:
+                updated = replace(item, score_before=before, score_after=after)
+                self.suggestions[index] = updated
+                self._mark_updated()
+                return updated
+        return None
 
     def record_chapter_result(
         self,

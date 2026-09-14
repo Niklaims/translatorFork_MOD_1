@@ -406,3 +406,10 @@ def test_the_cometkiwi_card_says_what_it_scores(qt_app):
     text = view.cometkiwi_scope_label.text()
 
     assert "проверкой полноты" in text
+
+
+def test_the_cometkiwi_card_says_it_also_weighs_the_refused_fixes(qt_app):
+    """CometKiwi подсказывает и по отклонённым правкам, в том числе без проверки полноты."""
+    view = QualitySettingsView(QaSettings())
+
+    assert "отклонённой правки" in view.cometkiwi_scope_label.text()

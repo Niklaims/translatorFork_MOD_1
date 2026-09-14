@@ -216,6 +216,31 @@ MANUAL_FIX_NOTE = "Такую правку вносят вручную."
 CHECKING_NOTE = "Глава сейчас проверяется."
 
 
+# Below this difference CometKiwi's two scores do not say which text is closer.
+SCORE_TIE = 0.02
+
+
+def describe_fix_scores(before: float | None, after: float | None) -> str:
+    """Say in words which version of the paragraph CometKiwi finds closer to the source."""
+    if before is None or after is None:
+        return ""
+    if abs(after - before) < SCORE_TIE:
+        return f"CometKiwi: разницы почти нет — {_score_text(before)} и {_score_text(after)}"
+    if after > before:
+        return (
+            f"CometKiwi: ближе к оригиналу «стало» — {_score_text(after)} "
+            f"против {_score_text(before)}"
+        )
+    return (
+        f"CometKiwi: ближе к оригиналу «было» — {_score_text(before)} "
+        f"против {_score_text(after)}"
+    )
+
+
+def _score_text(value: float) -> str:
+    return f"{value:.2f}".replace(".", ",")
+
+
 class SuggestionCard(QFrame):
     """One refused fix: where, what kind, why it was not applied, and both texts."""
 
@@ -270,6 +295,10 @@ class SuggestionCard(QFrame):
             layout.addWidget(
                 make_label(suggestion.explanation, "mutedLabel", wrap=True, parent=self)
             )
+        score_text = describe_fix_scores(suggestion.score_before, suggestion.score_after)
+        self.score_label = make_label(score_text, "mutedLabel", wrap=True, parent=self)
+        self.score_label.setVisible(bool(score_text))
+        layout.addWidget(self.score_label)
 
         actions = QHBoxLayout()
         actions.setSpacing(8)

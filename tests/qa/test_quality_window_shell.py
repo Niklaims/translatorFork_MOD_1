@@ -335,18 +335,21 @@ def test_a_running_pass_locks_only_the_chapter_it_is_checking(qt_app):
 
 
 @pytest.mark.parametrize(
-    ("completeness", "text"),
+    ("language", "completeness", "cometkiwi", "text"),
     [
-        (False, "После каждой главы: язык."),
-        (True, "После каждой главы: язык, полнота, оценка CometKiwi."),
+        (True, True, True, "После каждой главы: язык, полнота, оценка CometKiwi."),
+        (True, False, True, "После каждой главы: язык, оценка правок CometKiwi."),
+        (True, False, False, "После каждой главы: язык."),
+        (False, True, True, "После каждой главы: полнота, оценка CometKiwi."),
+        (False, False, True, "Проверки после глав выключены."),
     ],
 )
-def test_the_header_promises_cometkiwi_only_where_it_runs(completeness, text):
-    """CometKiwi оценивает то, что сопоставила проверка полноты, и без неё не запускается."""
+def test_the_header_promises_only_the_scores_that_run(language, completeness, cometkiwi, text):
+    """Без полноты CometKiwi не оценивает главу, но оценивает отклонённые правки языковой проверки."""
     settings = QaSettings(
-        check_language_after_chapter=True,
+        check_language_after_chapter=language,
         check_completeness_after_chapter=completeness,
-        capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+        capabilities=QaCapabilitySettings(cometkiwi_enabled=cometkiwi),
     )
 
     assert describe_checks(settings) == text

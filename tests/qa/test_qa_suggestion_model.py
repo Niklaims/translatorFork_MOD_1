@@ -101,3 +101,44 @@ def test_a_damaged_record_is_refused(damage):
 
     with pytest.raises(QaModelValidationError):
         QaSuggestion.from_dict(payload)
+
+
+def test_scores_travel_with_the_suggestion():
+    """Оценки CometKiwi хранятся в записи правки и переживают сохранение."""
+    scored = _suggestion(score_before=0.71, score_after=0.78)
+
+    assert QaSuggestion.from_dict(scored.to_dict()) == scored
+    assert (_suggestion().score_before, _suggestion().score_after) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (1.2, 0.5),
+        (-0.1, 0.5),
+        (float("nan"), 0.5),
+        (True, 0.5),
+        ("0.5", 0.5),
+        (0.5, None),
+        (None, 0.5),
+    ],
+)
+def test_a_score_outside_zero_to_one_or_half_a_pair_is_refused(before, after):
+    with pytest.raises(QaModelValidationError):
+        _suggestion(score_before=before, score_after=after)
+
+
+def test_a_version_3_record_reads_without_scores_and_nothing_else_is_forgiven():
+    """У правок из журнала версии 3 оценок нет; любое другое отличие по-прежнему портит запись."""
+    record = _suggestion().to_dict()
+    record.pop("score_before")
+    record.pop("score_after")
+
+    assert QaSuggestion.from_version_3_dict(record) == _suggestion()
+    with pytest.raises(QaModelValidationError):
+        QaSuggestion.from_dict(record)
+    with pytest.raises(QaModelValidationError):
+        QaSuggestion.from_version_3_dict(_suggestion().to_dict())
+    record["extra"] = "x"
+    with pytest.raises(QaModelValidationError):
+        QaSuggestion.from_version_3_dict(record)

@@ -539,6 +539,9 @@ _UNDECIDED_SUGGESTION_STATUSES = frozenset({"pending", "stale"})
 # Refusals no decision can overcome: the fragment is not unique in its
 # paragraph, or the fix wants a paragraph break a replacement cannot hold.
 _UNPLACEABLE_REFUSALS = frozenset({"ambiguous_span", "paragraph_break"})
+# CometKiwi's scores of a refused fix: the paragraph as it is and with the fix.
+# A journal of version 3 kept its fixes without them.
+_SUGGESTION_SCORE_FIELDS = ("score_before", "score_after")
 
 
 @dataclass(frozen=True, slots=True)
@@ -560,6 +563,10 @@ class QaSuggestion:
     created_at: str = ""
     status: str = "pending"
     status_note: str = ""
+    # How close CometKiwi finds the paragraph to its source as it is and
+    # with the fix, from 0 to 1; both None while the fix is unscored.
+    score_before: float | None = None
+    score_after: float | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -580,6 +587,13 @@ class QaSuggestion:
             _require_string(getattr(self, field_name), field_name)
         if self.status not in _SUGGESTION_STATUSES:
             raise QaModelValidationError("unsupported suggestion status")
+        for field_name in _SUGGESTION_SCORE_FIELDS:
+            value = getattr(self, field_name)
+            _require_finite_number(value, field_name, allow_none=True)
+            if value is not None and not 0.0 <= value <= 1.0:
+                raise QaModelValidationError(f"{field_name} must be within [0, 1]")
+        if (self.score_before is None) != (self.score_after is None):
+            raise QaModelValidationError("a fix is scored as a pair or not at all")
 
     @staticmethod
     def identity(
@@ -603,7 +617,7 @@ class QaSuggestion:
             and refusal not in _UNPLACEABLE_REFUSALS
         )
 
-    def to_dict(self) -> dict[str, str]:
+    def to_dict(self) -> dict[str, str | float | None]:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
 
     @classmethod
@@ -611,6 +625,18 @@ class QaSuggestion:
         if not isinstance(payload, Mapping):
             raise QaModelValidationError("suggestion must be an object")
         if set(payload) != set(cls.__dataclass_fields__):
+            raise QaModelValidationError("suggestion has an invalid schema")
+        try:
+            return cls(**dict(payload))
+        except (TypeError, ValueError) as exc:
+            raise QaModelValidationError("invalid suggestion") from exc
+
+    @classmethod
+    def from_version_3_dict(cls, payload: object) -> "QaSuggestion":
+        """Read a fix saved before fixes were scored: no scores, nothing else forgiven."""
+        if not isinstance(payload, Mapping):
+            raise QaModelValidationError("suggestion must be an object")
+        if set(payload) != set(cls.__dataclass_fields__) - set(_SUGGESTION_SCORE_FIELDS):
             raise QaModelValidationError("suggestion has an invalid schema")
         try:
             return cls(**dict(payload))

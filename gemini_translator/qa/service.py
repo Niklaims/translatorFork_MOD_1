@@ -228,6 +228,15 @@ class ChapterChange:
     same_language: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class SuggestionWindows:
+    """A refused fix as CometKiwi weighs it: its paragraph as it is and with the fix."""
+
+    suggestion_id: str
+    before: SourceTranslationWindow
+    after: SourceTranslationWindow
+
+
 @dataclass(frozen=True, slots=True, eq=False)
 class ChapterQaResult:
     """The complete, auditable outcome of one chapter QA pass."""
@@ -246,6 +255,9 @@ class ChapterQaResult:
     # chapter score. Empty without the completeness check; the coordinator
     # drops it once the score is taken, since it holds the chapter's text.
     quality_windows: tuple[SourceTranslationWindow, ...] = ()
+    # Both versions of each paragraph a refused fix would change, scored in
+    # the same request and dropped with the chapter's windows.
+    suggestion_windows: tuple[SuggestionWindows, ...] = ()
 
     def changes(self) -> tuple["ChapterChange", ...]:
         """List every change and refusal this pass produced, in reading order."""
@@ -643,6 +655,9 @@ class TranslationQualityService:
             quality_windows=_quality_windows(coverage),
         )
         self._record(result, chapter_fingerprint(request.translated_path))
+        fixes = self._suggestion_windows(result, request)
+        if fixes:
+            result = replace(result, suggestion_windows=fixes)
         return result
 
     def _requests_made(self) -> int:
@@ -719,6 +734,62 @@ class TranslationQualityService:
         self._journal.upsert_metrics(updated)
         self._save_journal()
         return replace(result, metrics=updated)
+
+    def attach_suggestion_scores(
+        self, chapter_id: str, scores: Mapping[str, tuple[float, float]]
+    ) -> int:
+        """Write CometKiwi's two scores into each fix of the chapter; decisions stay.
+
+        The pass recorded its fixes before the estimate came back, and a person
+        may have decided one meanwhile: the scores are added all the same and
+        never change what was decided.
+        """
+        written = 0
+        for suggestion_id, (before, after) in scores.items():
+            recorded = self._journal.suggestion(suggestion_id)
+            if recorded is None or recorded.chapter_id != chapter_id:
+                continue
+            self._journal.set_suggestion_scores(suggestion_id, before, after)
+            written += 1
+        if written:
+            self._save_journal()
+        return written
+
+    def _suggestion_windows(
+        self, result: ChapterQaResult, request: ChapterQaRequest
+    ) -> tuple[SuggestionWindows, ...]:
+        """Both versions of each paragraph a refused fix would change, for CometKiwi.
+
+        Built after the pass recorded its fixes: only a fix still waiting for a
+        person is worth scoring, and the chapter as it stands now, with this
+        pass's automatic edits, is the text the fix would go into.
+        """
+        suggestions = _suggestions_for(result) or ()
+        sources = request.source_text_by_block
+        if not suggestions or not sources:
+            return ()
+        try:
+            html = request.translated_path.read_text(encoding="utf-8")
+            model = build_html_document_model(html, document_id=request.chapter_id)
+            blocks = build_translation_payload(model)["blocks"]
+        except (OSError, ValueError):
+            return ()
+        paragraphs = {
+            block.get("id"): flatten_visible_text(block["inlines"])[0] for block in blocks
+        }
+        windows: list[SuggestionWindows] = []
+        for suggestion in suggestions:
+            recorded = self._journal.suggestion(suggestion.suggestion_id)
+            if recorded is None or recorded.status != "pending":
+                continue
+            pair = _suggestion_window_pair(
+                suggestion,
+                str(sources.get(suggestion.block_id, "") or ""),
+                paragraphs.get(suggestion.block_id, ""),
+            )
+            if pair is not None:
+                windows.append(pair)
+        return tuple(windows)
 
     @property
     def session_id(self) -> str:
@@ -1433,6 +1504,35 @@ def _suggestions_for(result: ChapterQaResult) -> tuple[QaSuggestion, ...] | None
             ),
         )
     return tuple(suggestions.values())
+
+
+def _suggestion_window_pair(
+    suggestion: QaSuggestion, source: str, paragraph: str
+) -> SuggestionWindows | None:
+    """The paragraph as it is and with the fix, each against the paragraph's source.
+
+    None when a score would mislead: no replacement to weigh, no source to
+    weigh it against, or a fragment the paragraph holds more than once.
+    """
+    original = suggestion.original_text
+    replacement = suggestion.replacement_text
+    source = source.strip()
+    if not source or not original.strip() or not replacement.strip():
+        return None
+    if paragraph.count(original) != 1:
+        return None
+    before = paragraph.strip()
+    after = paragraph.replace(original, replacement, 1).strip()
+    visible_before = sum(1 for character in before if not character.isspace())
+    visible_after = sum(1 for character in after if not character.isspace())
+    if visible_before <= 0 or visible_after <= 0:
+        return None
+    identity = suggestion.suggestion_id
+    return SuggestionWindows(
+        suggestion_id=identity,
+        before=SourceTranslationWindow(f"{identity}:before", source, before, visible_before),
+        after=SourceTranslationWindow(f"{identity}:after", source, after, visible_after),
+    )
 
 
 def _why_it_does_not_fit(chapter: bytes, suggestion: QaSuggestion) -> str:

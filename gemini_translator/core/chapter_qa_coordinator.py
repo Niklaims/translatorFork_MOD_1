@@ -570,10 +570,12 @@ class ChapterQaCoordinator:
                 self._report(f"[QA] Проверка главы '{event.chapter_id}' не удалась: {error}")
                 return None
             result = await self._estimate_quality(event, result)
-            if getattr(result, "quality_windows", ()):
+            if getattr(result, "quality_windows", ()) or getattr(
+                result, "suggestion_windows", ()
+            ):
                 # The windows hold the chapter's whole text, and a book
                 # pass keeps every result until it ends.
-                result = replace(result, quality_windows=())
+                result = replace(result, quality_windows=(), suggestion_windows=())
             self._note_limited_mode(result)
             self._report_chapter(event, result)
             return result
@@ -655,25 +657,29 @@ class ChapterQaCoordinator:
     async def _estimate_quality(
         self, event: TranslationReadyEvent, result: ChapterQaResult
     ) -> ChapterQaResult:
-        """Score every passage the completeness check aligned.
+        """Score every passage the completeness check aligned, and each refused fix.
 
         Scoring only what the checks disputed left CometKiwi idle through a
-        whole pass of clean chapters. Whatever it answers is evidence only —
+        whole pass of clean chapters. The fixes ride in the same request and
+        stay out of the chapter's score. Whatever comes back is evidence only —
         risk and repairs are already decided by the alignment and the model
         that read the text.
         """
         estimator = self._quality_estimator
         if estimator is None:
             return result
-        windows = tuple(getattr(result, "quality_windows", ()) or ())
-        if not windows:
-            return result
-        attach = getattr(self._service, "attach_quality_estimate", None)
-        if not callable(attach):
+        chapter_windows = tuple(getattr(result, "quality_windows", ()) or ())
+        fixes = tuple(getattr(result, "suggestion_windows", ()) or ())
+        if not callable(getattr(self._service, "attach_quality_estimate", None)):
+            chapter_windows = ()
+        if not callable(getattr(self._service, "attach_suggestion_scores", None)):
+            fixes = ()
+        if not chapter_windows and not fixes:
             return result
         request = QualityEstimateRequest(
             chapter_id=result.chapter_id,
-            windows=windows,
+            windows=chapter_windows
+            + tuple(window for fix in fixes for window in (fix.before, fix.after)),
             source_language=event.source_language or "auto",
             target_language=event.target_language or "ru",
         )
@@ -686,11 +692,51 @@ class ChapterQaCoordinator:
                 f"[QA] Оценка качества главы '{event.chapter_id}' недоступна: {error}"
             )
             return result
+        if chapter_windows:
+            result = self._record_chapter_estimate(
+                result, estimate, replace(request, windows=chapter_windows)
+            )
+        if fixes and estimate.status == "completed":
+            self._record_fix_scores(
+                result.chapter_id, fixes, estimate.window_scores[len(chapter_windows) :]
+            )
+        return result
+
+    def _record_chapter_estimate(
+        self,
+        result: ChapterQaResult,
+        estimate: QualityEstimate,
+        chapter_request: QualityEstimateRequest,
+    ) -> ChapterQaResult:
+        """Store the chapter's own score: an answer over its windows alone."""
         try:
-            return attach(result, estimate)
+            if estimate.status == "completed":
+                estimate = aggregate(
+                    estimate.estimator,
+                    estimate.model,
+                    chapter_request,
+                    estimate.window_scores[: len(chapter_request.windows)],
+                    estimate.metadata,
+                )
+            return self._service.attach_quality_estimate(result, estimate)
         except Exception as error:  # noqa: BLE001 - nor does recording one
             self._report(f"[QA] Оценку качества не удалось записать: {error}")
             return result
+
+    def _record_fix_scores(self, chapter_id: str, fixes, scores) -> None:
+        """Give each refused fix its pair: the paragraph as it is, and with the fix."""
+        if len(scores) != 2 * len(fixes):
+            return
+        pairs = {
+            fix.suggestion_id: (scores[2 * index], scores[2 * index + 1])
+            for index, fix in enumerate(fixes)
+        }
+        try:
+            self._service.attach_suggestion_scores(chapter_id, pairs)
+        except Exception as error:  # noqa: BLE001 - a fix's score never breaks QA
+            self._report(
+                f"[QA] Оценки правок главы '{chapter_id}' не удалось записать: {error}"
+            )
 
     async def _estimate_in_parts(
         self, estimator, request: QualityEstimateRequest

@@ -276,3 +276,38 @@ def test_the_tab_asks_for_decisions_by_id_and_locks_only_what_is_in_use(qt_app):
     view.set_suggestions((first, second, _suggestion("chapter-2", "e д", "f е")))
 
     assert not view.cards[2].apply_button.isEnabled()
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "text"),
+    [
+        (0.71, 0.78, "CometKiwi: ближе к оригиналу «стало» — 0,78 против 0,71"),
+        (0.78, 0.71, "CometKiwi: ближе к оригиналу «было» — 0,78 против 0,71"),
+        (0.74, 0.75, "CometKiwi: разницы почти нет — 0,74 и 0,75"),
+        (None, None, ""),
+    ],
+)
+def test_the_fix_scores_name_the_closer_version_in_words(before, after, text):
+    """Цвет не единственный сигнал: какой вариант ближе к оригиналу, сказано словами."""
+    from gemini_translator.ui.dialogs.validation_dialogs.quality_widgets import (
+        describe_fix_scores,
+    )
+
+    assert describe_fix_scores(before, after) == text
+
+
+def test_a_scored_card_shows_its_scores_under_the_explanation(qt_app):
+    from dataclasses import replace
+
+    scored = SuggestionCard(
+        replace(_suggestion(), explanation="Калька.", score_before=0.71, score_after=0.78)
+    )
+    plain = SuggestionCard(_suggestion())
+    explanation = next(
+        label for label in scored.findChildren(QtWidgets.QLabel) if label.text() == "Калька."
+    )
+
+    assert scored.score_label.text() == "CometKiwi: ближе к оригиналу «стало» — 0,78 против 0,71"
+    assert not scored.score_label.isHidden()
+    assert scored.layout().indexOf(explanation) < scored.layout().indexOf(scored.score_label)
+    assert plain.score_label.isHidden()

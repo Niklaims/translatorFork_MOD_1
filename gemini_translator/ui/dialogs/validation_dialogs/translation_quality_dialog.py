@@ -55,12 +55,17 @@ def describe_checks(settings: QaSettings) -> str:
     checks = []
     if settings.check_language_after_chapter:
         checks.append("язык")
+    cometkiwi = settings.capabilities.cometkiwi_enabled
     if settings.check_completeness_after_chapter:
         checks.append("полнота")
-        # CometKiwi scores what the completeness check aligned: without that
-        # check it never starts, so the header must not promise a score.
-        if settings.capabilities.cometkiwi_enabled:
+        # CometKiwi scores what the completeness check aligned, and the
+        # refused fixes along with it.
+        if cometkiwi:
             checks.append("оценка CometKiwi")
+    elif cometkiwi and settings.check_language_after_chapter:
+        # Without the alignment there is no chapter to score, but a fix the
+        # language check refused still has its paragraph and the source.
+        checks.append("оценка правок CometKiwi")
     if not checks:
         return "Проверки после глав выключены."
     return "После каждой главы: " + ", ".join(checks) + "."

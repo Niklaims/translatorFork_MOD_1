@@ -45,8 +45,8 @@ def _metrics() -> ChapterMetrics:
     )
 
 
-def test_journal_round_trip_uses_v3_json_and_dataframe_schema(tmp_path):
-    """Removing v3 persistence or metric serialization breaks a restored report."""
+def test_journal_round_trip_uses_v4_json_and_dataframe_schema(tmp_path):
+    """Removing v4 persistence or metric serialization breaks a restored report."""
     journal = QaJournal.empty(book_id="book-1")
     journal.upsert_metrics(_metrics())
     path = tmp_path / "translation_qa.json"
@@ -55,7 +55,7 @@ def test_journal_round_trip_uses_v3_json_and_dataframe_schema(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     restored = QaJournal.load(path)
 
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["book_id"] == "book-1"
     assert set(payload) == {
         "schema_version",
@@ -260,7 +260,7 @@ def test_suggestions_are_saved_with_their_reasons_and_read_back(tmp_path):
     assert saved["suggestions"][0]["reason"] == "validation_declined"
 
 
-def test_a_version_2_journal_loads_without_suggestions_and_saves_as_version_3(tmp_path):
+def test_a_version_2_journal_loads_without_suggestions_and_saves_as_version_4(tmp_path):
     """Журналы книг владельца — версии 2; они обязаны открыться."""
     path = tmp_path / "translation_qa.json"
     journal = QaJournal.empty(book_id="book-1")
@@ -276,7 +276,7 @@ def test_a_version_2_journal_loads_without_suggestions_and_saves_as_version_3(tm
 
     assert restored.suggestions == []
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["schema_version"] == 3
+    assert saved["schema_version"] == 4
     assert saved["suggestions"] == []
 
 
@@ -363,3 +363,54 @@ def test_a_damaged_suggestion_makes_the_journal_unreadable_but_untouched(tmp_pat
 
     assert path.read_text(encoding="utf-8") == original
 
+
+def test_a_version_3_journal_loads_its_fixes_unscored_and_saves_as_version_4(tmp_path):
+    """Журналы книг владельца сейчас версии 3; их правки открываются без оценок."""
+    path = tmp_path / "translation_qa.json"
+    journal = QaJournal.empty(book_id="book-1")
+    journal.record_chapter_result(state=_state(), suggestions=(_suggestion(),))
+    journal.save(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["schema_version"] = 3
+    for item in payload["suggestions"]:
+        item.pop("score_before")
+        item.pop("score_after")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    restored = QaJournal.load(path)
+    restored.save(path)
+
+    assert restored.suggestions == [_suggestion()]
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 4
+    assert (saved["suggestions"][0]["score_before"], saved["suggestions"][0]["score_after"]) == (None, None)
+
+
+def test_a_version_4_fix_without_its_scores_makes_the_journal_unreadable_but_untouched(tmp_path):
+    path = tmp_path / "translation_qa.json"
+    journal = QaJournal.empty(book_id="book-1")
+    journal.record_chapter_result(state=_state(), suggestions=(_suggestion(),))
+    journal.save(path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["suggestions"][0].pop("score_after")
+    original = json.dumps(payload)
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(QaJournalCorruptedError):
+        QaJournal.load(path)
+
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_scores_are_added_to_a_fix_without_touching_its_decision():
+    """Оценка приходит после записи правки: решение, принятое за это время, остаётся."""
+    journal = QaJournal.empty(book_id="book-1")
+    suggestion = _suggestion()
+    journal.record_chapter_result(state=_state(), suggestions=(suggestion,))
+    journal.set_suggestion_status(suggestion.suggestion_id, "dismissed")
+
+    updated = journal.set_suggestion_scores(suggestion.suggestion_id, 0.71, 0.78)
+
+    assert (updated.status, updated.score_before, updated.score_after) == ("dismissed", 0.71, 0.78)
+    assert journal.suggestion(suggestion.suggestion_id) == updated
+    assert journal.set_suggestion_scores("sg-unknown", 0.5, 0.5) is None
