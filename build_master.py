@@ -80,7 +80,10 @@ HIDDEN_IMPORTS_BLOCK = [
     *LAZY_HANDLER_HIDDEN_IMPORTS,
     *LAZY_SERVER_HIDDEN_IMPORTS,
 ]
-MANUAL_COLLECT_DATA_MODULES = {'certifi', 'docx', 'qoder_agent_sdk'}
+MANUAL_COLLECT_DATA_MODULES = {'certifi', 'docx'}
+# Qoder CLI в сборку не кладётся (его докачивает хендлер), а RECORD пакета
+# нужен, чтобы сверить скачанный бинарник с тем, что стоит на машине сборки.
+MANUAL_COPY_METADATA_PACKAGES = {'qoder-agent-sdk'}
 COLLECT_DATA_EXCLUDE_MODULES = {'setuptools'}
 MANUALLY_PACKAGED_PACKAGES = {'playwright'}
 # --- КОНФИГУРАЦИЯ ЗАВИСИМОСТЕЙ ---
@@ -361,12 +364,16 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
     collect_data_args = [
         f'--collect-data="{module}"' for module in sorted(collect_data_modules)
     ]
+    copy_metadata_args = [
+        f'--copy-metadata="{package}"' for package in sorted(MANUAL_COPY_METADATA_PACKAGES)
+    ]
 
     def build_runner_command(mode):
         runner_args = [
             f'"%PYTHON_CMD%" build_runner.py --mode {mode}',
             '--name="%AppName%"',
             *collect_data_args,
+            *copy_metadata_args,
         ]
         return " ^\n".join(runner_args)
 

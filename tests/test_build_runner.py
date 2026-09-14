@@ -171,3 +171,38 @@ def test_external_data_is_not_copied_after_pyinstaller_failure(monkeypatch):
         build_runner.run_build(mode="advanced", app_name="translator work", collect_data_modules=[])
 
     assert events == ["pyinstaller"]
+
+
+def test_every_generated_build_keeps_the_qoder_sdk_record(tmp_path, monkeypatch):
+    output_bat = tmp_path / "build.bat"
+    monkeypatch.setattr(build_master, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(build_master, "OUTPUT_BAT_FILE", str(output_bat))
+
+    build_master.generate_pure_bat_script([], set())
+
+    commands = output_bat.read_text(encoding="utf-8").split('"%PYTHON_CMD%" build_runner.py')[1:]
+    assert len(commands) >= 3
+    for command in commands:
+        arguments = command.split("\n\n", 1)[0]
+        assert '--copy-metadata="qoder-agent-sdk"' in arguments
+
+
+def test_runner_hands_metadata_packages_to_pyinstaller(monkeypatch):
+    build_runner = importlib.import_module("build_runner")
+    captured = {}
+    monkeypatch.setattr(build_runner, "run_build", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["build_runner.py", "--mode", "advanced", "--name", "App", "--copy-metadata", "qoder-agent-sdk"],
+    )
+
+    build_runner.main()
+    args = build_runner.build_pyinstaller_args(
+        mode="advanced",
+        app_name="App",
+        collect_data_modules=[],
+        copy_metadata_packages=captured["copy_metadata_packages"],
+    )
+
+    assert "--copy-metadata=qoder-agent-sdk" in args

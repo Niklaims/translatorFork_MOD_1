@@ -2,7 +2,7 @@
 import runpy
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 _BUILD_CONFIG = runpy.run_path(str(Path(SPECPATH) / "pyinstaller_config.py"))
@@ -50,6 +50,9 @@ datas += collect_data_files('docx')
 datas += collect_data_files('jieba')
 datas += collect_data_files('lxml')
 datas += collect_data_files('werkzeug')
+# Qoder CLI (~100 МБ) в сборку не кладётся: хендлер скачивает его при первом
+# запросе к Qoder и сверяет с хешем из RECORD пакета, поэтому нужны его метаданные.
+datas += copy_metadata('qoder-agent-sdk')
 
 
 a = Analysis(

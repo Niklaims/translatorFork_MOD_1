@@ -6,15 +6,17 @@ import types
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load_spec_hiddenimports(spec_name):
+def _load_spec(spec_name):
     captured = {}
 
     def analysis(*args, **kwargs):
         captured["hiddenimports"] = kwargs.get("hiddenimports", [])
+        captured["datas"] = kwargs.get("datas", [])
         return types.SimpleNamespace(pure=[], scripts=[], binaries=[], datas=[])
 
     hooks_module = types.ModuleType("PyInstaller.utils.hooks")
     hooks_module.collect_data_files = lambda _package: []
+    hooks_module.copy_metadata = lambda name: [(f"<metadata:{name}>", f"{name}.dist-info")]
     modules = {
         "PyInstaller": types.ModuleType("PyInstaller"),
         "PyInstaller.utils": types.ModuleType("PyInstaller.utils"),
@@ -61,7 +63,11 @@ def _load_spec_hiddenimports(spec_name):
         else:
             sys.modules["pyinstaller_config"] = previous_build_config
 
-    return captured["hiddenimports"]
+    return captured
+
+
+def _load_spec_hiddenimports(spec_name):
+    return _load_spec(spec_name)["hiddenimports"]
 
 
 def test_dual_release_script_packages_onedir_outputs():
@@ -100,3 +106,14 @@ def test_release_specs_package_every_lazy_api_module():
     assert handler_modules <= translator_only
     assert handler_modules | server_modules <= full
     assert handler_modules | server_modules <= ci_release
+
+
+def test_every_build_that_packages_qoder_keeps_the_record_its_cli_is_checked_against():
+    """Without the SDK's RECORD a frozen build cannot verify the CLI it downloads."""
+    for spec_name in (
+        "translatorFork_MOD.spec",
+        "translatorFork-translator-only.spec",
+        "translatorFork-full.spec",
+    ):
+        datas = _load_spec(spec_name)["datas"]
+        assert ("<metadata:qoder-agent-sdk>", "qoder-agent-sdk.dist-info") in datas, spec_name

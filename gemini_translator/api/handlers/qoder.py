@@ -1,11 +1,15 @@
 import asyncio
 import math
+import os
 import tempfile
+import threading
 import time
 from collections import deque
+from pathlib import Path
 from urllib.parse import quote
 
 from ..base import BaseApiHandler
+from ..qoder_cli import QoderCliError, build_installer
 from ..errors import (
     ModelNotFoundError,
     NetworkError,
@@ -53,6 +57,7 @@ _CLI_NOT_FOUND_ERRORS = ()
 _SDK_TRANSPORT_ERRORS = ()
 
 _SDK_IMPORT_ATTEMPTED = False
+_SDK_PACKAGE_DIR = None
 
 
 def _ensure_sdk_imported():
@@ -62,7 +67,8 @@ def _ensure_sdk_imported():
     не перезаписываются. Неполная/сломанная установка SDK оставляет имена
     равными None — setup_client сообщит об этом пользователю.
     """
-    global _SDK_IMPORT_ATTEMPTED, _AUTH_ERRORS, _CLI_NOT_FOUND_ERRORS, _SDK_TRANSPORT_ERRORS
+    global _SDK_IMPORT_ATTEMPTED, _SDK_PACKAGE_DIR
+    global _AUTH_ERRORS, _CLI_NOT_FOUND_ERRORS, _SDK_TRANSPORT_ERRORS
     if _SDK_IMPORT_ATTEMPTED:
         return
     _SDK_IMPORT_ATTEMPTED = True
@@ -80,11 +86,38 @@ def _ensure_sdk_imported():
     for name, value in resolved.items():
         if module_globals[name] is None:
             module_globals[name] = value
+    if _SDK_PACKAGE_DIR is None and getattr(_sdk, "__file__", None):
+        _SDK_PACKAGE_DIR = Path(_sdk.__file__).parent
     _AUTH_ERRORS = tuple(
         exc for exc in (AuthNotConfiguredError, AuthAccessTokenEnvVarError) if exc)
     _CLI_NOT_FOUND_ERRORS = tuple(exc for exc in (CLINotFoundError,) if exc)
     _SDK_TRANSPORT_ERRORS = tuple(
         exc for exc in (CLIConnectionError, ProcessError, QoderSDKError) if exc)
+
+
+_CLI_VERSION_CHECK_ENV = "QODER_SKIP_VERSION_CHECK"
+_CLI_PATH_ENV = "QODERCLI_PATH"
+
+
+def _skip_cli_version_probe():
+    """Keep the SDK from starting the CLI a second time just to print its version.
+
+    Unless this variable is set, the SDK runs ``qodercli -v`` before every
+    request and then starts the CLI again for the request itself. The answer
+    only feeds a log warning for CLIs older than the SDK's minimum, while the
+    CLI in use is the one pinned to the SDK. On a Mac the probe alone costs a
+    launch of a ~100 MB binary per request: 0.4 s warm and 1.8 s cold.
+    """
+    if not os.environ.get(_CLI_VERSION_CHECK_ENV):
+        os.environ[_CLI_VERSION_CHECK_ENV] = "1"
+
+
+def _bundled_cli_path():
+    """Where the SDK looks for its own CLI, or None while the SDK is not loaded."""
+    if _SDK_PACKAGE_DIR is None:
+        return None
+    binary = "qodercli.exe" if os.name == "nt" else "qodercli"
+    return Path(_SDK_PACKAGE_DIR) / "_bundled" / binary
 
 
 class QoderApiHandler(BaseApiHandler):
@@ -100,6 +133,7 @@ class QoderApiHandler(BaseApiHandler):
         self._last_usage = None
         self._auth_expired = False
         self._stderr_tail = deque(maxlen=20)
+        self._downloaded_cli_path = None
 
     def setup_client(self, client_override=None, proxy_settings=None):
         super().setup_client(client_override, proxy_settings)
@@ -111,6 +145,7 @@ class QoderApiHandler(BaseApiHandler):
                 "Не установлен официальный пакет qoder-agent-sdk. "
                 "Переустановите зависимости приложения."
             )
+        _skip_cli_version_probe()
 
         self.worker.api_key = str(client_override.api_key).strip()
         self.worker.model_id = str(self.worker.model_config.get("id") or "auto").strip()
@@ -157,7 +192,7 @@ class QoderApiHandler(BaseApiHandler):
             return None
         return parsed if parsed > 0 else None
 
-    def _options(self, max_output_tokens=None):
+    def _options(self, max_output_tokens=None, cli_path=None):
         configured_max = self._positive_int(max_output_tokens)
         if configured_max is None:
             configured_max = self._positive_int(
@@ -168,7 +203,7 @@ class QoderApiHandler(BaseApiHandler):
         if configured_max is not None:
             extra_args["max-output-tokens"] = str(configured_max)
 
-        return QoderAgentOptions(
+        options = dict(
             auth=access_token(self.worker.api_key),
             model=self.worker.model_id,
             system_prompt=self._system_prompt(),
@@ -185,6 +220,53 @@ class QoderApiHandler(BaseApiHandler):
             on_auth_expired=self._mark_auth_expired,
             stderr=self._capture_stderr,
         )
+        if cli_path:
+            options["cli_path"] = cli_path
+        return QoderAgentOptions(**options)
+
+    def _cli_installer(self):
+        return build_installer(proxy_url=self._proxy_url())
+
+    async def _cli_path_for_request(self):
+        """The CLI the SDK should start, or None when the SDK finds its own.
+
+        A frozen build keeps the SDK's code but not its binary; its first Qoder
+        request installs exactly the CLI the build's SDK expects. A CLI the user
+        chose through QODERCLI_PATH is always left in charge.
+        """
+        if os.environ.get(_CLI_PATH_ENV):
+            return None
+        bundled = _bundled_cli_path()
+        if bundled is None or bundled.is_file():
+            return None
+        if self._downloaded_cli_path is not None and Path(self._downloaded_cli_path).is_file():
+            return self._downloaded_cli_path
+
+        cancel = threading.Event()
+        first_install = False
+        try:
+            installer = self._cli_installer()
+            first_install = not installer.installed()
+            if first_install:
+                self.worker._post_event('log_message', {
+                    'message': "⏳ Qoder CLI нет в этой сборке: скачиваю официальный пакет "
+                               "qoder-agent-sdk с PyPI и сверяю хеш. Это нужно один раз."
+                })
+            path = await asyncio.to_thread(installer.ensure, cancel)
+        except asyncio.CancelledError:
+            cancel.set()
+            raise
+        except QoderCliError as error:
+            if error.retryable:
+                raise NetworkError(
+                    f"Qoder CLI пока не установлен: {error}", delay_seconds=60
+                ) from error
+            raise ModelNotFoundError(f"Qoder CLI недоступен: {error}") from error
+
+        if first_install:
+            self.worker._post_event('log_message', {'message': f"✅ Qoder CLI установлен: {path}"})
+        self._downloaded_cli_path = str(path)
+        return self._downloaded_cli_path
 
     def _mark_auth_expired(self):
         self._auth_expired = True
@@ -283,7 +365,8 @@ class QoderApiHandler(BaseApiHandler):
     ):
         self._auth_expired = False
         self._last_usage = None
-        options = self._options(max_output_tokens=max_output_tokens)
+        cli_path = await self._cli_path_for_request()
+        options = self._options(max_output_tokens=max_output_tokens, cli_path=cli_path)
         self._debug_record_request(
             {
                 "provider": "qoder",

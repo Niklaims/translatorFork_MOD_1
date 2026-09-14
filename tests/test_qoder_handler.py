@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from types import SimpleNamespace
 
@@ -369,3 +370,217 @@ def test_qoder_provider_config_and_factory_registration():
         "MiniMax-M3",
     }
     assert get_api_handler_class(provider["handler_class"]) is QoderApiHandler
+
+
+# --- Qoder CLI: version probe and delivery to builds without the binary ---
+
+
+class _FakeCliInstaller:
+    def __init__(self, path=None, error=None):
+        self.path = path
+        self.error = error
+        self.calls = 0
+
+    def installed(self):
+        return False
+
+    def ensure(self, cancel=None):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.path
+
+
+def _run_handler_with_captured_options(monkeypatch, *, worker=None):
+    from gemini_translator.api.handlers import qoder as qoder_module
+
+    captured = {}
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        yield _result_message(qoder_module)
+
+    monkeypatch.setattr(qoder_module, "query", fake_query)
+    monkeypatch.setattr(qoder_module, "access_token", lambda token: token)
+    handler = QoderApiHandler(worker or FakeWorker())
+    handler.setup_client(SimpleNamespace(api_key="qoder-pat"))
+    return handler, captured
+
+
+def test_setup_client_stops_the_sdk_from_launching_the_cli_to_read_its_version(
+    monkeypatch, tmp_path
+):
+    sdk = pytest.importorskip("qoder_agent_sdk")
+    transport = pytest.importorskip("qoder_agent_sdk._internal.transport.subprocess_cli")
+    monkeypatch.setenv("QODER_SKIP_VERSION_CHECK", "")
+
+    QoderApiHandler(FakeWorker()).setup_client(SimpleNamespace(api_key="qoder-pat"))
+
+    launched = []
+
+    class _NoProcessInTests(Exception):
+        pass
+
+    async def fake_open_process(command, *args, **kwargs):
+        launched.append([str(part) for part in command])
+        raise _NoProcessInTests("tests never start a real CLI")
+
+    monkeypatch.setattr(transport.anyio, "open_process", fake_open_process)
+    fake_cli = tmp_path / "qodercli"
+    fake_cli.write_bytes(b"")
+    options = sdk.QoderAgentOptions(
+        cli_path=str(fake_cli),
+        auth=sdk.access_token("qoder-pat"),
+        tools=[],
+        max_turns=1,
+        cwd=str(tmp_path),
+    )
+
+    async def run_query():
+        async for _message in sdk.query(prompt="text", options=options):
+            pass
+
+    with pytest.raises(Exception):
+        asyncio.run(run_query())
+
+    assert launched, "the CLI session itself must still be started"
+    assert all(command[1:] != ["-v"] for command in launched)
+
+
+def test_build_without_the_sdk_binary_runs_the_downloaded_cli(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+
+    downloaded = tmp_path / "cli" / "1.0.14" / "qodercli"
+    installer = _FakeCliInstaller(path=downloaded)
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    worker = FakeWorker()
+    handler, captured = _run_handler_with_captured_options(monkeypatch, worker=worker)
+
+    asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert captured["options"].cli_path == str(downloaded)
+    assert installer.calls == 1
+    assert any(
+        "Qoder CLI" in payload.get("message", "")
+        for name, payload in worker.events
+        if name == "log_message"
+    )
+
+
+def test_sdk_that_carries_its_own_binary_is_left_to_find_it(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+
+    sdk_dir = tmp_path / "sdk"
+    (sdk_dir / "_bundled").mkdir(parents=True)
+    binary = "qodercli.exe" if os.name == "nt" else "qodercli"
+    (sdk_dir / "_bundled" / binary).write_bytes(b"cli")
+    installer = _FakeCliInstaller(error=AssertionError("must not install"))
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", sdk_dir)
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    handler, captured = _run_handler_with_captured_options(monkeypatch)
+
+    asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert getattr(captured["options"], "cli_path", None) is None
+    assert installer.calls == 0
+
+
+def test_cli_chosen_by_the_user_is_not_replaced_by_a_download(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+
+    installer = _FakeCliInstaller(error=AssertionError("must not install"))
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.setenv("QODERCLI_PATH", str(tmp_path / "my-qodercli"))
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    handler, captured = _run_handler_with_captured_options(monkeypatch)
+
+    asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert getattr(captured["options"], "cli_path", None) is None
+    assert installer.calls == 0
+
+
+def test_cli_download_failure_is_retried_as_a_network_error(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+    from gemini_translator.api.qoder_cli import QoderCliError
+
+    installer = _FakeCliInstaller(error=QoderCliError("PyPI не ответил", retryable=True))
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    handler, captured = _run_handler_with_captured_options(monkeypatch)
+
+    with pytest.raises(NetworkError, match="Qoder CLI"):
+        asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert "options" not in captured
+
+
+def test_cli_that_fails_verification_makes_the_provider_unavailable(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+    from gemini_translator.api.qoder_cli import QoderCliError
+
+    installer = _FakeCliInstaller(
+        error=QoderCliError("хеш не совпал с записью сборки", retryable=False)
+    )
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    handler, captured = _run_handler_with_captured_options(monkeypatch)
+
+    with pytest.raises(ModelNotFoundError, match="Qoder CLI"):
+        asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert "options" not in captured
+
+
+def test_cancelled_request_stops_the_cli_download(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+    from gemini_translator.api.qoder_cli import QoderCliCancelled
+
+    observed = {}
+
+    class _BlockingInstaller(_FakeCliInstaller):
+        def ensure(self, cancel=None):
+            observed["started"] = True
+            observed["cancelled"] = cancel.wait(5)
+            raise QoderCliCancelled()
+
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: _BlockingInstaller())
+    handler, _captured = _run_handler_with_captured_options(monkeypatch)
+
+    async def cancel_while_downloading():
+        task = asyncio.create_task(handler.call_api("text", "[TEST]"))
+        while not observed.get("started"):
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_while_downloading())
+
+    assert observed["cancelled"] is True
+
+
+def test_cli_removed_after_install_is_installed_again(monkeypatch, tmp_path):
+    from gemini_translator.api.handlers import qoder as qoder_module
+
+    downloaded = tmp_path / "cli" / "1.0.14" / "qodercli"
+    downloaded.parent.mkdir(parents=True)
+    downloaded.write_bytes(b"cli")
+    installer = _FakeCliInstaller(path=downloaded)
+    monkeypatch.setattr(qoder_module, "_SDK_PACKAGE_DIR", tmp_path / "frozen_sdk")
+    monkeypatch.delenv("QODERCLI_PATH", raising=False)
+    monkeypatch.setattr(QoderApiHandler, "_cli_installer", lambda self: installer)
+    handler, _captured = _run_handler_with_captured_options(monkeypatch)
+
+    asyncio.run(handler.call_api("text", "[TEST]"))
+    downloaded.unlink()
+    asyncio.run(handler.call_api("text", "[TEST]"))
+
+    assert installer.calls == 2
