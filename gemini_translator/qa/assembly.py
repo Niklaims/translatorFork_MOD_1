@@ -11,6 +11,7 @@ import zipfile
 
 from ..utils.callbacks import safe_call
 from ..utils.epub_json import build_html_document_model, build_translation_payload
+from ..utils.text_sort import natural_sort_key
 from ..utils.translation_versions import select_target_translation_version
 from ..utils.validation_cache import build_file_fingerprint
 from .addition_detector import AdditionDetector
@@ -463,12 +464,15 @@ def attach_chapter_qa_coordinator(
     source_language_resolver: Callable[[str], str] | None = None,
     stop_requested: Callable[[], bool] | None = None,
     log=None,
+    on_unavailable: Callable[[str], None] | None = None,
 ):
     """Build and attach the coordinator the workers report saved chapters to.
 
     Returns ``None`` when quality control is switched off or cannot be built.
     Translation must run normally in both cases, so every failure here is
     reported and swallowed rather than raised into a session start.
+    ``on_unavailable`` hears why in words for the user whenever ``None``
+    comes back: the log alone left a window guessing, and it guessed wrong.
     """
 
     from ..core.chapter_qa_coordinator import ChapterQaCoordinator
@@ -482,6 +486,7 @@ def attach_chapter_qa_coordinator(
         qa_settings.check_completeness_after_chapter
         or qa_settings.check_language_after_chapter
     ):
+        safe_call(on_unavailable, "Проверка выключена целиком в настройках проверки.")
         return None
 
     paths = ProjectQaPaths.for_project(project_manager)
@@ -523,7 +528,9 @@ def attach_chapter_qa_coordinator(
         translation_provider, translation_model
     )
     if not provider or not model_name:
-        safe_call(log, "[QA] Не выбрана модель для проверки качества.")
+        reason = "Не выбрана модель для проверки качества."
+        safe_call(log, f"[QA] {reason}")
+        safe_call(on_unavailable, reason)
         return None
     model = QaModelSelection(provider, model_name)
 
@@ -537,9 +544,12 @@ def attach_chapter_qa_coordinator(
         )
     except QaAssemblyError as error:
         safe_call(log, f"[QA] {error}")
+        safe_call(on_unavailable, str(error))
         return None
     except Exception as error:  # noqa: BLE001 - a broken QA setup never stops translation
-        safe_call(log, f"[QA] Не удалось собрать проверку качества: {error}")
+        reason = f"Не удалось собрать проверку качества: {error}"
+        safe_call(log, f"[QA] {reason}")
+        safe_call(on_unavailable, reason)
         return None
 
     task_manager = getattr(app, "task_manager", None)
@@ -789,7 +799,7 @@ def build_manual_events(
     chapter_ids=None,
     target_language: str = "ru",
 ):
-    """List the chapters a manual pass can check, in book order.
+    """List the chapters a manual pass can check, in the order the report lists them.
 
     A chapter qualifies only when the project map records a translation and that
     file is actually on disk; everything else is silently left out, because a
@@ -802,7 +812,9 @@ def build_manual_events(
     project_folder = Path(getattr(project_manager, "project_folder", "") or "")
     translations = getattr(project_manager, "data", {}) or {}
     events = []
-    for original_path in sorted(translations):
+    # Natural order: sorted as strings, chapter10 came right after chapter1
+    # and a pass over a long book wandered through it by thousands.
+    for original_path in sorted(translations, key=natural_sort_key):
         if wanted is not None and original_path not in wanted:
             continue
         versions = translations.get(original_path) or {}
@@ -1198,4 +1210,4 @@ def _load_journal(path: Path, project_manager) -> QaJournal:
     except QaJournalError as error:
         # A corrupted journal is never silently replaced: QA runs in memory and
         # the user keeps the file to inspect.
-        raise QaAssemblyError(f"QA journal is unusable: {error}") from error
+        raise QaAssemblyError(f"Журнал проверки книги повреждён: {error}") from error

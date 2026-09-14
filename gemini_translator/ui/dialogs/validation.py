@@ -3309,6 +3309,7 @@ class TranslationValidatorPage(ShellPage):
             )
             return None
         proxy_settings = settings_manager.load_proxy_settings()
+        reasons: list[str] = []
         try:
             key_pool = QaKeyPool(
                 keys, model_id=model_name, settings_manager=settings_manager
@@ -3332,13 +3333,17 @@ class TranslationValidatorPage(ShellPage):
                 epub_path=str(getattr(self, "original_epub_path", "") or ""),
                 source_language_resolver=detect_source_language,
                 stop_requested=lambda: key_pool.seconds_until_available() is None,
+                on_unavailable=reasons.append,
             )
         except Exception as error:  # noqa: BLE001 - a report never crashes the window
             self._quality_setup_problem = f"Проверку не удалось собрать: {error}"
             return None
         if coordinator is None:
+            # The assembly names its own reason. A refusal that names none is
+            # no proof the checks are off, and saying so sent the user to
+            # settings that were already on.
             self._quality_setup_problem = (
-                "Проверка выключена целиком в настройках проверки."
+                reasons[-1] if reasons else "Проверка сейчас недоступна."
             )
         else:
             self._manual_quality_coordinator = coordinator

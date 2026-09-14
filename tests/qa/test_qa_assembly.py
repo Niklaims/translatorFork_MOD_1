@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -11,6 +12,7 @@ import pytest
 from gemini_translator.core.chapter_qa_coordinator import TranslationReadyEvent
 from gemini_translator.qa.assembly import (
     QaAssemblyError,
+    attach_chapter_qa_coordinator,
     build_chapter_qa_request,
     build_embedding_provider,
     load_project_glossary_terms,
@@ -323,3 +325,60 @@ def test_a_size_the_user_set_wins_over_the_project_limit():
             return {"task_size_limit": 25000, "task_size_unit": "chars"}
 
     assert _current_options(Manager()).language_chunk_chars == 12000
+
+
+def _attach_manual(project, qa_settings, reasons, *, provider="gemini", model="qa-model"):
+    class _Settings:
+        def get_qa_settings(self):
+            return qa_settings
+
+    return attach_chapter_qa_coordinator(
+        SimpleNamespace(qa_coordinator=None),
+        project_manager=project,
+        settings_manager=_Settings(),
+        handler_factory=lambda selection: object(),
+        session_id="manual",
+        api_keys_by_provider={},
+        session_factory=lambda: object(),
+        translation_provider=provider,
+        translation_model=model,
+        on_unavailable=reasons.append,
+    )
+
+
+def test_checks_switched_off_are_named_as_the_reason(project):
+    reasons: list[str] = []
+
+    coordinator = _attach_manual(
+        project,
+        QaSettings(check_language_after_chapter=False, check_completeness_after_chapter=False),
+        reasons,
+    )
+
+    assert coordinator is None
+    assert reasons == ["Проверка выключена целиком в настройках проверки."]
+
+
+def test_a_missing_model_is_named_as_the_reason(project):
+    reasons: list[str] = []
+
+    coordinator = _attach_manual(
+        project, QaSettings(check_language_after_chapter=True), reasons, provider="", model=""
+    )
+
+    assert coordinator is None
+    assert reasons == ["Не выбрана модель для проверки качества."]
+
+
+def test_a_damaged_journal_is_named_as_the_reason(project):
+    """Окно писало «проверка выключена целиком», хотя сломан был журнал книги."""
+    (Path(project.project_folder) / "translation_qa.json").write_text(
+        "not json at all", encoding="utf-8"
+    )
+    reasons: list[str] = []
+
+    coordinator = _attach_manual(project, QaSettings(check_language_after_chapter=True), reasons)
+
+    assert coordinator is None
+    assert len(reasons) == 1
+    assert reasons[0].startswith("Журнал проверки книги повреждён")
