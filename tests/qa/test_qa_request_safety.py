@@ -83,13 +83,24 @@ def test_translation_exhaustion_releases_first_throttled_key_for_rotation(elapse
 
 @pytest.mark.parametrize('status', [401, 403])
 @pytest.mark.parametrize('stream', [False, True])
-def test_project_suspension_stops_instead_of_trying_remaining_keys(status, stream):
+@pytest.mark.parametrize(
+    'message',
+    [
+        'Project has been suspended',
+        'Project has been suspended; API key not valid',
+    ],
+)
+def test_project_suspension_stops_instead_of_trying_remaining_keys(
+    status, stream, message
+):
     clock = Clock()
     calls = []
 
     class Response:
         async def text(self):
-            return json.dumps({'error': {'message': 'Project has been suspended', 'status': 'UNAUTHENTICATED'}})
+            return json.dumps(
+                {'error': {'message': message, 'status': 'UNAUTHENTICATED'}}
+            )
 
     class Handler:
         def __init__(self, key):
@@ -100,7 +111,9 @@ def test_project_suspension_stops_instead_of_trying_remaining_keys(status, strea
             classifier = object.__new__(GeminiApiHandler)
             classifier.worker = SimpleNamespace(api_key=self.key)
             if stream:
-                classifier._raise_for_stream_error({'message': 'Project has been suspended', 'status': 'UNAUTHENTICATED'})
+                classifier._raise_for_stream_error(
+                    {'message': message, 'status': 'UNAUTHENTICATED'}
+                )
             response = Response()
             response.status = status
             await classifier._handle_error_response(response)
@@ -113,6 +126,49 @@ def test_project_suspension_stops_instead_of_trying_remaining_keys(status, strea
         with pytest.raises(QaHandlerError, match='доступ'):
             asyncio.run(handler.execute_api_call('fake prompt', '[QA]'))
     assert len(calls) == 1, f'Keys attempted after suspension: {calls}'
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_invalid_authentication_credentials_rotate_to_the_next_key(stream):
+    clock = Clock()
+    calls = []
+    message = (
+        'Request had invalid authentication credentials. Expected OAuth 2 access '
+        'token, login cookie or other valid authentication credential.'
+    )
+
+    class Response:
+        status = 401
+
+        async def text(self):
+            return json.dumps(
+                {'error': {'message': message, 'status': 'UNAUTHENTICATED'}}
+            )
+
+    class Handler:
+        def __init__(self, key):
+            self.key = key
+
+        async def execute_api_call(self, *args, **kwargs):
+            calls.append((self.key, clock.now))
+            if len(calls) > 1:
+                return 'checked'
+            classifier = object.__new__(GeminiApiHandler)
+            classifier.worker = SimpleNamespace(api_key=self.key)
+            if stream:
+                classifier._raise_for_stream_error(
+                    {'message': message, 'status': 'UNAUTHENTICATED'}
+                )
+            await classifier._handle_error_response(Response())
+
+    handler = RotatingQaHandler(
+        QaKeyPool(['fake-a', 'fake-b'], clock=clock), Handler, sleep=clock.sleep
+    )
+
+    result = asyncio.run(handler.execute_api_call('fake prompt', '[QA]'))
+
+    assert result == 'checked'
+    assert calls == [('fake-b', 1000.0), ('fake-a', 1000.0)]
 
 
 def test_embedding_429_waits_on_first_refusal_and_rotates_after_second():

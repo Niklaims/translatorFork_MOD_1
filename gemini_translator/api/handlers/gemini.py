@@ -317,7 +317,16 @@ class GeminiApiHandler(BaseApiHandler):
         # 401/403: Permissions
         if response.status in [401, 403]:
             if "user location" in error_str: raise LocationBlockedError("Геоблокировка Gemini.")
-            if any(x in error_str for x in ["suspended", "api key", "permission"]): 
+            if "suspended" in error_str:
+                raise ApiAccessError(
+                    f"Ошибка доступа ({response.status}): {error_message}"
+                )
+            if self._is_key_credential_rejection(error_str):
+                raise RateLimitExceededError(
+                    f"Ключ …{self.worker.api_key[-4:]} не принят сервисом "
+                    f"({response.status}): {error_message}"
+                )
+            if any(x in error_str for x in ["api key", "permission"]):
                 raise ApiAccessError(f"Ошибка доступа ({response.status}): {error_message}")
             if "model" in error_str: raise ModelNotFoundError(f"Модель недоступна: {error_message}")
             raise ApiAccessError(f"Ошибка доступа ({response.status}): {error_message}")
@@ -375,9 +384,30 @@ class GeminiApiHandler(BaseApiHandler):
         if is_model_error:
             raise ModelNotFoundError(f"Модель недоступна: {error_message}")
         if error_status in {'PERMISSION_DENIED', 'UNAUTHENTICATED'}:
+            if "suspended" in error_str:
+                raise ApiAccessError(
+                    f"Ошибка доступа Gemini stream: {error_message}"
+                )
+            if self._is_key_credential_rejection(error_str):
+                raise RateLimitExceededError(
+                    f"Ключ …{self.worker.api_key[-4:]} не принят сервисом: "
+                    f"{error_message}"
+                )
             raise ApiAccessError(f"Ошибка доступа Gemini stream: {error_message}")
 
         raise NetworkError(f"Gemini stream error ({error_status}): {error_message}", delay_seconds=25)
+
+    @staticmethod
+    def _is_key_credential_rejection(error_text: str) -> bool:
+        return any(
+            marker in error_text
+            for marker in (
+                "invalid authentication credential",
+                "expected oauth 2 access token",
+                "api key not valid",
+                "invalid api key",
+            )
+        )
 
     def _extract_retry_delay(self, error_details: dict, error_message: str) -> int | None:
         """
