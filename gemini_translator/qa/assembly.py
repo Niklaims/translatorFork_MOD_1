@@ -614,19 +614,64 @@ def manual_session_settings(settings_manager, proxy_settings=None) -> dict:
     return settings
 
 
+@dataclass(frozen=True, slots=True)
+class QaModelChoices:
+    """The models «Модель проверки» offers in the quality window's settings.
+
+    Only the models of the service the book is checked with: the check spends
+    that service's keys.  ``models`` pairs the name the registry shows with the
+    id a request sends.
+    """
+
+    provider: str
+    translation_model: str
+    models: tuple[tuple[str, str], ...]
+
+
+def qa_model_choices(settings_manager) -> QaModelChoices | None:
+    """What a check may be switched to, or None when there is no service to check with."""
+    provider, translation_model = resolve_manual_qa_model(settings_manager, QaSettings())
+    if not provider:
+        return None
+    try:
+        from ..api import config as api_config
+
+        models = (api_config.api_providers_view().get(provider) or {}).get("models") or {}
+        offered = tuple(
+            (str(name), str((config or {}).get("id") or name))
+            for name, config in models.items()
+        )
+    except Exception:  # noqa: BLE001 - an unreadable registry offers nothing to switch to
+        offered = ()
+    return QaModelChoices(provider, translation_model, offered)
+
+
 def resolve_manual_qa_model(settings_manager, qa_settings: QaSettings) -> tuple[str, str]:
     """Choose the provider and model a manual check should use outside a session.
 
     A session hands QA the model it is translating with.  A book translated
     yesterday has no session, and the check still needs somewhere to ask: the
-    explicit QA model wins, and otherwise the last model the user actually
-    translated with is the closest honest guess.  An empty answer means the
-    caller must say so rather than start a pass that cannot run.
+    last model the user actually translated with is the closest honest guess,
+    and a QA model chosen for that same service wins over it.  A chosen model
+    of another service does not: it would be asked with keys it does not
+    accept.  An empty answer means the caller must say so rather than start a
+    pass that cannot run.
     """
+    translation = _last_translation_model(settings_manager)
     provider = str(qa_settings.correction_provider or "").strip()
     model = str(qa_settings.correction_model or "").strip()
-    if qa_settings.correction_model_mode == "custom" and provider and model:
+    if (
+        qa_settings.correction_model_mode == "custom"
+        and provider
+        and model
+        and translation[0] in ("", provider)
+    ):
         return provider, model
+    return translation
+
+
+def _last_translation_model(settings_manager) -> tuple[str, str]:
+    """The service and model the user last translated with, or the likeliest ones."""
     try:
         from ..api import config as api_config
 

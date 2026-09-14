@@ -105,6 +105,7 @@ class TranslationQualityDialog(QDialog):
         settings: QaSettings | None = None,
         key_counter=None,
         book_title: str = "",
+        model_choices=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Качество перевода")
@@ -123,7 +124,10 @@ class TranslationQualityDialog(QDialog):
         self.report_view = QualityReportView(self)
         self.suggestions_view = QualitySuggestionsView(self)
         self.settings_view = QualitySettingsView(
-            self._settings, key_counter=key_counter, parent=self
+            self._settings,
+            key_counter=key_counter,
+            model_choices=model_choices,
+            parent=self,
         )
         self.tabs = QTabWidget(self)
         self.tabs.addTab(self.report_view, "Отчёт")

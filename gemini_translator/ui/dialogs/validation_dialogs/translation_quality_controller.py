@@ -346,6 +346,23 @@ class TranslationQualityController(QObject):
 
         threading.Thread(target=run, name="qa-embedding-probe", daemon=True).start()
 
+    def note(self, message: str) -> None:
+        """Put one line the running check says into the log: keys, the server, a failure.
+
+        Chapters reach the log with everything they changed; these lines used
+        to go nowhere, and a pass stuck on a failing server looked exactly like
+        one quietly at work.
+        """
+        text = str(message or "").strip()
+        if text.startswith("[QA"):
+            # The tag tells readers of the application log where a line came
+            # from; in the quality window every line comes from the check.
+            closing = text.find("]")
+            if closing != -1:
+                text = text[closing + 1 :].strip()
+        if text:
+            self.chapter_logged.emit(f"<p>{escape_html(text)}</p>")
+
     def cancel(self) -> None:
         """Ask the running pass to stop, and keep the window busy until it has.
 

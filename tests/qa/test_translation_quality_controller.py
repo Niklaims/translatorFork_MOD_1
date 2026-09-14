@@ -129,6 +129,32 @@ def _controller(coordinator, *, events=("chapter-1",), journal_loader=None):
     )
 
 
+def test_a_line_from_the_running_check_lands_in_the_log_without_its_tag(qt_app):
+    """Ключи, сервер, сбой — то, что проверка говорит между главами."""
+    controller = _controller(_Coordinator())
+    logged = []
+    controller.chapter_logged.connect(logged.append)
+
+    controller.note(
+        "[QA] Ключ …1234 отдыхает 60 с по просьбе сервиса, проверка берёт следующий."
+    )
+
+    assert logged == [
+        "<p>Ключ …1234 отдыхает 60 с по просьбе сервиса, проверка берёт следующий.</p>"
+    ]
+
+
+def test_a_line_from_the_running_check_is_text_not_markup(qt_app):
+    controller = _controller(_Coordinator())
+    logged = []
+    controller.chapter_logged.connect(logged.append)
+
+    controller.note("Ошибка сервера (500): <html>")
+    controller.note("   ")
+
+    assert logged == ["<p>Ошибка сервера (500): &lt;html&gt;</p>"]
+
+
 def test_report_is_rebuilt_from_the_journal(qt_app):
     """The report must come from the durable record, not from memory."""
     controller = _controller(_Coordinator())

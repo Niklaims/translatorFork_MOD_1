@@ -82,11 +82,22 @@ class QualitySettingsView(QWidget):
     embedding_test_requested = pyqtSignal(object)
 
     def __init__(
-        self, settings: QaSettings | None = None, *, key_counter=None, parent=None
+        self,
+        settings: QaSettings | None = None,
+        *,
+        key_counter=None,
+        model_choices=None,
+        parent=None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings or QaSettings()
         self._key_counter = key_counter
+        # What «Модель проверки» offers (qa.assembly.QaModelChoices); without
+        # it the row is hidden and the saved choice passes through untouched.
+        self._model_choices = model_choices
+        # Set once the user picks a check model here: until then the saved
+        # choice is kept, even one the row cannot show.
+        self._check_model_chosen = False
         # A key provider an earlier version of this window saved for another
         # provider than the one it now names; kept until the user decides.
         self._legacy_key_provider = ""
@@ -165,6 +176,26 @@ class QualitySettingsView(QWidget):
         ):
             widget.toggled.connect(self._on_settings_edited)
             layout.addWidget(widget)
+
+        # The model the check asks: the translation's own, or another model of
+        # the same service when that one keeps failing.  Only that service's
+        # models are offered, because the check spends that service's keys.
+        self.check_model_row = QWidget(card)
+        model_row = QHBoxLayout(self.check_model_row)
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(8)
+        model_row.addWidget(
+            make_label("Модель проверки", "mutedLabel", parent=self.check_model_row)
+        )
+        self.check_model_combo = QComboBox(self.check_model_row)
+        self.check_model_combo.setToolTip(
+            "Какая модель отвечает проверке.\n"
+            "Сменить её посреди прохода: выберите модель,\n"
+            "затем «Остановить» и «Продолжить проверку»."
+        )
+        self.check_model_combo.currentIndexChanged.connect(self._on_check_model_chosen)
+        model_row.addWidget(self.check_model_combo, 1)
+        layout.addWidget(self.check_model_row)
 
         # A chapter is diagnosed piece by piece, and the piece size is what the
         # check costs: a larger piece is fewer requests over the same text.
@@ -402,6 +433,8 @@ class QualitySettingsView(QWidget):
                 settings.auto_repair_objective_language_issues
             )
             self.final_pass_check.setChecked(settings.final_book_pass)
+            self._check_model_chosen = False
+            self._show_check_model(settings)
 
             index = self.embedding_provider_combo.findData(provider)
             self.embedding_provider_combo.setCurrentIndex(max(index, 0))
@@ -441,6 +474,7 @@ class QualitySettingsView(QWidget):
         key_provider = self._legacy_key_provider or (
             GEMINI_KEY_PROVIDER if provider == "gemini" else ""
         )
+        correction = self._check_model_setting(settings)
         return QaSettings(
             check_completeness_after_chapter=self.completeness_check.isChecked(),
             auto_repair_confirmed_omissions=self.repair_omissions_check.isChecked(),
@@ -452,9 +486,9 @@ class QualitySettingsView(QWidget):
             embedding_api_key=api_key,
             embedding_key_provider=key_provider,
             embedding_base_url=self.embedding_base_url_edit.text().strip(),
-            correction_model_mode=settings.correction_model_mode,
-            correction_provider=settings.correction_provider,
-            correction_model=settings.correction_model,
+            correction_model_mode=correction[0],
+            correction_provider=correction[1],
+            correction_model=correction[2],
             final_book_pass=self.final_pass_check.isChecked(),
             batch_concurrency=settings.batch_concurrency,
             language_chunk_chars=self.language_chunk_spin.value(),
@@ -477,6 +511,59 @@ class QualitySettingsView(QWidget):
             cometkiwi_endpoint=self.cometkiwi_endpoint_edit.text().strip(),
             cometkiwi_license_accepted=self.cometkiwi_license_check.isChecked(),
         )
+
+    # -- check model -------------------------------------------------------
+
+    def _show_check_model(self, settings: QaSettings) -> None:
+        choices = self._model_choices
+        self.check_model_row.setHidden(choices is None)
+        combo = self.check_model_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            if choices is None:
+                return
+            names = {model_id: name for name, model_id in choices.models}
+            translation = names.get(choices.translation_model, choices.translation_model)
+            combo.addItem(f"Как у перевода — {translation}", "")
+            for name, model_id in choices.models:
+                combo.addItem(name, model_id)
+            chosen = (
+                settings.correction_model
+                if settings.correction_model_mode == "custom"
+                and settings.correction_provider == choices.provider
+                else ""
+            )
+            index = combo.findData(chosen) if chosen else 0
+            if index < 0:
+                index = combo.findText(chosen)
+            if index < 0:
+                # Gone from the registry, and still the model the check asks.
+                combo.addItem(chosen, chosen)
+                index = combo.count() - 1
+            combo.setCurrentIndex(index)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_check_model_chosen(self, *_args) -> None:
+        if self._loading:
+            return
+        self._check_model_chosen = True
+        self._on_settings_edited()
+
+    def _check_model_setting(self, settings: QaSettings) -> tuple[str, str, str]:
+        """The saved choice until the user picks a model here, then the one picked."""
+        choices = self._model_choices
+        if choices is None or not self._check_model_chosen:
+            return (
+                settings.correction_model_mode,
+                settings.correction_provider,
+                settings.correction_model,
+            )
+        model_id = str(self.check_model_combo.currentData() or "")
+        if not model_id:
+            return ("translation_model", "", "")
+        return ("custom", choices.provider, model_id)
 
     def set_embedding_result(self, text: str) -> None:
         """Show what the last connection check answered, for the setup it checked."""

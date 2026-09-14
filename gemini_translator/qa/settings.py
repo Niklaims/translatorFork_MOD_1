@@ -294,14 +294,21 @@ class QaSettings:
     def correction_model_for(
         self, translation_provider: str, translation_model: str
     ) -> tuple[str, str]:
-        """Return the provider and model that must perform QA corrections."""
+        """Return the provider and model that must perform QA corrections.
+
+        A chosen model counts only for the service the translation uses: the
+        check spends that service's keys, and a model of another service would
+        be asked with keys it does not accept.
+        """
+        translation_provider = str(translation_provider or "")
         if (
             self.correction_model_mode == "custom"
             and self.correction_provider
             and self.correction_model
+            and translation_provider in ("", self.correction_provider)
         ):
             return self.correction_provider, self.correction_model
-        return str(translation_provider or ""), str(translation_model or "")
+        return translation_provider, str(translation_model or "")
 
 
 def _language_chunk_setting(value: object) -> int:

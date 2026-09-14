@@ -6,6 +6,8 @@ import asyncio
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 import inspect
+import threading
+import time
 
 from ..utils.helpers import safe_int
 from .llm.completion import QaModelSelection
@@ -120,6 +122,86 @@ class QaHandlerWorker:
 # the chapter is better deferred than held for that long.
 MAX_KEY_WAIT_SECONDS = 120.0
 
+# How long the same failure of the service stays unrepeated in the log.  An
+# overloaded server answers every twenty seconds for hours, and a line each
+# time would push the chapters themselves out of the quality window's journal.
+SERVER_ERROR_REPEAT_SECONDS = 300.0
+# Where a check that keeps failing can be moved to another model.
+CHANGE_MODEL_HINT = (
+    "Сменить модель можно во вкладке «Настройки» → «Модель проверки», "
+    "затем «Остановить» и «Продолжить проверку»."
+)
+# The first line of a run of failures, and the line that reminds of it.
+_FAILURE_HEADLINES = {
+    "server": ("Сервер отвечает ошибкой", "Сервер всё ещё отвечает ошибкой"),
+    "keys": ("Ключи проверки на паузе", "Ключи проверки всё ещё на паузе"),
+}
+_FAILURE_TEXT_LIMIT = 300
+
+
+class ServerErrorNotices:
+    """Say that the service keeps failing: at once, now and then, and when it is back.
+
+    A request the retry loop keeps asking used to fail in silence: on 14.09 two
+    windows sat on their first chapter for half an hour with nothing to show
+    why.  One instance serves every request of a check, so a failure is not
+    told again by each request that meets it.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._last_said: tuple[str, float] | None = None
+
+    def failure(self, kind: str, detail: object, model: str) -> str | None:
+        """The line for one more failed request, or None when it was said just now."""
+        first, again = _FAILURE_HEADLINES[kind]
+        text = _sentence(detail)
+        with self._lock:
+            self._failures += 1
+            failures = self._failures
+            now = self._clock()
+            said = f"{kind}:{text}"
+            previous = self._last_said
+            if (
+                previous is not None
+                and previous[0] == said
+                and now - previous[1] < SERVER_ERROR_REPEAT_SECONDS
+            ):
+                return None
+            self._last_said = (said, now)
+        if previous is None:
+            named = f" Модель: {model}." if model else ""
+            return f"{first}: {text}{named} {CHANGE_MODEL_HINT}"
+        return f"{again}: {text} Неудачных попыток подряд: {failures}."
+
+    def success(self, model: str) -> str | None:
+        """The line for an answer after failures, or None when nothing had failed."""
+        with self._lock:
+            failures = self._failures
+            self._failures = 0
+            self._last_said = None
+        if not failures:
+            return None
+        named = f" (модель {model})" if model else ""
+        return f"Сервер снова отвечает{named}: неудачных попыток подряд было {failures}."
+
+
+def _sentence(detail: object) -> str:
+    """An error's words on one line, short enough for the log, ending as a sentence."""
+    text = " ".join(str(detail or "").split())
+    if len(text) > _FAILURE_TEXT_LIMIT:
+        text = text[: _FAILURE_TEXT_LIMIT - 1].rstrip() + "…"
+    if text and text[-1] not in ".!?…":
+        text += "."
+    return text
+
+
+def _is_service_trouble(error: BaseException) -> bool:
+    """A failure the service may get over by itself: a timeout, or one naming a pause."""
+    return isinstance(error, TimeoutError) or _requested_delay(error, default=0.0) > 0
+
 
 class RotatingQaHandler:
     """Answer one request with whichever key of the pool is ready for it.
@@ -147,6 +229,8 @@ class RotatingQaHandler:
         sleep=None,
         max_wait_seconds: float = MAX_KEY_WAIT_SECONDS,
         close_handler: Callable[[object], object] | None = None,
+        notices: ServerErrorNotices | None = None,
+        model_name: str = "",
     ) -> None:
         if not callable(make_handler):
             raise TypeError("make_handler must be callable")
@@ -156,6 +240,8 @@ class RotatingQaHandler:
         self._sleep = sleep if callable(sleep) else asyncio.sleep
         self._max_wait = max(0.0, float(max_wait_seconds))
         self._close_handler = close_handler
+        self._notices = notices if notices is not None else ServerErrorNotices()
+        self._model_name = str(model_name or "")
 
     async def execute_api_call(self, prompt, log_prefix, **kwargs):
         from ..api.errors import ApiAccessError, RateLimitExceededError, TemporaryRateLimitError
@@ -169,7 +255,12 @@ class RotatingQaHandler:
                     raise QaHandlerError(self._pool.blocked_reason) from last_error
                 wait = self._pool.seconds_until_available()
                 if wait is None or waited >= self._max_wait:
-                    raise QaHandlerError(self._refusal(last_error)) from last_error
+                    refusal = self._refusal(last_error)
+                    if getattr(last_error, "delay_seconds", None):
+                        self._say_line(
+                            self._notices.failure("keys", refusal, self._model_name)
+                        )
+                    raise QaHandlerError(refusal) from last_error
                 pause = min(max(float(wait), 0.5), self._max_wait - waited)
                 waited += pause
                 await self._sleep(pause)
@@ -180,6 +271,7 @@ class RotatingQaHandler:
                 if inspect.isawaitable(result):
                     result = await result
                 self._pool.note_success(key)
+                self._say_line(self._notices.success(self._model_name))
                 return result
             except ApiAccessError as error:
                 reason = f"QA остановлена: сервис отказал в доступе. {error}"
@@ -209,6 +301,14 @@ class RotatingQaHandler:
                 # The pool owns the full deadline for every caller. The next
                 # loop waits within this request's budget; expiry never makes
                 # the key available before the server's deadline.
+            except Exception as error:
+                # What happens next is the retry loop's decision; this only
+                # makes sure a service that keeps failing does not fail in silence.
+                if _is_service_trouble(error):
+                    self._say_line(
+                        self._notices.failure("server", error, self._model_name)
+                    )
+                raise
             finally:
                 await self._close(handler)
 
@@ -219,6 +319,10 @@ class RotatingQaHandler:
         if getattr(error, "delay_seconds", None):
             return f"Сервис просит ждать дольше, чем может одна проверка: {error}"
         return f"У проверки не осталось рабочих ключей: {error}"
+
+    def _say_line(self, line: str | None) -> None:
+        if line:
+            self._say(f"[QA] {line}")
 
     def _say(self, message: str) -> None:
         if self._log is None:
@@ -309,6 +413,10 @@ def build_qa_handler_factory(
             )
         return handler
 
+    # One for the whole check: every request builds its own handler, and the
+    # same failure must not be told again by each request that meets it.
+    notices = ServerErrorNotices()
+
     def factory(model: QaModelSelection):
         provider_config, model_config = resolve(model)
         if key_pool is not None:
@@ -316,6 +424,8 @@ def build_qa_handler_factory(
                 key_pool,
                 lambda key: build(model, provider_config, model_config, key),
                 log=log,
+                notices=notices,
+                model_name=model.model,
             )
         return build(model, provider_config, model_config, api_key_for(model.provider))
 

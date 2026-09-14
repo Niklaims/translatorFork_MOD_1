@@ -225,7 +225,7 @@ class StaleManualCoordinatorTests(unittest.TestCase):
         with assembly_patch, handler_patch:
             first = page._quality_coordinator()
 
-            # Пользователь сменил «Модель для исправлений».
+            # Пользователь сменил «Модель проверки».
             settings_manager.model = "gemini-model-2"
 
             second = page._quality_coordinator()
@@ -379,6 +379,138 @@ class StaleManualCoordinatorTests(unittest.TestCase):
         self.assertEqual(
             len(created), 1, "неудачная попытка сборки не должна детачить старый"
         )
+
+    def _capturing_assembly(self, settings_manager, captured, *, real_resolve=False):
+        """Как _patched_assembly, но записывает, что сборка передала каждой части."""
+
+        def fake_attach(app, **kwargs):
+            marker = object()
+            app.qa_coordinator = marker
+            captured.setdefault("attach", []).append(kwargs)
+            return marker
+
+        def fake_factory(**kwargs):
+            captured.setdefault("factory", []).append(kwargs)
+            return lambda *a, **k: None
+
+        def fake_green_keys(sm, provider, model):
+            captured.setdefault("green_keys", []).append((provider, model))
+            return list(settings_manager.healthy_keys)
+
+        replacements = dict(
+            green_keys=fake_green_keys,
+            aiohttp_session_factory=lambda proxy: (lambda: None),
+            detect_source_language=lambda text: "en",
+            manual_session_settings=lambda sm, proxy: object(),
+            embedding_keys_for_session=lambda provider, keys: {},
+            attach_chapter_qa_coordinator=fake_attach,
+            detach_chapter_qa_coordinator=lambda app: setattr(app, "qa_coordinator", None),
+        )
+        if not real_resolve:
+            replacements["resolve_manual_qa_model"] = lambda sm, qa_settings: (
+                settings_manager.provider,
+                settings_manager.model,
+            )
+        return patch.multiple("gemini_translator.qa.assembly", **replacements), patch(
+            "gemini_translator.qa.handler_factory.build_qa_handler_factory",
+            fake_factory,
+        )
+
+    def test_what_the_manual_check_says_about_keys_reaches_the_quality_journal(self):
+        """«Ключ …1234 отдыхает» уходил в никуда: ручной проверке не передавали лог."""
+        page = _make_page()
+        self.addCleanup(_dispose_page, page)
+        self.addCleanup(page.deleteLater)
+        settings_manager = _FakeSettingsManager("gemini", "gemini-model", ["key-1"])
+        page._quality_settings_manager = lambda: settings_manager
+        logged = []
+        page._quality_controller_instance().chapter_logged.connect(logged.append)
+
+        captured = {}
+        assembly_patch, handler_patch = self._capturing_assembly(settings_manager, captured)
+        with assembly_patch, handler_patch:
+            page._quality_coordinator()
+
+        say = captured["factory"][0]["log"]
+        say("[QA] Ключ …1234 отдыхает 60 с по просьбе сервиса, проверка берёт следующий.")
+
+        self.assertEqual(
+            logged,
+            ["<p>Ключ …1234 отдыхает 60 с по просьбе сервиса, проверка берёт следующий.</p>"],
+        )
+
+    def test_a_check_model_chosen_mid_pass_is_used_once_the_pass_is_stopped(self):
+        """«Остановить» → «Продолжить проверку» пересобирает проверку на выбранной модели."""
+        from gemini_translator.qa.settings import QaSettings
+
+        class _ChoosingSettingsManager(_FakeSettingsManager):
+            def __init__(self):
+                super().__init__("gemini", "gemini-3.8-flash", ["key-1"])
+                self.qa_settings = QaSettings()
+
+            def get_qa_settings(self):
+                return self.qa_settings
+
+            def get_last_settings(self):
+                return {"model": "gemini-3.8-flash"}
+
+        page = _make_page()
+        self.addCleanup(_dispose_page, page)
+        self.addCleanup(page.deleteLater)
+        settings_manager = _ChoosingSettingsManager()
+        page._quality_settings_manager = lambda: settings_manager
+        registry = patch(
+            "gemini_translator.api.config.api_providers_view",
+            lambda: {
+                "gemini": {
+                    "models": {
+                        "Gemini 3.8 Flash": {"id": "gemini-3.8-flash"},
+                        "Gemini 3.5 Flash": {"id": "gemini-3.5-flash"},
+                    }
+                }
+            },
+        )
+
+        captured = {}
+        assembly_patch, handler_patch = self._capturing_assembly(
+            settings_manager, captured, real_resolve=True
+        )
+        with assembly_patch, handler_patch, registry:
+            first = page._quality_coordinator()
+            page._quality_pass_running = True
+            settings_manager.qa_settings = QaSettings(
+                correction_model_mode="custom",
+                correction_provider="gemini",
+                correction_model="gemini-3.5-flash",
+            )
+            during = page._quality_coordinator()
+            # «Остановить» дошло до конца, пользователь жмёт «Продолжить проверку».
+            page._quality_pass_running = False
+            after = page._quality_coordinator()
+
+        self.assertIs(first, during)
+        self.assertIsNot(first, after)
+        self.assertEqual(
+            [call["translation_model"] for call in captured["attach"]],
+            ["gemini-3.8-flash", "gemini-3.5-flash"],
+        )
+        self.assertEqual(captured["green_keys"][-1], ("gemini", "gemini-3.5-flash"))
+
+    def test_a_check_without_a_model_says_what_is_missing(self):
+        """Прежний текст отправлял в «Модель для исправлений», которой в окне нет."""
+        page = _make_page()
+        self.addCleanup(_dispose_page, page)
+        self.addCleanup(page.deleteLater)
+        settings_manager = _FakeSettingsManager("", "", [])
+        page._quality_settings_manager = lambda: settings_manager
+
+        assembly_patch, handler_patch = self._capturing_assembly(settings_manager, {})
+        with assembly_patch, handler_patch:
+            coordinator = page._quality_coordinator()
+
+        self.assertIsNone(coordinator)
+        self.assertNotIn("Модель для исправлений", page._quality_setup_problem)
+        self.assertIn("ключ", page._quality_setup_problem)
 
 
 if __name__ == "__main__":

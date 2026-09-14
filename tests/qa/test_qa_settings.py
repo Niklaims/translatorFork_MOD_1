@@ -146,14 +146,27 @@ def test_correction_model_defaults_to_the_translation_model():
     default = QaSettings()
     custom = QaSettings(
         correction_model_mode="custom",
-        correction_provider="openai",
-        correction_model="gpt-qa",
+        correction_provider="gemini",
+        correction_model="gemini-qa",
     )
     incomplete = QaSettings(correction_model_mode="custom")
 
     assert default.correction_model_for("gemini", "flash") == ("gemini", "flash")
-    assert custom.correction_model_for("gemini", "flash") == ("openai", "gpt-qa")
+    assert custom.correction_model_for("gemini", "flash") == ("gemini", "gemini-qa")
     assert incomplete.correction_model_for("gemini", "flash") == ("gemini", "flash")
+
+
+def test_a_chosen_model_of_another_service_stops_applying():
+    """Проверка тратит ключи сервиса перевода: чужой модели достались бы чужие ключи."""
+    custom = QaSettings(
+        correction_model_mode="custom",
+        correction_provider="openai",
+        correction_model="gpt-qa",
+    )
+
+    assert custom.correction_model_for("gemini", "flash") == ("gemini", "flash")
+    # With no translation to compare against there is nothing to conflict with.
+    assert custom.correction_model_for("", "") == ("openai", "gpt-qa")
 
 
 def test_only_undisputed_defect_categories_are_fixed_by_default():

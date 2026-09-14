@@ -3057,6 +3057,7 @@ class TranslationValidatorPage(ShellPage):
             settings=qa_settings,
             key_counter=self._quality_key_counter(settings_manager),
             book_title=self._quality_book_title(),
+            model_choices=self._quality_model_choices(settings_manager),
         )
         dialog.settings_changed.connect(settings_manager.save_qa_settings)
         dialog.set_status(qa_settings.embedding_setup_problem() or "Готово.")
@@ -3113,6 +3114,17 @@ class TranslationValidatorPage(ShellPage):
         """Track whether a pass is running independently of any open dialog."""
         self._quality_pass_running = bool(busy)
 
+    def _quality_log(self, message: str) -> None:
+        """Send a line of a manual check into the quality window's log.
+
+        Only what the handlers say comes here — keys resting, the server
+        failing.  Chapters reach the log through the controller with all
+        their changes, and the coordinator's reports of them would repeat it.
+        """
+        controller = getattr(self, "_quality_controller", None)
+        if controller is not None:
+            controller.note(message)
+
     def _quality_settings_manager(self):
         app = QApplication.instance()
         getter = getattr(app, "get_settings_manager", None)
@@ -3129,6 +3141,16 @@ class TranslationValidatorPage(ShellPage):
             return embedding_key_counts(settings_manager, provider_id, model_id)
 
         return count
+
+    @staticmethod
+    def _quality_model_choices(settings_manager):
+        """What «Модель проверки» offers: the models of the book's own service."""
+        from ...qa.assembly import qa_model_choices
+
+        try:
+            return qa_model_choices(settings_manager)
+        except Exception:  # noqa: BLE001 - without a list the row stays hidden
+            return None
 
     def _quality_book_title(self) -> str:
         """The project folder's name, which is the book's name on disk."""
@@ -3297,8 +3319,8 @@ class TranslationValidatorPage(ShellPage):
         provider, model_name = resolve_manual_qa_model(settings_manager, qa_settings)
         if not provider or not model_name:
             self._quality_setup_problem = (
-                "Не удалось определить модель проверки. Выберите её во вкладке "
-                "«Настройки проверки» → «Модель для исправлений»."
+                "Не удалось определить модель проверки: нет ни модели последнего "
+                "перевода, ни ключей ни у одного сервиса."
             )
             return None
         keys = green_keys(settings_manager, provider, model_name)
@@ -3324,6 +3346,7 @@ class TranslationValidatorPage(ShellPage):
                     session_settings=manual_session_settings(
                         settings_manager, proxy_settings
                     ),
+                    log=self._quality_log,
                 ),
                 session_id="manual",
                 api_keys_by_provider=embedding_keys_for_session(provider, list(keys)),

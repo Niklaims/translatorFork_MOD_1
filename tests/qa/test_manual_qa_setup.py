@@ -5,7 +5,9 @@ from __future__ import annotations
 import pytest
 
 from gemini_translator.qa.assembly import (
+    QaModelChoices,
     green_keys,
+    qa_model_choices,
     resolve_manual_qa_model,
 )
 from gemini_translator.qa.settings import QaSettings
@@ -51,8 +53,8 @@ def _keys(*pairs):
     return [{"key": key, "provider": provider} for key, provider in pairs]
 
 
-def test_an_explicitly_chosen_qa_model_always_wins():
-    """Явный выбор пользователя не переспрашивается ни у какой эвристики."""
+def test_a_chosen_qa_model_is_used_when_no_service_is_known():
+    """Явный выбор пользователя не переспрашивается, когда сравнивать его не с чем."""
     settings = QaSettings(
         correction_model_mode="custom",
         correction_provider="openai",
@@ -60,6 +62,48 @@ def test_an_explicitly_chosen_qa_model_always_wins():
     )
 
     assert resolve_manual_qa_model(_SettingsManager(), settings) == ("openai", "gpt-qa")
+
+
+def test_a_chosen_qa_model_of_the_books_service_wins():
+    """Выбранная модель важнее модели перевода, если это тот же сервис."""
+    settings = QaSettings(
+        correction_model_mode="custom",
+        correction_provider="gemini",
+        correction_model="gemini-3.6-flash",
+    )
+    manager = _SettingsManager(last_model="Gemini 3.7 Flash")
+
+    assert resolve_manual_qa_model(manager, settings) == ("gemini", "gemini-3.6-flash")
+
+
+def test_a_chosen_qa_model_of_another_service_is_not_used():
+    """Книга проверяется ключами своего сервиса: чужой модели они не подойдут."""
+    settings = QaSettings(
+        correction_model_mode="custom",
+        correction_provider="nvidia",
+        correction_model="meta/llama-3.3-70b-instruct",
+    )
+    manager = _SettingsManager(last_model="Gemini 3.7 Flash")
+
+    assert resolve_manual_qa_model(manager, settings) == ("gemini", "gemini-3.7-flash")
+
+
+def test_the_models_offered_for_the_check_are_those_of_the_books_service():
+    """Сменить модель проверки можно только в пределах сервиса, которым она идёт."""
+    choices = qa_model_choices(_SettingsManager(last_model="Gemini 3.7 Flash"))
+
+    assert choices == QaModelChoices(
+        provider="gemini",
+        translation_model="gemini-3.7-flash",
+        models=(
+            ("Gemini 3.7 Flash", "gemini-3.7-flash"),
+            ("Gemini 3.6 Flash", "gemini-3.6-flash"),
+        ),
+    )
+
+
+def test_no_service_to_check_with_offers_no_models():
+    assert qa_model_choices(_SettingsManager()) is None
 
 
 def test_the_last_translated_model_is_the_next_best_answer():
