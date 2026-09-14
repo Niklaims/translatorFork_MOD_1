@@ -121,8 +121,10 @@ class QualityReportView(QWidget):
         content_layout.addLayout(self._build_totals())
         split = QHBoxLayout()
         split.setSpacing(10)
-        split.addWidget(self._build_chapter_list(), 5)
-        split.addWidget(self._build_chapter_card(), 6)
+        # The table takes the wider half: with scores it has seven columns, and
+        # at the window's usual width the last one went under a horizontal scroll.
+        split.addWidget(self._build_chapter_list(), 6)
+        split.addWidget(self._build_chapter_card(), 5)
         content_layout.addLayout(split, 1)
 
         self.stack.setCurrentWidget(self.empty_state)

@@ -248,3 +248,51 @@ def test_the_chapter_card_scrolls_rather_than_squeezes_in_a_short_window(qt_app,
         dialog.close()
         dialog.deleteLater()
         qt_app.processEvents()
+
+
+def test_every_chapter_column_fits_the_window_at_its_usual_size(qt_app, themed):
+    """С оценками у всех глав колонка «Оценка» уезжала под горизонтальную прокрутку."""
+    themed("light")
+    journal = QaJournal.empty(book_id="book-1")
+    for index in range(1000, 1030):
+        chapter_id = f"OEBPS/chapter{index}.xhtml"
+        journal.record_chapter_state(
+            QaChapterState(chapter_id=chapter_id, status="checked", updated_at="2026-09-14T13:31:00")
+        )
+        journal.upsert_metrics(
+            ChapterMetrics(
+                chapter_id=chapter_id,
+                source_language="zh",
+                target_language="ru",
+                source_chars=1400,
+                translated_chars=4400,
+                possible_gaps=index % 5,
+                quality_estimator="cometkiwi",
+                quality_score=0.74,
+                quality_score_status="completed",
+            )
+        )
+    settings = QaSettings(
+        check_language_after_chapter=True,
+        check_completeness_after_chapter=True,
+        capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+    )
+    dialog = TranslationQualityDialog(settings=settings, book_title="Король Демонов")
+    dialog.set_report(BookQaReportSnapshot.from_journal(journal))
+    try:
+        dialog.resize(dialog.sizeHint())
+        dialog.show()
+        dialog.select_chapter("OEBPS/chapter1006.xhtml")
+        # Column widths settle a turn after the resize that changed them.
+        for _ in range(3):
+            qt_app.processEvents()
+        table = dialog.report_view.table
+
+        assert table.columnCount() == 7
+        # In pixels: the scroll bar steps a whole column at a time.
+        assert table.horizontalHeader().length() <= table.viewport().width()
+        assert table.horizontalScrollBar().maximum() == 0
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        qt_app.processEvents()
