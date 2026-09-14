@@ -67,6 +67,27 @@ class HTMLCleaner:
 # Word Exception Matcher
 # =============================================================================
 
+# re.IGNORECASE treats U+0130 (dotted capital I) and U+0131 (dotless i) as
+# equal to "i", while str.casefold() turns the first into "i" + U+0307 and
+# leaves the second alone. Folding both away makes every IGNORECASE match of an
+# ASCII phrase a plain substring of the folded text; checked against every
+# Unicode code point.
+_DOTLESS_I_TO_I = str.maketrans({"\u0131": "i"})
+
+
+def _fold_for_prefilter(value: str) -> str:
+    return value.casefold().replace("\u0307", "").translate(_DOTLESS_I_TO_I)
+
+
+def _prefilter_key(phrase: str) -> "str | None":
+    """The substring a text must contain for ``phrase`` to match, when it is known.
+
+    Only ASCII phrases get one, because the fold was verified for them. Any
+    other phrase is always handed to its regex.
+    """
+    return _fold_for_prefilter(phrase) if phrase.isascii() else None
+
+
 class WordExceptionMatcher:
     """
     Handles matching of words against exception lists.
@@ -89,6 +110,8 @@ class WordExceptionMatcher:
         self.single_words: Set[str] = set()
         self.phrases: List[str] = []
         self._phrase_patterns: List[Tuple[str, re.Pattern]] = []
+        # Folded form of each phrase for the substring shortcut, or None to always try it.
+        self._phrase_keys: List["str | None"] = []
         
         self._compile_patterns(exceptions)
     
@@ -117,6 +140,7 @@ class WordExceptionMatcher:
         
         # Pre-compile phrase patterns for efficiency
         self._phrase_patterns = []
+        self._phrase_keys = []
         for phrase in self.phrases:
             pattern_str = (
                 self.UNICODE_WORD_BOUNDARY_START + 
@@ -126,6 +150,7 @@ class WordExceptionMatcher:
             try:
                 pattern = re.compile(pattern_str, re.IGNORECASE | re.UNICODE)
                 self._phrase_patterns.append((phrase, pattern))
+                self._phrase_keys.append(_prefilter_key(phrase))
             except re.error:
                 # Skip invalid patterns
                 pass
@@ -154,7 +179,15 @@ class WordExceptionMatcher:
         """
         result = text
         
-        for phrase, pattern in self._phrase_patterns:
+        # A phrase whose folded form is absent from the folded text cannot
+        # match, so its regex is skipped: most chapters contain none of them.
+        folded = None
+        for (phrase, pattern), key in zip(self._phrase_patterns, self._phrase_keys):
+            if key is not None:
+                if folded is None:
+                    folded = _fold_for_prefilter(text)
+                if key not in folded:
+                    continue
             result = pattern.sub(' ', result)
         
         return result
