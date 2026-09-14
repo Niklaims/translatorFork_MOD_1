@@ -142,6 +142,9 @@ class NvidiaApiHandler(BaseApiHandler):
             self._apply_gemma_options(payload)
 
     def _extract_text_from_result(self, result, allow_incomplete=False):
+        # Both the direct answer and the one fetched by status polling come through here.
+        if isinstance(result, dict):
+            self._remember_openai_usage(result.get("usage"))
         candidates = [result]
         if isinstance(result, dict):
             for key in ("response", "result", "data", "output"):
@@ -449,7 +452,9 @@ class NvidiaApiHandler(BaseApiHandler):
                     if use_stream:
                         try:
                             collected_text, finish_reason, raw_stream_lines = await parse_openai_compatible_sse_stream(
-                                response, capture_raw=(self._has_debug_trace() or debug)
+                                response,
+                                capture_raw=(self._has_debug_trace() or debug),
+                                on_usage=self._remember_openai_usage,
                             )
                         except SSEStreamInterrupted as interrupted:
                             raise PartialGenerationError(

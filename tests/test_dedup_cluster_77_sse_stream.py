@@ -275,7 +275,7 @@ class SSERoutingTests(unittest.TestCase):
         fake_text = "МАРКЕР_ИЗ_КАНОНИЧЕСКОЙ_ФУНКЦИИ"
         calls = []
 
-        async def fake_parse(response, capture_raw=False):
+        async def fake_parse(response, capture_raw=False, on_usage=None):
             calls.append((response, capture_raw))
             return fake_text, None, None
 

@@ -167,17 +167,66 @@ class BaseApiHandler:
         # loop. Kept as a method so existing setup_client callers stay valid.
         return
 
-    def _estimate_token_usage(self, prompt, response_text) -> dict:
-        input_tokens = estimate_gemini_tokens(prompt)
-        output_tokens = estimate_gemini_tokens(response_text)
-        return {
+    @staticmethod
+    def _usage_count(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
+
+    def _remember_token_usage(self, input_tokens, output_tokens, total_tokens=None, cached_tokens=None):
+        """Keep what the provider billed for the request in flight; the latest report wins."""
+        usage = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "estimated": True,
-            "model_id": getattr(self.worker, "model_id", None),
-            "provider": (getattr(self.worker, "model_config", {}) or {}).get("provider"),
+            "total_tokens": total_tokens or (input_tokens + output_tokens),
         }
+        if cached_tokens is not None:
+            usage["cached_tokens"] = cached_tokens
+        self._reported_token_usage = usage
+
+    def _remember_openai_usage(self, usage):
+        """Take the usage object of an OpenAI-compatible response or stream chunk.
+
+        Reasoning tokens are already counted in completion_tokens there.
+        """
+        if not isinstance(usage, dict):
+            return
+        prompt_tokens = self._usage_count(usage.get("prompt_tokens"))
+        completion_tokens = self._usage_count(usage.get("completion_tokens"))
+        if prompt_tokens is None and completion_tokens is None:
+            return
+        details = usage.get("prompt_tokens_details")
+        cached_tokens = self._usage_count(details.get("cached_tokens")) if isinstance(details, dict) else None
+        if cached_tokens is None:
+            # DeepSeek reports its context cache under its own name.
+            cached_tokens = self._usage_count(usage.get("prompt_cache_hit_tokens"))
+        self._remember_token_usage(
+            prompt_tokens or 0,
+            completion_tokens or 0,
+            self._usage_count(usage.get("total_tokens")),
+            cached_tokens,
+        )
+
+    def _estimate_token_usage(self, prompt, response_text) -> dict:
+        reported = getattr(self, "_reported_token_usage", None)
+        if reported:
+            usage = dict(reported, estimated=False)
+        else:
+            input_tokens = estimate_gemini_tokens(prompt)
+            output_tokens = estimate_gemini_tokens(response_text)
+            usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "estimated": True,
+            }
+        usage["model_id"] = getattr(self.worker, "model_id", None)
+        usage["provider"] = (getattr(self.worker, "model_config", {}) or {}).get("provider")
+        return usage
 
     def _post_token_usage(self, prompt, response_text) -> None:
         try:
@@ -547,6 +596,8 @@ class BaseApiHandler:
 
         try:
             while True:
+                # A retried attempt must not report the usage of the one before it.
+                self._reported_token_usage = None
                 try:
                     if self.is_async_native:
                         result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)

@@ -121,7 +121,9 @@ class DeepseekApiHandler(BaseApiHandler):
                     if use_stream:
                         try:
                             collected_text, finish_reason, raw_stream_lines = await parse_openai_compatible_sse_stream(
-                                response, capture_raw=(self._has_debug_trace() or debug)
+                                response,
+                                capture_raw=(self._has_debug_trace() or debug),
+                                on_usage=self._remember_openai_usage,
                             )
                         except SSEStreamInterrupted as interrupted:
                             raise PartialGenerationError(
@@ -167,6 +169,7 @@ class DeepseekApiHandler(BaseApiHandler):
                                     reason="LENGTH"
                                 )
                                 
+                            self._remember_openai_usage(result.get("usage"))
                             return content
                         
                         raise Exception(f"Пустой ответ JSON от DeepSeek: {result}")

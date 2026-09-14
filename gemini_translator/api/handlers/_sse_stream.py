@@ -28,7 +28,7 @@ class SSEStreamInterrupted(Exception):
         self.raw_lines = raw_lines
 
 
-async def parse_openai_compatible_sse_stream(response, capture_raw=False):
+async def parse_openai_compatible_sse_stream(response, capture_raw=False, on_usage=None):
     """Читает response.content построчно и собирает текст + finish_reason.
 
     - Пустые строки и 'data: [DONE]' пропускаются.
@@ -40,6 +40,10 @@ async def parse_openai_compatible_sse_stream(response, capture_raw=False):
     capture_raw=True включает накопление сырых декодированных строк для
     последующей debug-трассировки вызывающей стороной (иначе raw_lines
     остаётся None, чтобы не тратить память впустую на обычных прогонах).
+
+    on_usage, если передан, получает объект usage каждого чанка, где он
+    есть: OpenAI-совместимые API присылают его последним чанком с пустым
+    choices, и больше нигде стрим не говорит, сколько токенов списано.
 
     Если соединение обрывается посреди чтения и что-то уже накоплено --
     поднимает SSEStreamInterrupted с partial_text. Если не накоплено ничего --
@@ -66,6 +70,10 @@ async def parse_openai_compatible_sse_stream(response, capture_raw=False):
                 chunk = json.loads(json_str)
             except json.JSONDecodeError:
                 continue
+
+            usage = chunk.get("usage") if isinstance(chunk, dict) else None
+            if on_usage is not None and isinstance(usage, dict):
+                on_usage(usage)
 
             if "choices" in chunk and chunk["choices"]:
                 delta = chunk["choices"][0].get("delta", {})

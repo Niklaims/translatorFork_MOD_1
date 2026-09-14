@@ -53,6 +53,9 @@ def _handler_answering(response):
         provider_config={"is_async": True},
         model_config={"id": "gemini-test", "provider": "gemini", "min_thinking_budget": False},
         api_key="test-key",
+        model_id="gemini-test",
+        is_cancelled=False,
+        settings_manager=SimpleNamespace(increment_request_count=lambda *args, **kwargs: None),
         prompt_builder=SimpleNamespace(system_instruction=None),
         temperature_override_enabled=False,
         temperature=None,
@@ -69,8 +72,7 @@ def _handler_answering(response):
 
 
 def _posted_usage(handler, events, prompt, *, use_stream):
-    text = asyncio.run(handler.call_api(prompt, "[TEST]", use_stream=use_stream))
-    handler._post_token_usage(prompt, text)
+    asyncio.run(handler.execute_api_call(prompt, "[TEST]", use_stream=use_stream))
     return [payload for name, payload in events if name == "token_usage_updated"][-1]
 
 

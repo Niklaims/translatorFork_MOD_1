@@ -142,6 +142,7 @@ class LocalApiHandler(BaseApiHandler):
                 except json.JSONDecodeError:
                     continue
 
+                self._remember_openai_usage(chunk.get("usage"))
                 choices = chunk.get("choices")
                 if choices:
                     delta = choices[0].get("delta") or {}
@@ -297,6 +298,7 @@ class LocalApiHandler(BaseApiHandler):
                             status="http_200",
                             extra={"mode": "full_ignored_stream_flag", "http_status": response.status_code},
                         )
+                        self._remember_openai_usage(fallback_result.get("usage"))
                         choice = fallback_result["choices"][0]
                         content = choice.get("message", {}).get("content", "") or ""
                         finish_reason = choice.get("finish_reason")
@@ -358,6 +360,7 @@ class LocalApiHandler(BaseApiHandler):
                                 reason="LENGTH",
                             )
 
+                        self._remember_openai_usage(result.get("usage"))
                         return content
                     else:
                         raise ValidationFailedError(f"Генерация остановлена: '{finish_reason}'.")

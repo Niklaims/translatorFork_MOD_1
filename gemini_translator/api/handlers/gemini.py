@@ -27,7 +27,6 @@ class GeminiApiHandler(BaseApiHandler):
         return True
 
     async def call_api(self, prompt, log_prefix, allow_incomplete=False, use_stream=True, debug=False, max_output_tokens=None):
-        self._last_usage = None
         session = await self._get_or_create_session_internal()
 
         url = self.default_url.replace(":generateContent", ":streamGenerateContent") if use_stream else self.default_url
@@ -195,7 +194,7 @@ class GeminiApiHandler(BaseApiHandler):
                                             reason=error_status # Теперь причиной будет "INTERNAL" или код ошибки
                                         )
 
-                                    self._remember_usage(chunk_data)
+                                    self._remember_gemini_usage(chunk_data)
 
                                     # --- 2. Стандартная обработка ---
                                     if chunk_data.get('promptFeedback', {}).get('blockReason'):
@@ -252,7 +251,7 @@ class GeminiApiHandler(BaseApiHandler):
                     
                     # И только потом парсим из памяти
                     response_data = json.loads(raw_response_bytes)
-                    self._remember_usage(response_data)
+                    self._remember_gemini_usage(response_data)
                     
                     if response_data.get('promptFeedback', {}).get('blockReason'):
                         raise ContentFilterError(f"Блокировка на уровне промпта: {response_data['promptFeedback']['blockReason']}")
@@ -287,50 +286,24 @@ class GeminiApiHandler(BaseApiHandler):
             traceback.print_exc()
             raise Exception(f"Критическая ошибка при работе с Gemini REST API: {e}")
      
-    def _remember_usage(self, response_data):
-        """Keep the latest usageMetadata; stream chunks repeat it with running totals."""
-        usage = response_data.get("usageMetadata") if isinstance(response_data, dict) else None
-        if isinstance(usage, dict):
-            self._last_usage = usage
-
-    @staticmethod
-    def _usage_count(value):
-        if isinstance(value, bool):
-            return None
-        try:
-            count = int(value)
-        except (TypeError, ValueError):
-            return None
-        return count if count >= 0 else None
-
-    def _estimate_token_usage(self, prompt, response_text):
-        """Report what Gemini billed; estimate only when the response said nothing.
+    def _remember_gemini_usage(self, response_data):
+        """Take usageMetadata; stream chunks repeat it with running totals.
 
         Thinking tokens are billed as output, so they are counted as output.
         """
-        usage = getattr(self, "_last_usage", None) or {}
+        usage = response_data.get("usageMetadata") if isinstance(response_data, dict) else None
+        if not isinstance(usage, dict):
+            return
         prompt_tokens = self._usage_count(usage.get("promptTokenCount"))
         candidate_tokens = self._usage_count(usage.get("candidatesTokenCount"))
         if prompt_tokens is None and candidate_tokens is None:
-            return super()._estimate_token_usage(prompt, response_text)
-
-        input_tokens = prompt_tokens or 0
-        output_tokens = (candidate_tokens or 0) + (
-            self._usage_count(usage.get("thoughtsTokenCount")) or 0
+            return
+        self._remember_token_usage(
+            prompt_tokens or 0,
+            (candidate_tokens or 0) + (self._usage_count(usage.get("thoughtsTokenCount")) or 0),
+            self._usage_count(usage.get("totalTokenCount")),
+            self._usage_count(usage.get("cachedContentTokenCount")),
         )
-        report = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": self._usage_count(usage.get("totalTokenCount"))
-            or input_tokens + output_tokens,
-            "estimated": False,
-            "model_id": getattr(self.worker, "model_id", None),
-            "provider": (getattr(self.worker, "model_config", {}) or {}).get("provider"),
-        }
-        cached_tokens = self._usage_count(usage.get("cachedContentTokenCount"))
-        if cached_tokens is not None:
-            report["cached_tokens"] = cached_tokens
-        return report
 
     async def _handle_error_response(self, response):
         # 1. Получаем тело ошибки максимально надежно
