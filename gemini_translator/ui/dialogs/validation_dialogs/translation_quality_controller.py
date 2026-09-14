@@ -40,6 +40,7 @@ SUGGESTION_MESSAGES = {
     "stale": "Правку применить нельзя: {detail}. Файл главы не тронут.",
     "failed": "Правка не применена: {detail}.",
     "missing": "Правка уже решена или не найдена.",
+    "busy": "Глава «{chapter}» сейчас проверяется — примените правку после неё.",
 }
 
 
@@ -61,6 +62,10 @@ class TranslationQualityController(QObject):
     # The answer of «Проверить подключение», shown next to the embedding settings
     # as well as in the window's status line.
     embedding_checked = pyqtSignal(str)
+    # The chapters a check holds right now, and the fixes whose answer has not
+    # come back: their buttons are locked, everything else stays open.
+    checking_changed = pyqtSignal(object)
+    deciding_changed = pyqtSignal(object)
 
     def __init__(
         self,
@@ -86,6 +91,9 @@ class TranslationQualityController(QObject):
         # window stays busy until it has, so no second pass starts over it.
         self._stopping = False
         self._last_progress = (0, 0)
+        self._deciding: set[str] = set()
+        self._deciding_lock = threading.Lock()
+        self._listened_coordinator = None
 
     # -- wiring ------------------------------------------------------------
 
@@ -112,6 +120,13 @@ class TranslationQualityController(QObject):
             dialog.apply_suggestion_requested.connect(self.apply_suggestion)
         if hasattr(dialog, "dismiss_suggestion_requested"):
             dialog.dismiss_suggestion_requested.connect(self.dismiss_suggestion)
+        if hasattr(dialog, "set_checking_chapters"):
+            self.checking_changed.connect(dialog.set_checking_chapters)
+        if hasattr(dialog, "set_deciding_suggestions"):
+            self.deciding_changed.connect(dialog.set_deciding_suggestions)
+        # A window opened in the middle of a pass locks the chapter being
+        # checked at once, not after the next chapter finishes.
+        self._coordinator(quiet=True)
         self.refresh_report()
 
     # -- actions -----------------------------------------------------------
@@ -265,25 +280,29 @@ class TranslationQualityController(QObject):
         )
 
     def apply_suggestion(self, suggestion_id: str) -> None:
-        """Write one accepted suggestion into its chapter, off the interface thread."""
+        """Write one accepted suggestion into its chapter, off the interface thread.
+
+        It does not take the window: a running pass goes on, and only this
+        suggestion's card is locked until the answer comes back.
+        """
         coordinator = self._coordinator()
         if coordinator is None:
             return
-        self._set_busy(True)
+        self._decision_started(suggestion_id)
         coordinator.run_background(
             lambda: coordinator.apply_suggestion(suggestion_id),
-            lambda result, error: self._finish_suggestion(result, error),
+            lambda result, error: self._finish_suggestion(result, error, suggestion_id),
         )
 
     def dismiss_suggestion(self, suggestion_id: str) -> None:
-        """Take one suggestion off the list."""
+        """Take one suggestion off the list; like applying, it leaves a pass alone."""
         coordinator = self._coordinator()
         if coordinator is None:
             return
-        self._set_busy(True)
+        self._decision_started(suggestion_id)
         coordinator.run_background(
             lambda: coordinator.dismiss_suggestion(suggestion_id),
-            lambda result, error: self._finish_suggestion(result, error),
+            lambda result, error: self._finish_suggestion(result, error, suggestion_id),
         )
 
     def export_report(self, directory: str) -> None:
@@ -362,6 +381,11 @@ class TranslationQualityController(QObject):
             self.status_changed.emit(
                 "Проверка недоступна: не настроена модель проверки или ключ к ней."
             )
+        if coordinator is not None and coordinator is not self._listened_coordinator:
+            subscribe = getattr(coordinator, "set_checking_listener", None)
+            if callable(subscribe):
+                subscribe(self.checking_changed.emit)
+                self._listened_coordinator = coordinator
         return coordinator
 
     def _events_for(self, chapter_ids):
@@ -509,7 +533,7 @@ class TranslationQualityController(QObject):
         self._set_busy(False)
         self.refresh_report()
 
-    def _finish_suggestion(self, result, error) -> None:
+    def _finish_suggestion(self, result, error, suggestion_id: str = "") -> None:
         if error is not None:
             self.status_changed.emit(f"Не удалось обработать правку: {error}")
         else:
@@ -521,8 +545,21 @@ class TranslationQualityController(QObject):
                     detail=getattr(result, "detail", ""),
                 )
             )
-        self._set_busy(False)
+        self._decision_finished(suggestion_id)
         self.refresh_report()
+
+    def _decision_started(self, suggestion_id: str) -> None:
+        with self._deciding_lock:
+            self._deciding.add(suggestion_id)
+            deciding = frozenset(self._deciding)
+        self.deciding_changed.emit(deciding)
+
+    def _decision_finished(self, suggestion_id: str) -> None:
+        # Called from the QA thread; the signal carries the set to the window.
+        with self._deciding_lock:
+            self._deciding.discard(suggestion_id)
+            deciding = frozenset(self._deciding)
+        self.deciding_changed.emit(deciding)
 
     def _set_busy(self, busy: bool) -> None:
         if self._busy == bool(busy):

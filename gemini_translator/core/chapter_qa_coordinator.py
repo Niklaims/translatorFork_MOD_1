@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import threading
 import time
@@ -20,6 +21,7 @@ from ..qa.service import (
     DEFERRED_WARNINGS,
     ChapterQaResult,
     QaOptions,
+    SuggestionOutcome,
     TranslationQualityService,
     chapter_fingerprint,
     describe_deferral,
@@ -167,6 +169,11 @@ class ChapterQaCoordinator:
         self._thread: threading.Thread | None = None
         self._pending: set[asyncio.Future] = set()
         self._pending_lock = threading.Lock()
+        # Chapters a check is reading or writing right now, with how many checks
+        # hold each: a fix the user applies must not land in one of them.
+        self._checking: dict[str, int] = {}
+        self._checking_lock = threading.Lock()
+        self._checking_listener: Callable[[frozenset[str]], None] | None = None
 
     # -- runtime -----------------------------------------------------------
 
@@ -234,6 +241,20 @@ class ChapterQaCoordinator:
                 on_done(None, error)
 
         future.add_done_callback(finished)
+
+    def checking_chapters(self) -> frozenset[str]:
+        """The chapters a check holds at this moment."""
+        with self._checking_lock:
+            return frozenset(self._checking)
+
+    def set_checking_listener(self, listener) -> None:
+        """Hear every change of the chapters being checked, from the QA thread.
+
+        The listener hears the current set at once: a window opened in the
+        middle of a pass must not wait for the next chapter to learn it.
+        """
+        self._checking_listener = listener if callable(listener) else None
+        safe_call(self._checking_listener, self.checking_chapters())
 
     def reset_cancellation(self) -> None:
         """Allow a new manual pass after the previous one was cancelled."""
@@ -431,22 +452,25 @@ class ChapterQaCoordinator:
             async with limit:
                 if self._cancellation.is_cancelled:
                     return
-                request = self._build_request(event)
-                # A pool can already be terminal when the user starts a new
-                # pass in the same application session.  Always let the first
-                # buildable chapter reach the service so the report explains
-                # that state; silently skipping the entire book looks like a
-                # frozen UI.  An unreadable chapter is not an API attempt, so
-                # it must not prevent the next valid chapter from explaining
-                # why the provider is unavailable.
-                if request is not None:
-                    if attempted and self._should_stop():
-                        stopped.add(index)
-                        return
-                    attempted = True
-                    result = await self._check_one(
-                        event, resolved, request=request
-                    )
+                # Held from the moment the file is read: a fix written after
+                # that would be checked against text the check never saw.
+                with self._checking_chapter(event.chapter_id):
+                    request = self._build_request(event)
+                    # A pool can already be terminal when the user starts a new
+                    # pass in the same application session.  Always let the first
+                    # buildable chapter reach the service so the report explains
+                    # that state; silently skipping the entire book looks like a
+                    # frozen UI.  An unreadable chapter is not an API attempt, so
+                    # it must not prevent the next valid chapter from explaining
+                    # why the provider is unavailable.
+                    if request is not None:
+                        if attempted and self._should_stop():
+                            stopped.add(index)
+                            return
+                        attempted = True
+                        result = await self._check_one(
+                            event, resolved, request=request
+                        )
                 if result is not None:
                     outcomes[index] = result
             # Counted whether the chapter produced a result or not: the reader
@@ -495,6 +519,12 @@ class ChapterQaCoordinator:
         """Write one suggestion the user accepted into its chapter's translation."""
         suggestion = self._service.suggestion(suggestion_id)
         chapter_id = str(getattr(suggestion, "chapter_id", "") or "")
+        if chapter_id and chapter_id in self.checking_chapters():
+            # The check would write its own result over this fix, or judge a
+            # file that changed under it.  The fix waits; nothing is touched.
+            return SuggestionOutcome(
+                "busy", suggestion_id, chapter_id, "глава сейчас проверяется"
+            )
         translated_path = (
             next(
                 (
@@ -520,24 +550,45 @@ class ChapterQaCoordinator:
         *,
         request=_REQUEST_NOT_BUILT,
     ) -> ChapterQaResult | None:
-        if request is _REQUEST_NOT_BUILT:
-            request = self._build_request(event)
-        if request is None:
-            return None
+        with self._checking_chapter(event.chapter_id):
+            if request is _REQUEST_NOT_BUILT:
+                request = self._build_request(event)
+            if request is None:
+                return None
+            try:
+                async with self._one_check_at_a_time():
+                    result = await self._service.check_chapter(
+                        request, options, self._cancellation
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - QA never breaks translation
+                self._report(f"[QA] Проверка главы '{event.chapter_id}' не удалась: {error}")
+                return None
+            result = await self._estimate_quality(event, result)
+            self._note_limited_mode(result)
+            self._report_chapter(event, result)
+            return result
+
+    @contextmanager
+    def _checking_chapter(self, chapter_id: str):
+        self._mark_checking(chapter_id, 1)
         try:
-            async with self._one_check_at_a_time():
-                result = await self._service.check_chapter(
-                    request, options, self._cancellation
-                )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:  # noqa: BLE001 - QA never breaks translation
-            self._report(f"[QA] Проверка главы '{event.chapter_id}' не удалась: {error}")
-            return None
-        result = await self._estimate_quality(event, result)
-        self._note_limited_mode(result)
-        self._report_chapter(event, result)
-        return result
+            yield
+        finally:
+            self._mark_checking(chapter_id, -1)
+
+    def _mark_checking(self, chapter_id: str, step: int) -> None:
+        with self._checking_lock:
+            before = frozenset(self._checking)
+            held = self._checking.get(chapter_id, 0) + step
+            if held > 0:
+                self._checking[chapter_id] = held
+            else:
+                self._checking.pop(chapter_id, None)
+            current = frozenset(self._checking)
+        if current != before:
+            safe_call(self._checking_listener, current)
 
     def _build_request(self, event: TranslationReadyEvent):
         """Build one request and report project-state failures consistently."""

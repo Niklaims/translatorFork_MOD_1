@@ -176,6 +176,22 @@ def test_a_busy_window_locks_a_card(qt_app):
     assert card.dismiss_button.isEnabled()
 
 
+def test_a_card_of_a_chapter_being_checked_can_only_be_dismissed(qt_app):
+    """Проверяемую главу нельзя править, но отклонить правку можно: файл не трогается."""
+    card = SuggestionCard(_suggestion())
+
+    card.set_locks(checking=True)
+
+    assert not card.apply_button.isEnabled()
+    assert card.dismiss_button.isEnabled()
+    assert card.note_label.text() == "Глава сейчас проверяется."
+
+    card.set_locks()
+
+    assert card.apply_button.isEnabled()
+    assert card.note_label.text() == ""
+
+
 def _view(*suggestions) -> QualitySuggestionsView:
     view = QualitySuggestionsView()
     view.set_suggestions(suggestions)
@@ -239,14 +255,24 @@ def test_a_long_list_is_shown_fifty_cards_at_a_time(qt_app):
     assert view.more_button.isHidden()
 
 
-def test_the_tab_asks_for_decisions_by_id_and_locks_while_busy(qt_app):
-    suggestion = _suggestion()
-    view = _view(suggestion)
+def test_the_tab_asks_for_decisions_by_id_and_locks_only_what_is_in_use(qt_app):
+    first = _suggestion("chapter-1", "a а", "b б")
+    second = _suggestion("chapter-2", "c в", "d г")
+    view = _view(first, second)
     applied: list[str] = []
     view.apply_requested.connect(applied.append)
 
     view.cards[0].apply_button.click()
-    view.set_busy(True)
 
-    assert applied == [suggestion.suggestion_id]
-    assert not view.cards[0].apply_button.isEnabled()
+    assert applied == [first.suggestion_id]
+
+    view.set_checking_chapters(frozenset({"chapter-2"}))
+    view.set_deciding_suggestions(frozenset({first.suggestion_id}))
+
+    assert not view.cards[0].dismiss_button.isEnabled()
+    assert not view.cards[1].apply_button.isEnabled()
+    assert view.cards[1].dismiss_button.isEnabled()
+
+    view.set_suggestions((first, second, _suggestion("chapter-2", "e д", "f е")))
+
+    assert not view.cards[2].apply_button.isEnabled()

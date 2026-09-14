@@ -314,19 +314,24 @@ def test_both_tabs_ask_the_window_to_apply_or_dismiss(qt_app):
     assert set(applied + dismissed) <= {item.suggestion_id for item in suggestions}
 
 
-def test_a_running_pass_locks_every_suggestion_button(qt_app):
+def test_a_running_pass_locks_only_the_chapter_it_is_checking(qt_app):
+    """Правки ждали конца многочасового прохода; теперь закрыта только проверяемая глава."""
     snapshot, _suggestions = _snapshot_with_suggestions()
     dialog = TranslationQualityDialog()
     dialog.set_report(snapshot)
     dialog.select_chapter("chapter-1")
+    cards = dialog.suggestions_view.cards + dialog.report_view.pending_carousel.cards
 
     dialog.set_busy(True)
+    dialog.set_checking_chapters(frozenset({"chapter-2"}))
 
-    cards = dialog.suggestions_view.cards + dialog.report_view.pending_carousel.cards
     assert cards
-    assert not any(
-        card.apply_button.isEnabled() or card.dismiss_button.isEnabled() for card in cards
-    )
+    assert all(card.apply_button.isEnabled() and card.dismiss_button.isEnabled() for card in cards)
+
+    dialog.set_checking_chapters(frozenset({"chapter-1"}))
+
+    assert not any(card.apply_button.isEnabled() for card in cards)
+    assert all(card.dismiss_button.isEnabled() for card in cards)
 
 
 @pytest.mark.parametrize(

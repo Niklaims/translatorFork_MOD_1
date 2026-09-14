@@ -621,15 +621,18 @@ def test_applying_a_suggestion_says_what_happened_and_refreshes(qt_app):
 
     coordinator = _SuggestionCoordinator(SuggestionOutcome("applied", "sg-1", "chapter-1"))
     controller = _controller(coordinator)
-    statuses, busy, reports = [], [], []
+    statuses, busy, reports, deciding = [], [], [], []
     controller.status_changed.connect(statuses.append)
     controller.busy_changed.connect(busy.append)
     controller.report_ready.connect(reports.append)
+    controller.deciding_changed.connect(deciding.append)
 
     controller.apply_suggestion("sg-1")
 
     assert coordinator.applied == ["sg-1"]
-    assert busy == [True, False]
+    # A decision locks its own card, not the whole window.
+    assert busy == []
+    assert deciding == [frozenset({"sg-1"}), frozenset()]
     assert statuses[-1] == (
         "Правка применена в главе «chapter-1». Откатить её можно кнопкой "
         "«Отменить исправления главы»."
@@ -668,19 +671,21 @@ def test_dismissing_a_suggestion_goes_through_the_coordinator(qt_app):
     assert statuses[-1] == "Правка отклонена."
 
 
-def test_a_crash_while_applying_is_reported_and_releases_the_window(qt_app):
+def test_a_crash_while_applying_is_reported_and_releases_the_card(qt_app):
     class _Crashing(_Coordinator):
         async def apply_suggestion(self, suggestion_id):
             raise RuntimeError("disk full")
 
     controller = _controller(_Crashing())
-    statuses, busy = [], []
+    statuses, busy, deciding = [], [], []
     controller.status_changed.connect(statuses.append)
     controller.busy_changed.connect(busy.append)
+    controller.deciding_changed.connect(deciding.append)
 
     controller.apply_suggestion("sg-1")
 
-    assert busy == [True, False]
+    assert busy == []
+    assert deciding[-1] == frozenset()
     assert "disk full" in statuses[-1]
 
 
@@ -699,3 +704,56 @@ def test_the_windows_suggestion_buttons_reach_the_controller(qt_app):
     assert coordinator.applied == ["sg-1"]
     assert coordinator.dismissed == ["sg-2"]
 
+
+def test_a_fix_can_be_decided_while_a_pass_runs(qt_app):
+    """Правки ждали конца многочасового прохода, хотя проход их не касался."""
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    coordinator = _SuggestionCoordinator(SuggestionOutcome("applied", "sg-1", "chapter-1"))
+    controller = _controller(coordinator)
+    busy: list[bool] = []
+    controller.busy_changed.connect(busy.append)
+    controller._set_busy(True)  # a pass is running
+
+    controller.apply_suggestion("sg-1")
+    controller.dismiss_suggestion("sg-2")
+
+    assert coordinator.applied == ["sg-1"]
+    assert coordinator.dismissed == ["sg-2"]
+    assert busy == [True]
+
+
+def test_a_chapter_being_checked_says_to_apply_after_it(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    coordinator = _SuggestionCoordinator(
+        SuggestionOutcome("busy", "sg-1", "OEBPS/chapter12.xhtml", "глава сейчас проверяется")
+    )
+    controller = _controller(coordinator)
+    statuses: list[str] = []
+    controller.status_changed.connect(statuses.append)
+
+    controller.apply_suggestion("sg-1")
+
+    assert statuses[-1] == "Глава «chapter12» сейчас проверяется — примените правку после неё."
+
+
+def test_the_window_hears_which_chapters_are_being_checked(qt_app):
+    from gemini_translator.qa.service import SuggestionOutcome
+    from gemini_translator.ui.dialogs.validation_dialogs import TranslationQualityDialog
+
+    class _Listening(_SuggestionCoordinator):
+        listener = None
+
+        def set_checking_listener(self, listener):
+            self.listener = listener
+
+    coordinator = _Listening(SuggestionOutcome("dismissed", "sg-1", "chapter-1"))
+    controller = _controller(coordinator)
+    heard: list[frozenset] = []
+    controller.checking_changed.connect(heard.append)
+
+    controller.attach(TranslationQualityDialog())
+    coordinator.listener(frozenset({"chapter-2"}))
+
+    assert heard[-1] == frozenset({"chapter-2"})

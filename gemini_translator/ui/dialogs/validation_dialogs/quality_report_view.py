@@ -287,8 +287,13 @@ class QualityReportView(QWidget):
 
     def set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
-        self.pending_carousel.set_busy(self._busy)
         self._update_actions()
+
+    def set_checking_chapters(self, chapter_ids) -> None:
+        self.pending_carousel.set_checking_chapters(chapter_ids)
+
+    def set_deciding_suggestions(self, suggestion_ids) -> None:
+        self.pending_carousel.set_deciding_suggestions(suggestion_ids)
 
     def selected_chapter_id(self) -> str:
         indexes = self.table.selectionModel().selectedRows()
@@ -470,7 +475,6 @@ class QualityReportView(QWidget):
     def _refresh_pending(self, chapter_id: str) -> None:
         suggestions = self._snapshot.suggestions_for(chapter_id) if chapter_id else ()
         self.pending_carousel.set_suggestions(suggestions)
-        self.pending_carousel.set_busy(self._busy)
         self.pending_title_label.setText(f"Ждут решения: {len(suggestions)}")
         self.pending_title_label.setVisible(bool(suggestions))
         self.pending_carousel.setVisible(bool(suggestions))

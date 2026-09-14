@@ -45,7 +45,8 @@ class QualitySuggestionsView(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._suggestions: tuple[QaSuggestion, ...] = ()
-        self._busy = False
+        self._checking: frozenset[str] = frozenset()
+        self._deciding: frozenset[str] = frozenset()
         self._shown_limit = SUGGESTION_PAGE_SIZE
         self.cards: list[SuggestionCard] = []
 
@@ -106,10 +107,21 @@ class QualitySuggestionsView(QWidget):
         self.stack.setCurrentWidget(self.content if suggestions else self.empty_state)
         self._render_cards()
 
-    def set_busy(self, busy: bool) -> None:
-        self._busy = bool(busy)
+    def set_checking_chapters(self, chapter_ids) -> None:
+        """A running pass locks «Применить» only for the chapters it holds."""
+        self._checking = frozenset(chapter_ids or ())
+        self._apply_locks()
+
+    def set_deciding_suggestions(self, suggestion_ids) -> None:
+        self._deciding = frozenset(suggestion_ids or ())
+        self._apply_locks()
+
+    def _apply_locks(self) -> None:
         for card in self.cards:
-            card.set_busy(self._busy)
+            card.set_locks(
+                checking=card.suggestion.chapter_id in self._checking,
+                deciding=card.suggestion.suggestion_id in self._deciding,
+            )
 
     def visible_suggestions(self) -> tuple[QaSuggestion, ...]:
         chapter = self.chapter_filter.currentData() or ""
@@ -158,7 +170,6 @@ class QualitySuggestionsView(QWidget):
             card = SuggestionCard(suggestion, parent=self.cards_container)
             card.apply_requested.connect(self.apply_requested.emit)
             card.dismiss_requested.connect(self.dismiss_requested.emit)
-            card.set_busy(self._busy)
             self.cards_layout.addWidget(card)
             self.cards.append(card)
         hidden = len(visible) - len(self.cards)
@@ -166,6 +177,7 @@ class QualitySuggestionsView(QWidget):
             f"Показать ещё {min(hidden, SUGGESTION_PAGE_SIZE)} из {hidden}"
         )
         self.more_button.setVisible(hidden > 0)
+        self._apply_locks()
         self.cards_layout.addWidget(self.more_button)
         self.cards_layout.addStretch(1)
         self.counter_label.setText(pending_caption(len(self._suggestions)))

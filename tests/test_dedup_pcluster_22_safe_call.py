@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 
 from gemini_translator.utils.callbacks import safe_call
 
@@ -134,6 +135,10 @@ def test_chapter_qa_report_progress_routes_through_safe_call(monkeypatch):
     )
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
+    # check_all_now marks the chapter it holds; a bare instance needs that state.
+    coordinator._checking = {}
+    coordinator._checking_lock = threading.Lock()
+    coordinator._checking_listener = None
     coordinator._options = lambda: coordinator_module.QaOptions()
     # check_all_now builds each request itself and hands it to _check_one.
     coordinator._build_request = lambda event: event
@@ -174,6 +179,10 @@ def test_chapter_qa_report_chapter_routes_through_safe_call(monkeypatch):
     )
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
+    # check_all_now marks the chapter it holds; a bare instance needs that state.
+    coordinator._checking = {}
+    coordinator._checking_lock = threading.Lock()
+    coordinator._checking_listener = None
     coordinator._options = lambda: coordinator_module.QaOptions()
     # check_all_now builds each request itself and hands it to _check_one.
     coordinator._build_request = lambda event: event
@@ -217,6 +226,10 @@ def test_chapter_qa_report_chapter_skips_none_result_without_calling_safe_call(
     )
     coordinator._max_concurrency = 1
     coordinator._cancellation = _FakeCancellation()
+    # check_all_now marks the chapter it holds; a bare instance needs that state.
+    coordinator._checking = {}
+    coordinator._checking_lock = threading.Lock()
+    coordinator._checking_listener = None
     coordinator._options = lambda: coordinator_module.QaOptions()
     # check_all_now builds each request itself and hands it to _check_one.
     coordinator._build_request = lambda event: event

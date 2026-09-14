@@ -200,3 +200,21 @@ def test_the_carousel_is_as_tall_as_the_card_it_shows(qt_app):
     carousel.close()
 
     assert short < tall
+
+
+def test_the_carousel_locks_only_what_is_in_use(qt_app):
+    first, second = _suggestion(1), _suggestion(2)
+    carousel = _carousel(first, second)
+
+    carousel.set_checking_chapters(frozenset({"chapter-1"}))
+
+    assert not any(card.apply_button.isEnabled() for card in carousel.cards)
+    assert all(card.dismiss_button.isEnabled() for card in carousel.cards)
+
+    carousel.set_checking_chapters(frozenset())
+    carousel.set_deciding_suggestions(frozenset({second.suggestion_id}))
+    carousel.set_suggestions((first, second, _suggestion(3)))
+
+    assert carousel.cards[0].apply_button.isEnabled()
+    assert not carousel.cards[1].dismiss_button.isEnabled()
+    assert carousel.cards[2].dismiss_button.isEnabled()

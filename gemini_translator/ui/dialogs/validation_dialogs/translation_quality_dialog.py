@@ -270,10 +270,23 @@ class TranslationQualityDialog(QDialog):
         self._busy = bool(busy)
         self._stopping = False
         self.progress.setVisible(self._busy)
+        # Fixes stay open during a pass; set_checking_chapters locks the one
+        # chapter a check holds.
         self.report_view.set_busy(self._busy)
-        self.suggestions_view.set_busy(self._busy)
         self._refresh_header()
         self._update_action_state()
+
+    def set_checking_chapters(self, chapter_ids) -> None:
+        """Lock «Применить» for the chapters a check holds right now."""
+        chapter_ids = frozenset(chapter_ids or ())
+        self.report_view.set_checking_chapters(chapter_ids)
+        self.suggestions_view.set_checking_chapters(chapter_ids)
+
+    def set_deciding_suggestions(self, suggestion_ids) -> None:
+        """Lock the cards of the fixes whose answer has not come back yet."""
+        suggestion_ids = frozenset(suggestion_ids or ())
+        self.report_view.set_deciding_suggestions(suggestion_ids)
+        self.suggestions_view.set_deciding_suggestions(suggestion_ids)
 
     def set_progress(self, checked: int, total: int, chapter_id: str = "") -> None:
         """Show honest progress of a whole-book pass."""

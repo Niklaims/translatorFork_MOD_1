@@ -686,3 +686,83 @@ def test_a_suggestion_is_applied_to_its_chapters_translation():
     assert service.applied == [("sg-1", "/tmp/chapter-2"), ("sg-404", None)]
     assert service.dismissed == ["sg-1"]
 
+
+def test_a_chapter_is_marked_only_while_it_is_checked():
+    """Окно должно знать, в какую главу сейчас пишет проверка, и только в неё."""
+    seen: list[frozenset[str]] = []
+    heard: list[frozenset[str]] = []
+
+    class _Watching(_ServiceStub):
+        async def check_chapter(self, request, options, cancellation):
+            seen.append(coordinator.checking_chapters())
+            return await super().check_chapter(request, options, cancellation)
+
+    coordinator = _coordinator(_Watching())
+    coordinator.set_checking_listener(heard.append)
+
+    asyncio.run(coordinator.check_all_now((_event("chapter-1"), _event("chapter-2"))))
+    asyncio.run(coordinator.check_chapter_now(_event("chapter-3")))
+
+    assert seen == [frozenset({"chapter-1"}), frozenset({"chapter-2"}), frozenset({"chapter-3"})]
+    assert coordinator.checking_chapters() == frozenset()
+    assert heard[0] == frozenset()
+    assert frozenset({"chapter-2"}) in heard
+    assert heard[-1] == frozenset()
+
+
+def test_a_fix_for_a_chapter_being_checked_is_not_written():
+    """Проход и ручная правка не должны писать в одну главу одновременно."""
+    from gemini_translator.qa.service import SuggestionOutcome
+
+    class _Suggestion:
+        def __init__(self, chapter_id):
+            self.chapter_id = chapter_id
+
+    decided = {}
+
+    class _Service(_ServiceStub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.applied: list[str] = []
+
+        def suggestion(self, suggestion_id):
+            return _Suggestion({"sg-busy": "chapter-1", "sg-free": "chapter-2"}[suggestion_id])
+
+        async def apply_suggestion(self, suggestion_id, translated_path):
+            self.applied.append(suggestion_id)
+            return SuggestionOutcome("applied", suggestion_id, "chapter-2")
+
+        async def check_chapter(self, request, options, cancellation):
+            # While chapter-1 is checked, the user decides on two fixes.
+            decided["busy"] = await coordinator.apply_suggestion("sg-busy")
+            decided["free"] = await coordinator.apply_suggestion("sg-free")
+            return await super().check_chapter(request, options, cancellation)
+
+    service = _Service()
+    coordinator = ChapterQaCoordinator(
+        service=service,
+        task_manager=None,
+        request_builder=lambda event: event.chapter_id,
+        book_events_provider=lambda: (_event("chapter-1"), _event("chapter-2")),
+    )
+
+    asyncio.run(coordinator.check_all_now((_event("chapter-1"),)))
+
+    assert (decided["busy"].status, decided["busy"].detail) == ("busy", "глава сейчас проверяется")
+    assert decided["free"].status == "applied"
+    assert service.applied == ["sg-free"]
+
+
+def test_a_chapter_is_marked_before_its_file_is_read():
+    """Правка, записанная между чтением файла и проверкой, проверялась бы вслепую."""
+    seen: list[frozenset[str]] = []
+
+    def build(event):
+        seen.append(coordinator.checking_chapters())
+        return event.chapter_id
+
+    coordinator = _coordinator(_ServiceStub(), builder=build)
+
+    asyncio.run(coordinator.check_all_now((_event("chapter-1"),)))
+
+    assert seen == [frozenset({"chapter-1"})]

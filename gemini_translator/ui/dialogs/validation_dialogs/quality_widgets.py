@@ -213,6 +213,7 @@ DELETION_CATEGORIES = ("meta_comment", "hallucinated_addition")
 DELETION_TEXT = "удалить фрагмент"
 NO_REPLACEMENT_TEXT = "замена не предложена"
 MANUAL_FIX_NOTE = "Такую правку вносят вручную."
+CHECKING_NOTE = "Глава сейчас проверяется."
 
 
 class SuggestionCard(QFrame):
@@ -295,12 +296,27 @@ class SuggestionCard(QFrame):
             if not suggestion.applicable:
                 self.note_label.setText(MANUAL_FIX_NOTE)
         layout.addLayout(actions)
+        self._base_note = self.note_label.text()
         self.set_busy(False)
 
     def set_busy(self, busy: bool) -> None:
-        self.dismiss_button.setEnabled(not busy)
+        self.set_locks(deciding=busy)
+
+    def set_locks(self, *, checking: bool = False, deciding: bool = False) -> None:
+        """Lock what is in use: a check holds the chapter, a decision holds this card.
+
+        Dismissing never touches the chapter file, so only a decision on this
+        very card locks it; a check of the chapter locks «Применить» alone.
+        """
+        self.dismiss_button.setEnabled(not deciding)
+        note = self._base_note
         if self.apply_button is not None:
-            self.apply_button.setEnabled(not busy and self.suggestion.applicable)
+            self.apply_button.setEnabled(
+                not deciding and not checking and self.suggestion.applicable
+            )
+            if checking and self.suggestion.applicable:
+                note = CHECKING_NOTE
+        self.note_label.setText(note)
 
     def _text_row(self, layout: QVBoxLayout, caption: str, html_text: str) -> QLabel:
         row = QHBoxLayout()
@@ -338,7 +354,8 @@ class SuggestionCarousel(QWidget):
         self.cards: list[SuggestionCard] = []
         self._suggestions: tuple[QaSuggestion, ...] = ()
         self._index = 0
-        self._busy = False
+        self._checking: frozenset[str] = frozenset()
+        self._deciding: frozenset[str] = frozenset()
         self._swipe = 0
         self._swiped = False
 
@@ -385,17 +402,27 @@ class SuggestionCarousel(QWidget):
             card = SuggestionCard(suggestion, show_chapter=False, parent=self.cards_box)
             card.apply_requested.connect(self.apply_requested.emit)
             card.dismiss_requested.connect(self.dismiss_requested.emit)
-            card.set_busy(self._busy)
             self._cards_layout.addWidget(card)
             self.cards.append(card)
         self._suggestions = suggestions
+        self._apply_locks()
         ids = [item.suggestion_id for item in suggestions]
         self._show(ids.index(shown) if shown in ids else self._index)
 
-    def set_busy(self, busy: bool) -> None:
-        self._busy = bool(busy)
+    def set_checking_chapters(self, chapter_ids) -> None:
+        self._checking = frozenset(chapter_ids or ())
+        self._apply_locks()
+
+    def set_deciding_suggestions(self, suggestion_ids) -> None:
+        self._deciding = frozenset(suggestion_ids or ())
+        self._apply_locks()
+
+    def _apply_locks(self) -> None:
         for card in self.cards:
-            card.set_busy(self._busy)
+            card.set_locks(
+                checking=card.suggestion.chapter_id in self._checking,
+                deciding=card.suggestion.suggestion_id in self._deciding,
+            )
 
     def current_card(self) -> SuggestionCard | None:
         return self.cards[self._index] if self.cards else None
