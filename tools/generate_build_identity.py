@@ -18,6 +18,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--commit", required=True)
+    parser.add_argument("--repository", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--version-file", default="gemini_translator/version.py")
     args = parser.parse_args(argv)
@@ -27,8 +28,10 @@ def main(argv=None) -> int:
         gate.require_final_version(version)
         gate.require_tag_matches(args.tag, version)
         gate.require_commit(args.commit)
-        payload = {"schema": 1, "version": version, "tag": args.tag,
-                   "commit": args.commit.lower()}
+        gate.require_repository(args.repository)
+        payload = {"schema": 2, "version": version, "tag": args.tag,
+                   "commit": args.commit.lower(),
+                   "repository": args.repository}
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         print(f"build identity written: {args.output} ({args.tag})")

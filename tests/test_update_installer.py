@@ -546,7 +546,8 @@ def _archive_env(tmp_path, app_script, zip_extra=None, old_identity=None):
     (root / "obsolete.txt").write_text("old managed")
     (root / "changed.py").write_text("old code")
     identity = old_identity if old_identity is not None else {
-        "schema": 1, "commit": _OLD,
+        "schema": 2, "commit": _OLD,
+        "repository": "example/project",
         "files": ["obsolete.txt", "changed.py", "fake_app.py"]}
     (root / ".translator-update.json").write_text(json.dumps(identity))
     (root / "fake_app.py").write_text("print('old app')")
@@ -573,6 +574,7 @@ def _archive_env(tmp_path, app_script, zip_extra=None, old_identity=None):
         app_pid=99_999_999, zip_path=str(staged), root=str(root),
         journal_dir=str(journal), ack_path=str(ack), log_path=str(log),
         commit_sha=_NEW,
+        repository="example/project",
         python_argv=[sys.executable, str(root / "fake_app.py")],
         pip_argv=[sys.executable, "-c", "import sys; sys.exit(0)"])
     helper = tmp_path / "helper.py"
@@ -584,6 +586,7 @@ def test_archive_helper_script_content():
     script = inst.render_archive_helper(
         app_pid=1, zip_path="/z.zip", root="/root", journal_dir="/j",
         ack_path="/ack", log_path="/log", commit_sha=_NEW,
+        repository="example/project",
         python_argv=["python", "main.py"], pip_argv=["pip", "install"])
     assert "HEALTH-TIMEOUT" in script
     assert ".." in script and "restore" in script.lower()
@@ -604,6 +607,7 @@ def test_archive_helper_applies_and_writes_identity(tmp_path):
     assert (root / "keep_me.txt").exists()           # пользовательский файл не тронут
     identity = json.loads((root / ".translator-update.json").read_text())
     assert identity["commit"] == _NEW
+    assert identity["repository"] == "example/project"
     assert "added.py" in identity["files"] and "obsolete.txt" not in identity["files"]
     assert not journal.exists()                      # журнал убран после подтверждения
     assert not staged.exists()
@@ -632,6 +636,7 @@ def test_archive_helper_refuses_traversal(tmp_path):
         app_pid=99_999_999, zip_path=str(staged), root=str(root),
         journal_dir=str(tmp_path / "j"), ack_path=str(tmp_path / "a"),
         log_path=str(tmp_path / "l"), commit_sha=_NEW,
+        repository="example/project",
         python_argv=[sys.executable, "-c", "pass"],
         pip_argv=[sys.executable, "-c", "pass"])
     helper = tmp_path / "helper.py"
@@ -651,7 +656,13 @@ def test_prepare_source_archive_launches_helper(tmp_path, monkeypatch):
     root.mkdir()
     ctx = inst.InstallContext(app_pid=1, real_executable=sys.executable,
                               version_label=_NEW[:12])
-    inst.prepare_source_archive(tmp_path / "u.zip", root, ctx, commit_sha=_NEW)
+    inst.prepare_source_archive(
+        tmp_path / "u.zip",
+        root,
+        ctx,
+        commit_sha=_NEW,
+        repository="example/project",
+    )
     assert captured["argv"][0] == sys.executable
     content = Path(captured["argv"][1]).read_text(encoding="utf-8")
     assert "HEALTH-TIMEOUT" in content

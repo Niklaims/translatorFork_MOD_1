@@ -189,6 +189,7 @@ class ComplexOverlapResolverPage(WizardStepMixin, ShellPage):
     2. Пошаговый режим "Визард" (проход по нерешенным проблемам).
     """
     page_title = "Наложения"
+    preferred_window_size = (1200, 800)
     result_ready = pyqtSignal(bool)
 
     def __init__(self, overlap_groups, inverted_groups, original_glossary, pymorphy_available, parent=None):
@@ -205,7 +206,7 @@ class ComplexOverlapResolverPage(WizardStepMixin, ShellPage):
         self.show_translations_mode = True  # <--- НОВЫЙ ФЛАГ: По умолчанию показываем переводы
         
         self.setWindowTitle("Шаг 3: Комплексное разрешение наложений")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(900, 520)
         self.init_ui()
 
     def init_ui(self):
@@ -690,6 +691,7 @@ class ReverseConflictResolverPage(WizardStepMixin, ShellPage):
     Версия 2.2 с пошаговым режимом "Визард".
     """
     page_title = "Обратные конфликты"
+    preferred_window_size = (1200, 800)
     result_ready = pyqtSignal(bool)
 
     def __init__(self, reverse_issues, original_glossary, parent=None, morph=None):
@@ -705,7 +707,7 @@ class ReverseConflictResolverPage(WizardStepMixin, ShellPage):
         self.checked_items = set() # Для отметки проверенных
 
         self.setWindowTitle("Шаг 2: Обратные конфликты и связывание")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(900, 520)
         self.init_ui()
 
     @staticmethod

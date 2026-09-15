@@ -82,6 +82,7 @@ jobs:
           python tools/generate_build_identity.py \
             --tag "${GITHUB_REF_NAME}" \
             --commit "$(git rev-parse HEAD)" \
+            --repository "${GITHUB_REPOSITORY}" \
             --output update-build.json
 
       - name: Run PyInstaller
@@ -92,7 +93,7 @@ jobs:
         shell: pwsh
         run: |
           $version = $env:GITHUB_REF_NAME -replace '^v', ''
-          iscc "/DMyAppVersion=$version" windows_installer.iss
+          iscc "/DMyAppVersion=$version" "/DMyRepository=$env:GITHUB_REPOSITORY" windows_installer.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Package macOS

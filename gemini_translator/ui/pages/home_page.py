@@ -363,7 +363,7 @@ class HomePage(ShellPage):
             return
         if info.manual:
             import webbrowser
-            webbrowser.open(info.manual_url or upd.RELEASES_PAGE)
+            webbrowser.open(info.manual_url)
             return
         if info.kind == "release":
             self._start_release_download(info)
@@ -503,7 +503,8 @@ class HomePage(ShellPage):
 
         def job():
             inst.prepare_source_archive(staged_path, upd.project_root(), ctx,
-                                        commit_sha=info.commit)
+                                        commit_sha=info.commit,
+                                        repository=info.repository)
             return None
 
         self._run_prepare_worker(job)

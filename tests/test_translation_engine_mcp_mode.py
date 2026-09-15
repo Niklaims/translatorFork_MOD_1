@@ -61,6 +61,14 @@ class _TaskManager:
         return False
 
 
+class _WrongGlossaryQueueTaskManager(_TaskManager):
+    def has_pending_tasks(self):
+        return True
+
+    def get_first_pending_task_payload(self):
+        return ("epub", "/tmp/book.epub", "Text/one.xhtml")
+
+
 class TranslationEngineMcpModeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -137,6 +145,33 @@ class TranslationEngineMcpModeTests(unittest.TestCase):
         self.assertIn("MCP AI-клиент", reason)
         self.assertIn("Сброс примерно 2026-07-02 18:30:00 +05", reason)
         self.assertNotIn("Все API ключи исчерпаны", reason)
+
+    def test_explicit_glossary_session_rejects_replaced_translation_queue(self):
+        bus = _RecordingBus()
+        engine = TranslationEngine(
+            context_manager=_ContextManager(),
+            settings_manager=_SettingsManager(),
+            task_manager=_WrongGlossaryQueueTaskManager(),
+            event_bus=bus,
+        )
+        self.addCleanup(engine.cleanup)
+
+        engine.apply_and_start_session(
+            {
+                "session_kind": "glossary_generation",
+                "provider": "gemini",
+                "api_keys": ["test-key"],
+                "num_instances": 1,
+                "model_config": {"id": "test-model", "provider": "gemini"},
+            }
+        )
+
+        finished = [event for event in bus.events if event.get("event") == "session_finished"]
+        self.assertEqual(len(finished), 1)
+        reason = finished[0].get("data", {}).get("reason", "")
+        self.assertIn("очеред", reason.lower())
+        self.assertIn("глоссар", reason.lower())
+        self.assertNotIn("папка для вывода", reason.lower())
 
     def test_worker_initialization_failure_ends_only_the_session(self):
         bus = _RecordingBus()

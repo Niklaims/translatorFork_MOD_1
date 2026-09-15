@@ -6,6 +6,10 @@ import sys
 _VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.MULTILINE)
 _FINAL_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _HEX40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_REPOSITORY_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
+)
 
 
 class GateError(Exception):
@@ -41,6 +45,11 @@ def require_tag_matches(tag: str, version: str) -> None:
 def require_commit(commit: str) -> None:
     if not _HEX40_RE.match(commit or ""):
         fail(f"commit {commit!r} is not a 40-hex SHA")
+
+
+def require_repository(repository: str) -> None:
+    if not _REPOSITORY_RE.match(repository or ""):
+        fail(f"repository {repository!r} is not a GitHub owner/repo name")
 
 
 def run_gate(fn) -> int:

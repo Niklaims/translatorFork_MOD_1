@@ -750,6 +750,14 @@ class TranslationEngine(EventBusMixin, QObject):
         # --- ИЗМЕНЕНИЕ: Логика получения первой задачи адаптирована под SQLite ---
         first_task_payload = self.task_manager.get_first_pending_task_payload()
         first_task_type = first_task_payload[0] if first_task_payload else None
+        session_kind = str(settings.get('session_kind') or '').strip()
+        explicit_glossary_session = session_kind == 'glossary_generation'
+        if explicit_glossary_session and first_task_type != 'glossary_batch_task':
+            self._end_session(
+                "Критическая ошибка: очередь генерации глоссария была заменена "
+                "задачами другого типа. Пересоберите задачи глоссария и повторите запуск."
+            )
+            return
         self._qa_epub_path = (
             str(first_task_payload[1])
             if first_task_payload and len(first_task_payload) > 1
@@ -761,12 +769,12 @@ class TranslationEngine(EventBusMixin, QObject):
 
 
         self.project_manager = None
+        output_folder = settings.get('output_folder')
         
-        if first_task_type == 'glossary_batch_task':
+        if explicit_glossary_session or first_task_type == 'glossary_batch_task':
             merge_mode = settings.get('glossary_merge_mode', 'supplement')
             self._post_event('log_message', {'message': f"[MANAGER] Активирован режим генерации. Слияние: {merge_mode}."})
         else:
-            output_folder = settings.get('output_folder')
             if not output_folder and first_task_type != 'raw_text_translation':
                 self._end_session("Критическая ошибка: не указана папка для вывода.")
                 return
@@ -790,6 +798,7 @@ class TranslationEngine(EventBusMixin, QObject):
         self._activate_power_inhibitor_for_session()
         self._post_event('session_started', {
             'session_id': self.session_id,
+            'session_kind': session_kind,
             'model_id': model_id,
             'total_tasks': total_tasks_for_session,
             'background_session': bool(settings.get('background_session')),
@@ -1076,6 +1085,7 @@ class TranslationEngine(EventBusMixin, QObject):
         self._post_event('session_finished', {
             'reason': reason,
             "session_id_log": self.session_id,
+            'session_kind': self.session_settings.get('session_kind'),
             'background_session': bool(self.session_settings.get('background_session')),
             'background_role': self.session_settings.get('background_role'),
             'background_run_id': self.session_settings.get('background_run_id'),

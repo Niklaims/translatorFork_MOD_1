@@ -70,6 +70,29 @@ from ...widgets.overlay_tab_widget import install_tab_fade
 DEFAULT_NEW_TERMS_LIMIT = 100
 MAX_NEW_TERMS_LIMIT = 1000
 NEW_TERMS_LIMIT_TOKENS_PER_TERM = 200
+GLOSSARY_SESSION_KIND = "glossary_generation"
+
+
+def _queue_contains_only_glossary_tasks(task_manager) -> bool:
+    """Return whether the shared queue is ready for a glossary session."""
+    if task_manager is None:
+        return False
+
+    tasks = task_manager.get_all_pending_tasks()
+    if not tasks:
+        return False
+
+    for task in tasks:
+        if not isinstance(task, (tuple, list)) or len(task) < 2:
+            return False
+        payload = task[1]
+        if (
+            not isinstance(payload, (tuple, list))
+            or not payload
+            or payload[0] != 'glossary_batch_task'
+        ):
+            return False
+    return True
 
 
 def _prepare_glossary_tasks_background(epub_path, html_files, settings, task_manager):
@@ -397,6 +420,9 @@ class GenerationSessionPage(ShellPage):
         self._pending_glossary_rebuild_request = None
         self._is_glossary_rebuilding = False
         self._glossary_rebuild_failed = False
+        self._glossary_queue_ready = False
+        self._pending_session_start_request = None
+        self._active_generation_session_id = None
         
         app = QtWidgets.QApplication.instance()
         self.bus = event_bus
@@ -1979,6 +2005,7 @@ class GenerationSessionPage(ShellPage):
         QThread: на больших книгах окно продолжает отвечать во время подготовки.
         """
         self._update_new_terms_limit_from_current_size()
+        self._glossary_queue_ready = False
         if not self.task_manager:
             return
 
@@ -2080,6 +2107,8 @@ class GenerationSessionPage(ShellPage):
         self._glossary_rebuild_failed = not succeeded
         self._set_glossary_rebuild_busy(False)
         if not succeeded:
+            self._glossary_queue_ready = False
+            self._pending_session_start_request = None
             error = result.get('error') if isinstance(result, dict) else None
             error_text = error or 'неизвестная ошибка'
             self.task_preparation_finished.emit(False, error_text)
@@ -2092,12 +2121,34 @@ class GenerationSessionPage(ShellPage):
                 )
             return
 
+        self._glossary_queue_ready = bool(result.get('task_count', 0))
         self.model_settings_widget.update_cjk_options_availability(
             enabled=True,
             is_cjk_recommended=bool(result.get('is_any_cjk')),
         )
         self.task_preparation_finished.emit(True, '')
+        pipeline_was_waiting = bool(
+            getattr(self, '_pipeline_waiting_for_task_preparation', False)
+        )
         self._handle_pipeline_task_preparation_finished(True, '')
+        pending_start = getattr(self, '_pending_session_start_request', None)
+        self._pending_session_start_request = None
+        if (
+            pending_start is not None
+            and not pipeline_was_waiting
+            and self._glossary_queue_ready
+        ):
+            settings, sequential_mode = pending_start
+            self._start_session(
+                settings_override=copy.deepcopy(settings),
+                sequential_mode_override=sequential_mode,
+            )
+        elif pending_start is not None and not pipeline_was_waiting and self.isVisible():
+            QMessageBox.warning(
+                self,
+                "Нет задач",
+                "После пересборки не найдено задач для генерации глоссария.",
+            )
 
     def _handle_pipeline_task_preparation_finished(self, succeeded, error_text):
         if not getattr(self, '_pipeline_waiting_for_task_preparation', False):
@@ -2407,10 +2458,27 @@ class GenerationSessionPage(ShellPage):
         if event_name == 'log_message':
             self._handle_pipeline_log_event(data)
             return
+        event_session_id = event.get('session_id') or data.get('session_id_log')
+        event_session_kind = data.get('session_kind')
+
         if event_name == 'session_started':
+            if event_session_kind not in (None, GLOSSARY_SESSION_KIND):
+                return
+            if not self.is_session_active:
+                return
+            self._active_generation_session_id = event_session_id
             self._session_finished_successfully = False
             self._set_ui_active(True)
         elif event_name == 'session_finished':
+            if event_session_kind not in (None, GLOSSARY_SESSION_KIND):
+                return
+            active_session_id = getattr(self, '_active_generation_session_id', None)
+            if active_session_id and event_session_id != active_session_id:
+                return
+            if not active_session_id and not self.is_session_active:
+                return
+            self._active_generation_session_id = None
+            self._glossary_queue_ready = False
             self._shutdown_reason = data.get('reason')
             self._log_session_id = data.get('session_id_log')
             self._session_finished_successfully = (self._shutdown_reason == "Сессия успешно завершена")
@@ -2692,12 +2760,29 @@ class GenerationSessionPage(ShellPage):
             QMessageBox.warning(self, "Движок занят", "Другая операция уже выполняется. Пожалуйста, дождитесь ее завершения.")
             return
 
-        if not self.task_manager.has_pending_tasks():
-            QMessageBox.warning(self, "Нет задач", "Список задач для генерации пуст. Пожалуйста, соберите задачи.")
-            return
-            
         if not self.epub_path or not os.path.exists(self.epub_path):
             QMessageBox.critical(self, "Критическая ошибка: Файл не найден", f"Не удалось найти исходный EPUB файл: {self.epub_path}")
+            return
+
+        settings = (
+            self._get_common_settings()
+            if settings_override is None
+            else copy.deepcopy(settings_override)
+        )
+        settings['session_kind'] = GLOSSARY_SESSION_KIND
+        is_sequential = (
+            self.sequential_mode_checkbox.isChecked()
+            if sequential_mode_override is None
+            else bool(sequential_mode_override)
+        )
+
+        queue_is_valid = _queue_contains_only_glossary_tasks(self.task_manager)
+        if not getattr(self, '_glossary_queue_ready', False) or not queue_is_valid:
+            self._pending_session_start_request = (
+                copy.deepcopy(settings),
+                is_sequential,
+            )
+            self._rebuild_glossary_tasks()
             return
         
         # Гарантируем, что последнее редактирование сохранено
@@ -2737,17 +2822,6 @@ class GenerationSessionPage(ShellPage):
         self.settings_manager.save_last_glossary_prompt_text(prompt_text)
         self.settings_manager.save_last_glossary_prompt_preset_name(self.prompt_widget.get_current_preset_name())
         self._save_persistent_ui_settings()
-        
-        settings = (
-            self._get_common_settings()
-            if settings_override is None
-            else copy.deepcopy(settings_override)
-        )
-        is_sequential = (
-            self.sequential_mode_checkbox.isChecked()
-            if sequential_mode_override is None
-            else bool(sequential_mode_override)
-        )
         
         if is_sequential:
             settings_getter = (
@@ -2881,6 +2955,7 @@ class GenerationSessionPage(ShellPage):
 
     def _get_common_settings(self):
         settings = self.model_settings_widget.get_settings()
+        settings['session_kind'] = GLOSSARY_SESSION_KIND
         provider_getter = getattr(
             self.key_widget,
             "get_raw_selected_provider",

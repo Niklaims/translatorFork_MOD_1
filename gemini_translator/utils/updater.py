@@ -12,7 +12,6 @@ from urllib.parse import quote
 import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 from gemini_translator.api import config as api_config
-from gemini_translator.api.config import GITHUB_REPO
 from gemini_translator.utils.qt_worker import _CallableThread
 from gemini_translator.version import APP_VERSION
 
@@ -68,6 +67,10 @@ BUILD_IDENTITY_FILENAME = "update-build.json"
 ARCHIVE_IDENTITY_FILENAME = ".translator-update.json"
 
 _HEX40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_REPOSITORY_RE = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/"
+    r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?$"
+)
 
 
 class UpdateChannel(enum.Enum):
@@ -92,6 +95,7 @@ class BuildIdentity:
     version: ReleaseVersion
     tag: str
     commit: str
+    repository: str
 
 
 def project_root() -> Path:
@@ -109,18 +113,21 @@ def read_build_identity():
         path = Path(api_config.get_resource_path(BUILD_IDENTITY_FILENAME))
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or data.get("schema") != 1:
+        if not isinstance(data, dict) or data.get("schema") != 2:
             return None
         version = parse_version_tag(str(data["version"]))
         tag = str(data["tag"])
         commit = str(data["commit"])
+        repository = str(data["repository"])
         if not version.is_final:
             return None
         if tag != f"v{data['version']}":
             return None
         if not _HEX40_RE.match(commit):
             return None
-        return BuildIdentity(version, tag, commit)
+        if not _REPOSITORY_RE.match(repository):
+            return None
+        return BuildIdentity(version, tag, commit, repository)
     except Exception:
         return None
 
@@ -134,9 +141,11 @@ def read_archive_identity(root):
     try:
         with open(Path(root) / ARCHIVE_IDENTITY_FILENAME, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict) or data.get("schema") != 1:
+        if not isinstance(data, dict) or data.get("schema") != 2:
             return None
         if not _HEX40_RE.match(str(data.get("commit", ""))):
+            return None
+        if not _REPOSITORY_RE.match(str(data.get("repository", ""))):
             return None
         files = data.get("files")
         if files is not None and not (
@@ -283,13 +292,20 @@ class UpdateInfo:
     asset: ReleaseAsset = None
     commit: str = ""
     zip_url: str = ""         # SHA-pinned zipball для kind == "archive"
+    repository: str = ""      # проверенный owner/repo для source-архива
 
 
 # --- Сетевая сессия апдейтера ---------------------------------------------
 
 DEFAULT_TIMEOUT = (10, 30)
-RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
-_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
+
+
+def releases_page(repository: str) -> str:
+    return f"https://github.com/{repository}/releases/latest"
+
+
+def api_base(repository: str) -> str:
+    return f"https://api.github.com/repos/{repository}"
 
 
 def build_updater_session(settings_manager=None):
@@ -358,19 +374,23 @@ class UpdateChecker(QThread):
 
     # -- release-каналы (Windows/macOS) --
 
-    def _fetch_latest_release(self, session):
-        response = session.get(f"{_API_BASE}/releases/latest", timeout=DEFAULT_TIMEOUT)
+    def _fetch_latest_release(self, session, repository):
+        response = session.get(
+            f"{api_base(repository)}/releases/latest",
+            timeout=DEFAULT_TIMEOUT,
+        )
         if response.status_code != 200:
             raise UpdateError(f"HTTP {response.status_code} при запросе релиза")
         return response.json()
 
     def _check_release(self, channel, identity):
         session = self._session_factory()
-        data = self._fetch_latest_release(session)
+        repository = identity.repository
+        data = self._fetch_latest_release(session, repository)
         tag = str(data.get("tag_name", ""))
         remote_version = parse_version_tag(tag)
         gh_assets = data.get("assets") or []
-        html_url = str(data.get("html_url") or RELEASES_PAGE)
+        html_url = str(data.get("html_url") or releases_page(repository))
         body = str(data.get("body") or "Доступно новое обновление.")
         manifest_url = next(
             (a.get("browser_download_url") for a in gh_assets
@@ -404,18 +424,11 @@ class UpdateChecker(QThread):
                 description=body, asset=asset, commit=manifest.commit))
 
     def _check_development(self):
-        """DEVELOPMENT: только ручное объявление, никакой автоустановки."""
-        from gemini_translator.version import __version__
-        session = self._session_factory()
-        data = self._fetch_latest_release(session)
-        tag = str(data.get("tag_name", ""))
-        if parse_version_tag(tag) > parse_version_tag(__version__):
-            self.update_available.emit(UpdateInfo(
-                kind="release", suppress_id=tag, title_version=tag.lstrip("vV"),
-                description=str(data.get("body") or "Доступно новое обновление."),
-                manual=True, manual_url=str(data.get("html_url") or RELEASES_PAGE)))
-        else:
-            self.no_update.emit()
+        """Не выбирать репозиторий за сборку с неизвестным происхождением."""
+        raise UpdateError(
+            "Источник обновлений этой сборки не определён. "
+            "Скачайте новую версию с той страницы, откуда получили программу."
+        )
 
     # -- git-источники --
 
@@ -456,14 +469,17 @@ class UpdateChecker(QThread):
     def _check_archive(self):
         identity = read_archive_identity(project_root())
         if identity is None:
-            self.update_available.emit(UpdateInfo(
-                kind="archive", suppress_id="unknown-archive", title_version="?",
-                description=("Не удалось определить установленную ревизию исходников. "
-                             "Скачайте свежий архив вручную."),
-                manual=True, manual_url=RELEASES_PAGE))
-            return
+            raise UpdateError(
+                "Источник обновлений этого архива не определён. "
+                "Скачайте новую версию с той страницы, откуда получили программу."
+            )
+        repository = identity["repository"]
+        repository_api = api_base(repository)
         session = self._session_factory()
-        response = session.get(f"{_API_BASE}/commits/main", timeout=DEFAULT_TIMEOUT)
+        response = session.get(
+            f"{repository_api}/commits/main",
+            timeout=DEFAULT_TIMEOUT,
+        )
         if response.status_code != 200:
             raise UpdateError(f"HTTP {response.status_code} при запросе коммитов")
         data = response.json()
@@ -477,7 +493,7 @@ class UpdateChecker(QThread):
         self.update_available.emit(UpdateInfo(
             kind="archive", suppress_id=sha, title_version=sha[:10],
             description=f"Найден новый коммит:\n{message}", commit=sha,
-            zip_url=f"{_API_BASE}/zipball/{sha}"))
+            zip_url=f"{repository_api}/zipball/{sha}", repository=repository))
 
 
 # --- Загрузка с верификацией ----------------------------------------------

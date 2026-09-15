@@ -14,9 +14,11 @@ AppId={{5E1C3C0B-8D52-4C67-B9B2-3A6D3A0A7A1B}
 AppName=Gemini Translator
 AppVersion={#MyAppVersion}
 AppPublisher=SiberianTeam
-AppPublisherURL=https://github.com/Rasteo123/translatorFork_MOD
-AppSupportURL=https://github.com/Rasteo123/translatorFork_MOD/issues
-AppUpdatesURL=https://github.com/Rasteo123/translatorFork_MOD/releases
+#ifdef MyRepository
+AppPublisherURL=https://github.com/{#MyRepository}
+AppSupportURL=https://github.com/{#MyRepository}/issues
+AppUpdatesURL=https://github.com/{#MyRepository}/releases
+#endif
 
 ; Установка только для текущего пользователя (без прав админа)
 PrivilegesRequired=lowest
