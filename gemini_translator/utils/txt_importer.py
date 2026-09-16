@@ -831,7 +831,8 @@ class TxtImportWizardDialog(QDialog):
         self.toc_table.setHorizontalHeaderLabels(["Заголовок главы", "Размер (симв.)", "Индекс (симв.)", "№ Строки"])
         self.toc_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.toc_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.toc_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        # Shift/Ctrl выделяют несколько глав, чтобы удалять их одним нажатием
+        self.toc_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.toc_table.doubleClicked.connect(self.open_chapter_viewer)
         
         # ВКЛЮЧАЕМ СОРТИРОВКУ
@@ -840,8 +841,11 @@ class TxtImportWizardDialog(QDialog):
         layout.addWidget(self.toc_table)
         
         tools_layout = QHBoxLayout()
-        btn_del = QPushButton("Удалить главу")
-        btn_del.setToolTip("Удаляет метку главы. Текст объединяется с предыдущей главой.")
+        btn_del = QPushButton("Удалить выбранные")
+        btn_del.setToolTip(
+            "Удаляет метки выделенных глав. Их текст объединяется с предыдущей главой.\n"
+            "Shift+щелчок выделяет главы подряд, Ctrl+щелчок добавляет главу к выделению."
+        )
         btn_del.clicked.connect(self.delete_selected_chapter)
         
         btn_view = QPushButton("Просмотр / Разделить...")
@@ -1005,16 +1009,19 @@ class TxtImportWizardDialog(QDialog):
         self.toc_table.setSortingEnabled(True)
             
     def delete_selected_chapter(self):
-        row = self.toc_table.currentRow()
-        if row < 0: return
-        
-        # Получаем данные из скрытого хранилища (UserRole), так как индекс row 
-        # может не совпадать с индексом в списке self.structure_data из-за сортировки
-        item = self.toc_table.item(row, 0)
-        target_data = item.data(Qt.ItemDataRole.UserRole)
-        
-        if target_data in self.structure_data:
-            self.structure_data.remove(target_data)
+        # Получаем данные из скрытого хранилища (UserRole), так как номер строки таблицы
+        # может не совпадать с индексом в списке self.structure_data из-за сортировки.
+        # PyQt возвращает копию словаря, поэтому главу ищем по равенству, а не по ссылке.
+        targets = [
+            self.toc_table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+            for index in self.toc_table.selectionModel().selectedRows()
+        ]
+        removed = False
+        for target_data in targets:
+            if target_data in self.structure_data:
+                self.structure_data.remove(target_data)
+                removed = True
+        if removed:
             self._refresh_toc_table()
 
     def open_chapter_viewer(self):
