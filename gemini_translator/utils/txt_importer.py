@@ -951,7 +951,9 @@ class TxtImportWizardDialog(QDialog):
             self.structure_data.append({
                 'line_idx': 0,
                 'title': "Начало / Предисловие",
-                'char_idx': 0
+                'char_idx': 0,
+                # Предисловие узнаём по флагу: название можно переименовать в таблице
+                'is_preamble': True,
             })
         
         self.structure_data.extend(boundaries)
@@ -963,6 +965,23 @@ class TxtImportWizardDialog(QDialog):
         self.layout_stack.setCurrentWidget(self.page_regex)
 
     # --- ЛОГИКА СТРАНИЦЫ 2 (TOC) ---
+    def _update_titles_from_table(self):
+        # Название, исправленное прямо в ячейке, есть только в таблице. PyQt отдаёт
+        # из UserRole копию словаря главы, поэтому главу в self.structure_data
+        # ищем по равенству с этой копией, а не меняем саму копию.
+        items = [self.toc_table.item(row, 0) for row in range(self.toc_table.rowCount())]
+        for item in items:
+            snapshot = item.data(Qt.ItemDataRole.UserRole)
+            if not snapshot or item.text() == snapshot['title']:
+                continue
+            for chapter in self.structure_data:
+                if chapter == snapshot:
+                    chapter['title'] = item.text()
+                    # Иначе строку уже не найти по равенству, если таблица не пересобирается
+                    # (generate_epub, после которого пользователь остался в мастере)
+                    item.setData(Qt.ItemDataRole.UserRole, chapter)
+                    break
+
     def _refresh_toc_table(self):
         # Локальный импорт (см. комментарий у верхних импортов модуля):
         # utils не должен тянуть весь пакет gemini_translator.ui.widgets на
@@ -971,6 +990,8 @@ class TxtImportWizardDialog(QDialog):
 
         # Отключаем сортировку во время обновления, иначе строки будут прыгать при вставке
         self.toc_table.setSortingEnabled(False)
+        # Пересборка идёт из self.structure_data: без этого названия из ячеек пропадут
+        self._update_titles_from_table()
         self.toc_table.setRowCount(0)
         
         # Базовый список всегда должен быть отсортирован по физическому расположению (строкам)
@@ -987,8 +1008,8 @@ class TxtImportWizardDialog(QDialog):
             
             # 1. Title (Обычный Item)
             t_item = QTableWidgetItem(item_data['title'])
-            # ВАЖНО: Сохраняем ссылку на сам словарь данных в ячейку. 
-            # Это позволит найти правильную главу даже если таблица отсортирована.
+            # ВАЖНО: Сохраняем данные главы в ячейку, чтобы найти её даже в отсортированной
+            # таблице. PyQt хранит и отдаёт копию словаря, а не ссылку на item_data.
             t_item.setData(Qt.ItemDataRole.UserRole, item_data)
             self.toc_table.setItem(i, 0, t_item)
             
@@ -1074,17 +1095,8 @@ class TxtImportWizardDialog(QDialog):
             return
 
         # --- ИСПРАВЛЕНИЕ 1: БЕЗОПАСНОЕ ОБНОВЛЕНИЕ ЗАГОЛОВКОВ ---
-        # Мы не полагаемся на порядок строк (row index), а берем ссылку на данные из ячейки.
-        for row in range(self.toc_table.rowCount()):
-            item = self.toc_table.item(row, 0) # Ячейка с названием
-            new_title_text = item.text()
-            
-            # Получаем ссылку на словарь данных, привязанный к этой строке
-            data_dict = item.data(Qt.ItemDataRole.UserRole)
-            
-            # Обновляем заголовок в самом словаре
-            if data_dict:
-                data_dict['title'] = new_title_text
+        # Названия, исправленные в таблице, переносим в self.structure_data
+        self._update_titles_from_table()
 
         # Теперь сортируем структуру физически по порядку строк в файле,
         # чтобы в книге главы шли правильно, даже если в таблице их отсортировали по размеру.
@@ -1107,7 +1119,7 @@ class TxtImportWizardDialog(QDialog):
                 # Конец этой главы = начало следующей (или конец файла)
                 end = self.structure_data[i+1]['line_idx'] if i+1 < len(self.structure_data) else total_lines
                 
-                is_preamble = (start == 0 and item['title'] in ["Начало / Предисловие", "Начало / Метаданные"])
+                is_preamble = item.get('is_preamble', False)
                 
                 # Если не предисловие, то start-строка — это заголовок, берем контент с start+1
                 content_start = start if is_preamble else start + 1
