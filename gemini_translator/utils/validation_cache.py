@@ -30,6 +30,10 @@ def build_text_hash(text):
 
 
 def build_file_fingerprint(path):
+    if isinstance(path, str) and path.startswith("mem://"):
+        from os_patch import virtual_file_fingerprint
+
+        return virtual_file_fingerprint(path)
     if not path or not os.path.exists(path):
         return {}
 

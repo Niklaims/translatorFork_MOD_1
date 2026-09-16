@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import zipfile
 
 import pytest
+import os_patch
 
 from gemini_translator.core.chapter_qa_coordinator import TranslationReadyEvent
 from gemini_translator.qa.assembly import (
@@ -103,6 +105,69 @@ def test_request_is_built_from_the_epub_and_the_saved_translation(tmp_path, proj
     )
     assert "He opened the door." in source_text
     assert request.target_document_id == "OEBPS/chapter-1.xhtml"
+
+
+def test_request_reads_virtual_epub_without_native_stat(tmp_path, project, monkeypatch):
+    """A Windows virtual EPUB path must never reach the native stat call."""
+    from gemini_translator.qa.assembly import close_cached_source_archives
+
+    mem_fs = os_patch.MiniMemFS()
+    monkeypatch.setattr(os_patch, "_get_or_create_mem_fs", lambda: mem_fs)
+    monkeypatch.setattr(os.path, "exists", os_patch._patched_exists)
+    original_zip_init = zipfile.ZipFile.__init__
+    monkeypatch.setitem(os_patch._original, "zipfile_init", original_zip_init)
+    monkeypatch.setattr(zipfile.ZipFile, "__init__", os_patch._patched_zipfile_init)
+    original_stat = os.stat
+
+    def windows_stat(path, *args, **kwargs):
+        if str(path).startswith("mem://"):
+            raise OSError(123, "The filename, directory name, or volume label syntax is incorrect", str(path))
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", windows_stat)
+    virtual_path = (
+        "mem://C_drive/Users/Demik/Documents/BOOKS/"
+        "诡秘之觉醒愚者_imported.epub"
+    )
+    mem_fs.makedirs("/C_drive/Users/Demik/Documents/BOOKS", recreate=True)
+    mem_fs.writebytes(virtual_path.removeprefix("mem://"), _epub(tmp_path).read_bytes())
+    try:
+        request = build_chapter_qa_request(
+            _event(tmp_path, epub_path=virtual_path),
+            project_manager=project,
+            qa_settings=QaSettings(),
+            model=QaModelSelection("gemini", "qa-model"),
+            session_id="session-1",
+        )
+        assert request is not None
+        assert request.chapter_id == "OEBPS/chapter-1.xhtml"
+    finally:
+        close_cached_source_archives()
+
+
+def test_virtual_epub_cache_reopens_after_same_size_rewrite(tmp_path, project, monkeypatch):
+    """A changed in-memory book must not return a chapter from the old ZIP."""
+    from gemini_translator.qa.assembly import _read_source_chapter, close_cached_source_archives
+
+    mem_fs = os_patch.MiniMemFS()
+    monkeypatch.setattr(os_patch, "_get_or_create_mem_fs", lambda: mem_fs)
+    monkeypatch.setattr(os.path, "exists", os_patch._patched_exists)
+    original_zip_init = zipfile.ZipFile.__init__
+    monkeypatch.setitem(os_patch._original, "zipfile_init", original_zip_init)
+    monkeypatch.setattr(zipfile.ZipFile, "__init__", os_patch._patched_zipfile_init)
+    first = _epub(tmp_path)
+    virtual_path = os_patch.copy_to_mem(str(first), unique=True)
+    event = _event(tmp_path, epub_path=virtual_path)
+    try:
+        assert "He opened the door" in _read_source_chapter(event)
+        with zipfile.ZipFile(tmp_path / "replacement.epub", "w") as archive:
+            archive.writestr("OEBPS/chapter-1.xhtml", _SOURCE_HTML.replace("door", "gate"))
+        replacement = (tmp_path / "replacement.epub").read_bytes()
+        assert len(replacement) == len(first.read_bytes())
+        mem_fs.writebytes(virtual_path.removeprefix("mem://"), replacement)
+        assert "He opened the gate" in _read_source_chapter(event)
+    finally:
+        close_cached_source_archives()
 
 
 def test_project_glossary_reaches_the_request(tmp_path, project):

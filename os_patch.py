@@ -159,6 +159,7 @@ class _MemFSFile(io.RawIOBase):
             if any(c in mode for c in ("w", "x")):
                 shared.seek(0)
                 shared.truncate()
+                owner._touch(internal_path)
             if "a" in mode:
                 self._pos = shared.seek(0, io.SEEK_END)
 
@@ -201,6 +202,8 @@ class _MemFSFile(io.RawIOBase):
             self._shared.seek(self._pos)
             n = self._shared.write(b)
             self._pos = self._shared.tell()
+            if self._owner._files.get(self._internal_path) is self._shared:
+                self._owner._touch(self._internal_path)
             return n
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
@@ -220,6 +223,8 @@ class _MemFSFile(io.RawIOBase):
             self._shared.seek(self._pos)
             result = self._shared.truncate() if size is None else self._shared.truncate(size)
             self._pos = self._shared.tell()
+            if self._owner._files.get(self._internal_path) is self._shared:
+                self._owner._touch(self._internal_path)
             return result
 
 
@@ -239,9 +244,16 @@ class MiniMemFS:
 
     def __init__(self):
         self._files: dict[str, io.BytesIO] = {}
+        self._revisions: dict[str, int] = {}
+        self._next_revision = 0
         self._dirs: set[str] = {"/"}
         self._lock = threading.RLock()
         self._closed = False
+
+    def _touch(self, path: str) -> None:
+        """Advance the revision of a file after its bytes may have changed."""
+        self._next_revision += 1
+        self._revisions[path] = self._next_revision
 
     @staticmethod
     def _norm(path: str) -> str:
@@ -323,6 +335,7 @@ class MiniMemFS:
             # (remove() отвязывает запись каталога, а не трогает уже открытые
             # файловые объекты).
             del self._files[p]
+            self._revisions.pop(p, None)
 
     def move(self, src_path: str, dst_path: str):
         src = self._norm(src_path)
@@ -336,6 +349,8 @@ class MiniMemFS:
                 raise MemFSResourceNotFound(dst_path)
             buf = self._files.pop(src)
             self._files[dst] = buf
+            self._revisions.pop(src, None)
+            self._touch(dst)
 
     def writebytes(self, path: str, data: bytes):
         p = self._norm(path)
@@ -349,6 +364,7 @@ class MiniMemFS:
                 buf.seek(0)
                 buf.truncate()
                 buf.write(bytes(data))
+            self._touch(p)
 
     def getinfo(self, path: str, namespaces=None):
         p = self._norm(path)
@@ -358,7 +374,8 @@ class MiniMemFS:
             if buf is None:
                 raise MemFSResourceNotFound(path)
             size = buf.getbuffer().nbytes
-        return _MemFSInfo(size=size)
+            revision = self._revisions[p]
+        return _MemFSInfo(size=size, revision=revision)
 
     def openbin(self, path: str, mode: str = "r"):
         return self._open_handle(path, mode)
@@ -391,6 +408,7 @@ class MiniMemFS:
                 if buf is None:
                     buf = io.BytesIO()
                     self._files[p] = buf
+                    self._touch(p)
             else:
                 buf = self._files.get(p)
                 if buf is None:
@@ -405,16 +423,18 @@ class MiniMemFS:
         with self._lock:
             self._closed = True
             self._files.clear()
+            self._revisions.clear()
             self._dirs = {"/"}
 
 
 class _MemFSInfo:
-    """Лёгкая замена fs.info.Info: нужен только атрибут .size."""
+    """Лёгкая замена fs.info.Info с размером и версией содержимого."""
 
-    __slots__ = ("size",)
+    __slots__ = ("size", "revision")
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, revision: int):
         self.size = size
+        self.revision = revision
 
 
 # Явный список функций os.path, которые проксируются на mem://-пути.
@@ -445,6 +465,18 @@ def _parse_path(path):
             internal_path = '/' + internal_path
         return True, mem_fs, internal_path
     return False, None, path
+
+
+def virtual_file_fingerprint(path: str) -> dict[str, int]:
+    """Return a cheap change token for a file in the in-memory filesystem."""
+    is_virtual, mem_fs, internal_path = _parse_path(path)
+    if not is_virtual:
+        raise ValueError("Expected a mem:// path")
+    try:
+        info = mem_fs.getinfo(internal_path)
+    except MemFSResourceNotFound:
+        return {}
+    return {"size": info.size, "mtime_ns": info.revision, "fs_id": id(mem_fs)}
 
 def _safe_memfs_cleanup():
     app = QtWidgets.QApplication.instance()
