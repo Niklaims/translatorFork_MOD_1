@@ -54,6 +54,8 @@ class QaHandlerWorker:
         settings = dict(session_settings or {})
         self.settings_manager = settings_manager
         self.session_id = "translation_qa"
+        # QA also runs inside translation sessions; its tokens are not translation.
+        self.token_usage_operation = "quality_check"
         self.provider_config = dict(provider_config or {})
         self.model_config = dict(model_config or {})
         self.api_key = api_key

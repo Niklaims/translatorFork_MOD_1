@@ -102,6 +102,7 @@ def test_gemini_embeddings_without_usage_publish_an_estimate_from_the_texts(publ
         "estimated": True,
         "model_id": "gemini-embedding-001",
         "provider": "gemini",
+        "operation": "quality_check",
     }
     assert poster is None
 
@@ -143,6 +144,7 @@ def test_openai_compatible_embeddings_publish_the_prompt_tokens_of_the_response(
         "estimated": False,
         "model_id": "embedding-v1",
         "provider": "openai_compatible",
+        "operation": "quality_check",
     }
     assert poster is None
 

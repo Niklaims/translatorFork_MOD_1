@@ -93,6 +93,21 @@ def test_token_usage_of_a_qa_request_names_its_provider():
     assert BaseApiHandler._token_usage_provider(unlisted) == "gemini"
 
 
+def test_token_usage_of_a_qa_request_is_marked_as_quality_check():
+    """QA inside a translation session must not be counted as translation by whoever reads the usage."""
+    from gemini_translator.api.base import BaseApiHandler
+
+    handler = _factory()(QaModelSelection("gemini", "Gemini Flash"))
+    real_handler = BaseApiHandler.__new__(BaseApiHandler)
+    real_handler.worker = handler.worker
+    event = real_handler._token_usage_event(
+        {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}, estimated=False
+    )
+
+    assert event["operation"] == "quality_check"
+    assert event["provider"] == "gemini"
+
+
 def test_missing_provider_or_key_is_refused_clearly():
     """QA must fail with a typed error instead of half-configuring a handler."""
     with pytest.raises(QaHandlerError):

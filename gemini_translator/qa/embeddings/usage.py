@@ -42,6 +42,8 @@ def publish_embedding_usage(
                 "estimated": estimated,
                 "model_id": model,
                 "provider": provider,
+                # Embeddings serve quality checks only, also inside translation sessions.
+                "operation": "quality_check",
             }
         )
     except Exception:  # noqa: BLE001 - accounting never fails a check
