@@ -166,6 +166,8 @@ class HuggingFaceApiHandler(BaseApiHandler):
                             status="http_200",
                             extra={"mode": "full", "http_status": response.status},
                         )
+                        # An answer cut by the length limit is billed as well.
+                        self._remember_openai_usage(result.get("usage"))
                         if 'choices' in result and result['choices']:
                             choice = result['choices'][0]
                             content = choice['message']['content']
@@ -178,7 +180,6 @@ class HuggingFaceApiHandler(BaseApiHandler):
                                     reason="LENGTH"
                                 )
                                 
-                            self._remember_openai_usage(result.get("usage"))
                             return content
                         
                         raise Exception(f"Пустой ответ JSON от HF: {result}")

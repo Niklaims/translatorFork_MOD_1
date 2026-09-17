@@ -336,6 +336,8 @@ class LocalApiHandler(BaseApiHandler):
                     status="http_200",
                     extra={"mode": "full", "http_status": response.status_code},
                 )
+                # An answer cut by the length limit is billed as well.
+                self._remember_openai_usage(result.get("usage"))
                 has_content = bool(result.get('choices'))
                 if has_content:
                     choice = result['choices'][0]
@@ -360,7 +362,6 @@ class LocalApiHandler(BaseApiHandler):
                                 reason="LENGTH",
                             )
 
-                        self._remember_openai_usage(result.get("usage"))
                         return content
                     else:
                         raise ValidationFailedError(f"Генерация остановлена: '{finish_reason}'.")

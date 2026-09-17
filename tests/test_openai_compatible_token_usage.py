@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from gemini_translator.api.errors import PartialGenerationError
 from gemini_translator.api.handlers._sse_stream import parse_openai_compatible_sse_stream
 from gemini_translator.api.handlers.deepseek import DeepseekApiHandler
 from gemini_translator.api.handlers.huggingface import HuggingFaceApiHandler
@@ -173,7 +174,7 @@ class _LocalResponse:
         pass
 
 
-def _local_posted_usage(response, *, use_stream):
+def _local_published_usages(response, *, use_stream, allow_incomplete=False, raises=None):
     events = []
     base_url = "http://127.0.0.1:11434/v1/chat/completions"
     worker = SimpleNamespace(
@@ -196,8 +197,19 @@ def _local_posted_usage(response, *, use_stream):
     # The local handler is synchronous: execute_api_call runs it in a worker
     # thread, and the usage it reads there must reach this call's event.
     with patch("gemini_translator.api.handlers.local.requests.Session.post", return_value=response):
-        asyncio.run(handler.execute_api_call("SOURCE", "[TEST]", use_stream=use_stream))
-    return [payload for event, payload in events if event == "token_usage_updated"][-1]
+        call = handler.execute_api_call(
+            "SOURCE", "[TEST]", allow_incomplete=allow_incomplete, use_stream=use_stream
+        )
+        if raises is None:
+            asyncio.run(call)
+        else:
+            with pytest.raises(raises):
+                asyncio.run(call)
+    return [payload for event, payload in events if event == "token_usage_updated"]
+
+
+def _local_posted_usage(response, *, use_stream):
+    return _local_published_usages(response, use_stream=use_stream)[-1]
 
 
 def test_sse_stream_passes_the_usage_of_its_final_chunk_to_on_usage():
@@ -282,3 +294,29 @@ def test_local_server_ignoring_the_stream_flag_still_reports_the_billed_tokens()
 
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (1200, 400, 1600)
     assert usage["estimated"] is False
+
+
+@pytest.mark.parametrize("name", ["deepseek", "huggingface"])
+def test_full_response_cut_by_the_length_limit_still_publishes_the_billed_tokens(name):
+    body = _full_body(USAGE)
+    body["choices"][0]["finish_reason"] = "length"
+    handler, events = _handler(name, [_Response(json_body=body)])
+
+    with pytest.raises(PartialGenerationError):
+        asyncio.run(handler.execute_api_call("SOURCE", "[TEST]", use_stream=False))
+
+    [usage] = [payload for event, payload in events if event == "token_usage_updated"]
+    assert (usage["input_tokens"], usage["output_tokens"], usage["estimated"]) == (1200, 400, False)
+
+
+def test_local_server_answer_cut_by_the_length_limit_still_publishes_the_billed_tokens():
+    body = _full_body(USAGE)
+    body["choices"][0]["finish_reason"] = "length"
+
+    usages = _local_published_usages(
+        _LocalResponse(body=body), use_stream=False, allow_incomplete=True, raises=PartialGenerationError
+    )
+
+    assert [(usage["input_tokens"], usage["output_tokens"], usage["estimated"]) for usage in usages] == [
+        (1200, 400, False)
+    ]
