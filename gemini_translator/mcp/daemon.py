@@ -53,6 +53,10 @@ SSE_QUEUE_MIN_WAIT_SECONDS = 0.05
 # он заметит команду stop(). 0.1с давало 10 пробуждений/с бессрочно, пока
 # демон жив (дни); 1с — секунда задержки на stop() не критична.
 DAEMON_IDLE_POLL_INTERVAL_SECONDS = 1.0
+# Сколько непрочитанного тела запроса демон дочитывает перед ответом (см.
+# Handler._discard_unread_request_body). Тело больше предела не читается:
+# ответ уходит сразу, как раньше.
+MAX_DISCARDED_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -876,6 +880,7 @@ class McpDaemon:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "TranslatorMCP/0.1"
+            _request_body_consumed = False
 
             def do_GET(self) -> None:
                 self._dispatch("GET")
@@ -1049,6 +1054,7 @@ class McpDaemon:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length <= 0:
                     return {}
+                self._request_body_consumed = True
                 body = self.rfile.read(length).decode("utf-8")
                 try:
                     return json.loads(body)
@@ -1090,7 +1096,33 @@ class McpDaemon:
                     raise _HttpError(400, "request_id is required")
                 return request_id
 
+            def _discard_unread_request_body(self) -> None:
+                # Ответ без чтения тела POST (401, 400 до разбора, 404) закрывал
+                # соединение с непрочитанными байтами в сокете, а тело, пришедшее
+                # после ответа, упиралось в закрытый сокет. В обоих случаях ОС
+                # обрывает соединение сбросом, и Windows теряет уже отправленный
+                # ответ: клиент получает ConnectionAbortedError (WinError 10053)
+                # вместо 401. http.client шлёт заголовки и тело двумя send().
+                if self._request_body_consumed:
+                    return
+                self._request_body_consumed = True
+                try:
+                    remaining = int(self.headers.get("Content-Length") or "0")
+                except ValueError:
+                    return
+                if remaining > MAX_DISCARDED_REQUEST_BODY_BYTES:
+                    return
+                try:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(remaining, 64 * 1024))
+                        if not chunk:
+                            return
+                        remaining -= len(chunk)
+                except OSError:
+                    return
+
             def _send_json(self, status: int, payload: dict) -> None:
+                self._discard_unread_request_body()
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
