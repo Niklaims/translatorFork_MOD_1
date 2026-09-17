@@ -108,16 +108,18 @@ class _Ctx:
 class _Session:
     def __init__(self, responses):
         self._responses = list(responses)
+        self.payloads = []
 
     def post(self, *args, **kwargs):
+        self.payloads.append(kwargs.get("json"))
         return _Ctx(self._responses.pop(0))
 
 
-def _handler(name, responses):
+def _handler(name, responses, *, provider_config=None):
     events = []
     model_id = f"{name}-model"
     worker = SimpleNamespace(
-        provider_config={"is_async": True, "base_timeout": 600},
+        provider_config={"is_async": True, "base_timeout": 600, **(provider_config or {})},
         model_config={"id": model_id, "provider": name},
         prompt_builder=SimpleNamespace(system_instruction="sys"),
         temperature=0.7,
@@ -139,6 +141,7 @@ def _handler(name, responses):
     handler._reset_model_id_to_primary = lambda: None
     handler._force_session_reset = lambda *args, **kwargs: None
     session = _Session(responses)
+    handler.sent_payloads = session.payloads
 
     async def get_session():
         return session
@@ -320,3 +323,37 @@ def test_local_server_answer_cut_by_the_length_limit_still_publishes_the_billed_
     assert [(usage["input_tokens"], usage["output_tokens"], usage["estimated"]) for usage in usages] == [
         (1200, 400, False)
     ]
+
+
+def _deepseek_payload(*, use_stream, provider_config=None):
+    response = _Response(stream_lines=_stream_lines(USAGE)) if use_stream else _Response(json_body=_full_body(USAGE))
+    handler, _events = _handler("deepseek", [response], provider_config=provider_config)
+    asyncio.run(handler.execute_api_call("SOURCE", "[TEST]", use_stream=use_stream))
+    [payload] = handler.sent_payloads
+    return payload
+
+
+def test_deepseek_stream_asks_for_usage_when_the_provider_sets_stream_usage():
+    payload = _deepseek_payload(use_stream=True, provider_config={"stream_usage": True})
+
+    assert payload["stream_options"] == {"include_usage": True}
+
+
+def test_deepseek_stream_request_is_unchanged_without_stream_usage():
+    payload = _deepseek_payload(use_stream=True)
+
+    assert payload == {
+        "model": "deepseek-model",
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "SOURCE"},
+        ],
+        "stream": True,
+    }
+
+
+def test_deepseek_full_request_never_carries_stream_options():
+    # OpenAI-compatible APIs reject stream_options on a request that does not stream.
+    payload = _deepseek_payload(use_stream=False, provider_config={"stream_usage": True})
+
+    assert "stream_options" not in payload

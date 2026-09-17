@@ -53,6 +53,10 @@ class DeepseekApiHandler(BaseApiHandler):
             "messages": messages,
             "stream": use_stream
         }
+        if use_stream and self.worker.provider_config.get("stream_usage"):
+            # Without this an OpenAI-compatible stream never says what it billed;
+            # with it the usage arrives in a last chunk with empty choices.
+            payload["stream_options"] = {"include_usage": True}
         temperature = self._temperature_payload_value()
         if temperature is not None:
             payload["temperature"] = temperature
