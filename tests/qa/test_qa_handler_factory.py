@@ -77,6 +77,37 @@ def test_a_model_may_be_selected_by_its_api_id():
     assert handler.worker.model_id == "gemini-flash-001"
 
 
+def test_token_usage_of_a_qa_request_names_its_provider():
+    """QA runs inside translation sessions; its tokens must not be counted under no provider.
+
+    Provider views carry no "provider" key and neither do their model entries, so a
+    QA worker built from them used to publish token usage with provider None.
+    """
+    from gemini_translator.api.base import BaseApiHandler
+
+    listed = _factory()(QaModelSelection("gemini", "Gemini Flash"))
+    unlisted = _factory()(QaModelSelection("gemini", "gemini-unlisted-001"))
+
+    assert listed.worker.model_config["provider"] == "gemini"
+    assert BaseApiHandler._token_usage_provider(listed) == "gemini"
+    assert BaseApiHandler._token_usage_provider(unlisted) == "gemini"
+
+
+def test_token_usage_of_a_qa_request_is_marked_as_quality_check():
+    """QA inside a translation session must not be counted as translation by whoever reads the usage."""
+    from gemini_translator.api.base import BaseApiHandler
+
+    handler = _factory()(QaModelSelection("gemini", "Gemini Flash"))
+    real_handler = BaseApiHandler.__new__(BaseApiHandler)
+    real_handler.worker = handler.worker
+    event = real_handler._token_usage_event(
+        {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12}, estimated=False
+    )
+
+    assert event["operation"] == "quality_check"
+    assert event["provider"] == "gemini"
+
+
 def test_missing_provider_or_key_is_refused_clearly():
     """QA must fail with a typed error instead of half-configuring a handler."""
     with pytest.raises(QaHandlerError):

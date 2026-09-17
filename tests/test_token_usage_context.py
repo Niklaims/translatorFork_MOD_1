@@ -349,6 +349,21 @@ def test_provider_comes_from_the_provider_config_when_the_model_config_has_none(
     assert usage["provider"] == "seekai"
 
 
+def test_translation_usage_carries_no_operation_mark():
+    """Only QA marks its usage; the reader counts everything else by the command it ran."""
+    worker, events = _worker()
+
+    async def answer(handler):
+        handler._remember_token_usage(100, 10)
+        return "answer"
+
+    handler = _ScriptedAsyncHandler(worker, {"answer": answer})
+    asyncio.run(handler.execute_api_call("answer", "[TEST]"))
+
+    [usage] = _published(events)
+    assert "operation" not in usage
+
+
 def test_a_failing_poster_does_not_fail_the_call():
     worker, _events = _worker()
 

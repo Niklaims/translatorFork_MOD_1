@@ -54,6 +54,8 @@ class QaHandlerWorker:
         settings = dict(session_settings or {})
         self.settings_manager = settings_manager
         self.session_id = "translation_qa"
+        # QA also runs inside translation sessions; its tokens are not translation.
+        self.token_usage_operation = "quality_check"
         self.provider_config = dict(provider_config or {})
         self.model_config = dict(model_config or {})
         self.api_key = api_key
@@ -387,7 +389,12 @@ def build_qa_handler_factory(
         if not isinstance(provider_config, Mapping):
             raise QaHandlerError(f"Unknown QA provider: {model.provider}")
         provider_config = deepcopy(dict(provider_config))
-        return provider_config, _model_config(provider_config, model.model)
+        model_config = _model_config(provider_config, model.model)
+        # A provider view keeps the provider only as its key. Translation models get
+        # it from all_models_view; QA must name it too, or its token usage is
+        # published with no provider.
+        model_config.setdefault("provider", model.provider)
+        return provider_config, model_config
 
     def build(model: QaModelSelection, provider_config, model_config, api_key: str):
         from ..api.factory import get_api_handler_class

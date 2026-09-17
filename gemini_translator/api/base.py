@@ -231,12 +231,18 @@ class BaseApiHandler:
         return None
 
     def _token_usage_event(self, usage, *, estimated) -> dict:
-        return dict(
+        event = dict(
             usage,
             estimated=estimated,
             model_id=getattr(self.worker, "model_id", None),
             provider=self._token_usage_provider(),
         )
+        # A worker that is not a translation worker (QA inside a translation
+        # session) names its operation; everything else is counted by the reader.
+        operation = getattr(self.worker, "token_usage_operation", None)
+        if isinstance(operation, str) and operation:
+            event["operation"] = operation
+        return event
 
     def _estimate_token_usage(self, prompt, response_text) -> dict:
         reported = token_usage.reported()
