@@ -184,13 +184,19 @@ def _local_posted_usage(response, *, use_stream):
         temperature_override_enabled=True,
         api_key="",
         model_id="",
+        is_cancelled=False,
+        settings_manager=SimpleNamespace(
+            increment_request_count=lambda *args, **kwargs: None,
+            decrement_request_count=lambda *args, **kwargs: None,
+        ),
         _post_event=lambda event, payload: events.append((event, payload)),
     )
     handler = LocalApiHandler(worker)
     handler.setup_client(SimpleNamespace(api_key="local-key"))
+    # The local handler is synchronous: execute_api_call runs it in a worker
+    # thread, and the usage it reads there must reach this call's event.
     with patch("gemini_translator.api.handlers.local.requests.Session.post", return_value=response):
-        text = handler.call_api("SOURCE", "[TEST]", use_stream=use_stream)
-    handler._post_token_usage("SOURCE", text)
+        asyncio.run(handler.execute_api_call("SOURCE", "[TEST]", use_stream=use_stream))
     return [payload for event, payload in events if event == "token_usage_updated"][-1]
 
 

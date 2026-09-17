@@ -584,3 +584,32 @@ def test_cli_removed_after_install_is_installed_again(monkeypatch, tmp_path):
     asyncio.run(handler.call_api("text", "[TEST]"))
 
     assert installer.calls == 2
+
+
+def test_qoder_usage_is_published_through_the_token_usage_module(monkeypatch):
+    from gemini_translator.api import token_usage
+
+    worker = FakeWorker()
+    handler, _captured = _run_handler_with_captured_options(monkeypatch, worker=worker)
+
+    async def no_cli_download():
+        return None
+
+    monkeypatch.setattr(handler, "_cli_path_for_request", no_cli_download)
+    published = []
+    monkeypatch.setattr(
+        token_usage, "publish_token_usage", lambda usage, poster=None: published.append((usage, poster))
+    )
+
+    assert asyncio.run(handler.execute_api_call("text", "[TEST]")) == "перевод"
+
+    [(usage, poster)] = published
+    assert usage == {
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "total_tokens": 18,
+        "estimated": False,
+        "model_id": "auto",
+        "provider": "qoder",
+    }
+    assert poster == worker._post_event

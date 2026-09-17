@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication
 from ..utils.async_helpers import run_sync
 from ..utils.debug_logger import create_operation_trace
 from ..utils.helpers import estimate_gemini_tokens
+from . import token_usage
 from .errors import (
     OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
     ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
@@ -177,16 +178,19 @@ class BaseApiHandler:
             return None
         return count if count >= 0 else None
 
-    def _remember_token_usage(self, input_tokens, output_tokens, total_tokens=None, cached_tokens=None):
-        """Keep what the provider billed for the request in flight; the latest report wins."""
-        usage = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens or (input_tokens + output_tokens),
-        }
-        if cached_tokens is not None:
-            usage["cached_tokens"] = cached_tokens
-        self._reported_token_usage = usage
+    def _remember_token_usage(self, input_tokens, output_tokens, total_tokens=None, cached_tokens=None, thinking_tokens=None):
+        """Keep what the provider billed for the attempt in flight; the latest report wins.
+
+        The numbers go to the attempt's tally, not to the handler: one handler
+        serves several requests of a worker at once.
+        """
+        token_usage.remember(
+            input_tokens,
+            output_tokens,
+            cached_tokens=cached_tokens,
+            thinking_tokens=thinking_tokens,
+            total_tokens=total_tokens,
+        )
 
     def _remember_openai_usage(self, usage):
         """Take the usage object of an OpenAI-compatible response or stream chunk.
@@ -211,32 +215,56 @@ class BaseApiHandler:
             cached_tokens,
         )
 
+    def _token_usage_provider(self):
+        for config_name in ("model_config", "provider_config"):
+            config = getattr(self.worker, config_name, None)
+            if isinstance(config, dict) and config.get("provider"):
+                return config["provider"]
+        return None
+
+    def _token_usage_event(self, usage, *, estimated) -> dict:
+        return dict(
+            usage,
+            estimated=estimated,
+            model_id=getattr(self.worker, "model_id", None),
+            provider=self._token_usage_provider(),
+        )
+
     def _estimate_token_usage(self, prompt, response_text) -> dict:
-        reported = getattr(self, "_reported_token_usage", None)
+        reported = token_usage.reported()
         if reported:
-            usage = dict(reported, estimated=False)
-        else:
-            input_tokens = estimate_gemini_tokens(prompt)
-            output_tokens = estimate_gemini_tokens(response_text)
-            usage = {
+            return self._token_usage_event(reported, estimated=False)
+        input_tokens = estimate_gemini_tokens(prompt)
+        output_tokens = estimate_gemini_tokens(response_text)
+        return self._token_usage_event(
+            {
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": input_tokens + output_tokens,
-                "estimated": True,
-            }
-        usage["model_id"] = getattr(self.worker, "model_id", None)
-        usage["provider"] = (getattr(self.worker, "model_config", {}) or {}).get("provider")
-        return usage
+            },
+            estimated=True,
+        )
+
+    def _publish_token_usage(self, usage) -> None:
+        try:
+            # Looked up on the module at call time: the nolib bridge replaces it.
+            token_usage.publish_token_usage(usage, getattr(self.worker, "_post_event", None))
+        except Exception:
+            # Accounting never fails the request it accounts for.
+            pass
 
     def _post_token_usage(self, prompt, response_text) -> None:
         try:
             usage = self._estimate_token_usage(prompt, response_text)
         except Exception:
             return
+        self._publish_token_usage(usage)
 
-        poster = getattr(self.worker, "_post_event", None)
-        if callable(poster):
-            poster("token_usage_updated", usage)
+    def _post_failed_attempt_token_usage(self) -> None:
+        """A failed attempt is billed too: publish what the provider reported for it."""
+        reported = token_usage.reported()
+        if reported:
+            self._publish_token_usage(self._token_usage_event(reported, estimated=False))
 
     def setup_client(self, client_override=None, proxy_settings=None):
         """Базовая настройка."""
@@ -596,44 +624,49 @@ class BaseApiHandler:
 
         try:
             while True:
-                # A retried attempt must not report the usage of the one before it.
-                self._reported_token_usage = None
+                # Every attempt fills its own tally: neither a retry nor a
+                # neighbouring request on this handler sees these numbers.
+                usage_token = token_usage.begin_attempt()
                 try:
-                    if self.is_async_native:
-                        result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
-                    else:
-                        result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
-                    break
-                except asyncio.CancelledError as exc:
-                    if self._is_shutdown_cancellation():
-                        raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
+                    try:
+                        if self.is_async_native:
+                            result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                        else:
+                            result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                    except asyncio.CancelledError as exc:
+                        self._post_failed_attempt_token_usage()
+                        if self._is_shutdown_cancellation():
+                            raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
 
-                    error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
-                    self._force_session_reset()
-                    raise NetworkError(error_msg, delay_seconds=10) from exc
-                except Exception as exc:
-                    if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
-                        self._debug_record_error(
-                            exc,
-                            attempt=attempt,
-                            extra={
-                                "transient_disconnect_retry": True,
-                                "next_attempt": attempt + 1,
-                            },
-                        )
+                        error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
                         self._force_session_reset()
-                        delay = self._transient_disconnect_retry_delay(attempt)
-                        if delay:
-                            await asyncio.sleep(delay)
-                        attempt += 1
-                        continue
+                        raise NetworkError(error_msg, delay_seconds=10) from exc
+                    except Exception as exc:
+                        self._post_failed_attempt_token_usage()
+                        if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
+                            self._debug_record_error(
+                                exc,
+                                attempt=attempt,
+                                extra={
+                                    "transient_disconnect_retry": True,
+                                    "next_attempt": attempt + 1,
+                                },
+                            )
+                            self._force_session_reset()
+                            delay = self._transient_disconnect_retry_delay(attempt)
+                            if delay:
+                                await asyncio.sleep(delay)
+                            attempt += 1
+                            continue
 
-                    self._process_exception_and_counters(exc)
-                    raise
+                        self._process_exception_and_counters(exc)
+                        raise
 
-            self._finalize_debug_trace(trace, started_at=started_at, status="success")
-            self._post_token_usage(prompt, result)
-            return result
+                    self._finalize_debug_trace(trace, started_at=started_at, status="success")
+                    self._post_token_usage(prompt, result)
+                    return result
+                finally:
+                    token_usage.end_attempt(usage_token)
         except Exception as exc:
             self._finalize_debug_trace(
                 trace,
