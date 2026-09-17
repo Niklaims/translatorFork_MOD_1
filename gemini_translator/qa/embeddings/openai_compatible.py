@@ -22,6 +22,7 @@ from .base import (
 )
 from .factory import EmbeddingHttpError, EmbeddingResponseError, EmbeddingTransportError
 from .retry import DEFAULT_ATTEMPTS, with_retries
+from .usage import publish_embedding_usage
 
 
 def _embeddings_url(value: object) -> str:
@@ -88,6 +89,12 @@ def _response_matrix(payload: object, expected_rows: int) -> np.ndarray:
     return matrix
 
 
+def _prompt_tokens(payload: object) -> object:
+    """usage.prompt_tokens when the response carries one, else None."""
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    return usage.get("prompt_tokens") if isinstance(usage, dict) else None
+
+
 class OpenAICompatibleEmbeddingProvider:
     """Send one ordered ``/v1/embeddings`` request to a configured endpoint."""
 
@@ -126,6 +133,12 @@ class OpenAICompatibleEmbeddingProvider:
         if self._api_key and not self._api_key.startswith("__"):
             headers["Authorization"] = f"Bearer {self._api_key}"
         response_payload = await self._post_json(headers, payload)
+        publish_embedding_usage(
+            provider=self.name,
+            model=request.model,
+            texts=request.texts,
+            reported_input_tokens=_prompt_tokens(response_payload),
+        )
         matrix = _response_matrix(response_payload, len(request.texts))
         try:
             batch = validate_and_normalize_batch(

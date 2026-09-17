@@ -32,6 +32,7 @@ from .factory import (
     EmbeddingUnavailableError,
 )
 from .retry import DEFAULT_ATTEMPTS, DEFAULT_BASE_DELAY_SECONDS, exponential_delay
+from .usage import publish_embedding_usage
 from ..key_pool import QaKeyPool
 
 
@@ -84,6 +85,12 @@ def _response_matrix(payload: object, expected_rows: int) -> np.ndarray:
     if matrix.ndim != 2 or matrix.shape[0] != expected_rows or matrix.shape[1] <= 0:
         raise EmbeddingResponseError("gemini")
     return matrix
+
+
+def _prompt_token_count(payload: object) -> object:
+    """usageMetadata.promptTokenCount when the response carries one, else None."""
+    usage = payload.get("usageMetadata") if isinstance(payload, dict) else None
+    return usage.get("promptTokenCount") if isinstance(usage, dict) else None
 
 
 class GeminiEmbeddingProvider:
@@ -156,6 +163,12 @@ class GeminiEmbeddingProvider:
                 ]
             }
             response_payload = await self._post_json(url, payload)
+            publish_embedding_usage(
+                provider=self.name,
+                model=model.removeprefix("models/"),
+                texts=chunk,
+                reported_input_tokens=_prompt_token_count(response_payload),
+            )
             matrices.append(_response_matrix(response_payload, len(chunk)))
         if len({item.shape[1] for item in matrices}) > 1:
             raise EmbeddingResponseError(self.name)
