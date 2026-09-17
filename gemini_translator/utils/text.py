@@ -859,6 +859,46 @@ def clean_glossary_garbage(html_content):
     # Возвращаем строку (bs4 сам закроет теги если что-то было сломано)
     return str(soup)
     
+_FIN_MASK = r'\0TAG_FIN_\d+\0'
+_BLOCK_TAG_START = re.compile(
+    r'</?(?:p|div|h[1-6]|li|blockquote|br|hr|ul|ol|table|tr|td|th|section|article|body|html)\b',
+    re.IGNORECASE,
+)
+
+
+def _tighten_quote_spacing(content: str, tag_map: dict[str, str]) -> str:
+    """
+    Убирает пробелы внутри кавычек: после «„» и «„», перед «»» и перед «“»,
+    которая закрывает «„». Пробел, поставленный моделью у кавычки ("Привет "),
+    иначе доживал до книги как «„Привет “». Работает по тексту под масками
+    TAG_FIN: маски строчных тегов в зазоре сохраняются, через блочный тег
+    (границу абзаца) правило не перескакивает.
+    """
+    gap = fr'(?:[ \t ]|{_FIN_MASK})*[ \t ](?:[ \t ]|{_FIN_MASK})*'
+
+    def crosses_block(text):
+        return any(_BLOCK_TAG_START.match(tag_map.get(key, '')) for key in re.findall(_FIN_MASK, text))
+
+    def masks_of(text):
+        return ''.join(re.findall(_FIN_MASK, text))
+
+    def after_opening(m):
+        return m.group(0) if crosses_block(m.group(2)) else m.group(1) + masks_of(m.group(2))
+
+    def before_closing(m):
+        return m.group(0) if crosses_block(m.group(1)) else masks_of(m.group(1)) + m.group(2)
+
+    def inner_pair(m):
+        if crosses_block(m.group(0)):
+            return m.group(0)
+        return f'„{m.group(1)}{masks_of(m.group(2))}“'
+
+    content = re.sub(fr'([«„])({gap})', after_opening, content)
+    content = re.sub(fr'({gap})(»)', before_closing, content)
+    content = re.sub(fr'„([^„“«»]{{0,500}}?)({gap})“', inner_pair, content)
+    return content
+
+
 def finalize_cleanup(html_content: str) -> str:
     """
     Финальная зачистка:
@@ -927,7 +967,10 @@ def finalize_cleanup(html_content: str) -> str:
     content = re.sub(fr'({ELLIPSIS_CHAR})(?=[{ALL_LETTER_CHARS}])', r'\1 ', content)
     content = re.sub(fr'([{DASH_CHARS}])\s*{ELLIPSIS_CHAR}\s+(?=[{ALL_LETTER_CHARS}])', r'\1 …', content)
     content = re.sub(fr'([{DASH_CHARS}])\s*{ELLIPSIS_CHAR}', r'\1 …', content)
-    
+
+    # 4. Пробелы внутри кавычек: «„Привет “» -> «„Привет“»
+    content = _tighten_quote_spacing(content, tag_map)
+
     # --- ПЕРЕНОС: Работа с регистром теперь под защитой маски ---
     content = re.sub(CAPITALIZE_PATTERN, capitalize_sentence, content)
     content = re.sub(fr'([!?.])(?:{ELLIPSIS_CHAR})', r'\1', content)
