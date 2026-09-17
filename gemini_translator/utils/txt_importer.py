@@ -630,12 +630,12 @@ class TxtChapterAnalyzer:
 
 class ChapterViewerDialog(QDialog):
     """Диалог для просмотра содержимого главы и ручного разделения."""
-    def __init__(self, chapter_lines, start_line_idx, parent=None):
+    def __init__(self, chapter_lines, first_line_idx, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Просмотр главы")
         self.resize(700, 600)
         self.lines = chapter_lines
-        self.start_line_idx = start_line_idx # Глобальный индекс первой строки этой главы
+        self.first_line_idx = first_line_idx # Глобальный индекс строки chapter_lines[0]
         self.selected_split_index = None # Глобальный индекс, если выбрали
         self.selected_split_text = None
 
@@ -686,10 +686,9 @@ class ChapterViewerDialog(QDialog):
             QtWidgets.QMessageBox.warning(self, "Ошибка", "Нельзя сделать пустую строку заголовком.")
             return
 
-        # Глобальный индекс строки = start_line_idx + (offset + 1, так как строка заголовка исключена из lines в Viewer)
-        # НО: в Viewer мы передаем `lines` как "тело главы".
-        # Значит, row 0 в Viewer - это `start_line_idx + 1` (следующая после заголовка).
-        global_idx = self.start_line_idx + 1 + row
+        # row 0 в Viewer — строка first_line_idx. У обычной главы это строка после заголовка,
+        # у предисловия заголовка нет, и показ начинается прямо со строки 0.
+        global_idx = self.first_line_idx + row
         
         self.selected_split_index = global_idx
         self.selected_split_text = text
@@ -1068,12 +1067,12 @@ class TxtImportWizardDialog(QDialog):
         if real_index + 1 < len(self.structure_data):
             next_idx = self.structure_data[real_index + 1]['line_idx']
             
-        is_preamble = (start_idx == 0 and target_data['title'] in ["Начало / Предисловие", "Начало / Метаданные"])
+        is_preamble = target_data.get('is_preamble', False)
         content_start = start_idx if is_preamble else start_idx + 1
         
         chapter_lines = self.analyzer.lines[content_start : next_idx]
         
-        dlg = ChapterViewerDialog(chapter_lines, start_idx, self)
+        dlg = ChapterViewerDialog(chapter_lines, content_start, self)
         dlg.setWindowTitle(f"Глава: {target_data['title']}")
         
         if dlg.exec():
@@ -1082,6 +1081,10 @@ class TxtImportWizardDialog(QDialog):
                 new_title = dlg.selected_split_text
                 char_idx = sum(self.analyzer.line_lengths[:new_idx])
                 
+                if new_idx == start_idx:
+                    # Заголовком стала первая строка предисловия: текста до неё нет,
+                    # и пустое предисловие не должно остаться второй главой на этой строке
+                    del self.structure_data[real_index]
                 self.structure_data.append({
                     'line_idx': new_idx,
                     'title': new_title,
@@ -1167,10 +1170,10 @@ class TxtImportWizardDialog(QDialog):
             # --- ИСПРАВЛЕНИЕ 2: УМНАЯ НУМЕРАЦИЯ ---
             if self.chk_force_renumber.isChecked():
                 renumbered = []
-                for idx, (title, content) in enumerate(final_chapters, 1):
-                    # Пропускаем перенумерацию, если это явно Предисловие
-                    # (можно настроить логику, но обычно предисловия не нумеруют как "1")
-                    if title in ["Начало / Предисловие", "Начало / Метаданные"]:
+                # Предисловие (оно всегда первое) не нумеруем и не считаем: главы после него идут с 1
+                first_number = 0 if self.structure_data[0].get('is_preamble', False) else 1
+                for idx, (title, content) in enumerate(final_chapters, first_number):
+                    if idx == 0:
                         renumbered.append((title, content))
                         continue
 
