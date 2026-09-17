@@ -289,7 +289,8 @@ class GeminiApiHandler(BaseApiHandler):
     def _remember_gemini_usage(self, response_data):
         """Take usageMetadata; stream chunks repeat it with running totals.
 
-        Thinking tokens are billed as output, so they are counted as output.
+        Thinking tokens are billed as output, so they are counted as output
+        and reported once more as its thinking share.
         """
         usage = response_data.get("usageMetadata") if isinstance(response_data, dict) else None
         if not isinstance(usage, dict):
@@ -298,11 +299,13 @@ class GeminiApiHandler(BaseApiHandler):
         candidate_tokens = self._usage_count(usage.get("candidatesTokenCount"))
         if prompt_tokens is None and candidate_tokens is None:
             return
+        thinking_tokens = self._usage_count(usage.get("thoughtsTokenCount"))
         self._remember_token_usage(
             prompt_tokens or 0,
-            (candidate_tokens or 0) + (self._usage_count(usage.get("thoughtsTokenCount")) or 0),
+            (candidate_tokens or 0) + (thinking_tokens or 0),
             self._usage_count(usage.get("totalTokenCount")),
             self._usage_count(usage.get("cachedContentTokenCount")),
+            thinking_tokens,
         )
 
     async def _handle_error_response(self, response):

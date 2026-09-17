@@ -195,7 +195,8 @@ class BaseApiHandler:
     def _remember_openai_usage(self, usage):
         """Take the usage object of an OpenAI-compatible response or stream chunk.
 
-        Reasoning tokens are already counted in completion_tokens there.
+        Reasoning tokens are already counted in completion_tokens there;
+        completion_tokens_details.reasoning_tokens tells their share.
         """
         if not isinstance(usage, dict):
             return
@@ -208,11 +209,18 @@ class BaseApiHandler:
         if cached_tokens is None:
             # DeepSeek reports its context cache under its own name.
             cached_tokens = self._usage_count(usage.get("prompt_cache_hit_tokens"))
+        completion_details = usage.get("completion_tokens_details")
+        thinking_tokens = (
+            self._usage_count(completion_details.get("reasoning_tokens"))
+            if isinstance(completion_details, dict)
+            else None
+        )
         self._remember_token_usage(
             prompt_tokens or 0,
             completion_tokens or 0,
             self._usage_count(usage.get("total_tokens")),
             cached_tokens,
+            thinking_tokens,
         )
 
     def _token_usage_provider(self):

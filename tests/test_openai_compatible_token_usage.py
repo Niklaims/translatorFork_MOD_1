@@ -219,6 +219,7 @@ def test_full_response_reports_the_billed_tokens(name):
 
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (1200, 400, 1600)
     assert usage["cached_tokens"] == 1024
+    assert usage["thinking_tokens"] == 150
     assert usage["estimated"] is False
 
 
@@ -227,6 +228,7 @@ def test_stream_reports_the_billed_tokens_of_its_final_chunk(name):
     usage = _posted_usage(name, [_Response(stream_lines=_stream_lines(USAGE))], use_stream=True)[-1]
 
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (1200, 400, 1600)
+    assert usage["thinking_tokens"] == 150
     assert usage["estimated"] is False
 
 
@@ -244,6 +246,8 @@ def test_deepseek_prompt_cache_hits_count_as_cached_tokens():
     )[-1]
 
     assert usage["cached_tokens"] == 1024
+    # No completion_tokens_details: the provider did not say how much of the output was reasoning.
+    assert "thinking_tokens" not in usage
 
 
 def test_request_without_usage_is_estimated_instead_of_repeating_the_previous_one():
@@ -260,6 +264,7 @@ def test_local_server_full_response_reports_the_billed_tokens():
     usage = _local_posted_usage(_LocalResponse(body=_full_body(USAGE)), use_stream=False)
 
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (1200, 400, 1600)
+    assert usage["thinking_tokens"] == 150
     assert usage["estimated"] is False
 
 

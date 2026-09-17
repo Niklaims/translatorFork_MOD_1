@@ -95,6 +95,7 @@ def test_full_response_reports_billed_tokens_with_thinking_counted_as_output():
     assert usage["output_tokens"] == 400
     assert usage["total_tokens"] == 1600
     assert usage["cached_tokens"] == 1024
+    assert usage["thinking_tokens"] == 60
     assert usage["estimated"] is False
 
 
@@ -110,6 +111,8 @@ def test_stream_reports_the_usage_of_its_last_chunk():
 
     assert (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]) == (1200, 340, 1540)
     assert usage["estimated"] is False
+    # Without thoughtsTokenCount the model did not think: no thinking share to report.
+    assert "thinking_tokens" not in usage
 
 
 def test_response_without_usage_falls_back_to_the_estimate_instead_of_an_older_request():
