@@ -59,7 +59,7 @@ from ...utils.epub_tools import (
     normalize_task_size_unit,
     TASK_SIZE_UNIT_CHARS,
 )
-from ...utils.helpers import TokenCounter
+from ...utils.helpers import TokenCounter, safe_int
 from ...utils.language_tools import SmartGlossaryFilter, GlossaryReplacer
 from ...utils.project_migrator import ProjectMigrator
 from ...utils.project_manager import TranslationProjectManager
@@ -5729,6 +5729,127 @@ class InitialSetupPage(ShellPage):
 
     def on_leave(self) -> None:
         self._disconnect_event_bus()
+
+    @staticmethod
+    def _extract_chapters_from_payload(payload) -> list[str]:
+        return auto_workflow_helpers.extract_chapters_from_payload(payload)
+
+    @staticmethod
+    def _normalize_auto_chapters(chapters, preserve_order: bool = False) -> list[str]:
+        return auto_workflow_helpers.normalize_auto_chapters(
+            chapters,
+            preserve_order=preserve_order,
+        )
+
+    @staticmethod
+    def _make_auto_chapter_signature(chapters) -> tuple[str, ...]:
+        return auto_workflow_helpers.make_auto_chapter_signature(chapters)
+
+    @staticmethod
+    def _short_auto_name(chapter: str, max_length: int = 84) -> str:
+        return auto_workflow_helpers.short_auto_name(chapter, max_length=max_length)
+
+    @staticmethod
+    def _format_auto_chapter_list(chapters, limit: int = 8, preserve_order: bool = False) -> str:
+        return auto_workflow_helpers.format_auto_chapter_list(
+            chapters,
+            limit=limit,
+            preserve_order=preserve_order,
+        )
+
+    @staticmethod
+    def _compose_auto_details(sections) -> str:
+        return auto_workflow_helpers.compose_auto_details(sections)
+
+    @staticmethod
+    def _truncate_auto_trace_text(text: str | None, limit: int = 4000) -> str:
+        return auto_workflow_helpers.truncate_auto_trace_text(text, limit=limit)
+
+    @staticmethod
+    def _merge_auto_details(*parts: str) -> str:
+        return auto_workflow_helpers.merge_auto_details(*parts)
+
+    @staticmethod
+    def _compose_auto_trace_details(traces, max_entries: int = 4, text_limit: int = 4000) -> str:
+        return auto_workflow_helpers.compose_auto_trace_details(
+            traces,
+            max_entries=max_entries,
+            text_limit=text_limit,
+        )
+
+    @staticmethod
+    def _describe_auto_payload(payload) -> str:
+        return auto_workflow_helpers.describe_auto_payload(payload)
+
+    @staticmethod
+    def _estimate_auto_task_size_limit(token_limit: int):
+        return auto_workflow_helpers.estimate_auto_task_size_limit(token_limit)
+
+    def _auto_original_chapter_has_cjk(self, internal_path: str | None) -> bool:
+        internal_path = str(internal_path or "").strip()
+        if not internal_path or not getattr(self, "selected_file", None):
+            return False
+        try:
+            import zipfile
+            with open(self.selected_file, "rb") as epub_file, zipfile.ZipFile(epub_file, "r") as epub_zip:
+                original_html = epub_zip.read(internal_path).decode("utf-8", "ignore")
+            return auto_workflow_helpers.text_has_cjk(original_html)
+        except Exception:
+            return False
+
+    def _get_effective_auto_short_ratio_limit(self, auto_settings: dict | None, result_data: dict | None = None):
+        return auto_workflow_helpers.effective_auto_short_ratio_limit(
+            auto_settings,
+            result_data,
+            chapter_has_cjk=self._auto_original_chapter_has_cjk,
+        )
+
+    def _resolve_auto_translation_options(self, auto_settings: dict | None = None):
+        translation_options = self.translation_options_widget.get_settings().copy()
+        if not isinstance(auto_settings, dict):
+            auto_settings = {}
+
+        mode = str(auto_settings.get('translation_mode_override', 'inherit') or 'inherit')
+        has_override = False
+        if mode == 'batch':
+            translation_options.update({
+                'use_batching': True,
+                'chunking': False,
+                'chunk_on_error': False,
+            })
+            has_override = True
+        elif mode == 'single':
+            translation_options.update({
+                'use_batching': False,
+                'chunking': False,
+                'chunk_on_error': False,
+            })
+            has_override = True
+        elif mode == 'chunk':
+            translation_options.update({
+                'use_batching': False,
+                'chunking': True,
+                'chunk_on_error': True,
+            })
+            has_override = True
+        else:
+            mode = 'inherit'
+
+        batch_token_limit = safe_int(auto_settings.get('batch_token_limit_override', 0) or 0)
+        batch_task_limit = None
+        token_profile = None
+        if batch_token_limit > 0:
+            batch_task_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
+            if batch_task_limit:
+                translation_options['task_size_limit'] = batch_task_limit
+                has_override = True
+
+        chapter_limit = safe_int(auto_settings.get('batch_chapter_limit_override', 0) or 0)
+        if chapter_limit > 0:
+            translation_options['max_chapters_per_batch'] = chapter_limit
+            has_override = True
+
+        return translation_options, mode, has_override, batch_token_limit, batch_task_limit, token_profile
 
 
 class _InitialSetupDialogMeta(type(QDialog)):

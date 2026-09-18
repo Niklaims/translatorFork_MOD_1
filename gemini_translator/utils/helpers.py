@@ -11,8 +11,11 @@
 # ---------------------------------------------------------------------------
 
 import math
-import time
 import re
+import time
+from typing import Any
+
+from . import cjk_ranges
 
 GEMINI_ASCII_CHARS_PER_TOKEN = 4.0
 GEMINI_CYRILLIC_CHARS_PER_TOKEN = 2.2
@@ -26,12 +29,66 @@ OPENROUTER_OTHER_CHARS_PER_TOKEN = 1.5
 
 _ASCII_RUN_PATTERN = re.compile(r'[\x00-\x7f]+')
 _CYRILLIC_RUN_PATTERN = re.compile(r'[\u0400-\u04ff]+')
-_CJK_RUN_PATTERN = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]+')
+# cluster-32 dedup: диапазон (Ext-A + Unified + кана + хангыль) теперь
+# живёт в gemini_translator.utils.cjk_ranges.CJK_WITH_EXT_A_RUN_RE — то же
+# самое множество символов, что и раньше, один источник истины.
+
+
+def as_list(value: Any, *, sort_sets: bool = False) -> list:
+    """Приводит значение к списку.
+
+    Каноническая реализация для cluster-50:
+    - ``None`` -> ``[]``.
+    - ``list`` возвращается как есть (без копирования).
+    - ``tuple`` разворачивается в список своих элементов.
+    - ``set``: по умолчанию (``sort_sets=False``) набор целиком оборачивается
+      как единственный элемент (``[value]``). Передайте ``sort_sets=True``,
+      чтобы получить ``sorted(value)``.
+    - любой другой скаляр оборачивается в список из одного элемента.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        if sort_sets:
+            return sorted(value)
+        return [value]
+    return [value]
+
+
+def safe_int(
+    value: Any,
+    default: int = 0,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int:
+    """Безопасно приводит значение к ``int`` с опциональным клампом.
+
+    Каноническая реализация для finding-core-b/design/3:
+    - ``value`` парсится через ``int()``; при ``TypeError``/``ValueError``
+      подставляется ``default``.
+    - ``minimum``/``maximum`` по умолчанию ``None`` — без них функция ничего
+      не клампает.
+    - Если ``minimum`` передан, результат клампится к нему — причём клампу
+      подвергается и ``default``, если ``value`` не распарсилось.
+    - ``maximum``, если передан, клампит результат сверху.
+    """
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
 
 
 def _count_chars(pattern, text):
-    # Считаем длины непрерывных серий вместо findall по одному символу:
-    # findall на промпте в сотни КБ аллоцирует сотни тысяч строк-односимволок.
+    # Считаем длины непрерывных серий вместо findall по одному символу
     return sum(m.end() - m.start() for m in pattern.finditer(text))
 
 
@@ -43,7 +100,7 @@ def estimate_gemini_tokens(text):
     text = str(text)
     ascii_like_chars = _count_chars(_ASCII_RUN_PATTERN, text)
     cyrillic_chars = _count_chars(_CYRILLIC_RUN_PATTERN, text)
-    cjk_chars = _count_chars(_CJK_RUN_PATTERN, text)
+    cjk_chars = _count_chars(cjk_ranges.CJK_WITH_EXT_A_RUN_RE, text)
     other_chars = max(0, len(text) - ascii_like_chars - cyrillic_chars - cjk_chars)
 
     total_tokens = (
@@ -53,6 +110,7 @@ def estimate_gemini_tokens(text):
         + (other_chars / GEMINI_OTHER_CHARS_PER_TOKEN)
     )
     return max(1, int(math.ceil(total_tokens)))
+
 
 def estimate_openrouter_tokens(text):
     """Estimate tokens for OpenRouter, OpenAI, and other standard providers."""
@@ -72,6 +130,8 @@ def estimate_openrouter_tokens(text):
         + (other_chars / OPENROUTER_OTHER_CHARS_PER_TOKEN)
     )
     return max(1, int(math.ceil(total_tokens)))
+
+
 # --- Добавляем глобальную проверку BeautifulSoup, так как она нужна в main.py ---
 try:
     from bs4 import BeautifulSoup
@@ -80,6 +140,7 @@ except ImportError:
     BS4_AVAILABLE = False
     print("WARNING: beautifulsoup4 library not found. EPUB/HTML processing will be disabled.")
     print("Install it using: pip install beautifulsoup4")
+
 
 def format_size(size_bytes):
     """Converts bytes to a human-readable format (KB, MB, GB)."""
@@ -91,6 +152,60 @@ def format_size(size_bytes):
     p = math.pow(1024, i)
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
+
+
+def format_compact_number(value) -> str:
+    """Компактно форматирует число: 1_234 -> '1.2K', 2_500_000 -> '2.5M'."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        value = 0
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
+def format_thousands(value) -> str:
+    """Форматирует целое число с разделением тысяч пробелом: 1234567 -> '1 234 567'."""
+    if value is None:
+        return "0"
+    return f"{int(value):,}".replace(",", " ")
+
+
+class TokenUsageTrackerMixin:
+    """Учёт токенов текущей сессии + подпись/тултип с компактными числами."""
+
+    _token_usage_tooltip_scope = "текущий сеанс"
+
+    def _reset_token_usage(self):
+        self._token_input_total = 0
+        self._token_output_total = 0
+        self._token_total = 0
+        self._update_token_usage_label()
+
+    def _accumulate_token_usage(self, payload: dict) -> None:
+        try:
+            input_tokens = int((payload or {}).get('input_tokens', 0) or 0)
+            output_tokens = int((payload or {}).get('output_tokens', 0) or 0)
+            total_tokens = int((payload or {}).get('total_tokens', input_tokens + output_tokens) or 0)
+        except (TypeError, ValueError):
+            return
+        self._token_input_total += max(0, input_tokens)
+        self._token_output_total += max(0, output_tokens)
+        self._token_total += max(0, total_tokens)
+        self._update_token_usage_label()
+
+    def _update_token_usage_label(self):
+        total = format_compact_number(self._token_total)
+        input_tokens = format_compact_number(self._token_input_total)
+        output_tokens = format_compact_number(self._token_output_total)
+        self.token_usage_label.setText(f"Токены: ~{total}")
+        self.token_usage_label.setToolTip(
+            f"Оценка токенов за {self._token_usage_tooltip_scope}: всего ~{total}, "
+            f"вход ~{input_tokens}, выход ~{output_tokens}."
+        )
 
 
 class TokenCounter:
@@ -250,7 +365,6 @@ class TokenCounter:
         return report.strip()
 
 
-# --- НОВАЯ ВЕРСИЯ ФУНКЦИИ ---
 def calculate_potential_output_size(html_content, is_cjk):
     """
     Вычисляет потенциальный размер ответа модели в УСЛОВНЫХ СИМВОЛАХ (где 4 символа ~ 1 токен),
@@ -258,55 +372,32 @@ def calculate_potential_output_size(html_content, is_cjk):
     """
     try:
         if not BS4_AVAILABLE:
-            # Если BeautifulSoup недоступен, используем старый, более простой метод
             multiplier = 10 if is_cjk else 3
             return len(html_content) * multiplier
 
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html_content, 'html.parser')
         
-        # 1. Извлекаем только видимый пользователю текст
-        # Используем ' ' в качестве разделителя, чтобы избежать склеивания слов
         visible_text = soup.get_text(separator=' ', strip=True)
         
-        # 2. Считаем размеры компонентов
         len_html_total = len(html_content)
         len_text_original = len(visible_text)
         len_tags_and_scripts = len_html_total - len_text_original
 
-        # 3. Определяем коэффициенты "разрастания" текста при переводе
         if is_cjk:
-            # CJK -> Русский. Текст становится длиннее в 2.5-3 раза.
-            # Пример: "你好世界" (4 симв) -> "Привет, мир" (11 симв)
             text_expansion_ratio = 2.8 
         else:
-            # Английский -> Русский. Текст удлиняется в среднем на 20-30%.
             text_expansion_ratio = 1.25
 
-        # 4. Рассчитываем потенциальный размер переведенного текста в символах
         potential_text_size_chars = len_text_original * text_expansion_ratio
-        
-        # 5. Оцениваем, сколько токенов съедят теги и переведенный текст
-        # Теги и латиница ~4 символа/токен
-        # Кириллица ~2.2 символа/токен
-        
-        # Мы хотим получить итоговый размер в "условных символах", где 1 токен = 4 символа.
-        # Поэтому мы должны "утяжелить" кириллицу.
-        # Коэффициент "утяжеления" = (символов/токен в латинице) / (символов/токен в кириллице)
-        # 4 / 2.2 = ~1.8
         cyrillic_token_weight = 1.8 
-
-        # Умножаем размер переведенного текста на этот вес
         weighted_text_size = potential_text_size_chars * cyrillic_token_weight
-        
-        # 6. Складываем "вес" тегов (он не меняется) и "вес" переведенного текста
         final_potential_size = len_tags_and_scripts + weighted_text_size
         
         return int(final_potential_size)
 
     except Exception as e:
         print(f"[WARN] Ошибка в calculate_potential_output_size: {e}. Используется упрощенный расчет.")
-        # В случае любой ошибки парсинга, возвращаем безопасное, но более грубое значение
         multiplier = 10 if is_cjk else 3
         return len(html_content) * multiplier
         
@@ -318,26 +409,14 @@ def check_value(etalon, value, min_len=None) -> bool:
     Если min_len не задан, проверяет на "непустоту".
     Если min_len задан, проверяет, что длина value >= min_len.
     Безопасно обрабатывает типы, не имеющие длины.
-    
-    Примеры:
-    check_value([], [1, 2]) -> True
-    check_value([], [1, 2], min_len=3) -> False
-    check_value([], []) -> False
-    check_value("", "abc", min_len=3) -> True
-    check_value(0, 5, min_len=1) -> False (т.к. у int нет len())
     """
-    # 1. Жесткая проверка типа. Это наша главная защита.
     if not isinstance(value, type(etalon)):
         return False
     
-    # 2. Если min_len не указан, используем простую проверку на "истинность".
     if min_len is None:
         return bool(value)
         
-    # 3. Если min_len указан, используем безопасную проверку длины.
     try:
         return len(value) >= min_len
     except TypeError:
-        # Этот блок сработает, если у 'value' нет метода __len__
-        # (например, для чисел, None и т.д.)
         return False

@@ -707,6 +707,35 @@ class SettingsManager(QObject):
                             key_info['status_by_model'][model_id]["exhausted_level"] = 0
         return changed
     
+    def get_qa_settings(self):
+        """Return translation QA settings, migrating a missing section to defaults."""
+        from ..qa.settings import SETTINGS_KEY, QaSettings
+
+        with self.file_lock:
+            payload = deepcopy(self._cache.get(SETTINGS_KEY))
+        return QaSettings.from_dict(payload)
+
+    def save_qa_settings(self, qa_settings) -> bool:
+        """Persist translation QA settings after normalizing every value."""
+        from ..qa.settings import SETTINGS_KEY, QaSettings
+
+        if not isinstance(qa_settings, QaSettings):
+            qa_settings = QaSettings.from_dict(qa_settings)
+        return self._generic_saver(SETTINGS_KEY, qa_settings.to_dict())
+
+    def add_custom_provider_model(self, provider_id, display_name, model_config):
+        with self.file_lock:
+            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
+            provider_key = str(provider_id or "").strip()
+            model_name = str(display_name or "").strip()
+            if not provider_key or not model_name:
+                return False
+            provider_models = custom_models.setdefault(provider_key, {})
+            provider_models[model_name] = deepcopy(model_config or {})
+            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
+            self._save_to_disk_unsafe()
+        return True
+
     def get_custom_prompt(self): return self._generic_loader('custom_prompt', '')
     def save_custom_prompt(self, prompt): return self._generic_saver('custom_prompt', prompt)
     def get_active_models_for_provider(self, provider_id: str) -> list[str] | None:

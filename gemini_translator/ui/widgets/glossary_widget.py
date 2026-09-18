@@ -1085,6 +1085,8 @@ class GlossaryWidget(QWidget):
         def refresh_parent_after_generation():
             parent_dialog._check_and_sync_active_session()
             parent_dialog._prepare_and_display_tasks(clean_rebuild=True)
+            if hasattr(parent_dialog, 'auto_translate_widget'):
+                parent_dialog.auto_translate_widget.refresh_glossary_presets()
 
         if hasattr(parent_dialog, 'request_push'):
             page = GenerationSessionPage(
