@@ -1,10 +1,4 @@
-"""Движок не должен объявлять «Сессия успешно завершена», если остались главы за QA-гейтом.
-
-Находка core-a/bugs/6: ChapterQueueManager.is_finished() намеренно возвращает
-True при открытом high-гейте (иначе сессия зависла бы навсегда), а движок
-принимал это за успех: в лог уходило «Работа завершена», уведомление говорило об
-успехе, и pending-главы, которые никто не переводил, оставались незамеченными.
-"""
+"""Завершение перевода сообщает о замечаниях QA без заявления о блокировке."""
 from unittest.mock import MagicMock
 
 from gemini_translator.core.translation_engine import TranslationEngine
@@ -34,14 +28,15 @@ def _end_reason(events):
     return reasons[0]
 
 
-def test_open_high_gate_is_reported_as_blocked_not_success():
+def test_open_high_gate_is_reported_as_qa_risk_after_translation():
     events = []
     _engine(events, gate_open=True)._check_if_session_finished()
     reason = _end_reason(events)
     assert "успешно" not in reason.lower()
     assert "qa" in reason.lower() or "проверк" in reason.lower()
     messages = [data.get("message", "") for name, data in events if name == "log_message"]
-    assert any("заблокирован" in message.lower() for message in messages), messages
+    assert "заблокирован" not in reason.lower()
+    assert all("заблокирован" not in message.lower() for message in messages)
 
 
 def test_without_gate_the_success_message_is_unchanged():

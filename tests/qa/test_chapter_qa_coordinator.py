@@ -1,4 +1,4 @@
-"""A finished chapter must be checked before the next one is dispatched."""
+"""A finished chapter is checked and QA findings are reported."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ class _QueueStub:
         self.status[str(task_id)] = {
             "completed": "completed",
             "deferred": "completed",
-            "high_unresolved": "qa_blocked",
+            "high_unresolved": "completed",
             "cancelled": "qa_pending",
         }[outcome.kind]
 
@@ -93,17 +93,19 @@ def test_a_clean_chapter_completes_its_task(tmp_path):
     assert service.calls == ["chapter-1"]
 
 
-def test_unresolved_high_risk_blocks_the_task(tmp_path):
-    """A chapter QA could not repair must leave the task blocked."""
+def test_unresolved_high_risk_keeps_the_task_completed(tmp_path):
+    """An unresolved finding is reported without holding the task."""
+    queue = _QueueStub()
     service = _ServiceStub({"chapter-1": _result("chapter-1", may_continue=False)})
-    coordinator = _coordinator(service)
+    coordinator = _coordinator(service, queue)
 
-    outcome = asyncio.run(
-        coordinator.inspect_completed_task("task-1", (_event("chapter-1"),))
-    )
+    coordinator.submit("task-1", (_event("chapter-1"),))
+    coordinator.drain(timeout=5)
+    coordinator.shutdown(timeout=5)
 
-    assert outcome.outcome.kind == "high_unresolved"
-    assert "chapter-1" in outcome.outcome.reason
+    assert queue.outcomes[-1][1].kind == "high_unresolved"
+    assert "chapter-1" in queue.outcomes[-1][1].reason
+    assert queue.status["task-1"] == "completed"
 
 
 def test_book_pass_stops_scheduling_after_terminal_provider_failure():
@@ -447,8 +449,8 @@ def test_a_chapter_that_changed_nothing_is_not_logged_with_details():
     assert logged == []
 
 
-def test_a_blocked_chapter_is_logged_with_the_reason():
-    """A stopped translation must say in the log exactly what stopped it."""
+def test_a_high_risk_chapter_is_logged_with_the_reason():
+    """A high-risk chapter keeps its review reason in the log."""
     logged: list[tuple] = []
     from gemini_translator.qa.models import Decision
     from gemini_translator.qa.service import OmissionRepairOutcome
@@ -485,7 +487,7 @@ def test_a_blocked_chapter_is_logged_with_the_reason():
     asyncio.run(coordinator.inspect_completed_task("task-1", (_event("chapter-1"),)))
 
     message, _title, details = logged[-1]
-    assert "перевод остановлен" in message
+    assert "требуется проверка" in message
     assert "post_check_rejected" in details
     assert "He never told her." in details
 

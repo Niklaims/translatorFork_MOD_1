@@ -236,7 +236,7 @@ class QaQueueOutcome:
 
 @dataclass(frozen=True)
 class QaGateRecord:
-    """One unresolved quality gate that currently blocks new dispatch."""
+    """One unresolved high-risk quality finding for the review report."""
 
     task_id: str
     chapter_id: str
@@ -727,13 +727,8 @@ class ChapterQueueManager(QObject):
                         FROM tasks AS prev
                         WHERE prev.chain_id = t.chain_id
                           AND prev.chain_index < t.chain_index
-                          AND prev.status IN ('pending', 'in_progress', 'held', 'qa_pending', 'qa_blocked')
+                          AND prev.status IN ('pending', 'in_progress', 'held')
                     )
-              )
-              AND NOT EXISTS (
-                    SELECT 1 FROM qa_gates
-                    WHERE qa_gates.resolved_at IS NULL
-                      AND qa_gates.risk_level = 'high'
               )
             ORDER BY t.priority DESC, t.sequence ASC
             LIMIT 1
@@ -1753,7 +1748,7 @@ class ChapterQueueManager(QObject):
         if outcome.kind == 'high_unresolved':
             for chapter_id in outcome.chapter_ids or ('unknown',):
                 self.open_qa_gate(task_id, chapter_id, outcome.reason, risk_level='high')
-            new_status = 'qa_blocked'
+            new_status = 'completed'
         elif outcome.kind == 'cancelled':
             new_status = 'qa_pending'
         else:
@@ -1788,7 +1783,7 @@ class ChapterQueueManager(QObject):
         self.notify_structural_change()
 
     def close_qa_gate(self, task_id, chapter_id: str, resolution: str = 'resolved') -> None:
-        """Resolve one quality gate so the queue may dispatch again."""
+        """Resolve one quality finding in the chapter report."""
         with self._get_write_conn() as conn:
             conn.execute(
                 "UPDATE qa_gates SET resolved_at = ?, resolution = ?"
@@ -1840,7 +1835,7 @@ class ChapterQueueManager(QObject):
         return pending
 
     def has_blocking_qa_gate(self) -> bool:
-        """Report whether unresolved high risk currently blocks new dispatch."""
+        """Report unresolved high QA risk for the session summary."""
         return bool(
             self._execute_light_read(
                 "SELECT 1 FROM qa_gates WHERE resolved_at IS NULL"
@@ -1886,12 +1881,7 @@ class ChapterQueueManager(QObject):
         if not rows:
             return True
 
-        # Pending work that no worker may claim is not unfinished work: an
-        # unresolved high gate would otherwise deadlock the whole session.
-        active = self._execute_light_read(
-            "SELECT 1 FROM tasks WHERE status IN ('in_progress', 'qa_pending') LIMIT 1"
-        )
-        return not active and self.has_blocking_qa_gate()
+        return False
 
     # --- НАЧАЛО ВОССТАНОВЛЕННОГО БЛОКА КЭШИРОВАНИЯ ---
     @pyqtSlot()

@@ -277,14 +277,14 @@ def test_a_list_just_wider_than_its_numbers_keeps_the_chapter_names(qt_app):
 
 
 def test_the_totals_match_the_snapshot(qt_app):
-    """Итоги были протоколом: «отложено 1, блокирует 0», «В главах: 409.»."""
+    """Итоги называют главы с риском, не объявляя перевод остановленным."""
     view = QualityReportView()
 
     view.set_report(BookQaReportSnapshot.from_journal(_journal()))
 
     assert view.checked_card.value_label.text() == "1 из 3"
     assert view.checked_card.detail_label.text() == (
-        "1 глава отложена. 1 глава блокирует перевод."
+        "1 глава отложена. 1 глава требует проверки."
     )
     assert view.repaired_card.value_label.text() == "2"
     assert view.repaired_card.detail_label.text() == "В 1 главе. Откатываются по главе."
@@ -320,7 +320,7 @@ def test_a_book_with_nothing_held_back_says_so(qt_app):
 
     view.set_report(BookQaReportSnapshot.from_journal(journal), scoring_enabled=True)
 
-    assert view.checked_card.detail_label.text() == "Отложенных и блокирующих глав нет."
+    assert view.checked_card.detail_label.text() == "Отложенных и требующих проверки глав нет."
     assert view.repaired_card.detail_label.text() == "Автоисправлений пока нет."
     assert view.score_card.detail_label.text() == "Оценок пока нет."
 
@@ -419,7 +419,7 @@ def test_the_chapter_card_follows_the_selection(qt_app):
     assert view.select_chapter("chapter-404") is False
 
 
-def test_a_blocked_chapter_says_why(qt_app):
+def test_a_high_risk_chapter_says_why_without_claiming_translation_stopped(qt_app):
     class _Gate:
         chapter_id = "chapter-3"
         reason = "подтверждённый пропуск"
@@ -429,9 +429,10 @@ def test_a_blocked_chapter_says_why(qt_app):
 
     view.select_chapter("chapter-3")
 
-    assert view.table.item(2, 1).text() == "⛔ Блокирует"
+    assert view.table.item(2, 1).text() == "⚠️ Высокий риск"
+    assert view.table.item(2, 1).toolTip() == "Замечание QA: подтверждённый пропуск"
     assert not view.chapter_block_chip.isHidden()
-    assert view.chapter_block_chip.text() == "Перевод остановлен"
+    assert view.chapter_block_chip.text() == "Требует проверки"
     assert view.chapter_block_chip.property("tone") == "danger"
     assert "Причина: подтверждённый пропуск" in view.chapter_details_label.text()
 

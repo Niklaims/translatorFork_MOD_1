@@ -44,15 +44,15 @@ from .translation_quality_models import DECISION_LABELS
 # Only the statuses that ask for attention are coloured: a column where every
 # «Проверена» is green hides the one chapter that is not.
 ATTENTION_TONES = {"deferred": "warning", "blocked": "danger"}
-# How the chapter card's sentence begins.  A blocked chapter was checked; that
-# it holds the translation up is what the chip under the sentence says.
+# How the chapter card's sentence begins. High QA risk asks for review while
+# translation continues.
 STATUS_SENTENCES = {
     "checked": "Проверена",
     "blocked": "Проверена",
     "deferred": "Отложена",
     "": "Нет данных о проверке",
 }
-BLOCK_CHIP_TEXT = "Перевод остановлен"
+BLOCK_CHIP_TEXT = "Требует проверки"
 BASE_COLUMNS = (
     ("Глава", "chapter_id"),
     ("Статус", "status"),
@@ -578,7 +578,7 @@ def _attention_chapter(snapshot: BookQaReportSnapshot) -> str:
 
 
 def _held_back(deferred: int, blocking: int) -> str:
-    """Say how many chapters are held back, in words that agree with the numbers."""
+    """Summarize deferred checks and chapters needing review."""
     parts = []
     if deferred:
         parts.append(
@@ -588,9 +588,9 @@ def _held_back(deferred: int, blocking: int) -> str:
     if blocking:
         parts.append(
             f"{chapters_caption(blocking)} "
-            f"{plural(blocking, 'блокирует', 'блокируют', 'блокируют')} перевод."
+            f"{plural(blocking, 'требует', 'требуют', 'требуют')} проверки."
         )
-    return " ".join(parts) or "Отложенных и блокирующих глав нет."
+    return " ".join(parts) or "Отложенных и требующих проверки глав нет."
 
 
 def _in_chapters(count: int) -> str:
@@ -623,7 +623,7 @@ def _item(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> QTableWi
     elif field_name == "status":
         _paint_status(item, row)
         if row.blocked_reason:
-            item.setToolTip(f"Перевод остановлен: {row.blocked_reason}")
+            item.setToolTip(f"Замечание QA: {row.blocked_reason}")
     return item
 
 
@@ -632,8 +632,8 @@ def _cell_text(row: ChapterQaRow, field_name: str, names: dict[str, str]) -> str
         return names.get(row.chapter_id) or chapter_display_name(row.chapter_id)
     if field_name == "status":
         label = CHAPTER_STATUS_LABELS.get(row.status, row.status)
-        # Colour is never the only signal: a blocked chapter says so in words.
-        return f"⛔ {label}" if row.blocked_reason else label
+        # Colour is never the only signal: a high-risk chapter says so in words.
+        return f"⚠️ {label}" if row.blocked_reason else label
     if field_name in ("applied_repairs", "pending_suggestions"):
         value = int(getattr(row, field_name))
         return str(value) if value else ""

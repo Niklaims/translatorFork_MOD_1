@@ -1461,7 +1461,7 @@ def _joined_units(unit_ids: Sequence[str], texts: Mapping[str, str]) -> str:
 
 
 def _chapter_status(result: ChapterQaResult) -> str:
-    """Say whether this chapter is settled, waiting on infrastructure, or blocked."""
+    """Classify the chapter for QA review without affecting translation."""
     if not result.may_continue_translation:
         return "blocked"
     if any(warning in DEFERRED_WARNINGS for warning in result.warnings):

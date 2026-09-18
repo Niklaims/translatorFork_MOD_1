@@ -1444,17 +1444,15 @@ class TranslationEngine(EventBusMixin, QObject):
         if self.task_manager.is_finished():
             if self._start_final_qa_pass():
                 return
-            # is_finished() намеренно считает сессию завершённой при открытом
-            # high-гейте QA (иначе она зависла бы навсегда), но это не успех:
-            # pending-главы за гейтом никто не переводил. Говорим об этом прямо.
+            # Высокий риск QA остаётся в отчёте, но не задерживает перевод.
             gate_check = getattr(self.task_manager, 'has_blocking_qa_gate', None)
             if callable(gate_check) and gate_check():
                 self._post_event('log_message', {'message': (
-                    "[MANAGER] Работа остановлена: остались главы, заблокированные проверкой качества "
-                    "(высокий риск). Разрешите их в окне проверки качества и запустите перевод снова."
+                    "[QA] Перевод завершён; есть главы с высоким риском. "
+                    "Проверьте их в окне «Качество перевода»."
                 )})
                 self.show_summary_data()
-                self._end_session("Сессия завершена: главы заблокированы проверкой качества (QA-гейт)")
+                self._end_session("Перевод завершён: есть главы с замечаниями QA")
                 return
             self._post_event('log_message', {'message': "[MANAGER] Работа завершена (Задачи выполнены / Флаг снят)."})
             self.show_summary_data()

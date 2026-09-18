@@ -769,8 +769,8 @@ class ChapterQaCoordinator:
         if not getattr(result, "changed_anything", False):
             if not result.may_continue_translation:
                 self._report(
-                    f"[QA] Глава '{event.chapter_id}': перевод остановлен, "
-                    "нужно решение.",
+                    f"[QA] Глава '{event.chapter_id}': высокий риск, "
+                    "требуется проверка.",
                     details_title=f"Проверка главы '{event.chapter_id}'",
                     details_text=result.change_details(),
                     details_html=result.change_details_html(),

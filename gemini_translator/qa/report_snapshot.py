@@ -29,7 +29,7 @@ RELATIVE_RISK_LABELS = {
 CHAPTER_STATUS_LABELS = {
     "checked": "Проверена",
     "deferred": "Отложена",
-    "blocked": "Блокирует",
+    "blocked": "Высокий риск",
     "": "Нет данных",
 }
 

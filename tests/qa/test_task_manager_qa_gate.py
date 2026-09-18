@@ -108,26 +108,24 @@ class QaGateQueueTests(unittest.TestCase):
         self.assertTrue(self.manager.schema_has_table("qa_gates"))
         self.assertGreaterEqual(self.manager.schema_version, QA_GATE_SCHEMA_VERSION)
 
-    def test_qa_pending_predecessor_blocks_the_next_chained_task(self):
-        """A chapter still in QA must not release its chained successor."""
+    def test_qa_pending_predecessor_does_not_delay_the_next_chained_task(self):
+        """A saved chapter may be checked while its successor translates."""
         first = self._add_task(1, chain_id=7, chain_index=0)
         second = self._add_task(2, chain_id=7, chain_index=1)
         self.manager.update_task(first, new_status="in_progress")
 
         self.manager.mark_task_qa_pending(first, ["chapter-1"])
         self.assertEqual(self._status(first), "qa_pending")
-        self.assertIsNone(self.manager.get_next_task("worker-2"))
-
-        self.manager.resolve_task_qa(first, QaQueueOutcome.completed(["chapter-1"]))
-        self.assertEqual(self._status(first), "completed")
         claimed = self.manager.get_next_task("worker-2")
         self.assertIsNotNone(claimed)
         self.assertEqual(claimed[0], second)
+        self.manager.resolve_task_qa(first, QaQueueOutcome.completed(["chapter-1"]))
+        self.assertEqual(self._status(first), "completed")
 
-    def test_open_high_gate_blocks_every_new_dispatch_in_the_project(self):
-        """Unresolved high risk must stop the whole queue, not just one chain."""
+    def test_open_high_gate_records_risk_without_stopping_dispatch(self):
+        """Unresolved high risk remains visible while the next chapter runs."""
         first = self._add_task(1)
-        self._add_task(2)
+        second = self._add_task(2)
         self.manager.update_task(first, new_status="in_progress")
         self.manager.mark_task_qa_pending(first, ["chapter-1"])
 
@@ -136,15 +134,42 @@ class QaGateQueueTests(unittest.TestCase):
             QaQueueOutcome.high_unresolved(["chapter-1"], reason="confirmed omission"),
         )
 
-        self.assertEqual(self._status(first), "qa_blocked")
-        self.assertIsNone(self.manager.get_next_task("worker-2"))
+        self.assertEqual(self._status(first), "completed")
+        claimed = self.manager.get_next_task("worker-2")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], second)
         gates = self.manager.get_open_qa_gates()
         self.assertEqual([gate.chapter_id for gate in gates], ["chapter-1"])
         self.assertEqual(gates[0].risk_level, "high")
         self.assertEqual(gates[0].reason, "confirmed omission")
 
-    def test_closing_the_gate_releases_the_queue_again(self):
-        """A resolved gate must let translation continue without a restart."""
+    def test_high_qa_risk_does_not_finish_a_session_with_pending_chapters(self):
+        first = self._add_task(1)
+        self._add_task(2)
+        self.manager.update_task(first, new_status="in_progress")
+        self.manager.mark_task_qa_pending(first, ["chapter-1"])
+        self.manager.resolve_task_qa(
+            first, QaQueueOutcome.high_unresolved(["chapter-1"], reason="gap")
+        )
+
+        self.assertFalse(self.manager.is_finished())
+
+    def test_restored_qa_blocked_chapter_does_not_hold_its_chain(self):
+        first = self._add_task(1, chain_id=7, chain_index=0)
+        second = self._add_task(2, chain_id=7, chain_index=1)
+        self.manager.update_task(first, new_status="in_progress")
+        self.manager.mark_task_qa_pending(first, ["chapter-1"])
+        self.manager.resolve_task_qa(
+            first, QaQueueOutcome.high_unresolved(["chapter-1"], reason="gap")
+        )
+        self.manager.update_task(first, new_status="qa_blocked")
+
+        claimed = self.manager.get_next_task("worker-2")
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed[0], second)
+
+    def test_closing_the_gate_clears_reported_risk_without_changing_dispatch(self):
+        """Resolving QA risk removes the report marker; translation still runs."""
         first = self._add_task(1)
         second = self._add_task(2)
         self.manager.update_task(first, new_status="in_progress")
@@ -158,10 +183,10 @@ class QaGateQueueTests(unittest.TestCase):
         self.assertEqual(self.manager.get_open_qa_gates(), [])
         claimed = self.manager.get_next_task("worker-1")
         self.assertIsNotNone(claimed)
-        self.assertIn(claimed[0], {first, second})
+        self.assertEqual(claimed[0], second)
 
     def test_in_progress_work_is_never_cancelled_by_a_gate(self):
-        """An open gate stops new dispatch only; running workers keep their task."""
+        """Recording QA risk leaves running workers untouched."""
         running = self._add_task(1)
         blocked = self._add_task(2)
         self.manager.update_task(running, new_status="in_progress")
@@ -216,10 +241,9 @@ class QaGateQueueTests(unittest.TestCase):
 
         self.assertEqual(self.manager.get_open_qa_gates(), [])
 
-    def test_a_session_with_only_blocked_work_is_finished(self):
-        """A gate must not deadlock a session that can no longer dispatch."""
+    def test_a_session_with_only_qa_risk_is_finished(self):
+        """The recorded risk remains after all translation tasks finish."""
         first = self._add_task(1)
-        self._add_task(2)
         self.manager.update_task(first, new_status="in_progress")
         self.manager.mark_task_qa_pending(first, ["chapter-1"])
         self.manager.resolve_task_qa(
