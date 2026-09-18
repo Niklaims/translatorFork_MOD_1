@@ -118,7 +118,6 @@ class StartTranslationQueueTests(unittest.TestCase):
         harness._on_translation_options_changed()
 
         self.assertEqual(harness.prepare_calls, [((), {"clean_rebuild": True})])
-        self.assertEqual(harness.runtime_refreshes, 1)
         self.assertEqual(harness.dirty_marks, 1)
         self.assertFalse(harness._task_queue_needs_rebuild)
 

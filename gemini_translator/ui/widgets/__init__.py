@@ -14,7 +14,6 @@ from gemini_translator.ui.widgets import LogWidget
 """
 
 from .chapter_list_widget import ChapterListWidget
-from .auto_translate_widget import AutoTranslateWidget
 from .glossary_widget import GlossaryWidget
 from .key_management_widget import KeyManagementWidget
 from .log_widget import LogWidget
@@ -29,11 +28,14 @@ from .translation_options_widget import TranslationOptionsWidget
 from .common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox # <-- Добавь импорт
 from .sidebar_widget import SidebarWidget
 from .provider_models_widget import ProviderModelsWidget
+from .auto_translate_pipeline_widget import AutoTranslatePipelineWidget
+from .auto_translate_widget import AutoTranslateWidget
+
+from .ai_editing_settings_widget import AIEditingSettingsWidget
 # Опционально: можно определить __all__, чтобы указать,
 # какие имена экспортируются при 'from .widgets import *'
 __all__ = [
     'ChapterListWidget',
-    'AutoTranslateWidget',
     'GlossaryWidget',
     'KeyManagementWidget',
     'LogWidget',
@@ -50,4 +52,9 @@ __all__ = [
     'NoScrollComboBox',            # <-- Добавь эту строку
     'SidebarWidget',
     'ProviderModelsWidget',
+    'AutoTranslatePipelineWidget',
+    'AutoTranslateWidget',
+
+    'AIEditingSettingsWidget',
 ]
+

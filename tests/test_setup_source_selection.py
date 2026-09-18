@@ -390,30 +390,6 @@ def test_snapshot_restore_is_not_offered_for_different_epub_signature(tmp_path, 
     assert harness._snapshot_prompted_projects == set()
 
 
-def test_snapshot_restore_is_not_offered_while_auto_workflow_is_running(tmp_path, monkeypatch):
-    snapshot_path = tmp_path / "queue_snapshot.db"
-    snapshot_path.write_bytes(b"placeholder")
-    harness = _SnapshotHarness(
-        str(snapshot_path),
-        {
-            "epub_sig": "current",
-            "saved_task_count": 3,
-            "saved_at": 123.0,
-        },
-    )
-    harness._auto_workflow_enabled_for_session = True
-
-    def fail_question(*args, **kwargs):
-        raise AssertionError("snapshot restore must not interrupt the auto workflow")
-
-    monkeypatch.setattr(QtWidgets.QMessageBox, "question", fail_question)
-
-    harness._maybe_offer_snapshot_restore()
-
-    assert harness.engine.task_manager.meta_reads == 0
-    assert harness._snapshot_prompted_projects == set()
-
-
 def test_retry_files_refresh_does_not_offer_snapshot_restore():
     harness = _RetryFilesHarness()
     chapters = ["Text/chapter-1.xhtml"]

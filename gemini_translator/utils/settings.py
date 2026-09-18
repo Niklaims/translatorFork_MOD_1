@@ -259,7 +259,7 @@ class SettingsManager(QObject):
             merged = merge_settings_snapshots(self._disk_baseline, self._cache, disk_data)
             self._cache.clear()
             self._cache.update(merged)
-            self._apply_custom_provider_models_to_runtime()
+
 
         # 4. Записываем итоговый результат (наши настройки + общая история)
         self._save_unsafe(self._cache)

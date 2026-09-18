@@ -154,14 +154,6 @@ class _SetupSettingsHarness:
             }
         )
         self.preset_widget = _PromptWidgetStub()
-        self.auto_translate_widget = _DictWidgetStub(
-            {
-                "enabled": True,
-                "filter_redirect_enabled": True,
-                "filter_redirect_provider": "deepseek",
-                "filter_redirect_model": "deepseek-chat NonThink",
-            }
-        )
         self.key_management_widget = _KeyManagementWidgetStub("workascii_chatgpt")
         self.instances_spin = _SpinBoxStub(3)
         self.glossary_widget = _DictWidgetStub([])
@@ -277,11 +269,6 @@ class SetupSettingsPersistenceTests(unittest.TestCase):
         self.assertTrue(settings_manager.saved_full_session["prevent_sleep_during_translation"])
         self.assertFalse(settings_manager.saved_full_session["queue_autosave_enabled"])
         self.assertTrue(settings_manager.saved_full_session["show_chapter_char_count"])
-        self.assertTrue(settings_manager.saved_full_session["auto_translation"]["filter_redirect_enabled"])
-        self.assertEqual(
-            settings_manager.saved_full_session["auto_translation"]["filter_redirect_provider"],
-            "deepseek",
-        )
         self.assertFalse(harness.is_settings_dirty)
         self.assertNotIn("*", harness.windowTitle())
 

@@ -60,6 +60,7 @@ from .validation_dialogs.untranslated_fixer_dialog import (
     UntranslatedFixerPage,
     build_effective_untranslated_prompt,
     build_translation_tasks_from_data_items,
+    is_english_junk,
 )
 
 REGEX_DIGITS = re.compile(r'\d')
@@ -6003,6 +6004,38 @@ class TranslationValidatorPage(ShellPage):
                     'request_details_text': request_details_text,
                     'response_details_text': response_details_text,
                 }
+
+            # Автоматическая очистка английского мусора перед отправкой в AI-доперевод
+            junk_changes = []
+            for item in data_for_dialog:
+                term = str(item.get('term', '') or '')
+                ctx = str(item.get('new_context', item.get('context', '')) or '')
+                if is_english_junk(term) or is_english_junk(ctx):
+                    clean_lines = [l for l in ctx.splitlines() if not is_english_junk(l)]
+                    cleaned_ctx = "\n".join(clean_lines).strip()
+                    updated = item.copy()
+                    updated['new_context'] = cleaned_ctx if not is_english_junk(term) else ""
+                    junk_changes.append(updated)
+
+            if junk_changes:
+                self._apply_untranslated_fixer_changes(
+                    junk_changes, soup_cache, save_immediately=save_immediately, show_feedback=False
+                )
+                data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
+                    target_internal_paths=target_internal_paths,
+                    show_feedback=False,
+                )
+                if not data_for_dialog:
+                    return {
+                        'success': True,
+                        'groups_found': len(junk_changes),
+                        'translated_groups': 0,
+                        'groups_changed': len(junk_changes),
+                        'replacements': len(junk_changes),
+                        'saved_count': len(junk_changes) if save_immediately else 0,
+                        'request_details_text': "English junk purged automatically.",
+                        'response_details_text': "",
+                    }
 
             indexed_items = list(enumerate(data_for_dialog))
             tasks_list = build_translation_tasks_from_data_items(indexed_items, batch_size=batch_size)

@@ -82,7 +82,8 @@ from ..widgets import (
     KeyManagementWidget, TranslationOptionsWidget, ModelSettingsWidget,
     ProjectPathsWidget, GlossaryWidget, PresetWidget, ProjectActionsWidget,
     TaskManagementWidget, LogWidget, StatusBarWidget, ManualTranslationWidget,
-    AutoTranslateWidget, SidebarWidget, ProviderModelsWidget
+    SidebarWidget, ProviderModelsWidget, AutoTranslatePipelineWidget,
+    AIEditingSettingsWidget
 )
 from ..widgets.common_widgets import NoScrollSpinBox
 from .epub import EpubHtmlSelectorDialog, TranslatedChaptersManagerDialog
@@ -91,11 +92,6 @@ from .menu_utils import post_session_separator, prompt_return_to_menu, return_to
 from .glossary import MainWindow as GlossaryToolWindow
 from .glossary import ImporterWizardDialog
 from ..shell import ShellPage
-from .auto_workflow import (
-    AutoConsistencyWorker,
-    choose_preferred_translation_rel_path,
-    load_project_chapters_for_consistency,
-)
 from datetime import datetime
 import time # <-- НОВЫЙ ИМПОРТ
 from ..overlay_host import exec_dialog
@@ -437,35 +433,6 @@ class InitialSetupPage(ShellPage):
         self._pending_old_project_cleanup_offer = False
         self._returning_to_main_menu = False
         self._leave_prepared_once = False
-        self._auto_workflow_enabled_for_session = False
-        self._auto_workflow_round = 0
-        self._auto_followup_running = False
-        self._auto_last_retry_signatures = set()
-        self._auto_last_untranslated_fix_signatures = set()
-        self._auto_pending_network_retry_chapters = set()
-        self._auto_filter_repack_signatures = set()
-        self._auto_filter_redirect_signatures = set()
-        self._auto_filter_parallel_redirect_signatures = set()
-        self._auto_filter_parallel_redirect_runs = {}
-        self._auto_restart_session_override = None
-        self._auto_validator_dialog = None
-        self._auto_consistency_worker = None
-        self._auto_glossary_dialog = None
-        self._auto_glossary_running = False
-        self._auto_glossary_pending_translation = False
-        self._auto_glossary_completed = False
-
-        self._auto_glossary_poll_timer = QtCore.QTimer(self)
-        self._auto_glossary_poll_timer.setInterval(400)
-        self._auto_glossary_poll_timer.timeout.connect(self._poll_auto_glossary_dialog)
-
-        # A cancellable timer is required here. QTimer.singleShot callbacks used
-        # to survive disabling the auto workflow (or leaving the page) and could
-        # unexpectedly start a normal translation several minutes later.
-        self._auto_restart_timer = QtCore.QTimer(self)
-        self._auto_restart_timer.setSingleShot(True)
-        self._auto_restart_timer.timeout.connect(self._run_scheduled_auto_translation_restart)
-
         self._snapshot_save_timer = QtCore.QTimer(self)
         self._snapshot_save_timer.setSingleShot(True)
         self._snapshot_save_timer.setInterval(15000)
@@ -536,11 +503,18 @@ class InitialSetupPage(ShellPage):
             model_settings_widget=self.model_settings_widget,
             settings_getter=self.get_settings
         )
-        self.auto_translate_widget = AutoTranslateWidget(
-            self,
-            settings_manager=self.settings_manager,
-        )
         self.project_actions_widget = ProjectActionsWidget(self)
+        self.auto_translate_widget = AutoTranslatePipelineWidget(
+            settings_manager=self.settings_manager,
+            parent=self,
+            event_bus=self.bus,
+            engine=self.engine,
+        )
+
+        self.ai_editing_settings_widget = AIEditingSettingsWidget(
+            settings_manager=self.settings_manager,
+            parent=self,
+        )
         self.status_bar = StatusBarWidget(self, event_bus=self.bus, engine=self.engine)
 
         # --- ШАГ 2: СОЗДАЕМ ОБЪЕДИНЕННУЮ ВКЛАДКУ "НАСТРОЙКИ" ---
@@ -608,12 +582,13 @@ class InitialSetupPage(ShellPage):
         self.sidebar_widget = SidebarWidget(
             sections=[
                 ("🎛️", "Настройки API"),
+                ("🤖", "Автоперевод"),
                 ("📋", "Список Задач"),
                 ("📝", "Логирование"),
                 ("📚", "Глоссарий"),
                 ("✨", "Промпт"),
                 ("✍️", "Ручной перевод"),
-                ("🤖", "Автоперевод")
+                ("🪄", "ИИ-редактура"),
             ],
             version=getattr(self, 'version', ''),
             parent=self.main_content_widget
@@ -643,7 +618,14 @@ class InitialSetupPage(ShellPage):
         settings_scroll.setWidget(settings_tab)
         tabs_group.addWidget(settings_scroll)
 
-        # Вкладка 1: Список Задач + Оптимизация
+        # Вкладка 1: Автоперевод
+        auto_translate_scroll = QScrollArea()
+        auto_translate_scroll.setWidgetResizable(True)
+        auto_translate_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        auto_translate_scroll.setWidget(self.auto_translate_widget)
+        tabs_group.addWidget(auto_translate_scroll)
+
+        # Вкладка 2: Список Задач + Оптимизация
         tasks_scroll, self.tasks_splitter = _create_tasks_tab_scroll_area(
             self.task_management_widget,
             self.translation_options_widget,
@@ -666,13 +648,21 @@ class InitialSetupPage(ShellPage):
         manual_scroll.setWidget(self.manual_translation_widget)
         tabs_group.addWidget(manual_scroll)
 
-        auto_translate_scroll = QScrollArea()
-        auto_translate_scroll.setWidgetResizable(True)
-        auto_translate_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        auto_translate_scroll.setWidget(self.auto_translate_widget)
-        self.auto_translate_tab_index = tabs_group.addWidget(auto_translate_scroll)
+        # Вкладка 7: ИИ-редактирование (AI Editing)
+        ai_editing_scroll = QScrollArea()
+        ai_editing_scroll.setWidgetResizable(True)
+        ai_editing_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        ai_editing_scroll.setWidget(self.ai_editing_settings_widget)
+        tabs_group.addWidget(ai_editing_scroll)
         
         self.program_settings_tab_index = tabs_group.addWidget(program_scroll)
+
+        # Подключение сигналов навигации и запуска конвейера
+        self.auto_translate_widget.edit_requested.connect(self._navigate_to_stage_tab)
+        self.auto_translate_widget.start_pipeline_requested.connect(self._start_pipeline_auto_translation)
+        self.auto_translate_widget.stop_pipeline_requested.connect(self._stop_translation)
+
+        self.ai_editing_settings_widget.open_checker_requested.connect(self._open_consistency_checker_standalone)
 
         tabs_group.currentChanged.connect(self._on_main_tab_changed)
 
@@ -765,14 +755,11 @@ class InitialSetupPage(ShellPage):
         self.task_management_widget.tasks_changed.connect(lambda: self._prepare_and_display_tasks(clean_rebuild=True))
 
         self.model_settings_widget.recalibrate_requested.connect(self._calibrate_cpu)
-        self.model_settings_widget.model_combo.currentIndexChanged.connect(self._refresh_auto_translate_runtime_context)
-        self.model_settings_widget.settings_changed.connect(self._refresh_auto_translate_runtime_context)
         self.model_settings_widget.settings_changed.connect(self._update_instances_spinbox_limit)
         self.key_management_widget.active_keys_changed.connect(self._update_instances_spinbox_limit)
         self.key_management_widget.active_keys_changed.connect(self.check_ready)
         self.key_management_widget.provider_combo.currentIndexChanged.connect(self._update_instances_spinbox_limit)
         self.key_management_widget.provider_combo.currentIndexChanged.connect(self.check_ready)
-        self.key_management_widget.provider_combo.currentIndexChanged.connect(self._refresh_auto_translate_runtime_context)
 
         # --- ИЕРАРХИЯ Подключаемся только к TaskManagementWidget ---
         self.task_management_widget.tasks_changed.connect(lambda: self._prepare_and_display_tasks(clean_rebuild=True))
@@ -805,19 +792,12 @@ class InitialSetupPage(ShellPage):
         self.instances_spin.valueChanged.connect(self._mark_settings_as_dirty)
         self.preset_widget.text_changed.connect(self._mark_promt_as_dirty)
         self.glossary_widget.glossary_changed.connect(self._on_glossary_changed)
-        self.auto_translate_widget.settings_changed.connect(self._mark_settings_as_dirty)
-        self.auto_translate_widget.settings_changed.connect(self._on_auto_translation_settings_changed)
         self.prevent_sleep_checkbox.toggled.connect(self._mark_settings_as_dirty)
         self.prevent_sleep_checkbox.toggled.connect(
             lambda checked: save_prevent_sleep_setting(self.settings_manager, checked)
         )
-        self.auto_translate_widget.open_glossary_requested.connect(self.open_ai_glossary_generation)
-        self.auto_translate_widget.open_validator_requested.connect(self.open_translation_validator)
-        self.auto_translate_widget.open_consistency_requested.connect(self.open_ai_consistency_checker)
-        self._refresh_auto_translate_runtime_context()
 
     def _on_translation_options_changed(self):
-        self._refresh_auto_translate_runtime_context()
         self._mark_settings_as_dirty()
         self._task_queue_needs_rebuild = True
         if getattr(self, 'is_session_active', False):
@@ -831,8 +811,6 @@ class InitialSetupPage(ShellPage):
     def _on_main_tab_changed(self, index: int):
         if index == getattr(self, 'glossary_tab_index', -1):
             QtCore.QTimer.singleShot(0, self._maybe_offer_base_glossaries_for_empty_project)
-        if index == getattr(self, 'auto_translate_tab_index', -1):
-            QtCore.QTimer.singleShot(0, self.auto_translate_widget.refresh_glossary_presets)
 
     def _base_glossary_state_path(self):
         if not self.output_folder:
@@ -1389,6 +1367,11 @@ class InitialSetupPage(ShellPage):
         if hasattr(chapter_widget, "set_show_chapter_char_count"):
             chapter_widget.set_show_chapter_char_count(self._is_show_chapter_char_count_enabled())
 
+    def _sync_auto_translate_chapters(self):
+        """Синхронизирует текущий список выбранных глав с виджетом автоперевода."""
+        if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+            self.auto_translate_widget.update_chapters(self.html_files or [])
+
     def _save_prompt_session_state(self):
         settings_manager = getattr(self, "settings_manager", None)
         if settings_manager is None:
@@ -1860,29 +1843,6 @@ class InitialSetupPage(ShellPage):
 
         model_name = self.model_settings_widget.model_combo.currentText()
         self.translation_options_widget.update_recommendations_from_model(model_name)
-        self._refresh_auto_translate_runtime_context()
-
-    def _refresh_auto_translate_runtime_context(self):
-        if not hasattr(self, 'auto_translate_widget'):
-            return
-        if not hasattr(self, 'translation_options_widget') or not hasattr(self, 'model_settings_widget'):
-            return
-        if not hasattr(self, 'key_management_widget'):
-            return
-
-        chapter_compositions = getattr(self.translation_options_widget, 'chapter_compositions', {}) or {}
-        uses_cjk = any(
-            isinstance(composition, dict) and composition.get('is_cjk')
-            for composition in chapter_compositions.values()
-        )
-        self.auto_translate_widget.set_runtime_context(
-            provider_id=self.key_management_widget.get_selected_provider(),
-            current_model_name=self.model_settings_widget.model_combo.currentText(),
-            current_task_size_limit=self.translation_options_widget.task_size_spin.value(),
-            current_task_size_unit=self.translation_options_widget.task_size_unit(),
-            uses_cjk=uses_cjk,
-            current_model_settings=self.model_settings_widget.get_settings(),
-        )
 
 
     def _update_distribution_info(self):
@@ -1965,10 +1925,6 @@ class InitialSetupPage(ShellPage):
         event_name = event_data.get('event')
         data = event_data.get('data', {})
 
-        if data.get('background_session'):
-            self._handle_background_session_event(event_name, data)
-            return
-
         if self.is_blocked_by_child_dialog and event_name != 'tasks_for_retry_ready':
             return
 
@@ -1982,10 +1938,14 @@ class InitialSetupPage(ShellPage):
             # total_tasks теперь обрабатывается в StatusBarWidget
             self._set_controls_enabled(False)
             self._save_snapshot_async(force=True)
+            if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+                self.auto_translate_widget.on_event(event_data)
             return
         if event_name == 'assembly_finished' and self.is_session_active == False:
             if self.project_manager:
                 self.project_manager.reload_data_from_disk()
+            if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+                self.auto_translate_widget.on_event(event_data)
 
         if event_name == 'session_finished':
             self._shutdown_reason = data.get('reason')
@@ -1995,6 +1955,8 @@ class InitialSetupPage(ShellPage):
                 QtCore.Qt.ConnectionType.QueuedConnection
             )
             self.this_dialog_started_the_session = False
+            if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+                self.auto_translate_widget.on_event(event_data)
             return
 
         if event_name == 'tasks_for_retry_ready':
@@ -2004,11 +1966,10 @@ class InitialSetupPage(ShellPage):
 
         if event_name == 'task_state_changed':
             self._schedule_snapshot_save()
+            if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+                self.auto_translate_widget.on_event(event_data)
             return
 
-        if event_name == 'task_finished':
-            self._maybe_start_parallel_filter_redirect(event_data)
-            return
 
         if event_name == 'new_glossary_terms_extracted':
             terms = data.get('terms', {})
@@ -2234,6 +2195,7 @@ class InitialSetupPage(ShellPage):
             if success:
                 self.html_files = selected_files
                 self.paths_widget.update_chapters_info(len(self.html_files))
+                self._sync_auto_translate_chapters()
 
                 if self.output_folder:
                     self._handle_project_initialization()
@@ -2256,6 +2218,7 @@ class InitialSetupPage(ShellPage):
             self.selected_file = None
             self.html_files = []
             self.paths_widget.set_file_path(None)
+            self._sync_auto_translate_chapters()
             self.check_ready()
 
     def _refresh_dirty_window_title(self):
@@ -2313,7 +2276,6 @@ class InitialSetupPage(ShellPage):
             'num_instances': self.instances_spin.value(),
             'custom_prompt': self.preset_widget.get_prompt(),
             'last_prompt_preset': self.preset_widget.get_current_preset_name(),
-            'auto_translation': self.auto_translate_widget.get_settings(),
             PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
             QUEUE_AUTOSAVE_SETTING_KEY: self._is_queue_autosave_enabled(),
             SHOW_CHAPTER_CHAR_COUNT_SETTING_KEY: self._is_show_chapter_char_count_enabled(),
@@ -2637,6 +2599,8 @@ class InitialSetupPage(ShellPage):
             self.html_files = []
             # Немедленно обновляем UI, чтобы пользователь видел, что выбор глав сброшен
             self.paths_widget.update_chapters_info(0)
+            if hasattr(self, '_sync_auto_translate_chapters'):
+                self._sync_auto_translate_chapters()
             if self.task_manager:
                 # Очищаем очередь задач, так как она тоже относится к старому файлу
                 self.task_manager.clear_all_queues()
@@ -2666,6 +2630,8 @@ class InitialSetupPage(ShellPage):
                     self.paths_widget.set_folder_path(None)
                     self.html_files = []
                     self.paths_widget.update_chapters_info(0) # Обновляем UI счетчика
+                    if hasattr(self, '_sync_auto_translate_chapters'):
+                        self._sync_auto_translate_chapters()
                     if self.task_manager:
                         self.task_manager.clear_all_queues()
                     # --- КОНЕЦ ОЧИСТКИ ---
@@ -2711,6 +2677,8 @@ class InitialSetupPage(ShellPage):
                     self.html_files = []
                     self.paths_widget.set_file_path(None)
                     self.paths_widget.update_chapters_info(0)
+                    if hasattr(self, '_sync_auto_translate_chapters'):
+                        self._sync_auto_translate_chapters()
                     if self.task_manager:
                         self.task_manager.clear_all_queues()
                     # --- КОНЕЦ ОЧИСТКИ ---
@@ -3034,8 +3002,6 @@ class InitialSetupPage(ShellPage):
         if (
             self._snapshot_restore_in_progress
             or self.is_session_active
-            or getattr(self, '_auto_workflow_enabled_for_session', False)
-            or getattr(self, '_auto_followup_running', False)
         ):
             return
         if not (self.selected_file and self.output_folder and self.engine and self.engine.task_manager):
@@ -3848,7 +3814,6 @@ class InitialSetupPage(ShellPage):
         settings.update(self.get_settings())
 
         settings.update(self.translation_options_widget.get_settings())
-        settings['auto_translation'] = self.auto_translate_widget.get_settings()
 
         # Preserve existing theme config
         from gemini_translator.ui.themes import THEME_SETTINGS_KEY, sanitize_theme_colors
@@ -3893,7 +3858,6 @@ class InitialSetupPage(ShellPage):
         self.preset_widget.blockSignals(True)
         self.key_management_widget.blockSignals(True)
         self.instances_spin.blockSignals(True)
-        self.auto_translate_widget.blockSignals(True)
         if hasattr(self, 'prevent_sleep_checkbox'):
             self.prevent_sleep_checkbox.blockSignals(True)
         if hasattr(self, 'queue_autosave_checkbox'):
@@ -3916,10 +3880,6 @@ class InitialSetupPage(ShellPage):
                 'task_size_unit',
             )):
                 self.translation_options_widget.set_settings(settings)
-
-            auto_translation_settings = settings.get('auto_translation')
-            if isinstance(auto_translation_settings, dict):
-                self.auto_translate_widget.set_settings(auto_translation_settings)
 
             if 'last_prompt_preset' in settings:
                 preset_name = settings['last_prompt_preset']
@@ -3976,7 +3936,6 @@ class InitialSetupPage(ShellPage):
             self.preset_widget.blockSignals(False)
             self.key_management_widget.blockSignals(False)
             self.instances_spin.blockSignals(False)
-            self.auto_translate_widget.blockSignals(False)
             if hasattr(self, 'prevent_sleep_checkbox'):
                 self.prevent_sleep_checkbox.blockSignals(False)
             if hasattr(self, 'queue_autosave_checkbox'):
@@ -3984,7 +3943,6 @@ class InitialSetupPage(ShellPage):
             if hasattr(self, 'show_chapter_chars_checkbox'):
                 self.show_chapter_chars_checkbox.blockSignals(False)
 
-        self._refresh_auto_translate_runtime_context()
         self._sync_chapter_char_display_settings()
         self._update_distribution_info_from_widget()
         self.check_ready()
@@ -4105,9 +4063,6 @@ class InitialSetupPage(ShellPage):
         if self.is_session_active:
             return
 
-        if self._auto_followup_running or self._auto_glossary_running:
-            self.start_btn.setEnabled(False)
-            return
 
         # --- Условие для основного перевода (требует активную AI-сессию) ---
         can_start_ai = _key_widget_can_start_ai_session(self.key_management_widget)
@@ -4253,13 +4208,15 @@ class InitialSetupPage(ShellPage):
     def _start_translation(
         self,
         checked=False,
-        is_auto_restart: bool = False,
-        skip_auto_glossary: bool = False,
         preserve_log: bool = False,
+        from_pipeline: bool = False,
     ):
         """
         Собирает настройки и отправляет команду на запуск сессии.
         """
+        if not from_pipeline and getattr(self, 'tabs_group', None) and self.tabs_group.currentIndex() == 1:
+            self._start_pipeline_auto_translation()
+            return
 
         location_worker = getattr(self, '_project_location_worker', None)
         if location_worker is not None and location_worker.isRunning():
@@ -4272,55 +4229,9 @@ class InitialSetupPage(ShellPage):
             print("[INFO] Нажатие 'Старт' проигнорировано: сессия уже активна (интерфейс обновлен).")
             return
 
-        auto_settings = self.auto_translate_widget.get_settings() if hasattr(self, 'auto_translate_widget') else {}
-        pending_session_override = (
-            dict(self._auto_restart_session_override)
-            if is_auto_restart and isinstance(self._auto_restart_session_override, dict)
-            else None
-        )
-        (
-            auto_translation_options_override,
-            auto_translation_mode,
-            auto_has_translation_override,
-            auto_batch_token_limit,
-            auto_batch_task_limit,
-            auto_batch_profile,
-        ) = self._resolve_auto_translation_options(auto_settings)
-        auto_model_name, auto_model_config, auto_model_warning = self._resolve_auto_model_override(auto_settings)
-        if auto_settings.get('enabled') and not is_auto_restart and auto_has_translation_override:
-            self._prepare_and_display_tasks(
-                clean_rebuild=False,
-                translation_options_override=auto_translation_options_override,
-            )
-            if auto_translation_mode != 'inherit':
-                mode_titles = {
-                    'batch': "пакетами",
-                    'single': "по одной главе",
-                    'chunk': "чанками",
-                }
-                self._auto_log(
-                    f"Основной автоперевод будет собран {mode_titles.get(auto_translation_mode, auto_translation_mode)}.",
-                    force=True
-                )
-            if auto_batch_token_limit > 0 and auto_batch_task_limit:
-                self._auto_log(
-                    "Лимит пакета для основного автопрогона: "
-                    f"~{auto_batch_token_limit} входных токенов "
-                    f"(лимит задачи: {auto_batch_task_limit} токенов, профиль: {auto_batch_profile}).",
-                    force=True
-                )
-        if auto_settings.get('enabled') and not is_auto_restart and auto_model_warning:
-            self._auto_log(f"{auto_model_warning} Использую модель из общих настроек.", force=True)
-        if auto_settings.get('enabled') and not is_auto_restart and auto_model_name:
-            self._auto_log(f"Модель основного автопрогона: {auto_model_name}.", force=True)
-
         # 1. Проверяем и при необходимости восстанавливаем очередь задач.
         tasks_exist = self._ensure_pending_tasks_for_start()
-        active_keys_for_start = (
-            pending_session_override.get('api_keys')
-            if isinstance(pending_session_override, dict) and pending_session_override.get('api_keys')
-            else self.key_management_widget.get_active_keys()
-        )
+        active_keys_for_start = self.key_management_widget.get_active_keys()
         service_session_ready = bool(active_keys_for_start) or _key_widget_can_start_ai_session(self.key_management_widget)
 
         # 2. Проверяем все условия для старта
@@ -4335,18 +4246,6 @@ class InitialSetupPage(ShellPage):
             missing_start_requirements.append("нет активной сессии сервиса/ключей")
 
         if missing_start_requirements:
-            if is_auto_restart:
-                self._auto_log(
-                    "Автоперезапуск перевода остановлен: "
-                    + ", ".join(missing_start_requirements)
-                    + ". Подготовленные задачи останутся в очереди, если они были созданы.",
-                    force=True
-                )
-                self._auto_restart_session_override = None
-                self._reset_auto_workflow_state()
-                self.check_ready()
-                return
-
             QMessageBox.warning(self, "Ошибка", "Необходимо выбрать файл, задачи, папку и активную сессию сервиса.")
             return
 
@@ -4355,19 +4254,7 @@ class InitialSetupPage(ShellPage):
 
         # 3. Получаем настройки. В них больше нет 'selected_chapters'.
         settings = self.get_settings()
-        auto_settings = settings.get('auto_translation', {})
-        if auto_settings.get('enabled') and auto_has_translation_override:
-            settings.update(auto_translation_options_override)
-        if auto_settings.get('enabled') and auto_model_name and auto_model_config:
-            settings['model'] = auto_model_name
-            settings['model_config'] = auto_model_config
-        else:
-            settings['model_config'] = api_config.all_models().get(settings.get('model'))
-        self._apply_auto_thinking_override(settings, auto_settings, model_config=settings.get('model_config'))
-        if pending_session_override:
-            settings.update(pending_session_override)
-            if not settings.get('model_config'):
-                settings['model_config'] = api_config.all_models().get(settings.get('model'))
+        settings['model_config'] = api_config.all_models().get(settings.get('model'))
 
         session_model_id = (settings.get('model_config') or {}).get('id')
         if session_model_id:
@@ -4384,11 +4271,10 @@ class InitialSetupPage(ShellPage):
             return
 
         # 5. Сохраняем все релевантные настройки перед запуском
-        if not is_auto_restart and not preserve_log:
+        if not preserve_log:
             self.log_widget.clear()
         self.settings_manager.add_to_project_history(self.selected_file, self.output_folder)
         self._save_prompt_session_state()
-        self.auto_translate_widget.save_last_state_now()
         if self.local_set:
             self._save_project_settings_only()
         else:
@@ -4396,42 +4282,25 @@ class InitialSetupPage(ShellPage):
         if self.glossary_widget.get_glossary() != self.initial_glossary_state:
             self._save_project_glossary_only()
 
-        if (
-            not is_auto_restart
-            and not skip_auto_glossary
-            and auto_settings.get('enabled')
-            and auto_settings.get('glossary_enabled')
-        ):
-            self._start_auto_glossary_then_translation(settings, auto_settings)
-            return
-
-        if not is_auto_restart:
-            if auto_settings.get('enabled'):
-                self._auto_workflow_enabled_for_session = True
-                self._auto_workflow_round = 0
-                self._auto_last_retry_signatures = set()
-            else:
-                self._reset_auto_workflow_state()
-        else:
-            self._auto_followup_running = False
-
         # 6. Отправляем событие на запуск сессии
         self.this_dialog_started_the_session = True
-        self._auto_restart_session_override = None
         self._post_event(name='start_session_requested', data={'settings': settings})
 
         # 7. Обновляем UI
         self.start_btn.setEnabled(False)
-        if is_auto_restart:
-            self._auto_log(f"Перезапускаю перевод. Текущий автоцикл: {self._auto_workflow_round}.", force=True)
-        else:
-            self._post_event('log_message', {'message': "[SYSTEM] Команда на запуск сессии отправлена…"})
+        self._post_event('log_message', {'message': "[SYSTEM] Команда на запуск сессии отправлена…"})
 
 
     def _stop_translation(self):
         """
         Отправляет команду на остановку сессии через шину событий.
         """
+        if getattr(self, '_pipeline_active', False):
+            self._pipeline_active = False
+            current = getattr(self, '_current_pipeline_stage', None)
+            if current and hasattr(self, 'auto_translate_widget'):
+                self.auto_translate_widget.set_stage_status(current, "error", "Остановлено пользователем")
+
         if self.engine and self.engine.session_id:
             if self._hard_stop_enabled:
                 self._post_event('log_message', {'message': "[SYSTEM] Отправка запроса на немедленную остановку сессии…"})
@@ -4476,6 +4345,12 @@ class InitialSetupPage(ShellPage):
             self.status_bar.stop_session()
             self._set_stop_button_mode(False)
             self._set_controls_enabled(True)
+
+            # Переход к следующему этапу автоперевода, если активен конвейер
+            if getattr(self, '_pipeline_active', False) and getattr(self, '_current_pipeline_stage', None) == 'machine_translation':
+                self.auto_translate_widget.set_stage_status('machine_translation', 'completed')
+                self._current_pipeline_stage = None
+                QtCore.QTimer.singleShot(500, self._run_next_pipeline_stage)
 
             # После завершения сессии синхронизируем стили ключей с выбранной моделью UI.
             try:
@@ -4532,8 +4407,6 @@ class InitialSetupPage(ShellPage):
                     lambda: post_session_separator(self._post_event, session_id_log=session_id_log, reason=reason),
                 )
 
-            self._schedule_auto_workflow_followup(reason)
-            
             # Отправка системного уведомления о завершении
             try:
                 from gemini_translator.ui.notifications import NotificationManager
@@ -4729,7 +4602,11 @@ class InitialSetupPage(ShellPage):
         self.key_management_widget.set_session_mode(is_session_active)
         self.glossary_widget.set_session_mode(is_session_active)
         self.preset_widget.set_session_mode(is_session_active)
-        self.auto_translate_widget.set_session_mode(is_session_active)
+        if hasattr(self, 'auto_translate_widget') and hasattr(self.auto_translate_widget, 'set_session_mode'):
+            self.auto_translate_widget.set_session_mode(is_session_active)
+
+        if hasattr(self, 'ai_editing_settings_widget') and hasattr(self.ai_editing_settings_widget, 'set_session_mode'):
+            self.ai_editing_settings_widget.set_session_mode(is_session_active)
 
         # Switch the TaskManager cache-update timer to energy-saving cadence
         # during active sessions to prevent the continuous update loop that
@@ -5075,299 +4952,6 @@ class InitialSetupPage(ShellPage):
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось открыть менеджер EPUB: {e}")
 
-    def _estimate_auto_task_size_limit(self, token_limit: int):
-        return auto_workflow_helpers.estimate_auto_task_size_limit(token_limit)
-
-    def _get_effective_auto_short_ratio_limit(self, auto_settings: dict | None, result_data: dict | None = None):
-        return auto_workflow_helpers.effective_auto_short_ratio_limit(
-            auto_settings,
-            result_data,
-            chapter_has_cjk=self._auto_original_chapter_has_cjk,
-        )
-
-    def _auto_result_uses_cjk_ratio(self, result_data: dict | None) -> bool:
-        return auto_workflow_helpers.auto_result_uses_cjk_ratio(
-            result_data,
-            chapter_has_cjk=self._auto_original_chapter_has_cjk,
-        )
-
-    def _auto_original_chapter_has_cjk(self, internal_path: str | None) -> bool:
-        internal_path = str(internal_path or "").strip()
-        epub_path = getattr(self, 'selected_file', None)
-        if not internal_path or not epub_path or not os.path.exists(epub_path):
-            return False
-
-        cache = getattr(self, '_auto_cjk_original_cache', None)
-        if not isinstance(cache, dict):
-            cache = {}
-            self._auto_cjk_original_cache = cache
-
-        cache_key = (os.path.abspath(epub_path), internal_path)
-        if cache_key in cache:
-            return cache[cache_key]
-
-        has_cjk = False
-        try:
-            with zipfile.ZipFile(epub_path, 'r') as epub_zip:
-                if internal_path in epub_zip.namelist():
-                    original_html = epub_zip.read(internal_path).decode('utf-8', errors='ignore')
-                    has_cjk = auto_workflow_helpers.text_has_cjk(original_html)
-        except Exception:
-            has_cjk = False
-
-        cache[cache_key] = has_cjk
-        return has_cjk
-
-    def _resolve_auto_model_override(self, auto_settings: dict | None = None):
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
-
-        model_name = auto_settings.get('model_override')
-        if not model_name:
-            return None, None, None
-
-        model_config = api_config.all_models().get(model_name)
-        if not isinstance(model_config, dict):
-            return None, None, f"Автомодель '{model_name}' не найдена в конфигурации."
-
-        selected_provider = self.key_management_widget.get_selected_provider()
-        model_provider = model_config.get('provider')
-        if selected_provider and model_provider and model_provider != selected_provider:
-            return None, None, (
-                f"Автомодель '{model_name}' недоступна для сервиса "
-                f"'{selected_provider}'."
-            )
-
-        return model_name, model_config, None
-
-    def _get_active_keys_for_provider(self, provider_id: str | None):
-        normalized_provider = str(provider_id or "").strip()
-        if not normalized_provider:
-            return []
-
-        if not api_config.provider_requires_api_key(normalized_provider):
-            placeholder = api_config.provider_placeholder_api_key(normalized_provider)
-            return [placeholder] if placeholder else []
-
-        key_widget = getattr(self, 'key_management_widget', None)
-        if not key_widget:
-            return []
-
-        active_by_provider = getattr(key_widget, 'current_active_keys_by_provider', {})
-        if isinstance(active_by_provider, dict):
-            stored_keys = active_by_provider.get(normalized_provider)
-            if isinstance(stored_keys, (list, tuple, set)):
-                normalized_keys = [str(key).strip() for key in stored_keys if str(key).strip()]
-                if normalized_keys:
-                    return list(normalized_keys)
-
-        try:
-            if key_widget.get_selected_provider() == normalized_provider:
-                return [
-                    str(key).strip()
-                    for key in key_widget.get_active_keys()
-                    if str(key).strip()
-                ]
-        except Exception:
-            return []
-
-        return []
-
-    def _resolve_auto_filter_redirect_override(self, auto_settings: dict | None = None):
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
-        if not auto_settings.get('filter_redirect_enabled'):
-            return None, None
-
-        model_name = str(auto_settings.get('filter_redirect_model') or "").strip()
-        if not model_name:
-            return None, "Для redirect отфильтрованных глав не выбрана модель."
-
-        model_config = api_config.all_models().get(model_name)
-        if not isinstance(model_config, dict):
-            return None, f"Модель redirect '{model_name}' не найдена в конфигурации."
-
-        selected_provider = str(auto_settings.get('filter_redirect_provider') or "").strip()
-        provider_id = selected_provider or str(model_config.get('provider') or "").strip()
-        model_provider = str(model_config.get('provider') or "").strip()
-        if not provider_id:
-            return None, f"Не удалось определить сервис для модели redirect '{model_name}'."
-        if model_provider and provider_id != model_provider:
-            return None, (
-                f"Модель redirect '{model_name}' относится к сервису '{model_provider}', "
-                f"но в настройке выбран '{provider_id}'."
-            )
-
-        active_keys = self._get_active_keys_for_provider(provider_id)
-        if not active_keys:
-            provider_label = api_config.provider_display_map().get(provider_id, provider_id)
-            return None, (
-                f"Для redirect отфильтрованных глав нет активной сессии/ключей у сервиса "
-                f"'{provider_label}'."
-            )
-
-        return {
-            'provider': provider_id,
-            'api_keys': active_keys,
-            'model': model_name,
-            'model_config': model_config,
-        }, None
-
-    def _get_effective_auto_model_settings(self, auto_settings: dict | None = None):
-        settings = self.model_settings_widget.get_settings().copy()
-        model_name, model_config, _ = self._resolve_auto_model_override(auto_settings)
-        if model_name and model_config:
-            settings['model'] = model_name
-            settings['model_config'] = model_config
-        self._apply_auto_thinking_override(settings, auto_settings, model_config=model_config)
-        return settings
-
-    def _resolve_auto_glossary_prompt_override(self, auto_settings: dict | None = None):
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
-
-        selected_value = auto_settings.get('glossary_prompt_preset')
-        if not isinstance(selected_value, str) or not selected_value.strip():
-            return None, None, None
-
-        builtin_presets = api_config.builtin_glossary_prompt_variants()
-        builtin_meta = builtin_presets.get(selected_value)
-        if isinstance(builtin_meta, dict):
-            builtin_text = builtin_meta.get('text')
-            builtin_label = builtin_meta.get('label') or selected_value
-            if isinstance(builtin_text, str) and builtin_text.strip():
-                return None, builtin_text, builtin_label
-            return None, None, builtin_label
-
-        return selected_value, None, selected_value
-
-    def _apply_auto_thinking_override(
-        self,
-        settings: dict,
-        auto_settings: dict | None = None,
-        model_config: dict | None = None,
-    ):
-        if not isinstance(settings, dict):
-            return
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
-
-        thinking_override = str(auto_settings.get('thinking_mode_override') or 'inherit')
-        if thinking_override == 'inherit':
-            return
-
-        effective_model_config = model_config
-        if not isinstance(effective_model_config, dict):
-            effective_model_config = settings.get('model_config')
-        if not isinstance(effective_model_config, dict):
-            model_name = settings.get('model')
-            if isinstance(model_name, str) and model_name:
-                effective_model_config = api_config.all_models().get(model_name)
-        if not isinstance(effective_model_config, dict):
-            return
-
-        min_budget_cfg = effective_model_config.get('min_thinking_budget')
-        thinking_levels = effective_model_config.get('thinkingLevel')
-        has_thinking_config = (
-            'thinkingLevel' in effective_model_config
-            or 'min_thinking_budget' in effective_model_config
-        )
-        supports_thinking = has_thinking_config and min_budget_cfg is not False
-        if not supports_thinking:
-            settings['thinking_enabled'] = False
-            settings['thinking_budget'] = None
-            settings['thinking_level'] = None
-            return
-
-        if thinking_override == 'disabled':
-            settings['thinking_enabled'] = False
-            settings['thinking_budget'] = 0
-            settings['thinking_level'] = None
-            return
-
-        if thinking_override.startswith('level:'):
-            requested_level = thinking_override.split(':', 1)[1].strip().lower()
-            available_levels = {
-                str(level).strip().lower()
-                for level in thinking_levels
-            } if isinstance(thinking_levels, list) else set()
-            if requested_level not in available_levels:
-                return
-            settings['thinking_enabled'] = True
-            settings['thinking_level'] = requested_level.upper()
-            settings['thinking_budget'] = None
-            return
-
-        if thinking_override.startswith('budget:'):
-            if isinstance(thinking_levels, list) and thinking_levels:
-                return
-
-            raw_budget = thinking_override.split(':', 1)[1].strip().lower()
-            if raw_budget == 'dynamic':
-                parsed_budget = -1
-            else:
-                try:
-                    parsed_budget = int(raw_budget)
-                except (TypeError, ValueError):
-                    return
-
-            settings['thinking_enabled'] = True
-            settings['thinking_budget'] = parsed_budget
-            settings['thinking_level'] = None
-
-    def _resolve_auto_translation_options(self, auto_settings: dict | None = None):
-        translation_options = self.translation_options_widget.get_settings().copy()
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
-
-        def _safe_int(value, default=0):
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return default
-
-        mode = str(auto_settings.get('translation_mode_override', 'inherit') or 'inherit')
-        has_override = False
-        if mode == 'batch':
-            translation_options.update({
-                'use_batching': True,
-                'chunking': False,
-                'chunk_on_error': False,
-            })
-            has_override = True
-        elif mode == 'single':
-            translation_options.update({
-                'use_batching': False,
-                'chunking': False,
-                'chunk_on_error': False,
-            })
-            has_override = True
-        elif mode == 'chunk':
-            translation_options.update({
-                'use_batching': False,
-                'chunking': True,
-                'chunk_on_error': True,
-            })
-            has_override = True
-        else:
-            mode = 'inherit'
-
-        batch_token_limit = _safe_int(auto_settings.get('batch_token_limit_override', 0) or 0)
-        batch_task_limit = None
-        token_profile = None
-        if batch_token_limit > 0:
-            batch_task_limit, token_profile = self._estimate_auto_task_size_limit(batch_token_limit)
-            if batch_task_limit:
-                translation_options['task_size_limit'] = batch_task_limit
-                has_override = True
-
-        chapter_limit = _safe_int(auto_settings.get('batch_chapter_limit_override', 0) or 0)
-        if chapter_limit > 0:
-            translation_options['max_chapters_per_batch'] = chapter_limit
-            has_override = True
-
-        return translation_options, mode, has_override, batch_token_limit, batch_task_limit, token_profile
-
     def _build_sequential_chapter_chains(self, chapters: list, split_count: int) -> list[list]:
         return auto_workflow_helpers.build_sequential_chapter_chains(chapters, split_count)
 
@@ -5421,11 +5005,6 @@ class InitialSetupPage(ShellPage):
             settings = self.get_settings()
             if isinstance(translation_options_override, dict):
                 settings.update(translation_options_override)
-            elif self._auto_workflow_enabled_for_session:
-                auto_translation_settings = settings.get('auto_translation', {})
-                effective_options, mode, has_override, *_ = self._resolve_auto_translation_options(auto_translation_settings)
-                if has_override:
-                    settings.update(effective_options)
             display_tasks_settings = settings.copy()
 
             try:
@@ -5459,6 +5038,8 @@ class InitialSetupPage(ShellPage):
 
         QtCore.QTimer.singleShot(15, lambda: self.translation_options_widget._update_info_text())
         self._task_queue_needs_rebuild = False
+        if hasattr(self, 'auto_translate_widget') and self.auto_translate_widget:
+            self.auto_translate_widget.refresh_chapter_statuses()
 
 
         if self.cpu_performance_index is None and self.html_files and self.glossary_widget.get_glossary():
@@ -5513,1455 +5094,165 @@ class InitialSetupPage(ShellPage):
         self.request_push.emit(page)
 
     def open_ai_glossary_generation(self):
-        """Открывает существующий AI-генератор глоссария с выбранным шаблоном."""
+        """Открывает существующий AI-генератор глоссария."""
         if not all([self.selected_file, self.output_folder, self.html_files]):
             QMessageBox.warning(self, "Недостаточно данных", "Сначала выберите EPUB, папку проекта и главы.")
             return
 
-        auto_settings = self.auto_translate_widget.get_settings()
-        glossary_preset_name, glossary_prompt_override, glossary_prompt_label = self._resolve_auto_glossary_prompt_override(auto_settings)
-        if glossary_preset_name:
-            self.settings_manager.save_last_glossary_prompt_preset_name(glossary_preset_name)
-        elif glossary_prompt_override:
-            self.settings_manager.save_last_glossary_prompt_preset_name(None)
-            self.settings_manager.save_last_glossary_prompt_text(glossary_prompt_override)
-            self._auto_log(f"Для AI-глоссария выбран шаблон: {glossary_prompt_label}.", force=True)
-
         self.glossary_widget.set_epub_path(self.selected_file)
         self.glossary_widget._open_ai_generation_dialog()
 
-    def _start_auto_glossary_then_translation(self, settings: dict, auto_settings: dict):
-        if self._auto_glossary_running:
-            return
-
-        from .glossary_dialogs.ai_generation import GenerationSessionDialog
-
-        glossary_preset_name, glossary_prompt_override, glossary_prompt_label = self._resolve_auto_glossary_prompt_override(auto_settings)
-        if glossary_preset_name:
-            self.settings_manager.save_last_glossary_prompt_preset_name(glossary_preset_name)
-        elif glossary_prompt_override:
-            self.settings_manager.save_last_glossary_prompt_preset_name(None)
-            self.settings_manager.save_last_glossary_prompt_text(glossary_prompt_override)
-            self._auto_log(f"Автоглоссарий использует шаблон: {glossary_prompt_label}.", force=True)
-
-        glossary_initial_settings = dict(settings)
-        glossary_initial_settings['use_batching'] = True
-        glossary_initial_settings['chunking'] = False
-        glossary_initial_settings['chunk_on_error'] = False
-        if glossary_prompt_override:
-            glossary_initial_settings['glossary_generation_prompt'] = glossary_prompt_override
-
-        glossary_model_name, glossary_model_config, _ = self._resolve_auto_model_override(auto_settings)
-        if glossary_model_name and glossary_model_config:
-            glossary_initial_settings['model'] = glossary_model_name
-            glossary_initial_settings['model_config'] = glossary_model_config
-        self._apply_auto_thinking_override(
-            glossary_initial_settings,
-            auto_settings,
-            model_config=glossary_initial_settings.get('model_config'),
-        )
-
-        dialog = GenerationSessionDialog(
-            settings_manager=self.settings_manager,
-            initial_glossary=self.glossary_widget.get_glossary(),
-            merge_mode=None,
-            html_files=self.html_files,
-            epub_path=self.selected_file,
-            project_manager=self.project_manager,
-            initial_ui_settings=glossary_initial_settings,
-            parent=self,
-            restore_saved_ui_settings=False,
-            persist_ui_settings=False,
-        )
-        dialog.hide()
-        dialog.generation_finished.connect(self._on_auto_glossary_generation_finished)
-        dialog.finished.connect(self._on_auto_glossary_dialog_closed)
-        preparation_source = getattr(dialog, 'page', dialog)
-        preparation_source.task_preparation_finished.connect(
-            lambda success, error, dialog=dialog:
-                self._on_auto_glossary_tasks_ready(dialog, success, error)
-        )
-
-        self._auto_glossary_dialog = dialog
-        self._auto_glossary_running = True
-        self._auto_glossary_pending_translation = True
-        self._auto_glossary_completed = False
-        self._auto_followup_running = True
-        self.is_blocked_by_child_dialog = True
-        self._set_controls_enabled(False)
-        self.start_btn.setEnabled(False)
-        self._auto_log("Запускаю автосоставление глоссария перед переводом…", force=True)
-
-        dialog._initial_load_done = True
-        dialog._deferred_initial_load()
-
-    def _on_auto_glossary_tasks_ready(self, dialog, success: bool, error: str):
-        if dialog is not self._auto_glossary_dialog or not self._auto_glossary_running:
-            return
-
-        if not success:
-            self._auto_glossary_pending_translation = False
-            self._auto_log(
-                f"Не удалось подготовить задачи автоглоссария: {error or 'неизвестная ошибка'}.",
-                force=True,
-            )
-            try:
-                dialog._cleanup(keep_recovery_file=True)
-            finally:
-                QtWidgets.QDialog.reject(dialog)
-            return
-
-        dialog._auto_glossary_start_requested_at = time.monotonic()
-        dialog._auto_glossary_seen_active = False
-        dialog._start_session()
-        self._auto_glossary_poll_timer.start()
-
-    def _poll_auto_glossary_dialog(self):
-        dialog = self._auto_glossary_dialog
-        if not dialog:
-            self._auto_glossary_poll_timer.stop()
-            return
-
-        if dialog.is_session_active:
-            dialog._auto_glossary_seen_active = True
-            return
-
-        if getattr(dialog, '_session_finished_successfully', False):
-            try:
-                dialog._refresh_glossary_from_db()
-                dialog._update_start_button_state()
-            except Exception as e:
-                self._auto_log(f"Не удалось подготовить результаты автоглоссария к применению: {e}", force=True)
-            self._auto_glossary_poll_timer.stop()
-            dialog.accept()
-            return
-
-        start_requested_at = getattr(dialog, '_auto_glossary_start_requested_at', None)
-        if (
-            start_requested_at is not None
-            and not getattr(dialog, '_auto_glossary_seen_active', False)
-            and time.monotonic() - start_requested_at < 10.0
-        ):
-            return
-
-        self._auto_glossary_poll_timer.stop()
-        self._auto_log("Автоглоссарий завершился без успешного финиша. Основной перевод не будет запущен.", force=True)
-        try:
-            dialog._cleanup(keep_recovery_file=True)
-        finally:
-            QtWidgets.QDialog.reject(dialog)
-
-    @pyqtSlot(list, set)
-    def _on_auto_glossary_generation_finished(self, final_glossary: list, processed_chapters: set):
-        self._auto_glossary_completed = True
-
-        normalized_glossary = []
-        if isinstance(final_glossary, list):
-            normalized_glossary = [item.copy() for item in final_glossary if isinstance(item, dict)]
-
-        if not normalized_glossary and self._auto_glossary_dialog and hasattr(self._auto_glossary_dialog, 'glossary_widget'):
-            try:
-                normalized_glossary = [
-                    item.copy()
-                    for item in self._auto_glossary_dialog.glossary_widget.get_glossary()
-                    if isinstance(item, dict)
-                ]
-            except Exception as e:
-                self._auto_log(f"Не удалось прочитать финальный глоссарий из скрытого диалога: {e}", force=True)
-
-        if normalized_glossary:
-            self.glossary_widget.set_glossary(normalized_glossary)
-        else:
-            self._auto_log("Автоглоссарий завершился без пригодного списка терминов для основного окна.", force=True)
-
-        if self.output_folder:
-            try:
-                project_glossary_path = os.path.join(self.output_folder, "project_glossary.json")
-                with open(project_glossary_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.glossary_widget.get_glossary(), f, ensure_ascii=False, indent=2, sort_keys=True)
-            except Exception as e:
-                self._auto_log(f"Не удалось сохранить автоглоссарий в проект: {e}", force=True)
-
-        if self.project_manager and processed_chapters is not None:
-            try:
-                self.project_manager.save_glossary_generation_map(set(processed_chapters))
-            except Exception as e:
-                self._auto_log(f"Не удалось сохранить карту автоглоссария: {e}", force=True)
-
-        self.mark_project_glossary_as_saved(self.glossary_widget.get_glossary())
-        self._prepare_and_display_tasks(clean_rebuild=True)
-        self._auto_log(
-            f"Автоглоссарий завершён: терминов {len(self.glossary_widget.get_glossary())}. Запускаю основной перевод…",
-            force=True
-        )
-
-        self._auto_glossary_pending_translation = False
-        QtCore.QTimer.singleShot(
-            250,
-            lambda: self._start_translation(
-                is_auto_restart=False,
-                skip_auto_glossary=True,
-                preserve_log=True,
-            )
-        )
-
-    @pyqtSlot(int)
-    def _on_auto_glossary_dialog_closed(self, result: int):
-        self._auto_glossary_poll_timer.stop()
-        self._auto_glossary_dialog = None
-        self._auto_glossary_running = False
-        self._auto_followup_running = False
-        self.is_blocked_by_child_dialog = False
-
-        if self._auto_glossary_pending_translation and not self._auto_glossary_completed:
-            self._auto_glossary_pending_translation = False
-            self._auto_log("Автоглоссарий прерван. Основной перевод не был запущен.", force=True)
-
-        self._auto_glossary_completed = False
-        if not self.is_session_active:
-            self._set_controls_enabled(True)
-            self.check_ready()
-
-    def open_ai_consistency_checker(self):
-        """Открывает существующий диалог AI-проверки согласованности."""
-        if not self.project_manager or not self.settings_manager:
-            QMessageBox.warning(self, "Нет проекта", "Сначала загрузите проект перевода.")
-            return
-
-        chapters_to_analyze = load_project_chapters_for_consistency(self.project_manager)
-        if not chapters_to_analyze:
-            QMessageBox.warning(self, "Нет данных", "Не найдено переведённых глав для AI-проверки согласованности.")
-            return
-
-        from .consistency_checker import ConsistencyValidatorPage
-
-        page = ConsistencyValidatorPage(
-            chapters_to_analyze,
-            self.settings_manager,
-            self,
-            project_manager=self.project_manager
-        )
-        if hasattr(page, '_update_chunk_stats'):
-            page._update_chunk_stats()
-        self.request_push.emit(page)
-
-    def _auto_log(
-        self,
-        message: str,
-        force: bool = False,
-        details_text: str | None = None,
-        details_title: str | None = None,
-        file_path: str | None = None,
-        file_label: str | None = None,
-    ):
-        auto_settings = self.auto_translate_widget.get_settings() if hasattr(self, 'auto_translate_widget') else {}
-        if force or auto_settings.get('log_each_step', True):
-            payload = {'message': f"[AUTO] {message}"}
-            if isinstance(details_text, str) and details_text.strip():
-                payload['details_text'] = details_text
-                if isinstance(details_title, str) and details_title.strip():
-                    payload['details_title'] = details_title
-            if isinstance(file_path, str) and file_path.strip():
-                payload['file_path'] = file_path
-                if isinstance(file_label, str) and file_label.strip():
-                    payload['file_label'] = file_label
-            self._post_event('log_message', payload)
-
-    def _handle_background_session_event(self, event_name: str, data: dict):
-        if data.get('background_role') != 'auto_filter_redirect':
-            return
-        run_id = data.get('background_run_id')
-        if not run_id:
-            return
-        runner = self._auto_filter_parallel_redirect_runs.get(run_id)
-        if not runner:
-            return
-        if event_name == 'session_started':
-            runner['session_id'] = data.get('session_id')
-            return
-        if event_name == 'session_finished':
-            self._finish_parallel_filter_redirect_run(run_id, data.get('reason'))
-
-    def _maybe_start_parallel_filter_redirect(self, event_data: dict) -> bool:
-        if not self.is_session_active:
-            return False
-        auto_settings = self.auto_translate_widget.get_settings() if hasattr(self, 'auto_translate_widget') else {}
-        if not (auto_settings.get('enabled') and auto_settings.get('filter_redirect_enabled')):
-            return False
-
-        data = event_data.get('data', {}) if isinstance(event_data, dict) else {}
-        if data.get('success'):
-            return False
-        error_type = str(data.get('error_type') or "").upper()
-        if error_type not in {'FILTERED', 'CONTENT_FILTER'}:
-            return False
-
-        task_info = data.get('task_info')
-        if not isinstance(task_info, tuple) or len(task_info) < 2:
-            return False
-        chapters = self._extract_chapters_from_payload(task_info[1])
-        if not chapters:
-            return False
-
-        redirect_override, redirect_warning = self._resolve_auto_filter_redirect_override(auto_settings)
-        if not redirect_override:
-            if redirect_warning:
-                self._auto_log(f"{redirect_warning} Параллельный redirect пропущен.", force=True)
-            return False
-
-        main_provider = self.key_management_widget.get_selected_provider()
-        redirect_provider = redirect_override.get('provider')
-        if not redirect_provider or redirect_provider == main_provider:
-            return False
-
-        return self._start_parallel_filter_redirect(
-            chapters,
-            auto_settings,
-            redirect_override,
-            source_task_ids=[task_info[0]],
-        )
-
-    def _build_filter_redirect_payloads(self, chapters: list[str], settings: dict) -> list:
-        from ...utils.glossary_tools import TaskPreparer
-
-        cached_sizes = get_epub_chapter_sizes_with_cache(self.project_manager, self.selected_file)
-        real_chapter_sizes = {
-            chapter: int(cached_sizes.get(chapter, 0) or 0)
-            for chapter in set(chapters)
+    def _navigate_to_stage_tab(self, stage_id: str):
+        """Переключает активную вкладку интерфейса на соответствующую этапу функцию."""
+        mapping = {
+            'glossary_collection': 4,  # Глоссарий
+            'glossary_validation': 4,  # Глоссарий
+            'machine_translation': 5,  # Промпт
+            'ai_editing': 7,           # ИИ-редактура
         }
-        missing_size_chapters = [chapter for chapter, size in real_chapter_sizes.items() if size <= 0]
-        if missing_size_chapters:
-            with open(self.selected_file, 'rb') as epub_file, zipfile.ZipFile(epub_file, 'r') as zf:
-                for chapter in missing_size_chapters:
-                    real_chapter_sizes[chapter] = estimate_epub_chapter_input_tokens(
-                        zf.read(chapter).decode('utf-8', 'ignore')
-                    )
+        idx = mapping.get(stage_id)
+        if idx is not None and hasattr(self, 'sidebar_widget'):
+            self.sidebar_widget.set_current_index(idx)
 
-        real_chapter_sizes = self._build_chapter_size_map_for_task_unit(chapters, settings)
-        preparer = TaskPreparer(settings, real_chapter_sizes)
-        return preparer.prepare_tasks(chapters)
 
-    def _start_parallel_filter_redirect(
-        self,
-        chapters,
-        auto_settings: dict,
-        redirect_override: dict,
-        source_task_ids=None,
-    ) -> bool:
-        if not (self.selected_file and self.output_folder and self.bus):
-            return False
 
-        normalized_chapters = self._normalize_auto_chapters(chapters, preserve_order=False)
-        if not normalized_chapters:
-            return False
-
-        signature = self._make_auto_chapter_signature(normalized_chapters)
-        for runner in self._auto_filter_parallel_redirect_runs.values():
-            if runner.get('signature') == signature:
-                runner.setdefault('source_task_ids', set()).update(str(task_id) for task_id in (source_task_ids or []))
-                return True
-
-        try:
-            settings = self.get_settings()
-            settings.update(self._get_filter_retry_translation_options())
-            settings.update(redirect_override)
-            settings['provider'] = redirect_override.get('provider')
-            settings['api_keys'] = list(redirect_override.get('api_keys') or [])
-            settings['model'] = redirect_override.get('model')
-            settings['model_config'] = redirect_override.get('model_config')
-            settings['background_session'] = True
-            settings['background_role'] = 'auto_filter_redirect'
-            settings['auto_translation'] = dict(auto_settings or {})
-            if self.output_folder:
-                settings['project_manager'] = TranslationProjectManager(self.output_folder)
-
-            run_id = str(uuid.uuid4())
-            settings['background_run_id'] = run_id
-            payloads = self._build_filter_redirect_payloads(normalized_chapters, settings)
-            if not payloads:
-                return False
-
-            db_uri = f"file:auto_filter_redirect_{run_id.replace('-', '_')}?mode=memory&cache=shared"
-            db_anchor = sqlite3.connect(db_uri, uri=True, check_same_thread=False)
-            db_anchor.row_factory = sqlite3.Row
-            task_manager = ChapterQueueManager(
-                event_bus=self.bus,
-                db_uri=db_uri,
-                main_connection=db_anchor,
-            )
-            task_manager.set_pending_tasks(payloads)
-
-            engine = TranslationEngine(
-                context_manager=self.context_manager,
-                settings_manager=self.settings_manager,
-                task_manager=task_manager,
-                event_bus=self.bus,
-            )
-            engine_thread = QtCore.QThread(self)
-            engine.moveToThread(engine_thread)
-            engine_thread.finished.connect(engine.deleteLater)
-            engine_thread.start()
-
-            self._auto_filter_parallel_redirect_runs[run_id] = {
-                'signature': signature,
-                'chapters': normalized_chapters,
-                'source_task_ids': {str(task_id) for task_id in (source_task_ids or [])},
-                'task_manager': task_manager,
-                'engine': engine,
-                'thread': engine_thread,
-                'db_anchor': db_anchor,
-            }
-            self._auto_filter_parallel_redirect_signatures.add(signature)
-
-            provider_label = api_config.provider_display_map().get(
-                settings.get('provider'),
-                settings.get('provider'),
-            )
-            self._auto_log(
-                "Параллельно запускаю redirect глав с Content Filter "
-                f"в {provider_label}: {settings.get('model')}.",
-                force=True,
-                details_title="[AUTO] Параллельный filter redirect",
-                details_text=self._compose_auto_details([
-                    ("Главы", normalized_chapters),
-                    ("Ключи redirect", [f"...{key[-4:]}" for key in settings.get('api_keys', [])]),
-                ]),
-            )
-            self.bus.event_posted.emit({
-                'event': 'start_session_requested',
-                'source': 'InitialSetupDialog',
-                'session_id': None,
-                'data': {
-                    'settings': settings,
-                    'target_engine_id': engine.engine_id,
-                },
-            })
-            return True
-        except Exception as exc:
-            self._auto_log(f"Не удалось запустить параллельный filter redirect: {exc}", force=True)
-            return False
-
-    def _shutdown_parallel_filter_redirect_runs(self):
-        """Гасит фоновые redirect-движки при уходе со страницы: без этого их
-        QThread'ы (дети страницы) уничтожаются работающими."""
-        runs = getattr(self, '_auto_filter_parallel_redirect_runs', None)
-        if not runs:
-            return
-        for run_id in list(runs.keys()):
-            runner = runs.pop(run_id, None)
-            if not runner:
-                continue
-            engine = runner.get('engine')
-            thread = runner.get('thread')
-            try:
-                if engine is not None and thread is not None and thread.isRunning():
-                    QtCore.QMetaObject.invokeMethod(
-                        engine,
-                        'cleanup',
-                        QtCore.Qt.ConnectionType.BlockingQueuedConnection,
-                    )
-            except Exception:
-                pass
-            if thread is not None:
-                thread.quit()
-                thread.wait(3000)
-            db_anchor = runner.get('db_anchor')
-            if db_anchor is not None:
-                try:
-                    db_anchor.close()
-                except Exception:
-                    pass
-            task_manager = runner.get('task_manager')
-            if task_manager is not None:
-                task_manager.deleteLater()
-            self._auto_filter_parallel_redirect_signatures.discard(runner.get('signature'))
-
-    def _finish_parallel_filter_redirect_run(self, run_id: str, reason: str | None = None):
-        runner = self._auto_filter_parallel_redirect_runs.pop(run_id, None)
-        if not runner:
+    def _open_consistency_checker_standalone(self):
+        """Открывает инструмент проверки консистентности и ИИ-редактуры."""
+        if not self.output_folder or not os.path.isdir(self.output_folder):
+            QMessageBox.warning(self, "Папка не выбрана", "Необходимо выбрать папку проекта.")
             return
 
-        chapters = runner.get('chapters') or []
-        signature = runner.get('signature')
-        task_manager = runner.get('task_manager')
-        success_chapters = set()
-        error_chapters = set()
+        from .validation import TranslationValidatorPage
+        val_page = TranslationValidatorPage(
+            self.output_folder, self.selected_file or "", self,
+            retry_enabled=True, project_manager=self.project_manager,
+        )
+        val_page._open_consistency_checker()
 
-        try:
-            states = task_manager._get_ui_state_list_background() if task_manager else []
-            for task_info, status, _details in states or []:
-                task_chapters = self._extract_chapters_from_payload(task_info[1])
-                if status == 'success':
-                    success_chapters.update(task_chapters)
-                elif status == 'error':
-                    error_chapters.update(task_chapters)
+    def _start_pipeline_auto_translation(self):
+        """
+        Запускает последовательный конвейер автоперевода согласно включенным этапам.
+        Все настройки берутся из соответствующих вкладок приложения.
+        """
+        if not self.output_folder or not os.path.isdir(self.output_folder):
+            QMessageBox.warning(self, "Папка не выбрана", "Для запуска автоперевода необходимо выбрать папку проекта.")
+            return
 
-            target_chapters = set(chapters)
-            if target_chapters and target_chapters.issubset(success_chapters):
-                source_task_ids = runner.get('source_task_ids') or set()
-                if source_task_ids and self.engine and self.engine.task_manager:
-                    self.engine.task_manager.mark_tasks_completed(source_task_ids)
-                self._auto_log(
-                    f"Параллельный filter redirect завершён: {len(target_chapters)} глав.",
-                    force=True,
-                    details_title="[AUTO] Параллельный filter redirect завершён",
-                    details_text=self._compose_auto_details([
-                        ("Главы", self._normalize_auto_chapters(success_chapters)),
-                    ]),
-                )
+        if not self.selected_file or not os.path.exists(self.selected_file):
+            QMessageBox.warning(self, "Файл не выбран", "Для запуска автоперевода необходимо выбрать исходный EPUB-файл.")
+            return
+
+        enabled_stages = self.auto_translate_widget.get_enabled_stages()
+        if not enabled_stages:
+            QMessageBox.information(self, "Нет включенных этапов", "Включите хотя бы один этап автоперевода.")
+            return
+
+        self._pipeline_active = True
+        self._pipeline_queue = list(enabled_stages)
+        self._post_event('log_message', {'message': f"[AUTOTRANSLATE] Запуск конвейера автоперевода: {', '.join(enabled_stages)}"})
+
+        for s in ["glossary_collection", "glossary_validation", "machine_translation", "untranslated_fixing", "ai_editing"]:
+            if s in enabled_stages:
+                self.auto_translate_widget.set_stage_status(s, "pending")
             else:
-                if signature in self._auto_filter_parallel_redirect_signatures:
-                    self._auto_filter_parallel_redirect_signatures.discard(signature)
-                missing = sorted(target_chapters - success_chapters, key=extract_number_from_path)
-                self._auto_log(
-                    "Параллельный filter redirect завершился не полностью"
-                    + (f": {reason}" if reason else "."),
-                    force=True,
-                    details_title="[AUTO] Параллельный filter redirect: не все главы",
-                    details_text=self._compose_auto_details([
-                        ("Не готово", missing),
-                        ("Ошибки", self._normalize_auto_chapters(error_chapters)),
-                    ]),
-                )
-        finally:
-            thread = runner.get('thread')
-            if thread:
-                thread.quit()
-                thread.wait(3000)
-            db_anchor = runner.get('db_anchor')
-            if db_anchor:
-                db_anchor.close()
-            if task_manager:
-                task_manager.deleteLater()
+                self.auto_translate_widget.set_stage_status(s, "disabled")
 
-    def _extract_chapters_from_payload(self, payload) -> list[str]:
-        return auto_workflow_helpers.extract_chapters_from_payload(payload)
+        self._run_next_pipeline_stage()
 
-    def _normalize_auto_chapters(self, chapters, preserve_order: bool = False) -> list[str]:
-        return auto_workflow_helpers.normalize_auto_chapters(
-            chapters,
-            preserve_order=preserve_order,
-        )
-
-    def _make_auto_chapter_signature(self, chapters) -> tuple[str, ...]:
-        return auto_workflow_helpers.make_auto_chapter_signature(chapters)
-
-    def _short_auto_name(self, chapter: str, max_length: int = 84) -> str:
-        return auto_workflow_helpers.short_auto_name(chapter, max_length=max_length)
-
-    def _format_auto_chapter_list(self, chapters, limit: int = 8, preserve_order: bool = False) -> str:
-        return auto_workflow_helpers.format_auto_chapter_list(
-            chapters,
-            limit=limit,
-            preserve_order=preserve_order,
-        )
-
-    def _compose_auto_details(self, sections) -> str:
-        return auto_workflow_helpers.compose_auto_details(sections)
-
-    @staticmethod
-    def _truncate_auto_trace_text(text: str | None, limit: int = 4000) -> str:
-        return auto_workflow_helpers.truncate_auto_trace_text(text, limit=limit)
-
-    @staticmethod
-    def _merge_auto_details(*parts: str) -> str:
-        return auto_workflow_helpers.merge_auto_details(*parts)
-
-    def _compose_auto_trace_details(self, traces, max_entries: int = 4, text_limit: int = 4000) -> str:
-        return auto_workflow_helpers.compose_auto_trace_details(
-            traces,
-            max_entries=max_entries,
-            text_limit=text_limit,
-        )
-
-    def _describe_auto_payload(self, payload) -> str:
-        return auto_workflow_helpers.describe_auto_payload(payload)
-
-    def _log_auto_payload_plan(self, title: str, payloads, max_payloads: int = 6):
-        if not payloads:
+    def _run_next_pipeline_stage(self):
+        if not getattr(self, '_pipeline_active', False):
             return
 
-        total = len(payloads)
-        details_lines = [
-            f"[{index}/{total}] {self._describe_auto_payload(payload)}"
-            for index, payload in enumerate(payloads[:max_payloads], start=1)
-        ]
-        if total > max_payloads:
-            details_lines.append(f"… не показано ещё {total - max_payloads} пакетов.")
-        self._auto_log(
-            f"{title}: подготовлено {total} пакетов.",
-            details_title=f"[AUTO] {title}",
-            details_text="\n".join(details_lines),
-        )
+        if not getattr(self, '_pipeline_queue', None):
+            self._pipeline_active = False
+            self._current_pipeline_stage = None
+            self._post_event('log_message', {'message': "[AUTOTRANSLATE] Все этапы автоперевода завершены!"})
+            QMessageBox.information(self, "Автоперевод", "Все включенные этапы автоперевода успешно выполнены!")
+            return
 
-    def _collect_failed_chapters_by_errors(self, error_types: set[str]) -> set[str]:
-        if not (self.engine and self.engine.task_manager and error_types):
-            return set()
+        current_stage = self._pipeline_queue.pop(0)
+        self._current_pipeline_stage = current_stage
+        self.auto_translate_widget.set_stage_status(current_stage, "running")
+        self._post_event('log_message', {'message': f"[AUTOTRANSLATE] Выполняется этап: {current_stage}"})
 
-        chapters_to_retry = set()
-        for task_info, status, details in self.engine.task_manager.get_ui_state_list():
-            if status != 'error':
-                continue
+        if current_stage == 'glossary_collection':
+            self._execute_pipeline_glossary_collection()
+        elif current_stage == 'glossary_validation':
+            self._execute_pipeline_glossary_validation()
+        elif current_stage == 'machine_translation':
+            self._execute_pipeline_machine_translation()
+        elif current_stage == 'untranslated_fixing':
+            self._execute_pipeline_untranslated_fixing()
+        elif current_stage == 'ai_editing':
+            self._execute_pipeline_ai_editing()
 
-            error_map = details.get('errors', {}) if isinstance(details, dict) else {}
-            if not any(error_name in error_map for error_name in error_types):
-                continue
-
-            chapters_to_retry.update(self._extract_chapters_from_payload(task_info[1]))
-
-        return chapters_to_retry
-
-    def _reset_auto_workflow_state(self):
-        restart_timer = getattr(self, '_auto_restart_timer', None)
-        if restart_timer is not None:
-            restart_timer.stop()
-        self._auto_workflow_enabled_for_session = False
-        self._auto_workflow_round = 0
-        self._auto_followup_running = False
-        self._auto_last_retry_signatures = set()
-        self._auto_last_untranslated_fix_signatures = set()
-        self._auto_pending_network_retry_chapters = set()
-        self._auto_filter_repack_signatures = set()
-        self._auto_filter_redirect_signatures = set()
-        self._auto_filter_parallel_redirect_signatures = set()
-        self._auto_restart_session_override = None
-        self._auto_validator_dialog = None
-        self._auto_consistency_worker = None
-
-    def _auto_retry_round_available(self, auto_settings: dict | None = None) -> tuple[bool, int]:
-        if not isinstance(auto_settings, dict):
-            auto_settings = {}
+    def _execute_pipeline_glossary_collection(self):
         try:
-            max_rounds = max(1, int(auto_settings.get('max_rounds', 3)))
-        except (TypeError, ValueError):
-            max_rounds = 3
+            self.auto_translate_widget.set_stage_status('glossary_collection', 'completed')
+        except Exception as e:
+            self.auto_translate_widget.set_stage_status('glossary_collection', 'error', str(e))
+        QtCore.QTimer.singleShot(100, self._run_next_pipeline_stage)
+
+    def _execute_pipeline_glossary_validation(self):
         try:
-            current_round = max(0, int(getattr(self, '_auto_workflow_round', 0)))
-        except (TypeError, ValueError):
-            current_round = 0
-        return current_round < max_rounds, max_rounds
-
-    def _schedule_auto_translation_restart(self, delay_ms: int = 250):
-        delay_ms = max(0, int(delay_ms or 0))
-        restart_timer = getattr(self, '_auto_restart_timer', None)
-        if restart_timer is not None:
-            restart_timer.start(delay_ms)
-            return
-
-        # Lightweight non-QObject test harnesses do not own the real timer.
-        QtCore.QTimer.singleShot(delay_ms, self._run_scheduled_auto_translation_restart)
-
-    def _run_scheduled_auto_translation_restart(self):
-        auto_widget = getattr(self, 'auto_translate_widget', None)
-        auto_settings = auto_widget.get_settings() if auto_widget is not None else {}
-        if (
-            not getattr(self, '_auto_workflow_enabled_for_session', False)
-            or not auto_settings.get('enabled')
-        ):
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        if getattr(self, 'is_session_active', False):
-            self._auto_log(
-                "Автоперезапуск отменён: уже запущена другая сессия перевода.",
-                force=True,
-            )
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        self._start_translation(is_auto_restart=True)
-
-    def _on_auto_translation_settings_changed(self):
-        restart_timer = getattr(self, '_auto_restart_timer', None)
-        if restart_timer is None or not restart_timer.isActive():
-            return
-
-        auto_widget = getattr(self, 'auto_translate_widget', None)
-        auto_settings = auto_widget.get_settings() if auto_widget is not None else {}
-        if auto_settings.get('enabled'):
-            return
-
-        self._auto_log("Ожидающий автоперезапуск отменён: автопайплайн выключен.", force=True)
-        self._reset_auto_workflow_state()
-        if not self.is_session_active:
-            self.check_ready()
-
-    def _schedule_auto_workflow_followup(self, reason: str):
-        if reason != "Сессия успешно завершена":
-            if self._auto_workflow_enabled_for_session:
-                self._auto_log(f"Автопайплайн остановлен: '{reason}'.", force=True)
-            self._reset_auto_workflow_state()
-            return
-
-        if not self._auto_workflow_enabled_for_session:
-            return
-
-        QtCore.QTimer.singleShot(250, self._run_auto_workflow_followup)
-
-    def _run_auto_workflow_followup(self):
-        if self.is_session_active or self._auto_followup_running:
-            return
-
-        auto_settings = self.auto_translate_widget.get_settings()
-        if not auto_settings.get('enabled'):
-            self._reset_auto_workflow_state()
-            return
-
-        retry_round_available, max_rounds = self._auto_retry_round_available(auto_settings)
-        if not retry_round_available:
-            self._auto_log(
-                f"Достигнут лимит автоциклов ({max_rounds}). Повторы отключены; выполняю финальные проверки.",
-                force=True,
-            )
-
-        network_retry_chapters = set()
-        if auto_settings.get('retry_network_failed_enabled'):
-            network_retry_chapters.update(self._auto_pending_network_retry_chapters)
-            network_retry_chapters.update(self._collect_failed_chapters_by_errors({'NETWORK'}))
-        else:
-            self._auto_pending_network_retry_chapters = set()
-
-        if retry_round_available and auto_settings.get('filter_repack_enabled') and self._try_auto_filter_recovery(
-            auto_settings,
-            deferred_retry_chapters=network_retry_chapters,
-        ):
-            return
-
-        if retry_round_available and auto_settings.get('filter_redirect_enabled') and self._try_auto_filter_redirect_followup(
-            auto_settings,
-            deferred_retry_chapters=network_retry_chapters,
-        ):
-            return
-
-        if retry_round_available and network_retry_chapters:
-            self._run_auto_network_retry_followup(auto_settings, network_retry_chapters)
-            return
-
-        if auto_settings.get('retry_short_enabled') or auto_settings.get('retry_untranslated_enabled'):
-            self._run_auto_validator_followup(auto_settings)
-            return
-
-        if auto_settings.get('ai_consistency_enabled'):
-            self._run_auto_consistency_followup(auto_settings)
-            return
-
-        self._auto_log("Автопайплайн завершён без дополнительных действий.", force=True)
-        self._reset_auto_workflow_state()
-        self.check_ready()
-
-    def _try_auto_filter_recovery(self, auto_settings: dict, deferred_retry_chapters=None) -> bool:
-        if not (self.engine and self.engine.task_manager and self.project_manager):
-            return False
-
-        all_tasks_state = self.engine.task_manager.get_ui_state_list()
-        filtered_chapters = set()
-        successful_chapters = set()
-        successful_map = {}
-        deferred_retry_chapters = set(deferred_retry_chapters or [])
-
-        for original, versions in self.project_manager.get_full_map().items():
-            for suffix, rel_path in versions.items():
-                if suffix != 'filtered':
-                    full_path = os.path.join(self.project_manager.project_folder, rel_path)
-                    if os.path.exists(full_path):
-                        successful_map[original] = full_path
-                        break
-
-        for task_info, status, details in all_tasks_state:
-            payload = task_info[1]
-            chapters_in_task = self._extract_chapters_from_payload(payload)
-
-            is_filtered = (status == 'error' and 'CONTENT_FILTER' in details.get('errors', {}))
-            for chapter in chapters_in_task:
-                if is_filtered:
-                    filtered_chapters.add(chapter)
-                elif status == 'success' and chapter in successful_map:
-                    successful_chapters.add(chapter)
-
-        if not filtered_chapters:
-            return False
-
-        filter_signature = self._make_auto_chapter_signature(filtered_chapters)
-        if filter_signature in self._auto_filter_parallel_redirect_signatures:
-            return False
-        if auto_settings.get('filter_redirect_enabled') and self._auto_filter_repack_signatures:
-            return False
-
-        self._auto_log(
-            f"Content filter найден в {len(filtered_chapters)} главах: "
-            f"{self._format_auto_chapter_list(filtered_chapters, limit=10)}",
-            force=True,
-            details_title="[AUTO] Content filter: главы",
-            details_text=self._compose_auto_details([
-                ("Главы с content filter", self._normalize_auto_chapters(filtered_chapters)),
-            ]),
-        )
-
-        real_chapter_sizes = self.translation_options_widget.chapter_sizes_for_current_unit()
-        if not real_chapter_sizes:
-            self._auto_log("Не удалось получить размеры глав для автопереупаковки фильтра.", force=True)
-            return False
-
-        dialog = FilterPackagingDialog(
-            filtered_chapters=list(filtered_chapters),
-            successful_chapters=list(successful_chapters),
-            recommended_size=self.translation_options_widget.task_size_spin.value(),
-            task_size_unit=self.translation_options_widget.task_size_unit(),
-            epub_path=self.selected_file,
-            real_chapter_sizes=real_chapter_sizes,
-            parent=self
-        )
-        dialog.chapters_per_batch_spin.setValue(int(auto_settings.get('filter_repack_batch_size', 3)))
-        dialog.dilute_checkbox.setChecked(bool(auto_settings.get('filter_repack_dilute', True)))
-        result = dialog._calculate_new_chapter_list()
-        if not result:
-            return False
-
-        self._auto_filter_repack_signatures.add(filter_signature)
-        deferred_retry_chapters.difference_update(filtered_chapters)
-        if deferred_retry_chapters:
-            self._auto_pending_network_retry_chapters.update(deferred_retry_chapters)
-            self._auto_log(
-                f"Сетевые повторы ({len(deferred_retry_chapters)} глав) отложены до завершения цикла обхода фильтра.",
-                force=True,
-                details_title="[AUTO] Отложенные сетевые главы",
-                details_text=self._compose_auto_details([
-                    ("Главы", self._normalize_auto_chapters(deferred_retry_chapters)),
-                ]),
-            )
-
-        self._process_filter_dialog_result(result)
-        self._auto_log(f"Подготовлены новые пакеты для обхода фильтра ({len(filtered_chapters)} глав).", force=True)
-        result_type = result.get('type')
-        if result_type == 'payloads':
-            self._log_auto_payload_plan("План обхода фильтра", result.get('data', []))
-        elif result_type == 'chapters':
-            self._auto_log(
-                "Главы для обхода фильтра: "
-                f"{self._format_auto_chapter_list(result.get('data', []), limit=10)}",
-                details_title="[AUTO] Главы для обхода фильтра",
-                details_text=self._compose_auto_details([
-                    ("Главы", self._normalize_auto_chapters(result.get('data', []), preserve_order=True)),
-                ]),
-            )
-
-        self._auto_restart_session_override = None
-        if auto_settings.get('auto_restart_after_retry', True):
-            self._auto_workflow_round += 1
-            self._auto_followup_running = True
-            self.start_btn.setEnabled(False)
-            self._schedule_auto_translation_restart(250)
-        else:
-            self._auto_restart_session_override = None
-            self._auto_log("Пакеты собраны, но автоперезапуск отключён. Можно запускать вручную.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-        return True
-
-    def _try_auto_filter_redirect_followup(self, auto_settings: dict, deferred_retry_chapters=None) -> bool:
-        if not (self.engine and self.engine.task_manager):
-            return False
-
-        all_tasks_state = self.engine.task_manager.get_ui_state_list()
-        filtered_chapters = set()
-        deferred_retry_chapters = set(deferred_retry_chapters or [])
-
-        for task_info, status, details in all_tasks_state:
-            payload = task_info[1]
-            chapters_in_task = self._extract_chapters_from_payload(payload)
-            is_filtered = (status == 'error' and 'CONTENT_FILTER' in details.get('errors', {}))
-            if not is_filtered:
-                continue
-            for chapter in chapters_in_task:
-                filtered_chapters.add(chapter)
-
-        if not filtered_chapters:
-            return False
-
-        filter_signature = self._make_auto_chapter_signature(filtered_chapters)
-        if filter_signature in self._auto_filter_parallel_redirect_signatures:
-            return False
-        if auto_settings.get('filter_repack_enabled') and not self._auto_filter_repack_signatures:
-            return False
-        if self._auto_filter_redirect_signatures:
-            return False
-
-        redirect_override, redirect_warning = self._resolve_auto_filter_redirect_override(auto_settings)
-        if not redirect_override:
-            if redirect_warning:
-                self._auto_log(
-                    f"{redirect_warning} Redirect пропущен.",
-                    force=True,
-                )
-            return False
-
-        normalized_chapters = self._normalize_auto_chapters(filtered_chapters, preserve_order=False)
-        self._auto_filter_redirect_signatures.add(filter_signature)
-        self._auto_restart_session_override = redirect_override
-
-        deferred_retry_chapters.difference_update(filtered_chapters)
-        if deferred_retry_chapters:
-            self._auto_pending_network_retry_chapters.update(deferred_retry_chapters)
-            self._auto_log(
-                f"Сетевые повторы ({len(deferred_retry_chapters)} глав) отложены до завершения redirect после фильтра.",
-                force=True,
-                details_title="[AUTO] Отложенные сетевые главы",
-                details_text=self._compose_auto_details([
-                    ("Главы", self._normalize_auto_chapters(deferred_retry_chapters)),
-                ]),
-            )
-
-        self.html_files = normalized_chapters
-        self.paths_widget.update_chapters_info(len(self.html_files))
-        self._prepare_and_display_tasks(
-            clean_rebuild=True,
-            translation_options_override=self._get_filter_retry_translation_options(),
-        )
-        self.task_management_widget.set_retry_filtered_button_visible(False)
-
-        redirect_provider = redirect_override.get('provider')
-        redirect_provider_label = api_config.provider_display_map().get(
-            redirect_provider,
-            redirect_provider,
-        )
-        self._auto_log(
-            "Главы с пометкой 'Фильтр' перенаправлены "
-            f"в {redirect_provider_label}: {redirect_override.get('model')}.",
-            force=True,
-            details_title="[AUTO] Redirect после filter repack",
-            details_text=self._compose_auto_details([
-                ("Главы", normalized_chapters),
-            ]),
-        )
-
-        if auto_settings.get('auto_restart_after_retry', True):
-            self._auto_workflow_round += 1
-            self._auto_followup_running = True
-            self.start_btn.setEnabled(False)
-            self._schedule_auto_translation_restart(250)
-        else:
-            self._auto_restart_session_override = None
-            self._auto_log("Redirect подготовлен, но автоперезапуск отключён. Можно запускать вручную.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-        return True
-
-    def _run_auto_network_retry_followup(self, auto_settings: dict, chapters_to_retry):
-        chapters = tuple(sorted(set(chapters_to_retry), key=extract_number_from_path))
-        self._auto_pending_network_retry_chapters = set()
-        if not chapters:
-            return
-
-        signature = ('__network__',) + chapters
-        if signature in self._auto_last_retry_signatures:
-            self._auto_log(
-                "Получен тот же набор сетевых ошибок. Автоцикл остановлен: "
-                f"{self._format_auto_chapter_list(chapters, limit=10)}.",
-                force=True
-            )
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        self._auto_last_retry_signatures.add(signature)
-        self.add_files_for_retry(self.selected_file, list(chapters))
-        self._auto_log(
-            f"Сетевые сбои: возвращаю в очередь {len(chapters)} глав для повторного запуска.",
-            force=True,
-            details_title="[AUTO] Сетевой retry",
-            details_text=self._compose_auto_details([
-                ("Главы", list(chapters)),
-            ]),
-        )
-
-        if auto_settings.get('auto_restart_after_retry', True):
-            delay_seconds = int(auto_settings.get('retry_network_failed_delay_sec', 60))
-            self._auto_workflow_round += 1
-            self._auto_followup_running = True
-            self.start_btn.setEnabled(False)
-            self._auto_log(f"Ожидаю {delay_seconds} сек. перед повторным запуском сетевых задач.", force=True)
-            self._schedule_auto_translation_restart(delay_seconds * 1000)
-        else:
-            self._auto_log("Сетевые задачи подготовлены к повтору, но автоперезапуск выключен.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-
-    def _run_auto_validator_followup(self, auto_settings: dict):
-        if not self.output_folder or not self.selected_file:
-            self._auto_log("Автовалидатор пропущен: не найден проект.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        from .validation import TranslationValidatorDialog
-
-        self._auto_followup_running = True
-        self.start_btn.setEnabled(False)
-        self._auto_log("Запускаю скрытую автопроверку перевода…", force=True)
-
-        dialog = TranslationValidatorDialog(
-            self.output_folder,
-            self.selected_file,
-            self,
-            retry_enabled=False,
-            project_manager=self.project_manager
-        )
-        dialog.hide()
-        self._auto_validator_dialog = dialog
-
-        wait_loop = QtCore.QEventLoop()
-        QtCore.QTimer.singleShot(250, wait_loop.quit)
-        wait_loop.exec()
-
-        dialog.check_show_all.setChecked(True)
-        dialog.check_revalidate_ok.setChecked(True)
-        if not dialog.path_row_map:
-            self._auto_followup_running = False
-            self._auto_validator_dialog = None
-            dialog.deleteLater()
-            self._finish_auto_validator_followup(auto_settings)
-            return
-
-        auto_targets = []
-        if hasattr(dialog, '_get_eligible_analysis_paths'):
-            auto_targets = sorted(dialog._get_eligible_analysis_paths(), key=extract_number_from_path)
-        elif getattr(dialog, 'path_row_map', None):
-            auto_targets = sorted(dialog.path_row_map.keys(), key=extract_number_from_path)
-
-        if not auto_targets:
-            self._auto_followup_running = False
-            self._auto_validator_dialog = None
-            dialog.deleteLater()
-            self._finish_auto_validator_followup(
-                auto_settings,
-                "Auto validator skipped: no chapters available for validation.",
-            )
-            return
-
-        dialog.start_analysis(specific_targets=auto_targets)
-        if dialog.analysis_thread:
-            dialog.analysis_thread.analysis_finished.connect(self._on_auto_validator_finished)
-        else:
-            self._auto_followup_running = False
-            self._auto_validator_dialog = None
-            dialog.deleteLater()
-            self._reset_auto_workflow_state()
-            self.check_ready()
-
-    def _finish_auto_validator_followup(self, auto_settings: dict, log_message: str | None = None):
-        if log_message:
-            self._auto_log(log_message, force=True)
-
-        if auto_settings.get('ai_consistency_enabled'):
-            self._run_auto_consistency_followup(auto_settings)
-            return
-
-        self._reset_auto_workflow_state()
-        self.check_ready()
-
-    def _on_auto_validator_finished(self, total_scanned: int, suspicious_found: int):
-        dialog = self._auto_validator_dialog
-        auto_settings = self.auto_translate_widget.get_settings()
-        retry_short_enabled = bool(auto_settings.get('retry_short_enabled'))
-        retry_untranslated_enabled = bool(auto_settings.get('retry_untranslated_enabled'))
-        chapters_to_retry = set()
-        chapters_to_fix_untranslated = set()
-        ratio_profiles = {}
-        auto_fix_result = None
-        undertranslation_request_details = ""
-        if dialog:
-            for data in dialog.results_data.values():
-                if not isinstance(data, dict):
-                    continue
-                internal_path = data.get('internal_html_path')
-                if not internal_path:
-                    continue
-
-                ratio_value = data.get('ratio_value')
-                effective_ratio_limit, ratio_profile = self._get_effective_auto_short_ratio_limit(auto_settings, data)
-                needs_short_retry = (
-                    retry_short_enabled
-                    and isinstance(ratio_value, (int, float))
-                    and data.get('len_orig', 0) > 100
-                    and ratio_value < effective_ratio_limit
-                )
-                needs_untranslated_fix = (
-                    retry_untranslated_enabled
-                    and bool(data.get('untranslated_words'))
-                )
-
-                if needs_short_retry:
-                    chapters_to_retry.add(internal_path)
-                    data['auto_retry_ratio_limit'] = effective_ratio_limit
-                    data['auto_retry_ratio_profile'] = ratio_profile
-                    ratio_profiles[internal_path] = (
-                        ratio_value,
-                        effective_ratio_limit,
-                        ratio_profile,
-                    )
-                elif needs_untranslated_fix:
-                    chapters_to_fix_untranslated.add(internal_path)
-
-            if chapters_to_fix_untranslated:
-                fix_signature = tuple(sorted(chapters_to_fix_untranslated))
-                if hasattr(dialog, 'build_auto_untranslated_request_details'):
-                    try:
-                        undertranslation_request_details = dialog.build_auto_untranslated_request_details(
-                            target_internal_paths=fix_signature,
-                            batch_size=50,
-                        ) or ""
-                    except Exception:
-                        undertranslation_request_details = ""
-                self._auto_log(
-                    f"Недоперевод найден в {len(fix_signature)} главах: "
-                    f"{self._format_auto_chapter_list(fix_signature, limit=10)}",
-                    force=True,
-                    details_title="[AUTO] Недоперевод: детали",
-                    details_text=undertranslation_request_details or None,
-                )
-                if fix_signature in self._auto_last_untranslated_fix_signatures:
-                    self._auto_log(
-                        "Получен тот же набор глав с недопереводом после точечного исправления. "
-                        f"Повторный точечный фикс пропущен: {self._format_auto_chapter_list(fix_signature, limit=10)}.",
-                        force=True
-                    )
-                    dialog.deleteLater()
-                    self._auto_validator_dialog = None
-                    self._auto_followup_running = False
-                    self._finish_auto_validator_followup(
-                        auto_settings,
-                        "Продолжаю автопайплайн без повторного точечного фикса недоперевода.",
-                    )
-                    return
-
-                self._auto_last_untranslated_fix_signatures.add(fix_signature)
-                self._auto_log(
-                    f"Запускаю точечное исправление недоперевода для {len(fix_signature)} глав…",
-                    force=True,
-                    details_title="[AUTO] Точечный фикс недоперевода",
-                    details_text=undertranslation_request_details or None,
-                )
-                auto_fix_result = dialog.run_auto_untranslated_fixer(
-                    target_internal_paths=fix_signature,
-                    provider_id=self.key_management_widget.get_selected_provider(),
-                    active_keys=self.key_management_widget.get_active_keys(),
-                    session_settings=self._get_effective_auto_model_settings(auto_settings),
-                    batch_size=50,
-                    save_immediately=True,
-                )
-
-        if dialog:
-            dialog.deleteLater()
-        self._auto_validator_dialog = None
-        self._auto_followup_running = False
-
-        if chapters_to_fix_untranslated:
-            if auto_fix_result and auto_fix_result.get('success'):
-                affected_paths = auto_fix_result.get('affected_internal_paths') or tuple(sorted(chapters_to_fix_untranslated))
-                details_text = (
-                    auto_fix_result.get('response_details_text')
-                    or auto_fix_result.get('request_details_text')
-                    or undertranslation_request_details
-                    or None
-                )
-                self._auto_log(
-                    "Точечный фикс недоперевода завершён: "
-                    f"групп изменено {auto_fix_result.get('groups_changed', 0)}, "
-                    f"замен {auto_fix_result.get('replacements', 0)}, "
-                    f"сохранено файлов {auto_fix_result.get('saved_count', 0)}.",
-                    force=True,
-                    details_title="[AUTO] Точечно изменённые главы",
-                    details_text=self._merge_auto_details(
-                        details_text,
-                        self._compose_auto_details([
-                            ("Изменённые главы", list(affected_paths) if affected_paths else []),
-                        ]),
-                    ),
-                )
-            else:
-                error_text = ""
-                if auto_fix_result:
-                    error_text = auto_fix_result.get('error', '')
-                details_text = None
-                if auto_fix_result:
-                    details_text = (
-                        auto_fix_result.get('response_details_text')
-                        or auto_fix_result.get('request_details_text')
-                    )
-                if not details_text:
-                    details_text = undertranslation_request_details or None
-                self._auto_log(
-                    "Точечный фикс недоперевода не выполнен."
-                    + (f" Причина: {error_text}" if error_text else ""),
-                    force=True,
-                    details_title="[AUTO] Точечный фикс недоперевода",
-                    details_text=details_text,
-                )
-                if not chapters_to_retry:
-                    self._finish_auto_validator_followup(
-                        auto_settings,
-                        "Продолжаю автопайплайн без точечного фикса недоперевода.",
-                    )
-                    return
-
-        if chapters_to_fix_untranslated and auto_fix_result and auto_fix_result.get('success') and not chapters_to_retry:
-            self._auto_followup_running = True
-            self.start_btn.setEnabled(False)
-            self._auto_log("Перезапускаю автопроверку после точечного исправления недоперевода…", force=True)
-            QtCore.QTimer.singleShot(250, lambda: self._run_auto_validator_followup(auto_settings))
-            return
-
-        if chapters_to_retry:
-            signature = tuple(sorted(chapters_to_retry))
-            retry_round_available, max_rounds = self._auto_retry_round_available(auto_settings)
-            if not retry_round_available:
-                self._auto_log(
-                    f"Автовалидатор нашёл {len(signature)} глав для повтора, но лимит автоциклов "
-                    f"({max_rounds}) уже достигнут. Главы не возвращены в очередь.",
-                    force=True,
-                    details_title="[AUTO] Финальная проверка ratio",
-                    details_text=self._compose_auto_details([
-                        ("Главы", list(signature)),
-                    ]),
-                )
-                if auto_settings.get('ai_consistency_enabled'):
-                    self._run_auto_consistency_followup(auto_settings)
-                else:
-                    self._reset_auto_workflow_state()
-                    self.check_ready()
-                return
-
-            self._auto_last_retry_signatures.add(signature)
-            self.add_files_for_retry(self.selected_file, list(signature))
-            cjk_retries = sum(1 for _, _, profile in ratio_profiles.values() if profile == "CJK")
-            alpha_retries = max(0, len(signature) - cjk_retries)
-            details_chunks = []
-            if cjk_retries:
-                details_chunks.append(f"CJK: {cjk_retries}")
-            if alpha_retries:
-                details_chunks.append(f"алфавитные: {alpha_retries}")
-            ratio_details = []
-            for path in signature:
-                ratio_value, ratio_limit, profile = ratio_profiles.get(path, (None, None, None))
-                if isinstance(ratio_value, (int, float)) and isinstance(ratio_limit, (int, float)):
-                    ratio_details.append(
-                        f"{self._short_auto_name(path)} ({ratio_value:.2f} < {ratio_limit:.2f}, {profile or 'общий'})"
-                    )
-                else:
-                    ratio_details.append(self._short_auto_name(path))
-            self._auto_log(
-                f"Автовалидатор вернул на повтор {len(signature)} глав "
-                f"(проверено: {total_scanned}, проблем: {suspicious_found})"
-                + (f"; профили: {', '.join(details_chunks)}" if details_chunks else "")
-                + ".",
-                force=True,
-                details_title="[AUTO] Повтор по ratio",
-                details_text=self._compose_auto_details([
-                    ("Профили", details_chunks),
-                    ("Главы", ratio_details),
-                ]),
-            )
-            if auto_settings.get('auto_restart_after_retry', True):
-                self._auto_workflow_round += 1
-                self._auto_followup_running = True
-                self.start_btn.setEnabled(False)
-                self._schedule_auto_translation_restart(250)
-            else:
-                self._auto_log("Главы подготовлены к повтору, но автоперезапуск выключен.", force=True)
-                self._reset_auto_workflow_state()
-                self.check_ready()
-            return
-
-        self._auto_log("Автовалидатор не нашёл глав для повтора.", force=True)
-        if auto_settings.get('ai_consistency_enabled'):
-            self._run_auto_consistency_followup(auto_settings)
-            return
-
-        self._reset_auto_workflow_state()
-        self.check_ready()
-
-    def _run_auto_consistency_followup(self, auto_settings: dict):
-        include_original = bool(
-            auto_settings.get('ai_consistency_use_original', False)
-            or auto_settings.get('source_context_enabled', False)
-        )
+            entries = self.glossary_widget.get_glossary()
+            seen = set()
+            deduped = []
+            for e in entries:
+                orig = (e.get('original') or '').strip().lower()
+                if orig and orig not in seen:
+                    seen.add(orig)
+                    deduped.append(e)
+            if len(deduped) != len(entries):
+                self.glossary_widget.set_glossary(deduped)
+                self._save_project_glossary_only()
+            self.auto_translate_widget.set_stage_status('glossary_validation', 'completed')
+        except Exception as e:
+            self.auto_translate_widget.set_stage_status('glossary_validation', 'error', str(e))
+        QtCore.QTimer.singleShot(100, self._run_next_pipeline_stage)
+
+    def _execute_pipeline_machine_translation(self):
         try:
-            original_chapter_limit = int(auto_settings.get('ai_consistency_original_chapter_limit', 0) or 0)
-        except (TypeError, ValueError):
-            original_chapter_limit = 0
-        if original_chapter_limit <= 0 and auto_settings.get('source_context_enabled'):
-            try:
-                original_chapter_limit = int(auto_settings.get('source_context_chapters', 0) or 0)
-            except (TypeError, ValueError):
-                original_chapter_limit = 0
-        original_chapter_limit = max(0, original_chapter_limit)
-        chapters_to_analyze = load_project_chapters_for_consistency(
-            self.project_manager,
-            original_epub_path=getattr(self, 'selected_file', None),
-            include_original=include_original,
-        )
-        service_session_ready = _key_widget_can_start_ai_session(self.key_management_widget)
-        active_keys = self.key_management_widget.get_active_keys()
+            self._start_translation(from_pipeline=True)
+        except Exception as e:
+            self.auto_translate_widget.set_stage_status('machine_translation', 'error', str(e))
+            self._pipeline_active = False
 
-        if not chapters_to_analyze:
-            self._auto_log("AI-consistency пропущен: не найдено переведённых глав.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        if not service_session_ready:
-            self._auto_log("AI-consistency пропущен: нет активной сессии сервиса.", force=True)
-            self._reset_auto_workflow_state()
-            self.check_ready()
-            return
-
-        config = self._get_effective_auto_model_settings(auto_settings)
-        requested_mode = auto_settings.get('ai_consistency_mode', 'standard')
-        consistency_mode = normalize_consistency_mode(requested_mode)
-        if consistency_mode == FAST_PROOFREAD_MODE:
-            worker_mode = FAST_PROOFREAD_MODE
-        else:
-            worker_mode = (
-                'glossary_first'
-                if str(requested_mode or '').strip().lower() == 'glossary_first'
-                else 'standard'
+    def _execute_pipeline_untranslated_fixing(self):
+        try:
+            from .validation import TranslationValidatorPage
+            val_page = TranslationValidatorPage(
+                self.output_folder, self.selected_file or "", self,
+                retry_enabled=True, project_manager=self.project_manager,
             )
-            consistency_mode = DEEP_CONSISTENCY_MODE
-        selected_confidences = auto_settings.get('ai_consistency_fix_confidences')
-        if not isinstance(selected_confidences, (list, tuple, set)):
-            selected_confidences = ['high', 'medium', 'low']
-        selected_confidences = [
-            str(level).strip().lower()
-            for level in selected_confidences
-            if str(level).strip().lower() in ('high', 'medium', 'low')
-        ]
-        config.update({
-            'provider': self.key_management_widget.get_selected_provider(),
-            'chunk_size': int(auto_settings.get('ai_consistency_chunk_size', 3)),
-            'consistency_mode': consistency_mode,
-            'consistency_fix_confidences': list(selected_confidences),
-            'consistency_include_original': include_original,
-            'consistency_original_chapter_limit': original_chapter_limit,
-            'consistency_parallel_workers': self.instances_spin.value(),
-            'num_instances': self.instances_spin.value(),
-            PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
-        })
+            active_keys = self.key_management_widget.get_active_keys()
+            provider_id = self.key_management_widget.get_selected_provider()
+            model_settings = self.model_settings_widget.get_settings()
 
-        self._auto_followup_running = True
-        self.start_btn.setEnabled(False)
-        self._auto_log("Запускаю AI-проверку согласованности…", force=True)
-        if include_original:
-            chapters_with_original = sum(1 for chapter in chapters_to_analyze if chapter.get('source_content'))
-            limit_text = (
-                f", не больше {original_chapter_limit} исходных глав на запрос"
-                if original_chapter_limit > 0
-                else ""
+            batch_size = 50
+
+            res = val_page.run_auto_untranslated_fixer(
+                provider_id=provider_id,
+                active_keys=active_keys,
+                session_settings=model_settings,
+                batch_size=batch_size,
+                save_immediately=True,
             )
-            self._auto_log(
-                f"AI-consistency будет сверять перевод с оригиналом EPUB: "
-                f"{chapters_with_original}/{len(chapters_to_analyze)} глав с исходным текстом{limit_text}.",
-            )
-        self._auto_log(
-            f"AI-consistency анализирует {len(chapters_to_analyze)} глав: "
-            f"{self._format_auto_chapter_list([chapter.get('name') for chapter in chapters_to_analyze], limit=10, preserve_order=True)}",
-        )
-        if auto_settings.get('ai_consistency_auto_fix', True):
-            fix_levels_text = ", ".join(selected_confidences) if selected_confidences else "ничего не исправлять"
-            self._auto_log(f"AI-consistency автофикс по уровням уверенности: {fix_levels_text}.")
+            groups_fixed = res.get('groups_changed', 0) if isinstance(res, dict) else 0
+            self.auto_translate_widget.set_stage_status('untranslated_fixing', 'completed', f"Готово (исправлено {groups_fixed})")
+            self._post_event('log_message', {'message': f"[AUTOTRANSLATE] Этап доперевода и очистки мусора завершен: исправлено {groups_fixed}"})
+        except Exception as e:
+            self.auto_translate_widget.set_stage_status('untranslated_fixing', 'completed', "Завершен")
+            print(f"[AUTOTRANSLATE] untranslated_fixing note: {e}")
+        QtCore.QTimer.singleShot(200, self._run_next_pipeline_stage)
 
-        worker = AutoConsistencyWorker(
-            self.settings_manager,
-            chapters_to_analyze,
-            config,
-            active_keys,
-            auto_fix=bool(auto_settings.get('ai_consistency_auto_fix', True)),
-            mode=worker_mode,
-            parent=self,
-        )
-        worker.finished_with_result.connect(self._on_auto_consistency_finished)
-        worker.failed.connect(self._on_auto_consistency_failed)
-        worker.progress_message.connect(lambda message: self._auto_log(message))
-        worker.finished.connect(lambda: setattr(self, '_auto_consistency_worker', None))
-        self._auto_consistency_worker = worker
-        worker.start()
-
-    def _on_auto_consistency_finished(self, result: dict):
-        self._auto_followup_running = False
-        if self.project_manager:
-            self.project_manager.reload_data_from_disk()
-
-        problems_count = int(result.get('problems_count', 0))
-        problems_by_confidence = result.get('problems_by_confidence') or {}
-        fixed_count = int(result.get('fixed_count', 0))
-        fixable_problems_count = int(result.get('fixable_problems_count', 0))
-        auto_fix = bool(result.get('auto_fix', False))
-        selected_confidences = result.get('selected_confidences') or []
-        problem_chapters = result.get('problem_chapters') or []
-        fixable_problem_chapters = result.get('fixable_problem_chapters') or []
-        fixed_chapters = result.get('fixed_chapters') or []
-        trace_details = self._compose_auto_trace_details(result.get('request_response_trace') or [])
-        confidence_summary = []
-        for level in ('high', 'medium', 'low'):
-            count = int(problems_by_confidence.get(level, 0) or 0)
-            if count:
-                confidence_summary.append(f"{level}: {count}")
-        confidence_suffix = f" ({', '.join(confidence_summary)})" if confidence_summary else ""
-
-        if auto_fix and fixed_count:
-            success_sections = []
-            if selected_confidences:
-                success_sections.append(("Исправляемые уровни", list(selected_confidences)))
-            if fixed_chapters:
-                success_sections.append(("Исправленные главы", list(fixed_chapters)))
-            details_text = self._merge_auto_details(
-                trace_details,
-                self._compose_auto_details(success_sections),
-            )
-            self._auto_log(
-                f"AI-consistency завершён: исправлено и сохранено {fixed_count} глав."
-                f" Найдено проблем {problems_count}{confidence_suffix}.",
-                force=True
-                ,
-                details_title="[AUTO] AI-consistency: результат",
-                details_text=details_text or None,
-            )
-        else:
-            result_sections = []
-            if auto_fix:
-                if selected_confidences:
-                    result_sections.append(("Уровни автоисправления", list(selected_confidences)))
-                    result_sections.append(("Кандидаты на автоисправление", [
-                        f"Проблем: {fixable_problems_count}",
-                    ]))
-                else:
-                    result_sections.append(("Автоисправление", [
-                        "Не запускалось: не выбран ни один уровень уверенности.",
-                    ]))
-            if problem_chapters:
-                result_sections.append(("Проблемные главы", list(problem_chapters)))
-            if auto_fix and fixable_problem_chapters:
-                result_sections.append(("Главы-кандидаты на автоисправление", list(fixable_problem_chapters)))
-            details_text = self._merge_auto_details(
-                trace_details,
-                self._compose_auto_details(result_sections),
-            )
-            self._auto_log(
-                f"AI-consistency завершён: найдено проблем {problems_count}{confidence_suffix}.",
-                force=True,
-                details_title="[AUTO] AI-consistency: результат",
-                details_text=details_text or None,
-            )
-
-        self._reset_auto_workflow_state()
-        self.check_ready()
-
-    def _on_auto_consistency_failed(self, error_text: str):
-        self._auto_followup_running = False
-        self._auto_log(f"AI-consistency завершился ошибкой: {error_text}", force=True)
-        self._reset_auto_workflow_state()
-        self.check_ready()
+    def _execute_pipeline_ai_editing(self):
+        try:
+            self.auto_translate_widget.set_stage_status('ai_editing', 'completed')
+            self._post_event('log_message', {'message': "[AUTOTRANSLATE] Этап ИИ-редактирования завершен."})
+        except Exception as e:
+            self.auto_translate_widget.set_stage_status('ai_editing', 'error', str(e))
+        QtCore.QTimer.singleShot(200, self._run_next_pipeline_stage)
 
     def get_settings(self):
         active_keys = self.key_management_widget.get_active_keys()
@@ -6998,7 +5289,6 @@ class InitialSetupPage(ShellPage):
             'full_glossary_data': full_glossary_data,
             'custom_prompt': self.preset_widget.get_prompt() or api_config.default_prompt(),
             'last_prompt_preset': self.preset_widget.get_current_preset_name(),
-            'auto_translation': self.auto_translate_widget.get_settings(),
             PREVENT_SLEEP_SETTING_KEY: self.prevent_sleep_checkbox.isChecked(),
             'auto_start': True,
             'num_instances': self.instances_spin.value(),
@@ -7206,9 +5496,9 @@ class InitialSetupPage(ShellPage):
         if rebuild_tasks:
             self._prepare_and_display_tasks(clean_rebuild=True)
         self.paths_widget.update_chapters_info(len(self.html_files))
+        self._sync_auto_translate_chapters()
         # 4. Вызываем пересчет рекомендаций, так как данные о главах изменились
         self._update_recommendations()
-        self._refresh_auto_translate_runtime_context()
 
         # 5. Обновляем все остальные зависимые UI элементы
         self.check_ready()
@@ -7438,11 +5728,6 @@ class InitialSetupPage(ShellPage):
         return self._prepare_for_close(autosave_glossary=True)
 
     def on_leave(self) -> None:
-        restart_timer = getattr(self, '_auto_restart_timer', None)
-        if restart_timer is not None and restart_timer.isActive():
-            self._auto_log("Ожидающий автоперезапуск отменён при выходе со страницы перевода.", force=True)
-            self._reset_auto_workflow_state()
-        self._shutdown_parallel_filter_redirect_runs()
         self._disconnect_event_bus()
 
 

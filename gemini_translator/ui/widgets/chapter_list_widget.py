@@ -261,6 +261,144 @@ class BatchChapterOrderDialog(QDialog):
             return
         self._preview_callback(str(item.data(Qt.ItemDataRole.UserRole)))
 
+
+def get_task_display_texts(task_payload, chapter_widget=None) -> tuple[str, str]:
+    """Вспомогательный метод для генерации текста ячейки и подсказки задачи."""
+    display_text = "Потерянная задача..."
+    tooltip_text = ""
+    if not task_payload:
+        return display_text, tooltip_text
+
+    task_type = task_payload[0]
+
+    def _char_suffix(chapters):
+        if chapter_widget and hasattr(chapter_widget, "_char_suffix_for_chapters"):
+            return chapter_widget._char_suffix_for_chapters(chapters)
+        return ""
+
+    try:
+        # --- Пакеты (Glossary и EPUB) ---
+        if task_type in ("glossary_batch_task", "epub_batch"):
+            content_data = task_payload[2] if len(task_payload) > 2 else []
+
+            prefix = "✨ Пакет глоссария" if task_type == "glossary_batch_task" else "📦 Пакет"
+            display_text = f"{prefix} из {len(content_data)} глав"
+            if content_data:
+                display_text += f" (начиная с '{os.path.basename(str(content_data[0]))}')"
+            display_text += _char_suffix(content_data)
+
+            tooltip_header = "Главы для генерации глоссария:\n" if task_type == "glossary_batch_task" else "Содержимое пакета:\n"
+            tooltip_text = tooltip_header + "\n".join(map(str, content_data))
+            char_suffix = _char_suffix(content_data)
+            if char_suffix:
+                tooltip_text += f"\n\nРазмер пакета: {char_suffix.strip(' ·')}"
+
+        # --- Одиночная глава EPUB ---
+        elif task_type == "epub":
+            epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
+            chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
+
+            original_filename = os.path.basename(epub_path)
+            display_text = f"📄 HTML: {os.path.basename(chapter_path)}"
+            char_suffix = _char_suffix([chapter_path])
+            if char_suffix:
+                display_text += char_suffix
+            tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+            if char_suffix:
+                tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
+
+        # --- Часть главы (чанк) EPUB ---
+        elif task_type == "epub_chunk":
+            epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
+            chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
+            chunk_index = task_payload[4] if len(task_payload) > 4 else -1
+            total_chunks = task_payload[5] if len(task_payload) > 5 else -1
+
+            original_filename = os.path.basename(epub_path)
+            display_text = f"쪼 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
+            char_suffix = _char_suffix([chapter_path])
+            if char_suffix:
+                display_text += char_suffix
+            tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+            if char_suffix:
+                tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
+
+        # --- Прямой перевод текста (НОВЫЙ БЛОК) ---
+        elif task_type == "raw_text_translation":
+            # task_payload[3] - это title
+            title = task_payload[3] if len(task_payload) > 3 and task_payload[3] else "Прямой перевод"
+            # task_payload[2] - это сам текст
+            text_content = task_payload[2] if len(task_payload) > 2 else ""
+
+            display_text = f"✨ {title}"
+            # Показываем первые 100 символов в подсказке
+            tooltip_text = text_content[:100] + ('...' if len(text_content) > 100 else '')
+
+        # --- Обработчик для всех остальных, неизвестных типов ---
+        else:
+            display_text = f"Задача типа: '{task_type}'"
+            tooltip_text = str(task_payload)
+
+    except (IndexError, TypeError) as e:
+        # Защитный блок на случай, если payload придет поврежденным
+        display_text = f"Ошибка отображения задачи ({task_type})"
+        tooltip_text = f"Некорректный payload: {task_payload}\nОшибка: {e}"
+
+    return display_text, tooltip_text
+
+
+def get_task_status_display_info(status: str, details: dict = None, task_payload: tuple = None, palette=None) -> tuple[str, str]:
+    """Возвращает (текст_статуса, цвет_hex) для заданного состояния."""
+    is_glossary_task = task_payload and task_payload[0] == 'glossary_batch_task'
+
+    final_status_key = status
+    if status in ('success', 'completed') and is_glossary_task:
+        final_status_key = 'glossary_success'
+    elif status in ('success', 'completed'):
+        final_status_key = 'success'
+    elif status == 'error':
+        error_types = details.get('errors', {}).keys() if isinstance(details, dict) else []
+        if 'CONTENT_FILTER' in error_types: final_status_key = 'error_filter'
+        elif 'NETWORK' in error_types: final_status_key = 'error_network'
+        elif 'VALIDATION' in error_types: final_status_key = 'error_validation'
+        else: final_status_key = 'error'
+    elif status == 'waiting':
+        final_status_key = 'pending'
+
+    text_color = "#888888"
+    if palette is not None:
+        try:
+            text_color = palette.color(QtGui.QPalette.ColorRole.Text).name()
+        except Exception:
+            pass
+
+    status_map = {
+        'success': ("✅ Успешно", "#2ECC71"),
+        'glossary_success': ("✅ Сгенерировано", "#1ABC9C"),
+        'error': ("❌ Ошибка", "#E74C3C"),
+        'error_filter': ("🛡️ Фильтр", "#9B59B6"),
+        'error_network': ("🔌 Сеть лежит!", "#E67E22"),
+        'error_validation': ("📋 Невалидно!", "#F39C12"),
+        'in_progress': ("🔄 В работе…", "#3498DB"),
+        'pending': ("⏳ Ожидание…", text_color),
+        'held': ("⏸ Заморожено", "#7F8C8D"),
+        'completion': ("✍️ До-генерация…", "#F39C12")
+    }
+
+    return status_map.get(final_status_key, (f"❓ {final_status_key}", "#FFFFFF"))
+
+
+def get_task_status_tooltip(display_text: str, status: str, details: dict = None) -> str:
+    """Формирует подсказку статуса задачи с историей ошибок."""
+    error_tooltip = ""
+    if status.startswith('error') and isinstance(details, dict):
+        error_counts = details.get('errors', {})
+        if error_counts:
+            error_lines = [f"- {err_type}: {count} раз" for err_type, count in error_counts.items()]
+            error_tooltip = "\n\nИстория ошибок:\n" + "\n".join(error_lines)
+    return f"Статус: {display_text}{error_tooltip}"
+
+
 class ChapterListWidget(QWidget):
     """
     Виджет для отображения списка глав/заданий для перевода и управления этим списком.
@@ -995,111 +1133,15 @@ class ChapterListWidget(QWidget):
 
     def _get_display_texts(self, task_payload):
         """Вспомогательный метод для генерации текста ячейки."""
-        display_text = "Потерянная задача..."
-        tooltip_text = ""
-        if not task_payload:
-            return display_text, tooltip_text
-
-        task_type = task_payload[0]
-
-        try:
-            # --- Пакеты (Glossary и EPUB) ---
-            if task_type in ("glossary_batch_task", "epub_batch"):
-                content_data = task_payload[2] if len(task_payload) > 2 else []
-
-                prefix = "✨ Пакет глоссария" if task_type == "glossary_batch_task" else "📦 Пакет"
-                display_text = f"{prefix} из {len(content_data)} глав"
-                if content_data:
-                    display_text += f" (начиная с '{os.path.basename(str(content_data[0]))}')"
-                display_text += self._char_suffix_for_chapters(content_data)
-
-                tooltip_header = "Главы для генерации глоссария:\n" if task_type == "glossary_batch_task" else "Содержимое пакета:\n"
-                tooltip_text = tooltip_header + "\n".join(map(str, content_data))
-                char_suffix = self._char_suffix_for_chapters(content_data)
-                if char_suffix:
-                    tooltip_text += f"\n\nРазмер пакета: {char_suffix.strip(' ·')}"
-
-            # --- Одиночная глава EPUB ---
-            elif task_type == "epub":
-                epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
-                chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
-
-                original_filename = os.path.basename(epub_path)
-                display_text = f"📄 HTML: {os.path.basename(chapter_path)}"
-                char_suffix = self._char_suffix_for_chapters([chapter_path])
-                if char_suffix:
-                    display_text += char_suffix
-                tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
-                if char_suffix:
-                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
-
-            # --- Часть главы (чанк) EPUB ---
-            elif task_type == "epub_chunk":
-                epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
-                chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
-                chunk_index = task_payload[4] if len(task_payload) > 4 else -1
-                total_chunks = task_payload[5] if len(task_payload) > 5 else -1
-
-                original_filename = os.path.basename(epub_path)
-                display_text = f"쪼 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
-                char_suffix = self._char_suffix_for_chapters([chapter_path])
-                if char_suffix:
-                    display_text += char_suffix
-                tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
-                if char_suffix:
-                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
-
-            # --- Прямой перевод текста (НОВЫЙ БЛОК) ---
-            elif task_type == "raw_text_translation":
-                # task_payload[3] - это title
-                title = task_payload[3] if len(task_payload) > 3 and task_payload[3] else "Прямой перевод"
-                # task_payload[2] - это сам текст
-                text_content = task_payload[2] if len(task_payload) > 2 else ""
-
-                display_text = f"✨ {title}"
-                # Показываем первые 100 символов в подсказке
-                tooltip_text = text_content[:100] + ('...' if len(text_content) > 100 else '')
-
-            # --- Обработчик для всех остальных, неизвестных типов ---
-            else:
-                display_text = f"Задача типа: '{task_type}'"
-                tooltip_text = str(task_payload)
-
-        except (IndexError, TypeError) as e:
-            # Защитный блок на случай, если payload придет поврежденным
-            display_text = f"Ошибка отображения задачи ({task_type})"
-            tooltip_text = f"Некорректный payload: {task_payload}\nОшибка: {e}"
-
-        return display_text, tooltip_text
+        return get_task_display_texts(task_payload, chapter_widget=self)
 
     def _get_status_display_info(self, status, details, task_payload):
         """Возвращает (текст_статуса, цвет_hex) для заданного состояния."""
-        is_glossary_task = task_payload and task_payload[0] == 'glossary_batch_task'
+        palette = self.palette() if hasattr(self, "palette") else None
+        return get_task_status_display_info(status, details, task_payload, palette=palette)
 
-        final_status_key = status
-        if status == 'success' and is_glossary_task:
-            final_status_key = 'glossary_success'
-        elif status == 'error':
-            error_types = details.get('errors', {}).keys()
-            if 'CONTENT_FILTER' in error_types: final_status_key = 'error_filter'
-            elif 'NETWORK' in error_types: final_status_key = 'error_network'
-            elif 'VALIDATION' in error_types: final_status_key = 'error_validation'
-            else: final_status_key = 'error'
-
-        status_map = {
-            'success': ("✅ Успешно", "#2ECC71"),
-            'glossary_success': ("✅ Сгенерировано", "#1ABC9C"),
-            'error': ("❌ Ошибка", "#E74C3C"),
-            'error_filter': ("🛡️ Фильтр", "#9B59B6"),
-            'error_network': ("🔌 Сеть лежит!", "#E67E22"),
-            'error_validation': ("📋 Невалидно!", "#F39C12"),
-            'in_progress': ("🔄 В работе…", "#3498DB"),
-            'pending': ("⏳ Ожидание…", self.palette().color(QtGui.QPalette.ColorRole.Text).name()),
-            'held': ("స్త Заморожено", "#7F8C8D"),
-            'completion': ("✍️ До-генерация…", "#F39C12")
-        }
-
-        return status_map.get(final_status_key, (f"❓ {final_status_key}", "#FFFFFF"))
+    get_display_texts = staticmethod(get_task_display_texts)
+    get_status_display_info = staticmethod(get_task_status_display_info)
 
     def _update_row_status(self, row, status, details={}):
         status_item = self.table.item(row, 1)
@@ -1112,13 +1154,7 @@ class ChapterListWidget(QWidget):
 
         # 2. Обращаемся к "мозгу" за инструкциями
         display_text, color_hex = self._get_status_display_info(status, details, task_payload)
-
-        error_tooltip = ""
-        if status.startswith('error'):
-            error_counts = details.get('errors', {})
-            error_lines = [f"- {err_type}: {count} раз" for err_type, count in error_counts.items()]
-            error_tooltip = "\n\nИстория ошибок:\n" + "\n".join(error_lines)
-        new_tooltip = f"Статус: {display_text}{error_tooltip}"
+        new_tooltip = get_task_status_tooltip(display_text, status, details)
 
         # 3. Diff gate — skip if text+colour+tooltip all match current.
         def _get_color(item):

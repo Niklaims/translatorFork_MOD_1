@@ -37,6 +37,23 @@ ALIEN_WORD_PATTERN = re.compile(r'[^\W\d_а-яА-ЯёЁ]+')
 CJK_PATTERN = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
 LATIN_PATTERN = re.compile(r'[a-zA-Z]')
 GREEK_PATTERN = re.compile(r'[\u0370-\u03ff\u1f00-\u1fff]')
+ENGLISH_JUNK_PATTERNS = re.compile(
+    r'(?i)\b(?:'
+    r'read\s+(?:more|at|latest|online|free|first|chapter)|'
+    r'visit\s+[\w\.\-]+(?:\s+for)?|'
+    r'translated\s+by|tl\s*:\s*|ed\s*:\s*|editor\s*:\s*|t/n\s*:|'
+    r'patreon(?:\.com)?|discord(?:\.gg|\.com)?|ko-fi(?:\.com)?|paypal(?:\.me)?|boosty(?:\.to)?|'
+    r'support\s+(?:the\s+)?translator|support\s+(?:us\s+)?on|'
+    r'all\s+rights?\s+reserved|bonus\s+chapter|sponsored\s+chapter|'
+    r'pirated\s+at|stolen\s+from|novelsite|wuxiaworld|webnovel|lightnovelpub|boxnovel|freewebnovel'
+    r')\b'
+)
+
+def is_english_junk(text: str) -> bool:
+    if not text:
+        return False
+    return bool(ENGLISH_JUNK_PATTERNS.search(str(text)))
+
 NORMAL_CHARS_PATTERN = re.compile(r'[а-яА-ЯёЁ0-9\s\.,!?;:«»"\'\-\(\)\[\]\%№—–\/\+\*]')
 SOURCE_TYPE_LABELS = {
     'system': 'SYSTEM',
@@ -50,9 +67,17 @@ UNTRANSLATED_PROMPT_GUARDRAILS = f"""{UNTRANSLATED_PROMPT_GUARDRAILS_MARKER}
 
 1. CJK-недоперевод в обычной русской фразе запрещен. Любые китайские, японские или корейские слова/иероглифы, которые не являются видимой надписью, знаком, татуировкой, позой, именем или намеренным визуальным объектом, нужно полностью заменить естественным русским переводом. Нельзя оставлять конструкцию вида «русский текст <иероглифы> русский текст».
 2. Если CJK-элемент стоит в кавычках после русского пояснения или как техническая вставка после названия, выбери один литературный русский вариант и удали оригинальные иероглифы. Не добавляй скобки, сноски или пояснения.
-3. Удаляй из содержимого фрагмента все внешние ссылки, URL, домены, рекламные призывы, донаты, Telegram/Discord/Patreon/Boosty, водяные знаки переводчика, подписи сайтов, навигационную рекламу и призывы перейти/подписаться/купить/читать дальше. Это исключение из правила структурной идентичности: рекламные `<a>`, `span`, `br` и другой мусор внутри обрабатываемого `<p data-id="...">` можно и нужно удалить.
-4. Внутренние художественные ссылки EPUB, сноски и якоря сохраняй только если они являются частью повествования или сноски книги. Внешние веб-ссылки и рекламные ссылки всегда удаляй вместе с рекламным текстом.
-5. После правки внутри каждого возвращенного `<p data-id="...">` не должно остаться CJK-символов, URL, доменов, `http`, `www`, `t.me`, `discord`, `patreon`, `boosty`, рекламных подписей и посторонних сервисных сообщений, кроме случаев намеренной визуальной графики по правилам промпта.
+3. ТОТАЛЬНОЕ УДАЛЕНИЕ АНГЛИЙСКОГО МУСОРА И РЕКЛАМЫ (ENGLISH JUNK & AD REMOVAL):
+   Удаляй из содержимого фрагмента без следа любой английский мусор веб-парсинга и анлейта:
+   - Рекламные фразы и призывы («Read more at...», «Visit novel... for fastest updates», «Read latest chapters on...»).
+   - Подписи переводчиков, редакторов, групп («Translated by...», «Editor:...», «T/N:...», «TL/ED:...»).
+   - Призывы к поддержке и донатам (Patreon, Discord, Boosty, Ko-fi, PayPal).
+   - Предупреждения о пиратстве и копирайте («This novel is translated by...», «All rights reserved», «If you read this on other sites...»).
+   - Любые внешние ссылки, URL, домены, водяные знаки сайтов. Если абзац состоял целиком из рекламного или технического мусора — полностью очисти его текст.
+4. АНГЛИЙСКИЙ ТЕКСТ СЮЖЕТА И ПОВЕСТВОВАНИЯ:
+   Если английский текст является частью повествования (реплика персонажа, системное оповещение интерфейса книги, описание действия, пропущенное при машинном переводе), переведи его на естественный литературный русский язык в соответствии с контекстом текущей сцены. Не оставляй английских предложений в русской речи.
+5. Внутренние художественные ссылки EPUB, сноски и якоря сохраняй только если они являются частью повествования или сноски книги. Внешние веб-ссылки и рекламные ссылки всегда удаляй вместе с рекламным текстом.
+6. После правки внутри каждого возвращенного `<p data-id="...">` не должно остаться CJK-символов, английского рекламного мусора, URL, доменов, `http`, `www`, `t.me`, `discord`, `patreon`, `boosty`, рекламных подписей и посторонних сервисных сообщений, кроме случаев намеренной визуальной графики по правилам промпта.
 """
 
 
@@ -1177,8 +1202,14 @@ class UntranslatedFixerPage(ShellPage):
         self.btn_mark_retry.setToolTip("Пометить главы выбранных строк к повторному переводу в основном окне проверки.")
         self.btn_mark_retry.clicked.connect(self._mark_selected_chapters_for_retry)
         
+        self.btn_purge_junk = QPushButton("🧹 Очистить мусор")
+        self.btn_purge_junk.setStyleSheet(f"background-color: {theme_manager.color('warning')}; color: {theme_manager.color('accent_text')}; font-weight: bold;")
+        self.btn_purge_junk.setToolTip("Находит английский мусор (реклама, ссылки, домены, Patreon, TL/ED) и очищает его.")
+        self.btn_purge_junk.clicked.connect(self._purge_english_junk)
+
         cp_layout.addWidget(self.total_filtered_label)
         cp_layout.addWidget(self.btn_clear_selected)
+        cp_layout.addWidget(self.btn_purge_junk)
         cp_layout.addWidget(self.btn_mark_retry)
         cp_layout.addWidget(self.ai_translate_btn)
         
@@ -1244,8 +1275,9 @@ class UntranslatedFixerPage(ShellPage):
         if op == "<": return value < target
         return value == target
 
-    def apply_filters(self):
-        self._save_current_view_changes()
+    def apply_filters(self, save_ui=True):
+        if save_ui:
+            self._save_current_view_changes()
 
         active_tags = set()
         if self.chk_latin.isChecked(): active_tags.add('latin')
@@ -1324,7 +1356,7 @@ class UntranslatedFixerPage(ShellPage):
         filtered_set = set(self.filtered_indices)
         self.selected_indices = self.selected_indices.intersection(filtered_set)
         
-        self.update_table_view()
+        self.update_table_view(save_ui=save_ui)
 
 
     def update_table_view(self, save_ui=True):
@@ -1960,6 +1992,66 @@ class UntranslatedFixerPage(ShellPage):
             
             if count > 0:
                 QMessageBox.information(self, "Очищено", f"Очищен текст в {count} отмеченных флагом строках.")
+
+    def _purge_english_junk(self, interactive: bool = True) -> int:
+        """
+        Сканирует элементы и очищает английский мусор (реклама, ссылки, домены,
+        водяные знаки, подписи анлейта Patreon/Discord/Boosty/TL/ED).
+        """
+        self._save_current_view_changes()
+        junk_indices = []
+        for idx, item in enumerate(self.original_data):
+            if item.get('_deleted'):
+                continue
+            term = str(item.get('term', '') or '')
+            ctx = str(item.get('new_context', item.get('context', '')) or '')
+            if is_english_junk(term) or is_english_junk(ctx):
+                junk_indices.append(idx)
+
+        if not junk_indices:
+            if interactive:
+                QMessageBox.information(self, "Очистка мусора", "Английский мусор (реклама, ссылки анлейта) не обнаружен.")
+            return 0
+
+        if interactive:
+            reply = QMessageBox.question(
+                self,
+                "Очистка английского мусора",
+                f"Обнаружено {len(junk_indices)} фрагментов с английским рекламным/служебным мусором.\n\n"
+                f"Очистить мусорные фрагменты сейчас?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return 0
+
+        cleaned_count = 0
+        for idx in junk_indices:
+            item = self.original_data[idx]
+            ctx = str(item.get('new_context', item.get('context', '')) or '')
+            term = str(item.get('term', '') or '')
+
+            clean_lines = []
+            for line in ctx.splitlines():
+                if not is_english_junk(line):
+                    clean_lines.append(line)
+
+            cleaned_ctx = "\n".join(clean_lines).strip()
+            if not cleaned_ctx or is_english_junk(term):
+                item['new_context'] = ""
+            else:
+                item['new_context'] = cleaned_ctx
+            cleaned_count += 1
+
+        self.apply_filters(save_ui=False)
+        self.update_table_view(save_ui=False)
+        if interactive:
+            QMessageBox.information(
+                self,
+                "Очистка завершена",
+                f"Успешно очищен английский мусор в {cleaned_count} фрагментах."
+            )
+        return cleaned_count
 
     def _start_ai_translation(self):
         # 1. Сначала сохраняем ручные правки, если они были до нажатия кнопки
