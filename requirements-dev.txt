@@ -1,3 +1,7 @@
+fuzzywuzzy
+hypothesis
 pytest
 pytest-qt
+pytest-timeout
+python-Levenshtein
 ruff

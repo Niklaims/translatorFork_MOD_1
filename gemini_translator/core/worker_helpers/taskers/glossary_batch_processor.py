@@ -283,8 +283,8 @@ class GlossaryBatchProcessor(BaseTaskProcessor):
                 if discarded_new_terms:
                     self.worker._post_event('log_message', {'message': f"📖 [Глоссарий] Лимит в {new_terms_limit} новых терминов. Отброшено наименее частотных по книге: {len(discarded_new_terms)}."})
                 if merge_mode == 'supplement':
-                    updated_terms = []
                     num_updated_override = len(updated_terms)
+                    updated_terms = []
                 truly_validated_glossary_list = updated_terms + limited_new_terms
 
             if truly_validated_glossary_list:

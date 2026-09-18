@@ -142,7 +142,6 @@ class GluedWordCandidate:
 @dataclass(frozen=True)
 class _MorphProfile:
     poses: frozenset[str]
-    top_pos: str | None
     top_grammemes: frozenset[str]
     top_score: float
     method_names: tuple[str, ...]
@@ -311,7 +310,6 @@ def _morph_profile(
             for parsed in parses[:8]
             if getattr(getattr(parsed, "tag", None), "POS", None)
         ),
-        top_pos=getattr(top_tag, "POS", None),
         top_grammemes=frozenset(getattr(top_tag, "grammemes", ()) or ()),
         top_score=float(getattr(top, "score", 0.0) or 0.0),
         method_names=tuple(
@@ -776,6 +774,12 @@ def find_glued_russian_words(
     return candidates
 
 
+# Слипшееся из нескольких частей слово расходится не за один проход. Предел
+# нужен как страховка от колебаний: на 3000 сгенерированных текстов покоя
+# хватало двух проходов.
+_MAX_REPAIR_PASSES = 5
+
+
 def repair_glued_russian_words(
     text: str,
     analyzer=None,
@@ -786,23 +790,47 @@ def repair_glued_russian_words(
     _profile_cache: dict[str, _MorphProfile | None] | None = None,
     _protected_rules=None,
 ) -> tuple[str, list[GluedWordCandidate]]:
-    candidates = find_glued_russian_words(
-        text,
-        analyzer=analyzer,
-        protected_terms=protected_terms,
-        _known_cache=_known_cache,
-        _plausible_cache=_plausible_cache,
-        _profile_cache=_profile_cache,
-        _protected_rules=_protected_rules,
-    )
-    confident = [candidate for candidate in candidates if candidate.confident]
-    if not confident:
-        return text, candidates
+    """Расклеивает слова, повторяя проход до покоя.
+
+    Один проход разделяет слипшееся слово не до конца: «дверьдверьИван»
+    превращается в «дверьдверь Иван», и вторая склейка доживает до следующего
+    запуска проверки. Поэтому проходы повторяются, пока текст меняется.
+
+    Возвращаются кандидаты ПЕРВОГО прохода — «что нашли», а не «что осталось»:
+    на этом контракте держатся и тесты, и отчёт. Список оставшегося неясным
+    validation.py получает отдельно, повторным вызовом уже на результате.
+    """
+    def _scan(value):
+        return find_glued_russian_words(
+            value,
+            analyzer=analyzer,
+            protected_terms=protected_terms,
+            _known_cache=_known_cache,
+            _plausible_cache=_plausible_cache,
+            _profile_cache=_profile_cache,
+            _protected_rules=_protected_rules,
+        )
 
     repaired = text
-    for candidate in reversed(confident):
-        repaired = repaired[:candidate.start] + candidate.replacement + repaired[candidate.end:]
-    return repaired, candidates
+    candidates = _scan(repaired)
+    reported = candidates
+    for _pass in range(_MAX_REPAIR_PASSES):
+        confident = [candidate for candidate in candidates if candidate.confident]
+        if not confident:
+            break
+
+        following = repaired
+        for candidate in reversed(confident):
+            following = (
+                following[:candidate.start] + candidate.replacement + following[candidate.end:]
+            )
+        if following == repaired:
+            break
+
+        repaired = following
+        candidates = _scan(repaired)
+
+    return repaired, reported
 
 
 class _VisibleTextRepairParser(HTMLParser):

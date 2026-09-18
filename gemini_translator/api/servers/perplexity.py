@@ -70,9 +70,6 @@ REQUEST_LOG_FILE = os.path.join(APP_DIR, "perplexity_requests.log")
 
 HOST = CFG.host
 PORT = CFG.port
-CONCURRENT_REQUESTS = CFG.concurrent_requests
-REQUEST_TIMEOUT = CFG.acquire_timeout_s
-USER_AGENT = CFG.user_agent
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(levelname)s - %(message)s")
@@ -417,24 +414,14 @@ class PerplexityBackend:
 
         temp_uploader = PerplexityUploader(self.session, active_token)
         s3_filename = f"CONTEXT_{int(time.time())}.txt"
-        tf = tempfile.NamedTemporaryFile(
-            mode="w+", encoding="utf-8", delete=False, suffix=".txt")
-        temp_path = tf.name
+        logger.info("Uploading large context (%s chars)...", len(text))
         try:
-            tf.write(text)
-            tf.close()
-            logger.info("Uploading large context (%s chars)...", len(text))
-            result = temp_uploader.upload_file(temp_path, s3_filename)
+            result = temp_uploader.upload_text_as_file(
+                text, filename=s3_filename)
             return result.get("url")
         except Exception as e:
             logger.error("File upload failed: %s", e)
             raise
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
 
     def _ask_once(self, *, text: str, model: str, token: str, search_focus: str) -> Dict[str, Any]:
         attachments: List[str] = []
@@ -683,9 +670,6 @@ class FlaskServerThread(threading.Thread):
 
     def get_url(self) -> Optional[str]:
         return f"http://{self._host}:{self._actual_port}" if self._actual_port else None
-
-    def get_port(self) -> Optional[int]:
-        return self._actual_port
 
 # ==================================================================================
 # SERVER INTERFACE IMPL

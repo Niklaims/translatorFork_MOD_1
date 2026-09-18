@@ -22,6 +22,9 @@ from gemini_translator.api.errors import (
     ValidationFailedError,
 )
 from gemini_translator.api.factory import get_api_handler_class
+from gemini_translator.core.handler_cleanup import cleanup_provider_handler
+from gemini_translator.utils.helpers import estimate_gemini_tokens, safe_int
+from gemini_translator.utils.text import split_csv
 
 
 TRANSLATION_TASK_TYPES = {"epub", "epub_batch", "epub_chunk", "raw_text_translation"}
@@ -120,17 +123,6 @@ class _ProviderWorkerProxy:
         return getattr(self._base_worker, name)
 
 
-def _safe_int(value: Any, default: int, minimum: int = 0, maximum: int | None = None) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = default
-    parsed = max(minimum, parsed)
-    if maximum is not None:
-        parsed = min(maximum, parsed)
-    return parsed
-
-
 def _safe_float(value: Any) -> float | None:
     if value is None or isinstance(value, bool):
         return None
@@ -138,10 +130,6 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _split_csv(value: str) -> list[str]:
-    return [item.strip() for item in re.split(r"[,;\n]+", value or "") if item.strip()]
 
 
 def _post_log(worker, message: str, **extra) -> None:
@@ -291,7 +279,7 @@ def _normalize_provider_specs(worker) -> list[dict[str, Any]]:
 
     items: list[Any]
     if isinstance(raw, str):
-        items = _split_csv(raw)
+        items = split_csv(raw)
     elif isinstance(raw, dict):
         items = [raw]
     elif isinstance(raw, (list, tuple)):
@@ -332,7 +320,7 @@ def _normalize_pass_specs(worker) -> list[dict[str, Any]]:
         if variants:
             return variants
 
-    count = _safe_int(
+    count = safe_int(
         getattr(worker, "multi_pass_count", getattr(worker, "multi_pass_chapter_count", 3)),
         default=3,
         minimum=1,
@@ -344,7 +332,7 @@ def _normalize_pass_specs(worker) -> list[dict[str, Any]]:
 
     raw_temperatures = getattr(worker, "multi_pass_temperatures", None)
     if isinstance(raw_temperatures, str):
-        temperatures = [_safe_float(item) for item in _split_csv(raw_temperatures)]
+        temperatures = [_safe_float(item) for item in split_csv(raw_temperatures)]
     elif isinstance(raw_temperatures, (list, tuple)):
         temperatures = [_safe_float(item) for item in raw_temperatures]
     else:
@@ -387,7 +375,7 @@ def _build_attempts(worker) -> list[ProviderAttempt]:
         provider_specs.insert(0, _primary_provider_spec(worker))
 
     pass_specs = _normalize_pass_specs(worker) if multi_pass_enabled else [{"label": "single"}]
-    max_attempts = _safe_int(getattr(worker, "translation_orchestration_max_attempts", 8), 8, minimum=1, maximum=32)
+    max_attempts = safe_int(getattr(worker, "translation_orchestration_max_attempts", 8), 8, minimum=1, maximum=32)
 
     attempts: list[ProviderAttempt] = []
     seen = set()
@@ -498,18 +486,6 @@ async def _maybe_await(value):
     return value
 
 
-async def _cleanup_handler(handler) -> None:
-    cleanup = getattr(handler, "_close_thread_session_internal", None)
-    if not callable(cleanup):
-        return
-    try:
-        result = cleanup()
-        if inspect.isawaitable(result):
-            await result
-    except Exception:
-        return
-
-
 async def _run_attempt(worker, attempt: ProviderAttempt, prompt: str, log_prefix: str, call_kwargs: dict) -> ProviderAttemptResult:
     provider_info = _provider_info(attempt.provider_id)
     if not provider_info:
@@ -546,7 +522,7 @@ async def _run_attempt(worker, attempt: ProviderAttempt, prompt: str, log_prefix
         )
     finally:
         if handler is not None:
-            await _cleanup_handler(handler)
+            await cleanup_provider_handler(handler)
 
 
 def _score_result(result: ProviderAttemptResult) -> int:
@@ -619,9 +595,11 @@ def _target_input_token_budget(worker) -> tuple[int | None, str | None]:
 def _estimate_input_tokens(text: str) -> int:
     if not text:
         return 0
+    # Наивная оценка chars/4 занижает кириллицу/CJK в 1.8-2.7 раза, из-за чего
+    # страж бюджета синтеза пропускал промпты, реально не влезающие в контекст
+    # целевой модели. estimate_gemini_tokens учитывает алфавит символов.
     compact_pieces = len(re.findall(r"\S+", text))
-    char_estimate = (len(text) + TOKEN_ESTIMATE_CHARS_PER_TOKEN - 1) // TOKEN_ESTIMATE_CHARS_PER_TOKEN
-    return max(1, compact_pieces, char_estimate)
+    return max(1, compact_pieces, estimate_gemini_tokens(text))
 
 
 def _synthesis_context_budget_exceeded(worker, synthesis_prompt: str) -> tuple[bool, str]:

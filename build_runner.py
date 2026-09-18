@@ -27,7 +27,13 @@ def _existing_data_entries():
         yield source, destination
 
 
-def build_pyinstaller_args(*, mode: str, app_name: str, collect_data_modules: list[str]) -> list[str]:
+def build_pyinstaller_args(
+    *,
+    mode: str,
+    app_name: str,
+    collect_data_modules: list[str],
+    copy_metadata_packages: list[str] = (),
+) -> list[str]:
     args = [
         str(PROJECT_ROOT / MAIN_PY_FILE),
         "--windowed",
@@ -47,6 +53,7 @@ def build_pyinstaller_args(*, mode: str, app_name: str, collect_data_modules: li
         args.append(f"--additional-hooks-dir={hook_dirs[0]}")
 
     args.extend(f"--collect-data={module}" for module in sorted(set(collect_data_modules)))
+    args.extend(f"--copy-metadata={package}" for package in sorted(set(copy_metadata_packages)))
     args.extend(f"--hidden-import={module}" for module in HIDDEN_IMPORTS_BLOCK)
 
     if mode in {"portable", "hybrid"}:
@@ -78,7 +85,13 @@ def copy_external_data(*, app_name: str, mode: str) -> None:
     print("[OK] Данные скопированы.")
 
 
-def run_build(*, mode: str, app_name: str, collect_data_modules: list[str]) -> None:
+def run_build(
+    *,
+    mode: str,
+    app_name: str,
+    collect_data_modules: list[str],
+    copy_metadata_packages: list[str] = (),
+) -> None:
     from PyInstaller.__main__ import run as run_pyinstaller
 
     os.chdir(PROJECT_ROOT)
@@ -87,6 +100,7 @@ def run_build(*, mode: str, app_name: str, collect_data_modules: list[str]) -> N
             mode=mode,
             app_name=app_name,
             collect_data_modules=collect_data_modules,
+            copy_metadata_packages=copy_metadata_packages,
         )
     )
     copy_external_data(app_name=app_name, mode=mode)
@@ -97,11 +111,13 @@ def main() -> None:
     parser.add_argument("--mode", choices=("portable", "hybrid", "advanced"), required=True)
     parser.add_argument("--name", required=True)
     parser.add_argument("--collect-data", action="append", default=[])
+    parser.add_argument("--copy-metadata", action="append", default=[])
     args = parser.parse_args()
     run_build(
         mode=args.mode,
         app_name=args.name,
         collect_data_modules=args.collect_data,
+        copy_metadata_packages=args.copy_metadata,
     )
 
 

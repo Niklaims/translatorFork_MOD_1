@@ -5,8 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PyQt6 import QtWidgets, sip
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6 import QtWidgets
+from PyQt6.QtCore import Qt, QEventLoop, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -51,6 +51,7 @@ from ..widgets.key_management_widget import KeyManagementWidget
 from ..widgets.model_settings_widget import ModelSettingsWidget
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.dialogs.qidian_rulate_creator import _split_csv
+from gemini_translator.utils import qt_utils
 from ..widgets.overlay_tab_widget import install_tab_fade
 
 
@@ -59,15 +60,6 @@ CODEX_COVER_DROP_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif"}
 SOURCE_COVER_DROP_EXTENSIONS = CODEX_COVER_DROP_EXTENSIONS | {".webp"}
 CODEX_COVER_DROP_TOOLTIP = "Перетащите PNG, JPG или GIF сюда, чтобы выбрать обложку для Rulate."
 SOURCE_COVER_DROP_TOOLTIP = "Перетащите PNG, JPG, GIF или WEBP сюда, если обложка источника не загрузилась."
-
-
-def _qt_object_is_alive(obj) -> bool:
-    if obj is None:
-        return False
-    try:
-        return not sip.isdeleted(obj)
-    except TypeError:
-        return True
 
 
 class _CoverDropLabel(QLabel):
@@ -597,7 +589,7 @@ class QidianCreatorPage(ShellPage):
         worker.start()
 
     def _apply_qidian_metadata(self, metadata: QidianBookMetadata) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._qidian_metadata = metadata
         self._local_source_cover_path = ""
@@ -612,7 +604,7 @@ class QidianCreatorPage(ShellPage):
         self._update_action_state()
 
     def _apply_prepared_metadata(self, prepared: PreparedRulateMetadata) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._prepared_metadata = prepared
         self.english_title_edit.setText(prepared.english_title)
@@ -640,20 +632,20 @@ class QidianCreatorPage(ShellPage):
         self._update_action_state()
 
     def _apply_cover_prompt(self, prompt: str) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self.cover_prompt_edit.setPlainText(prompt)
         self._update_action_state()
 
     def _apply_codex_cover(self, image_path: str) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._generated_cover_path = image_path
         self._set_codex_cover_preview(image_path)
         self._update_action_state()
 
     def _apply_dropped_source_cover(self, image_path: str) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         cover_path = Path(image_path).expanduser()
         if not cover_path.is_file():
@@ -675,12 +667,12 @@ class QidianCreatorPage(ShellPage):
 
         self._local_source_cover_path = str(cover_path.resolve())
         self._set_cover_preview(image_data)
-        if _qt_object_is_alive(getattr(self, "cover_preview_label", None)):
+        if qt_utils.qt_object_is_alive(getattr(self, "cover_preview_label", None)):
             self.cover_preview_label.setToolTip(self._local_source_cover_path)
         self._log("INFO", f"Источник: выбрана локальная обложка для Codex: {self._local_source_cover_path}")
 
     def _apply_dropped_codex_cover(self, image_path: str) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         cover_path = Path(image_path).expanduser()
         if not cover_path.is_file():
@@ -701,7 +693,7 @@ class QidianCreatorPage(ShellPage):
         self._log("INFO", f"Codex: выбрана локальная обложка для Rulate: {self._generated_cover_path}")
 
     def _open_codex_cover_folder(self) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         cover_path = Path(getattr(self, "_generated_cover_path", "") or "").expanduser()
         if not cover_path.is_file():
@@ -749,6 +741,91 @@ class QidianCreatorPage(ShellPage):
     def _on_translator_team_mode_changed(self, _index: int) -> None:
         self._save_ui_state()
 
+    def _prepare_for_close(self) -> bool:
+        # Хук MainShell.closeEvent (gemini_translator/ui/shell.py) — вызывается
+        # по hasattr при закрытии всего приложения, в обход
+        # NavigationController.pop()/can_leave(). Без него закрытие программы
+        # с открытым Rulate-браузером уничтожало QThread на ходу, не дав ему
+        # шанса на cancel(). Логика та же, что и при обычном уходе со
+        # страницы — переиспользуем can_leave() как есть.
+        return self.can_leave()
+
+    def can_leave(self) -> bool:
+        # Реентрантная защита: пока идёт ожидание остановки ниже (вложенный
+        # QEventLoop прокачивает события), повторный клик "Назад" вызовет
+        # can_leave() ещё раз поверх ещё не завершившегося первого вызова —
+        # см. тот же приём в TranslationValidatorPage.can_leave.
+        if getattr(self, "_awaiting_worker_cancel", False):
+            return False
+
+        running = [worker for worker in list(getattr(self, "_workers", [])) if worker.isRunning()]
+        if not running:
+            return True
+
+        # RulateFillWorker/RulateLoginWorker (qidian_rulate/workers.py) держат
+        # видимый Chromium открытым, пока пользователь не закроет его сам, но
+        # умеют cancel() (qidian-tools/bugs/6-rulate-fill-worker-unstoppable).
+        # Отбираем по наличию cancel(), а не isinstance от конкретных
+        # классов: AiPrepareWorker формально тоже попадёт сюда, если запущен
+        # (обычно им управляет отдельная явная кнопка "Отменить генерацию",
+        # но не блокировать и этот путь безопаснее, чем расширять список
+        # классов вручную при каждом новом отменяемом воркере). cancel() у
+        # AiPrepareWorker и даже у RulateFillWorker/RulateLoginWorker не
+        # прерывает уже летящий сетевой запрос/goto с большим таймаутом —
+        # поэтому ниже даём пользователю обратную связь (лог + курсор
+        # ожидания) на время ожидания вместо тихого "зависания".
+        cancelable = [worker for worker in running if callable(getattr(worker, "cancel", None))]
+        if cancelable:
+            answer = QMessageBox.question(
+                self, "Выход",
+                "Операция ещё не завершена (например, открыт браузер Rulate). "
+                "Прервать и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            for worker in cancelable:
+                worker.cancel()
+            self._awaiting_worker_cancel = True
+            self._log("INFO", "Останавливаю операцию Rulate...")
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                for worker in cancelable:
+                    if worker.isRunning() and not worker.wait(2000):
+                        # Не блокируем цикл событий вечно (закрытие
+                        # persistent-контекста Chromium может занять
+                        # время) — ждём штатного finished через вложенный
+                        # QEventLoop, как в TranslationValidatorPage. Пока
+                        # цикл крутится, страница остаётся интерактивной —
+                        # финальная проверка ниже поэтому обязана читать
+                        # self._workers заново, а не снимок running/cancelable.
+                        wait_loop = QEventLoop()
+                        worker.finished.connect(wait_loop.quit)
+                        if worker.isRunning():
+                            wait_loop.exec()
+            finally:
+                self._awaiting_worker_cancel = False
+                if app is not None:
+                    app.restoreOverrideCursor()
+
+        # ВАЖНО: перечитываем self._workers заново, а не переиспользуем
+        # снимок running, снятый в начале функции. Пока крутился вложенный
+        # QEventLoop выше, страница оставалась полностью интерактивной, и
+        # пользователь мог успеть запустить новый воркер (например, повторно
+        # нажать "Войти в Rulate" — кнопки заново включает _update_action_state
+        # из _worker_finished) — такой воркер не попал бы в старый снимок, и
+        # can_leave() ошибочно вернул бы True с живым QThread/браузером.
+        if any(worker.isRunning() for worker in list(getattr(self, "_workers", []))):
+            QMessageBox.warning(
+                self, "Подождите",
+                "Сначала дождитесь завершения текущей операции.",
+            )
+            return False
+        return True
+
     def on_leave(self) -> None:
         self._save_ui_state()
 
@@ -776,7 +853,7 @@ class QidianCreatorPage(ShellPage):
         )
 
     def _update_action_state(self) -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._set_prepare_ai_running(getattr(self, "_prepare_ai_worker", None) is not None)
         self._set_button_enabled(self.login_rulate_btn, True)
@@ -787,25 +864,25 @@ class QidianCreatorPage(ShellPage):
 
     def _set_prepare_ai_running(self, running: bool) -> None:
         prepare_btn = getattr(self, "prepare_ai_btn", None)
-        if _qt_object_is_alive(prepare_btn):
+        if qt_utils.qt_object_is_alive(prepare_btn):
             prepare_btn.setVisible(not running)
             prepare_btn.setEnabled(not running)
 
         cancel_btn = getattr(self, "cancel_prepare_ai_btn", None)
-        if _qt_object_is_alive(cancel_btn):
+        if qt_utils.qt_object_is_alive(cancel_btn):
             cancel_requested = bool(getattr(self, "_prepare_ai_cancel_requested", False))
             cancel_btn.setText("Отмена..." if running and cancel_requested else "Отменить генерацию")
             cancel_btn.setVisible(running)
             cancel_btn.setEnabled(running and not cancel_requested)
 
     def _set_button_enabled(self, button: QPushButton | None, enabled: bool) -> None:
-        if _qt_object_is_alive(button):
+        if qt_utils.qt_object_is_alive(button):
             button.setEnabled(enabled)
 
     def _worker_finished(self, worker, button: QPushButton) -> None:
         if worker in self._workers:
             self._workers.remove(worker)
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._set_button_enabled(button, True)
         self._update_action_state()
@@ -816,7 +893,7 @@ class QidianCreatorPage(ShellPage):
         if getattr(self, "_prepare_ai_worker", None) is worker:
             self._prepare_ai_worker = None
         self._prepare_ai_cancel_requested = False
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._set_prepare_ai_running(False)
         self._update_action_state()
@@ -824,7 +901,7 @@ class QidianCreatorPage(ShellPage):
     def _codex_cover_worker_finished(self, worker) -> None:
         if worker in self._workers:
             self._workers.remove(worker)
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         self._set_codex_cover_buttons_enabled(True)
         self._update_action_state()
@@ -842,10 +919,10 @@ class QidianCreatorPage(ShellPage):
     def _log(self, level: str, message: str) -> None:
         if level == "DEBUG" and not message:
             return
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         log_edit = getattr(self, "log_edit", None)
-        if not _qt_object_is_alive(log_edit):
+        if not qt_utils.qt_object_is_alive(log_edit):
             return
         log_edit.appendPlainText(f"[{level}] {message}")
         log_edit.verticalScrollBar().setValue(log_edit.verticalScrollBar().maximum())
@@ -881,10 +958,10 @@ class QidianCreatorPage(ShellPage):
         self._set_cover_preview(image_data)
 
     def _set_codex_cover_preview(self, image_path: str | None, placeholder: str = "Обложка\nне создана") -> None:
-        if not _qt_object_is_alive(self):
+        if not qt_utils.qt_object_is_alive(self):
             return
         label = getattr(self, "codex_cover_preview_label", None)
-        if not _qt_object_is_alive(label):
+        if not qt_utils.qt_object_is_alive(label):
             return
 
         pixmap = QPixmap()
@@ -896,7 +973,7 @@ class QidianCreatorPage(ShellPage):
             )
             label.setPixmap(scaled)
             label.setToolTip(image_path)
-            if _qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
+            if qt_utils.qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
                 self.codex_cover_path_label.setText(Path(image_path).name)
                 self.codex_cover_path_label.setToolTip(image_path)
             return
@@ -904,6 +981,6 @@ class QidianCreatorPage(ShellPage):
         label.clear()
         label.setText(placeholder)
         label.setToolTip(CODEX_COVER_DROP_TOOLTIP)
-        if _qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
+        if qt_utils.qt_object_is_alive(getattr(self, "codex_cover_path_label", None)):
             self.codex_cover_path_label.setText("")
             self.codex_cover_path_label.setToolTip("")

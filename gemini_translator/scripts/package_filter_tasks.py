@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from ..utils.epub_tools import TASK_SIZE_UNIT_CHARS, extract_number_from_path, normalize_task_size_unit
 from ..ui.widgets.common_widgets import NoScrollSpinBox
+from ..core.auto_workflow_helpers import extract_chapters_from_payload
 
 class FilterPackagingDialog(QDialog):
     SAVE_CHAPTERS_KEY = "save_chapters"
@@ -76,7 +77,7 @@ class FilterPackagingDialog(QDialog):
         main_layout.addWidget(settings_group)
         
         buttons = QDialogButtonBox()
-        form_list_btn = buttons.addButton("Сформировать список", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Сформировать список", QDialogButtonBox.ButtonRole.AcceptRole)
         self.only_filter_btn = buttons.addButton("Оставить только фильтр", QDialogButtonBox.ButtonRole.ActionRole)
         buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
 
@@ -100,18 +101,8 @@ class FilterPackagingDialog(QDialog):
             self.CONTEXT_CHAPTERS_KEY: context_list,
         }
 
-    def _payload_chapters(self, payload):
-        if not payload:
-            return []
-        task_type = payload[0]
-        if task_type in ("epub", "epub_chunk") and len(payload) > 2:
-            return [payload[2]]
-        if task_type == "epub_batch" and len(payload) > 2:
-            return list(payload[2])
-        return []
-
     def _with_filter_save_targets(self, payload, filtered_set):
-        chapters = self._payload_chapters(payload)
+        chapters = extract_chapters_from_payload(payload)
         save_targets = [chapter for chapter in chapters if chapter in filtered_set]
         if not save_targets:
             return None
@@ -209,15 +200,12 @@ class FilterPackagingDialog(QDialog):
 
         for payload in final_payloads:
             task_type = payload[0]
-            chapters_in_task = []
-            
+            chapters_in_task = extract_chapters_from_payload(payload)
+
             if task_type == 'epub_batch':
-                chapters_in_task = payload[2]
                 batch_count += 1
                 total_chapters_in_batches += len(chapters_in_task)
-            elif task_type == 'epub':
-                chapters_in_task = [payload[2]]
-            
+
             # Проверяем, не "одинок" ли наш пациент
             task_chapters_set = set(chapters_in_task)
             filtered_in_task = task_chapters_set.intersection(filtered_set)
@@ -261,8 +249,14 @@ class FilterPackagingDialog(QDialog):
             
             for filtered_chapter in self.filtered_chapters:
                 batch = [filtered_chapter]
-                num_needed_to_pad = chapters_per_batch - 1
-                
+                # Ограничиваем количеством уникальных успешных глав: если их
+                # меньше, чем запрошено в спинбоксе, `itertools.cycle` иначе
+                # вернул бы одну и ту же главу несколько раз в ЭТОТ ЖЕ batch
+                # (главу «за одну попытку» модель бы переводила повторно и
+                # впустую тратила вызов API). Между разными batch-ами глава
+                # по-прежнему может повторяться — это ожидаемое разбавление.
+                num_needed_to_pad = min(chapters_per_batch - 1, len(self.successful_chapters))
+
                 if num_needed_to_pad > 0:
                     for _ in range(num_needed_to_pad):
                         batch.append(next(successful_cycler))

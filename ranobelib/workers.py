@@ -2,7 +2,6 @@ import logging
 import json
 import os
 import re
-import sys
 import tempfile
 import time
 import traceback
@@ -15,6 +14,8 @@ from pathlib import Path
 from docx import Document
 from playwright.sync_api import sync_playwright
 from PyQt6.QtCore import QThread, pyqtSignal
+
+from qidian_rulate import playwright_launcher
 
 from constants import (
     BROWSER_ARGS,
@@ -89,68 +90,44 @@ RANOBELIB_TAGS = (
 )
 
 
-def _playwright_browser_install_hint() -> str:
-    python_executable = sys.executable or "python"
-    return (
-        "Playwright не нашел совместимый Chromium. "
-        f"Установите браузер командой: \"{python_executable}\" -m playwright install chromium"
-    )
+# Playwright Chromium launcher: каноническая реализация вынесена в
+# qidian_rulate/playwright_launcher.py (cluster-57 dedup). Здесь остаются
+# только тонкие обёртки с site-specific extra_globs (headless_shell) - их
+# имена сохранены для обратной совместимости с существующими тестами и с
+# main.py/api_upload.py, обращающимися к ним по имени через модуль workers.
+_RANOBELIB_EXTRA_CHROMIUM_GLOBS = (
+    "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+    # ranobelib/bugs/6-cached-chromium-finder-windows: канонический
+    # _BASE_CHROMIUM_GLOB в playwright_launcher ищет только Windows-раскладку
+    # ("chrome-win*/chrome.exe"), поэтому на macOS/Linux фолбэк на уже
+    # забандленный кэш Chromium в playwright_runtime/ms-playwright никогда не
+    # находил исполняемый файл. Реальные имена каталогов/бинарников для
+    # обычного (headed) Chromium и chrome-headless-shell подтверждены по
+    # EXECUTABLE_PATHS установленного в .venv playwright (driver/package/lib/
+    # coreBundle.js): headed-сборка на macOS называется не "Chromium.app", а
+    # "Google Chrome for Testing.app" (для обоих mac-x64/mac-arm64); имя файла
+    # headless-shell на mac и linux-x64 - всегда "chrome-headless-shell", а на
+    # linux-arm64 (non-cft сборка) каталог называется "chrome-linux", а файл -
+    # "headless_shell". Старый Chromium.app-шаблон оставлен как легаси для
+    # уже существующих у пользователей старых кэшей с такой раскладкой.
+    "chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium",
+    "chromium-*/chrome-mac*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+    "chromium-*/chrome-linux*/chrome",
+    "chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell",
+    "chromium_headless_shell-*/chrome-headless-shell-linux*/chrome-headless-shell",
+    "chromium_headless_shell-*/chrome-headless-shell-linux*/headless_shell",
+    "chromium_headless_shell-*/chrome-linux*/headless_shell",
+)
 
 
 def _is_browser_missing_error(error: Exception) -> bool:
-    text = str(error).lower()
-    return (
-        "executable doesn't exist" in text
-        or "playwright install" in text
-        or ("browsertype.launch" in text and "executable" in text)
-        or ("chromium distribution" in text and "not found" in text)
-    )
-
-
-def _candidate_browser_cache_roots() -> list[Path]:
-    roots: list[Path] = []
-    env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
-    if env_value:
-        roots.append(Path(env_value))
-
-    module_root = Path(__file__).resolve().parents[1]
-    for base in (module_root, Path.cwd()):
-        roots.append(Path(base) / "playwright_runtime" / "ms-playwright")
-
-    localappdata = os.environ.get("LOCALAPPDATA")
-    if localappdata:
-        roots.append(Path(localappdata) / "ms-playwright")
-
-    unique = []
-    seen = set()
-    for root in roots:
-        try:
-            resolved = root.resolve()
-        except Exception:
-            resolved = root
-        key = str(resolved).lower()
-        if key not in seen and resolved.exists() and resolved.is_dir():
-            seen.add(key)
-            unique.append(resolved)
-    return unique
-
-
-def _revision_from_path(path: Path) -> int:
-    match = re.search(r"chromium-(\d+)", str(path))
-    if not match:
-        return -1
-    return int(match.group(1))
+    return playwright_launcher.is_browser_missing_error(error)
 
 
 def _find_cached_chromium_executable() -> Path | None:
-    candidates: list[Path] = []
-    for root in _candidate_browser_cache_roots():
-        candidates.extend(root.glob("chromium-*/chrome-win*/chrome.exe"))
-        candidates.extend(root.glob("chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe"))
-    existing = [candidate for candidate in candidates if candidate.exists() and candidate.is_file()]
-    if not existing:
-        return None
-    return max(existing, key=_revision_from_path)
+    return playwright_launcher._find_cached_chromium_executable(
+        extra_globs=_RANOBELIB_EXTRA_CHROMIUM_GLOBS,
+    )
 
 
 def _launch_persistent_chromium_context(
@@ -161,78 +138,15 @@ def _launch_persistent_chromium_context(
     headless: bool = False,
     log_callback=None,
 ):
-    kwargs = {
-        "user_data_dir": user_data_dir,
-        "headless": headless,
-        "args": BROWSER_ARGS,
-    }
-    if viewport:
-        kwargs["viewport"] = viewport
-    try:
-        return playwright.chromium.launch_persistent_context(**kwargs)
-    except Exception as error:
-        if not _is_browser_missing_error(error):
-            raise
-        if log_callback:
-            log_callback("WARNING", "Playwright Chromium не найден, пробую fallback-браузер.")
-
-    cached_executable = _find_cached_chromium_executable()
-    if cached_executable:
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: запускаю Chromium из {cached_executable}.")
-            return playwright.chromium.launch_persistent_context(
-                **kwargs,
-                executable_path=str(cached_executable),
-            )
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Кэшированный Chromium не запустился: {error}")
-
-    for channel in ("chrome", "msedge"):
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: пробую системный браузер {channel}.")
-            return playwright.chromium.launch_persistent_context(**kwargs, channel=channel)
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Системный браузер {channel} не запустился: {error}")
-
-    raise RuntimeError(_playwright_browser_install_hint())
-
-
-def _has_saved_ranobelib_auth(profile_dir) -> tuple[bool, str | None]:
-    try:
-        with sync_playwright() as p:
-            context = _launch_persistent_chromium_context(
-                p,
-                user_data_dir=str(profile_dir),
-                headless=True,
-                viewport={"width": 1280, "height": 900},
-            )
-            try:
-                page = context.pages[0] if context.pages else context.new_page()
-                page.goto("https://ranobelib.me", wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(1200)
-                auth_detected = page.evaluate(
-                    """() => {
-                        try {
-                            const raw = localStorage.getItem("auth");
-                            if (!raw) {
-                                return false;
-                            }
-                            const parsed = JSON.parse(raw);
-                            return !!(parsed && parsed.token && parsed.token.access_token);
-                        } catch (error) {
-                            return false;
-                        }
-                    }"""
-                )
-                return bool(auth_detected), None
-            finally:
-                context.close()
-    except Exception as error:
-        return False, str(error)
+    return playwright_launcher.launch_persistent_chromium_context(
+        playwright,
+        user_data_dir=user_data_dir,
+        args=BROWSER_ARGS,
+        viewport=viewport,
+        headless=headless,
+        extra_globs=_RANOBELIB_EXTRA_CHROMIUM_GLOBS,
+        log_callback=log_callback,
+    )
 
 
 def _collapse_rulate_spaces(value: str | None) -> str:
@@ -1514,6 +1428,35 @@ class RulateDownloadWorker(QThread):
 
 # ─── Рабочий поток: создание карточки RanobeLib из Rulate ───────────────────
 
+def _fetch_rulate_edit_metadata(playwright, *, rulate_edit_url: str, rulate_url: str, log, on_browser=None) -> dict:
+    """Открывает edit/info Rulate в persistent-профиле и возвращает
+    нормализованные метаданные книги.
+
+    Общая часть RulateToRanobeMetadataWorker.run и
+    RulateToRanobeCreateWorker._read_rulate_metadata
+    (dups-ranobelib_workers-60). ``on_browser`` получает открытый контекст
+    сразу после запуска — воркер сохраняет его в своём поле, чтобы stop()
+    мог закрыть браузер; закрытие после чтения остаётся на вызывающем.
+    """
+    log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
+    log("INFO", f"Rulate: страница данных: {rulate_edit_url}")
+    log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
+    browser = _launch_persistent_chromium_context(
+        playwright,
+        user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
+        viewport={"width": 1280, "height": 900},
+        log_callback=log,
+    )
+    if on_browser is not None:
+        on_browser(browser)
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    page.goto(rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
+    raw_payload = _merge_public_rulate_cover(page, raw_payload, rulate_url, log)
+    return _normalize_rulate_media_payload(raw_payload, rulate_edit_url)
+
+
 class RulateToRanobeMetadataWorker(QThread):
     log_signal = pyqtSignal(str, str)
     metadata_ready = pyqtSignal(dict)
@@ -1531,21 +1474,16 @@ class RulateToRanobeMetadataWorker(QThread):
     def run(self):
         try:
             with sync_playwright() as p:
-                self.log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
-                self.log("INFO", f"Rulate: страница данных: {self.rulate_edit_url}")
-                self.log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
-                self._browser = _launch_persistent_chromium_context(
+                def _remember_browser(browser):
+                    self._browser = browser
+
+                metadata = _fetch_rulate_edit_metadata(
                     p,
-                    user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
-                    viewport={"width": 1280, "height": 900},
-                    log_callback=self.log,
+                    rulate_edit_url=self.rulate_edit_url,
+                    rulate_url=self.rulate_url,
+                    log=self.log,
+                    on_browser=_remember_browser,
                 )
-                page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
-                page.goto(self.rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(2500)
-                raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
-                raw_payload = _merge_public_rulate_cover(page, raw_payload, self.rulate_url, self.log)
-                metadata = _normalize_rulate_media_payload(raw_payload, self.rulate_edit_url)
                 self.log("SUCCESS", f"Rulate: данные получены: {metadata['title_ru']}")
                 self.metadata_ready.emit(metadata)
         except Exception as error:
@@ -1666,21 +1604,16 @@ class RulateToRanobeCreateWorker(QThread):
             self.log("INFO", "Rulate: использую данные, уже загруженные в форме. Повторно Rulate не открываю.")
             return prefetched
 
-        self.log("INFO", "Rulate: открываю edit/info через профиль Qidian/Fanqie/Ciweimao -> Rulate...")
-        self.log("INFO", f"Rulate: страница данных: {self.rulate_edit_url}")
-        self.log("INFO", f"Rulate: профиль куки: {QIDIAN_RULATE_PROFILE_DIR}")
-        self._rulate_browser = _launch_persistent_chromium_context(
+        def _remember_browser(browser):
+            self._rulate_browser = browser
+
+        metadata = _fetch_rulate_edit_metadata(
             playwright,
-            user_data_dir=str(QIDIAN_RULATE_PROFILE_DIR),
-            viewport={"width": 1280, "height": 900},
-            log_callback=self.log,
+            rulate_edit_url=self.rulate_edit_url,
+            rulate_url=self.rulate_url,
+            log=self.log,
+            on_browser=_remember_browser,
         )
-        page = self._rulate_browser.pages[0] if self._rulate_browser.pages else self._rulate_browser.new_page()
-        page.goto(self.rulate_edit_url, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2500)
-        raw_payload = page.evaluate(_RULATE_MEDIA_EXTRACT_SCRIPT)
-        raw_payload = _merge_public_rulate_cover(page, raw_payload, self.rulate_url, self.log)
-        metadata = _normalize_rulate_media_payload(raw_payload, self.rulate_edit_url)
         self._rulate_browser.close()
         self._rulate_browser = None
 
@@ -3015,6 +2948,8 @@ class UploadWorker(QThread):
         self.force_num = force_num
         self.is_running = True
         self.limit_date = datetime.now() + timedelta(days=60)
+        # Сбой вне цикла по главам (запуск браузера): главы не обрабатывались
+        self.fatal_error = ""
 
         # Статистика
         self._ok = 0
@@ -3329,6 +3264,7 @@ class UploadWorker(QThread):
 
     def run(self):
         self.log("INFO", "Запуск браузера Chrome...")
+        self.fatal_error = ""
         try:
             with sync_playwright() as p:
                 browser = _launch_persistent_chromium_context(
@@ -3398,6 +3334,7 @@ class UploadWorker(QThread):
                 browser.close()
 
         except Exception as e:
+            self.fatal_error = str(e) or e.__class__.__name__
             self.log("ERROR", f"Критическая ошибка браузера: {e}")
             logging.error(traceback.format_exc())
 

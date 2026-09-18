@@ -19,8 +19,9 @@ import json
 import shutil
 from pathlib import Path
 from datetime import datetime
-from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QRectF, QEvent
+from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QRectF, QEvent, QEventLoop, QTimer
 from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QBrush, QTextOption, QPainter
+from ...utils.glossary_tools import normalize_glossary_entries
 
 class CenteredCheckboxDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -104,11 +105,14 @@ from ...utils.power_inhibitor import (
     save_prevent_sleep_setting,
 )
 from ...api import config as api_config
+from ...utils import chapter_identity as chapter_identity_utils
+from ...utils.helpers import TokenUsageTrackerMixin
 from ..widgets.key_management_widget import KeyManagementWidget
 from ..widgets.model_settings_widget import ModelSettingsWidget
 from ..shell import ShellPage
 from ..overlay_host import exec_dialog, present_dialog
 from .chapter_selection_dialog import ChapterSelectionDialog
+from .menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 from gemini_translator.ui import theme_manager
 
 # Fuzzy matching: rapidfuzz через прослойку fuzzy_compat (fuzzywuzzy — фолбэк)
@@ -300,7 +304,7 @@ class SingleFixWorker(QThread):
             self.engine.close_session_resources()
 
 
-class ConsistencyValidatorPage(ShellPage):
+class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
     page_title = "Проверка согласованности"
     preferred_window_size = (1400, 950)
 
@@ -692,11 +696,10 @@ class ConsistencyValidatorPage(ShellPage):
         self.prevent_sleep_checkbox.toggled.connect(self._save_shared_sleep_prevention_setting)
         extra_layout.addWidget(self.prevent_sleep_checkbox)
 
-        from PyQt6.QtCore import QSettings
+        from gemini_translator.ui.notifications import NotificationManager
         self.cb_notifications = QCheckBox("Звуковые и системные уведомления")
-        settings = QSettings("SiberianTeam", "TranslatorFork")
-        self.cb_notifications.setChecked(settings.value("notifications_enabled", True, type=bool))
-        self.cb_notifications.toggled.connect(self._on_notifications_toggled)
+        self.cb_notifications.setChecked(NotificationManager.is_enabled())
+        self.cb_notifications.toggled.connect(NotificationManager.set_enabled)
         extra_layout.addWidget(self.cb_notifications)
         
         # Инфо о чанке (Токены)
@@ -1004,45 +1007,11 @@ class ConsistencyValidatorPage(ShellPage):
 
     @staticmethod
     def _normalize_shared_project_glossary_entries(glossary_data):
-        raw_entries = []
-        if isinstance(glossary_data, dict):
-            raw_entries = [
-                {'original': key, **value}
-                for key, value in glossary_data.items()
-                if isinstance(value, dict)
-            ]
-        elif isinstance(glossary_data, list):
-            raw_entries = glossary_data
-
-        normalized = []
-        seen = set()
-        for entry in raw_entries:
-            if not isinstance(entry, dict):
-                continue
-
-            original = str(entry.get('original', '') or '').strip()
-            rus = str(
-                entry.get('rus') or entry.get('translation') or entry.get('target') or ''
-            ).strip()
-            note = str(
-                entry.get('note') or entry.get('notes') or entry.get('definition') or ''
-            ).strip()
-            if not any([original, rus, note]):
-                continue
-
-            signature = (original.casefold(), rus, note)
-            if signature in seen:
-                continue
-            seen.add(signature)
-
-            normalized.append({
-                'original': original,
-                'rus': rus,
-                'note': note,
-                'timestamp': entry.get('timestamp'),
-            })
-
-        return normalized
+        return normalize_glossary_entries(
+            glossary_data,
+            note_fallbacks=('note', 'notes', 'definition'),
+            stamp_missing_timestamp=False,
+        )
 
     def _load_shared_project_glossary(self):
         glossary_widget = self._find_shared_glossary_widget()
@@ -1083,16 +1052,13 @@ class ConsistencyValidatorPage(ShellPage):
             self.engine.import_shared_glossary_entries(glossary_entries)
             self._update_glossary_button_state()
 
-    def _chapter_id(self, chapter: dict) -> str:
-        """Возвращает стабильный идентификатор главы для выбора и восстановления."""
-        if not isinstance(chapter, dict):
-            return ""
-        return str(chapter.get('path') or chapter.get('name') or "").strip()
-
     def _all_chapter_ids(self) -> list[str]:
         return [
             chapter_id
-            for chapter_id in (self._chapter_id(chapter) for chapter in self.chapters)
+            for chapter_id in (
+                chapter_identity_utils.chapter_identity(chapter)
+                for chapter in self.chapters
+            )
             if chapter_id
         ]
 
@@ -1103,7 +1069,7 @@ class ConsistencyValidatorPage(ShellPage):
         return [
             chapter
             for chapter in self.chapters
-            if self._chapter_id(chapter) in self.selected_chapter_ids
+            if chapter_identity_utils.chapter_identity(chapter) in self.selected_chapter_ids
         ]
 
     def _set_selected_chapters(self, chapter_ids, *, fallback_to_all: bool = False):
@@ -1134,7 +1100,7 @@ class ConsistencyValidatorPage(ShellPage):
             if result != QDialog.DialogCode.Accepted:
                 return
             self._set_selected_chapters(
-                [self._chapter_id(ch) for ch in dialog.get_selected_chapters()],
+                [chapter_identity_utils.chapter_identity(ch) for ch in dialog.get_selected_chapters()],
             )
 
         present_dialog(self, dialog, _apply_selection)
@@ -1192,39 +1158,27 @@ class ConsistencyValidatorPage(ShellPage):
         
         return config
 
-    def _restore_shared_sleep_prevention_setting(self):
-        if hasattr(self, 'prevent_sleep_checkbox'):
-            self.prevent_sleep_checkbox.setChecked(load_prevent_sleep_setting(self.settings_manager))
-
     def _save_shared_sleep_prevention_setting(self, enabled: bool):
         save_prevent_sleep_setting(self.settings_manager, enabled)
 
     def _is_session_persistence_enabled(self) -> bool:
-        settings_manager = getattr(self, "settings_manager", None)
-        if settings_manager is None:
-            return True
-        for loader_name in ("load_full_session_settings", "load_settings"):
-            loader = getattr(settings_manager, loader_name, None)
-            if not callable(loader):
-                continue
-            try:
-                settings = loader()
-            except Exception:
-                continue
-            if isinstance(settings, dict) and SESSION_PERSISTENCE_SETTING_KEY in settings:
-                return bool(settings.get(SESSION_PERSISTENCE_SETTING_KEY))
-        return True
+        # Ленивый импорт: setup.py сам ленивo импортирует этот модуль (см.
+        # InitialSetupPage._show_consistency_checker), поэтому модульный
+        # импорт здесь избегаем ради симметрии и чтобы не тянуть тяжёлый
+        # setup.py при каждой загрузке consistency_checker.py.
+        from .setup import load_bool_setting
+
+        return load_bool_setting(
+            getattr(self, "settings_manager", None),
+            SESSION_PERSISTENCE_SETTING_KEY,
+            True,
+        )
 
     def _current_session_persistence_enabled(self) -> bool:
         checker = getattr(self, "_is_session_persistence_enabled", None)
         if callable(checker):
             return bool(checker())
         return bool(ConsistencyValidatorPage._is_session_persistence_enabled(self))
-
-    def _on_notifications_toggled(self, checked):
-        from PyQt6.QtCore import QSettings
-        settings = QSettings("SiberianTeam", "TranslatorFork")
-        settings.setValue("notifications_enabled", checked)
 
     def _activate_power_inhibitor_for_config(self, config: dict):
         if not config.get(PREVENT_SLEEP_SETTING_KEY):
@@ -1373,46 +1327,17 @@ class ConsistencyValidatorPage(ShellPage):
         self.analysis_thread.error.connect(self.on_error)
         self.analysis_thread.start()
 
-    def _reset_token_usage(self):
-        self._token_input_total = 0
-        self._token_output_total = 0
-        self._token_total = 0
-        self._update_token_usage_label()
-
-    @staticmethod
-    def _format_compact_tokens(value: int) -> str:
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            value = 0
-        if value >= 1_000_000:
-            return f"{value / 1_000_000:.1f}M"
-        if value >= 1_000:
-            return f"{value / 1_000:.1f}K"
-        return str(value)
-
-    def _update_token_usage_label(self):
-        total = self._format_compact_tokens(self._token_total)
-        input_tokens = self._format_compact_tokens(self._token_input_total)
-        output_tokens = self._format_compact_tokens(self._token_output_total)
-        self.token_usage_label.setText(f"Токены: ~{total}")
-        self.token_usage_label.setToolTip(
-            f"Оценка токенов за текущий сеанс: всего ~{total}, "
-            f"вход ~{input_tokens}, выход ~{output_tokens}."
-        )
+    # _reset_token_usage / _update_token_usage_label: см.
+    # TokenUsageTrackerMixin (pcluster-03) — дефолтный
+    # _token_usage_tooltip_scope ("текущий сеанс") подходит без переопределения.
 
     @pyqtSlot(dict)
     def on_token_usage_updated(self, usage: dict):
-        try:
-            input_tokens = int((usage or {}).get('input_tokens', 0) or 0)
-            output_tokens = int((usage or {}).get('output_tokens', 0) or 0)
-            total_tokens = int((usage or {}).get('total_tokens', input_tokens + output_tokens) or 0)
-        except (TypeError, ValueError):
-            return
-        self._token_input_total += max(0, input_tokens)
-        self._token_output_total += max(0, output_tokens)
-        self._token_total += max(0, total_tokens)
-        self._update_token_usage_label()
+        # Подписка на прямой Qt-сигнал engine.token_usage_updated (см. connect
+        # выше) — архитектура подписки своя для этого класса, но само
+        # накопление (парсинг+клампинг+++) общее — TokenUsageTrackerMixin
+        # (pcluster-03, issue №1 ревью).
+        self._accumulate_token_usage(usage)
 
     def _stop_analysis(self):
         """Останавливает анализ."""
@@ -1654,15 +1579,68 @@ class ConsistencyValidatorPage(ShellPage):
             setattr(self, thread_attr, None)
             return False
 
-    def _wait_for_thread(self, thread_attr: str, timeout_ms: int = 1000):
-        """Wait for a QThread without crashing on a stale PyQt wrapper."""
+    def _wait_for_thread(self, thread_attr: str, timeout_ms: int = 1000, hard_cap_ms: int = 20000):
+        """Wait for a QThread without crashing on a stale PyQt wrapper.
+
+        Короткого timeout_ms обычно достаточно, но реальный сетевой AI-запрос
+        часто идёт намного дольше: если поток всё ещё жив после быстрого
+        ожидания, дожидаемся его сигнала finished через локальный цикл
+        событий, не убивая поток через terminate() — terminate() посреди
+        сетевого/CPU-bound кода под GIL опаснее подвисания (то же
+        обоснование, что у TranslationValidatorPage.can_leave).
+
+        Вложенный цикл ожидания запускается с ExcludeUserInputEvents: в этот
+        момент страница всё ещё в середине ещё не завершившегося
+        NavigationController.pop() (can_leave() уже вернул True, on_leave()
+        ещё не вернулся). Если пропускать пользовательский ввод, повторный
+        клик по «← Назад» реентерабельно войдёт в pop() поверх текущего,
+        снимет страницу со стека и удалит её, пока первый вызов ещё ждёт —
+        когда тот проснётся, он попытается сделать то же самое со страницей,
+        которой уже нет (см. can_leave()/on_leave() — там же флаг-страж
+        от повторного входа). Системные события (таймеры, сигналы потока)
+        по-прежнему доставляются.
+
+        hard_cap_ms — верхняя граница ожидания на случай, если поток вообще
+        не завершится (у сетевого запроса внутри может не быть собственного
+        таймаута): по истечении этого времени выходим из цикла, не дожидаясь
+        потока, и глушим его сигналы (blockSignals) — Worker(QThread) здесь
+        одновременно и есть эмиттер result_ready/error/finished, — чтобы
+        поздний сигнал не долетел до слотов уже удалённой страницы. Сам
+        поток при этом никто не убивает, он продолжает жить своей жизнью и
+        остаётся в _threads_pending_delete до фактического уничтожения."""
         thread = getattr(self, thread_attr, None)
         if thread is None:
             return
 
         try:
+            if not thread.isRunning():
+                return
+            if thread.wait(timeout_ms):
+                return
+
+            wait_loop = QEventLoop()
+            thread.finished.connect(wait_loop.quit)
+            cap_timer = QTimer()
+            cap_timer.setSingleShot(True)
+            cap_timer.timeout.connect(wait_loop.quit)
+            cap_timer.start(hard_cap_ms)
+            try:
+                # thread.isRunning() может на короткое время разойтись с
+                # isFinished(): QThreadPrivate::finish() снимает running
+                # только ПОСЛЕ emit finished. Проверяем именно isFinished(),
+                # иначе в этом узком окне можно поймать вечное ожидание
+                # сигнала, который уже никогда не придёт.
+                if not thread.isFinished():
+                    wait_loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+            finally:
+                cap_timer.stop()
+
             if thread.isRunning():
-                thread.wait(timeout_ms)
+                try:
+                    thread.blockSignals(True)
+                except RuntimeError:
+                    pass
+                self._remember_thread_until_deleted(thread)
         except RuntimeError:
             setattr(self, thread_attr, None)
 
@@ -1783,11 +1761,6 @@ class ConsistencyValidatorPage(ShellPage):
         bg, text = colors.get(problem_type, ('#f5f5f5', '#424242'))
         return self._blend_bg_color(bg), self._blend_text_color(text)
 
-    def _get_type_color(self, problem_type: str) -> QColor:
-        """Возвращает цвет фона для типа проблемы (обратная совместимость)."""
-        bg_color, _ = self._get_type_colors(problem_type)
-        return QColor(bg_color)
-
     def _get_confidence_colors(self, confidence: str) -> tuple:
         """Возвращает (bg_color, text_color) для уровня уверенности."""
         colors = {
@@ -1797,11 +1770,6 @@ class ConsistencyValidatorPage(ShellPage):
         }
         bg, text = colors.get(confidence, ('#f5f5f5', '#424242'))
         return self._blend_bg_color(bg), self._blend_text_color(text)
-
-    def _get_confidence_color(self, confidence: str) -> QColor:
-        """Возвращает цвет фона для уровня уверенности (обратная совместимость)."""
-        bg_color, _ = self._get_confidence_colors(confidence)
-        return QColor(bg_color)
 
     @pyqtSlot(list)
     def on_analysis_finished(self, all_problems):
@@ -2062,6 +2030,10 @@ class ConsistencyValidatorPage(ShellPage):
         worker.error.connect(
             lambda worker=worker: self.on_single_fix_error(worker)
         )
+        # Активируем непосредственно перед стартом воркера: между активацией
+        # и start() не должно быть операций, способных бросить исключение
+        # (иначе run_fix() без try/except не освободит инхибитор).
+        self._activate_power_inhibitor_for_config(config)
         worker.start()
 
     def start_manual_fix(self):
@@ -2186,6 +2158,15 @@ class ConsistencyValidatorPage(ShellPage):
 
     def _finish_single_fix_ui(self):
         """Возвращает интерфейс в обычное состояние после одиночного исправления."""
+        # single_fix_thread здесь не проверяем: в момент вызова он всё ещё
+        # указывает на завершающийся воркер этого же одиночного исправления.
+        # Снимаем защиту от сна, только если не идёт другая долгая AI-сессия
+        # (анализ или массовое исправление) — по образцу on_engine_error().
+        if not (
+            self._is_thread_running('analysis_thread') or
+            self._is_thread_running('fix_thread')
+        ):
+            self._release_power_inhibitor()
         worker = self.single_fix_thread
         self.single_fix_thread = None
         self.fix_btn.setEnabled(bool(self.current_problem and self.current_chapter))
@@ -2378,6 +2359,7 @@ class ConsistencyValidatorPage(ShellPage):
         config = self._get_current_config()
         
         self._log(f"⚡ Начало массового исправления ({count} проблем)...")
+        self._activate_power_inhibitor_for_config(config)
         # Временно подменяем карту проблем в движке на отфильтрованную
         old_map = self.engine.chapter_problems_map
         self._batch_fix_original_problems_map = old_map
@@ -2424,6 +2406,16 @@ class ConsistencyValidatorPage(ShellPage):
     @pyqtSlot(dict)
     def on_batch_fix_finished(self, results):
         """Обрабатывает завершение массового исправления."""
+        # fix_thread здесь не проверяем: в момент вызова он всё ещё указывает
+        # на завершающийся воркер этого же массового исправления. Снимаем
+        # защиту от сна, только если не идёт другая долгая AI-сессия (анализ
+        # или одиночное исправление) — по образцу on_engine_error().
+        if not (
+            self._is_thread_running('analysis_thread') or
+            self._is_thread_running('single_fix_thread') or
+            self._single_fix_in_progress
+        ):
+            self._release_power_inhibitor()
         for path, new_content in results.items():
             self._store_pending_fix(path, new_content)
         self.start_btn.setEnabled(True)
@@ -2806,6 +2798,19 @@ class ConsistencyValidatorPage(ShellPage):
             self._log(f"❌ Ошибка восстановления сессии: {e}")
 
     def can_leave(self) -> bool:
+        # Пока on_leave() крутит вложенный цикл ожидания потока
+        # (_wait_for_thread, с ExcludeUserInputEvents), Qt всё равно
+        # продолжает доставлять системные события — таймеры, сигналы. Если
+        # что-то (например, повторный клик, дошедший через другой путь, или
+        # отложенный вызов) вызовет can_leave()/pop() ещё раз поверх ещё не
+        # завершившегося ухода, NavigationController.pop() не защищён от
+        # такого реентерабельного вызова: второй pop() успеет снять страницу
+        # со стека и удалить её, пока первый ещё ждёт — тогда первый
+        # проснётся и попытается сделать то же самое со страницей, которой
+        # уже нет. Блокируем повторный вход целиком.
+        if getattr(self, "_leaving_in_progress", False):
+            return False
+
         if self.pending_fixes:
             reply = QMessageBox.question(
                 self, "Несохранённые изменения",
@@ -2815,23 +2820,44 @@ class ConsistencyValidatorPage(ShellPage):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return False
+
+        if (
+            self._is_thread_running('analysis_thread')
+            or self._is_thread_running('fix_thread')
+            or self._is_thread_running('single_fix_thread')
+        ):
+            reply = QMessageBox.question(
+                self, "Операция не завершена",
+                "Фоновая AI-проверка или исправление ещё выполняется.\n\n"
+                "Прервать и уйти со страницы?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return False
+
         return True
 
     def on_leave(self) -> None:
-        # Отменяем фоновые операции
-        self.engine.cancel()
-        self._wait_for_thread('analysis_thread', 1000)
-        self._wait_for_thread('fix_thread', 1000)
-        self._wait_for_thread('single_fix_thread', 1000)
-        self._release_power_inhibitor()
+        # Флаг-страж от реентерабельного вызова can_leave()/on_leave() —
+        # см. комментарий в can_leave().
+        self._leaving_in_progress = True
+        try:
+            # Отменяем фоновые операции
+            self.engine.cancel()
+            self._wait_for_thread('analysis_thread', 1000)
+            self._wait_for_thread('fix_thread', 1000)
+            self._wait_for_thread('single_fix_thread', 1000)
+            self._release_power_inhibitor()
+        finally:
+            self._leaving_in_progress = False
 
 
-class _ConsistencyValidatorDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(ConsistencyValidatorPage, name)
-
-
-class ConsistencyValidatorDialog(QDialog, metaclass=_ConsistencyValidatorDialogMeta):
+class ConsistencyValidatorDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(ConsistencyValidatorPage),
+):
     """Thin modal wrapper hosting ConsistencyValidatorPage for the legacy exec() API."""
 
     def __init__(self, chapters, settings_manager, parent=None, project_manager=None):
@@ -2853,12 +2879,6 @@ class ConsistencyValidatorDialog(QDialog, metaclass=_ConsistencyValidatorDialogM
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.page)
         self.page.request_back.connect(self.close)
-
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
 
     def closeEvent(self, event):
         if not self.page.can_leave():

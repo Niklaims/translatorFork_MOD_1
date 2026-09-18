@@ -182,7 +182,7 @@ Any earlier instruction about raw HTML or chapter boundary markers is overridden
 
     def _replace_media_with_placeholders(self, html_content, return_maps=False):
         if not html_content:
-            return (({}, {}), "") if return_maps else ""
+            return ({}, {}) if return_maps else ""
 
         media_map, link_map = {}, {}
         soup = BeautifulSoup(html_content, 'html.parser')

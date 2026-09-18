@@ -17,14 +17,20 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot, QRect, QPoint, QTimer
 # Используем тот же самый делегат, что и в менеджере глоссариев
 from ..glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 from ....api import config as api_config
+from ....utils.helpers import TokenUsageTrackerMixin
+from ....utils import cjk_ranges
+from ....utils.glossary_tools import glossary_entry_key, normalize_glossary_entries
+from ....utils.io_utils import atomic_write_json
 
 from ...widgets import (
     KeyManagementWidget, ModelSettingsWidget, LogWidget, PresetWidget
 )
 from ...widgets.common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from ...widgets.ancestor_utils import find_ancestor_by_predicate
 from ...shell import ShellPage
 from gemini_translator.ui import theme_manager
 from ...overlay_host import exec_dialog
+from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 
 # Алиасы для удобства
 QSpinBox = NoScrollSpinBox
@@ -34,7 +40,18 @@ QDoubleSpinBox = NoScrollDoubleSpinBox
 
 # Паттерны
 ALIEN_WORD_PATTERN = re.compile(r'[^\W\d_а-яА-ЯёЁ]+')
-CJK_PATTERN = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
+# cluster-32 dedup + fix (раунд 1 + 2): раньше здесь был узкий диапазон
+# (Unified без Ext-A + кана + хангыль), из-за чего термины с иероглифами
+# CJK Ext-A получали lang_tag='other' и пропадали из списка при фильтре
+# только по 'cjk'. Раунд 2: детектор кандидатов (untranslated_detector.py)
+# ищет их через широкий ALL_CJK_PATTERN, который включает ещё CJK
+# Compatibility Ideographs и Bopomofo -- та же пропажа была и для них.
+# Используем gemini_translator.utils.cjk_ranges.CJK_SCRIPTS_CHAR_RE (все
+# CJK-письменности: Unified + Ext-A + compat ideographs + кана + хангыль +
+# бопомофо) -- НЕ широкий ALL_CJK_CHAR_RE: тот также включает
+# CJK-пунктуацию/Kangxi radicals, из-за чего одиночные символы вроде
+# '\u3011' ('】') стали бы 'cjk' вместо 'other', ломая пин на это
+# поведение в tests/test_untranslated_fixer_navigation.py.
 LATIN_PATTERN = re.compile(r'[a-zA-Z]')
 GREEK_PATTERN = re.compile(r'[\u0370-\u03ff\u1f00-\u1fff]')
 ENGLISH_JUNK_PATTERNS = re.compile(
@@ -209,61 +226,36 @@ class ProjectGlossaryController:
         self.glossary_owner = None
         self._discover_context()
 
+    @staticmethod
+    def _has_project_info(node):
+        project_manager = getattr(node, 'project_manager', None)
+        if project_manager and getattr(project_manager, 'project_folder', None):
+            return True
+        return bool(getattr(node, 'output_folder', None))
+
     def _discover_context(self):
-        parent = self.owner.parent()
-        while parent:
-            if self.project_folder is None:
-                project_manager = getattr(parent, 'project_manager', None)
-                if project_manager and getattr(project_manager, 'project_folder', None):
-                    self.project_folder = project_manager.project_folder
-                elif getattr(parent, 'output_folder', None):
-                    self.project_folder = parent.output_folder
+        start = self.owner.parent()
 
-            if self.glossary_widget is None and hasattr(parent, 'glossary_widget'):
-                self.glossary_widget = parent.glossary_widget
-                self.glossary_owner = parent
+        project_node = find_ancestor_by_predicate(start, self._has_project_info)
+        if project_node is not None:
+            project_manager = getattr(project_node, 'project_manager', None)
+            if project_manager and getattr(project_manager, 'project_folder', None):
+                self.project_folder = project_manager.project_folder
+            else:
+                self.project_folder = project_node.output_folder
 
-            parent = parent.parent()
+        glossary_node = find_ancestor_by_predicate(start, lambda node: hasattr(node, 'glossary_widget'))
+        if glossary_node is not None:
+            self.glossary_widget = glossary_node.glossary_widget
+            self.glossary_owner = glossary_node
 
     def is_available(self):
         return bool(self.project_folder or self.glossary_widget)
 
     def _normalize_entries(self, glossary_data):
-        now = time.time()
-        normalized = []
-        raw_entries = []
-
-        if isinstance(glossary_data, dict):
-            raw_entries = [{'original': key, **value} for key, value in glossary_data.items() if isinstance(value, dict)]
-        elif isinstance(glossary_data, list):
-            raw_entries = glossary_data
-
-        seen_exact = set()
-        for entry in raw_entries:
-            if not isinstance(entry, dict):
-                continue
-
-            original = str(entry.get('original', '') or '').strip()
-            rus = str(entry.get('rus') or entry.get('translation') or entry.get('target') or '').strip()
-            note = str(entry.get('note', '') or '').strip()
-
-            if not any([original, rus, note]):
-                continue
-
-            normalized_entry = {
-                'original': original,
-                'rus': rus,
-                'note': note,
-                'timestamp': entry.get('timestamp') or now,
-            }
-
-            exact_signature = (original.casefold(), rus, note)
-            if exact_signature in seen_exact:
-                continue
-            seen_exact.add(exact_signature)
-            normalized.append(normalized_entry)
-
-        return normalized
+        return normalize_glossary_entries(
+            glossary_data, note_fallbacks=('note',), stamp_missing_timestamp=True
+        )
 
     def load(self):
         if self.glossary_widget and hasattr(self.glossary_widget, 'commit_active_editor'):
@@ -296,16 +288,32 @@ class ProjectGlossaryController:
 
         if self.project_folder:
             project_glossary_path = os.path.join(self.project_folder, "project_glossary.json")
-            with open(project_glossary_path, 'w', encoding='utf-8') as f:
-                json.dump(normalized, f, ensure_ascii=False, indent=2, sort_keys=True)
+            atomic_write_json(project_glossary_path, normalized, indent=2, sort_keys=True)
 
         return normalized
 
-    def find_entries(self, glossary_entries, term):
-        term_key = (term or '').strip().casefold()
+    def build_index(self, glossary_entries):
+        """Строит индекс term_key -> список записей ОДИН раз за проход.
+        Без него find_entries сканирует линейно ВЕСЬ глоссарий для каждого
+        отдельного термина каждой строки (ui-dialogs-validation/runtime/10):
+        на большом глоссарии и большом числе строк это квадратичная
+        стоимость на каждый тик фильтра. Индекс строится один раз перед
+        циклом по строкам и переиспользуется через параметр `index`."""
+        index = {}
+        for entry in glossary_entries:
+            key = glossary_entry_key(entry)
+            if not key:
+                continue
+            index.setdefault(key, []).append(entry)
+        return index
+
+    def find_entries(self, glossary_entries, term, index=None):
+        term_key = glossary_entry_key({'original': term})
         if not term_key:
             return []
-        return [entry.copy() for entry in glossary_entries if str(entry.get('original', '')).strip().casefold() == term_key]
+        if index is not None:
+            return [entry.copy() for entry in index.get(term_key, [])]
+        return [entry.copy() for entry in glossary_entries if glossary_entry_key(entry) == term_key]
 
     def upsert_entry(self, glossary_entries, original, rus, note):
         original = (original or '').strip()
@@ -314,11 +322,11 @@ class ProjectGlossaryController:
         if not original:
             raise ValueError("Термин не может быть пустым.")
 
-        term_key = original.casefold()
+        term_key = glossary_entry_key({'original': original})
         working = [entry.copy() for entry in glossary_entries]
         match_indices = [
             index for index, entry in enumerate(working)
-            if str(entry.get('original', '')).strip().casefold() == term_key
+            if glossary_entry_key(entry) == term_key
         ]
 
         removed_duplicates = max(0, len(match_indices) - 1)
@@ -358,13 +366,13 @@ class ProjectGlossaryController:
         }
 
     def delete_term(self, glossary_entries, term):
-        term_key = (term or '').strip().casefold()
+        term_key = glossary_entry_key({'original': term})
         if not term_key:
             return glossary_entries, 0
 
         filtered = [
             entry.copy() for entry in glossary_entries
-            if str(entry.get('original', '')).strip().casefold() != term_key
+            if glossary_entry_key(entry) != term_key
         ]
         removed_count = len(glossary_entries) - len(filtered)
         if removed_count:
@@ -492,13 +500,11 @@ class AdvancedTagFilterDialog(QDialog):
         # --- ПОИСК ПАПКИ ПРОЕКТА ---
         # Поднимаемся по иерархии родителей, пока не найдем project_manager
         self.project_folder = None
-        current_parent = parent
-        while current_parent:
-            if hasattr(current_parent, 'project_manager') and current_parent.project_manager:
-                if hasattr(current_parent.project_manager, 'project_folder'):
-                    self.project_folder = current_parent.project_manager.project_folder
-                break
-            current_parent = current_parent.parent()
+        owner_node = find_ancestor_by_predicate(
+            parent, lambda node: bool(getattr(node, 'project_manager', None))
+        )
+        if owner_node is not None and hasattr(owner_node.project_manager, 'project_folder'):
+            self.project_folder = owner_node.project_manager.project_folder
         
         layout = QVBoxLayout(self)
         
@@ -611,7 +617,6 @@ class AdvancedTagFilterDialog(QDialog):
 
     def _save_to_project(self):
         import os
-        import json
         if not self.project_folder: return
         file_path = os.path.join(self.project_folder, "untranslated_filters.json")
         try:
@@ -619,8 +624,7 @@ class AdvancedTagFilterDialog(QDialog):
                 "whitelist": sorted(list(self.whitelist)),
                 "blacklist": sorted(list(self.blacklist))
             }
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
+            atomic_write_json(file_path, data, indent=4)
             QMessageBox.information(self, "Сохранено", f"Фильтры успешно сохранены в проект:\n{file_path}")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось сохранить фильтры:\n{e}")
@@ -649,6 +653,36 @@ class AdvancedTagFilterDialog(QDialog):
             QMessageBox.information(self, "Загружено", "Фильтры успешно загружены из проекта.")
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить фильтры:\n{e}")
+
+def _partition_blacklist_entries(blacklist_set):
+    """Разбивает набор blacklist на одиночные слова (множество, проверка
+    вхождения за O(1)) и многословные фразы (список, AND-проверка по
+    haystack). Вынесено в свободную функцию (а не метод), чтобы её можно
+    было вызвать один раз ДО цикла по строкам, не требуя от вызывающего
+    объекта ничего, кроме самого множества (ui-dialogs-validation/
+    runtime/10: раньше это разбиение пересобиралось заново — двумя
+    линейными проходами по ВСЕМУ blacklist_set — для КАЖДОГО кандидата
+    КАЖДОЙ строки)."""
+    singles = set()
+    phrases = []
+    for entry in blacklist_set:
+        words = str(entry).split()
+        # Пустые записи (например, из untranslated_filters.json без
+        # валидации) раньше молча игнорировались: len(''.split()) == 0 не
+        # попадало ни в single (==1), ни в phrase (>1) старой ветки.
+        # _phrase_matches_context('', haystack) же трактует пустую фразу как
+        # len(words) <= 1 и возвращает '' in haystack == True для ЛЮБОГО
+        # контекста — если бы такая запись попала в phrases, blacklist
+        # блокировал бы вообще всех кандидатов (ui-dialogs-validation/
+        # runtime/10, доработка). Сохраняем прежнюю семантику: игнорируем.
+        if not words:
+            continue
+        if len(words) == 1:
+            singles.add(entry.lower())
+        else:
+            phrases.append(entry)
+    return singles, phrases
+
 
 # --- ОСНОВНОЙ КЛАСС ---
 class UntranslatedFixerPage(ShellPage):
@@ -698,7 +732,7 @@ class UntranslatedFixerPage(ShellPage):
             term = str(item.get('term', '') or '')
             raw_context = item.get('context', '')
             
-            if CJK_PATTERN.search(term): item['lang_tag'] = 'cjk'
+            if cjk_ranges.CJK_SCRIPTS_CHAR_RE.search(term): item['lang_tag'] = 'cjk'
             elif LATIN_PATTERN.search(term): item['lang_tag'] = 'latin'
             elif GREEK_PATTERN.search(term): item['lang_tag'] = 'greek'
             else: item['lang_tag'] = 'other'
@@ -737,12 +771,44 @@ class UntranslatedFixerPage(ShellPage):
             item.get('_effective_stats', item.get('stats', (0, 0, 0))),
         )
 
-    def _collect_visible_candidates_for_item(self, item):
+    def _blacklist_partition(self):
+        """Разбивает blacklist_set один раз на одиночные слова (множество
+        для проверки за O(1)) и многословные фразы (список для AND-проверки
+        по haystack). Раньше это разбиение пересобиралось заново — двумя
+        линейными проходами по ВСЕМУ blacklist_set — для КАЖДОГО кандидата
+        КАЖДОЙ строки в _collect_visible_candidates_for_item
+        (ui-dialogs-validation/runtime/10). Вызывающий код, обрабатывающий
+        много строк за раз (apply_filters, подсчёт связанных вхождений),
+        обязан вызвать это один раз до цикла и передать результат."""
+        return _partition_blacklist_entries(self.blacklist_set)
+
+    def _collect_visible_candidates_for_item(self, item, blacklist_partition=None):
+        if blacklist_partition is None:
+            # Свободная функция, а не self._blacklist_partition(): метод
+            # может отсутствовать на минимальных тестовых харнессах, которые
+            # связывают только этот метод целиком (см.
+            # tests/test_untranslated_fixer_navigation.py).
+            blacklist_partition = _partition_blacklist_entries(self.blacklist_set)
+        blacklist_singles, blacklist_phrases = blacklist_partition
+
         _, clean_text, stats = self._get_effective_context_payload(item)
         clean_text_lower = clean_text.lower()
         source_type = item.get('source_type', 'system')
         term = str(item.get('term', '') or '').strip()
         term_lower = term.lower()
+
+        # phrase_blocked_for_item не зависит от кандидата (аргументы —
+        # blacklist_phrases и clean_text_lower, оба инвариантны в обоих
+        # циклах ниже), поэтому считается один раз на item, а не заново на
+        # каждого кандидата в каждом из двух циклов (ui-dialogs-validation/
+        # runtime/10: до этой правки half-фикс ускорял только одиночные
+        # слова — множество O(1) — а фразовый blacklist оставался
+        # мультипликативным: N кандидатов * M фраз * 2 цикла проверок на
+        # КАЖДУЮ строку).
+        phrase_blocked_for_item = any(
+            self._phrase_matches_context(e, clean_text_lower)
+            for e in blacklist_phrases
+        )
 
         all_candidates = ALIEN_WORD_PATTERN.findall(clean_text)
         symbol_candidates = []
@@ -772,29 +838,17 @@ class UntranslatedFixerPage(ShellPage):
         for word in display_candidates:
             word_lower = word.lower()
             # Однословные записи blacklist: точное совпадение с кандидатом
-            # Многословные фразы: проверяем AND по haystack
-            single_blocked = any(
-                len(e.split()) == 1 and e.lower() == word_lower
-                for e in self.blacklist_set
-            )
-            phrase_blocked = any(
-                len(e.split()) > 1 and self._phrase_matches_context(e, clean_text_lower)
-                for e in self.blacklist_set
-            )
-            if not single_blocked and not phrase_blocked:
+            # (проверка за O(1) по предвычисленному множеству).
+            # Многословные фразы: результат один на весь item (см.
+            # phrase_blocked_for_item выше) — не зависит от word.
+            single_blocked = word_lower in blacklist_singles
+            if not single_blocked and not phrase_blocked_for_item:
                 remaining_candidates.append(word)
 
         for word in all_candidates + symbol_candidates:
             word_lower = word.lower()
-            single_blocked = any(
-                len(e.split()) == 1 and e.lower() == word_lower
-                for e in self.blacklist_set
-            )
-            phrase_blocked = any(
-                len(e.split()) > 1 and self._phrase_matches_context(e, clean_text_lower)
-                for e in self.blacklist_set
-            )
-            if not single_blocked and not phrase_blocked:
+            single_blocked = word_lower in blacklist_singles
+            if not single_blocked and not phrase_blocked_for_item:
                 valid_alien_chars_count += len(word)
 
         total_len = stats[0]
@@ -842,11 +896,11 @@ class UntranslatedFixerPage(ShellPage):
 
         return sorted(candidates, key=sort_key)
 
-    def _get_glossary_entries_for_term(self, term):
-        return self.glossary_controller.find_entries(self.project_glossary, term)
+    def _get_glossary_entries_for_term(self, term, index=None):
+        return self.glossary_controller.find_entries(self.project_glossary, term, index=index)
 
-    def _get_glossary_match_summary(self, term):
-        entries = self._get_glossary_entries_for_term(term)
+    def _get_glossary_match_summary(self, term, index=None):
+        entries = self._get_glossary_entries_for_term(term, index=index)
         if not entries:
             return ""
 
@@ -860,17 +914,32 @@ class UntranslatedFixerPage(ShellPage):
             parts.append(f"... и ещё {len(entries) - 3}")
         return "\n".join(parts)
 
+    def _count_related_occurrences_batch(self, terms):
+        """Считает связанные вхождения сразу для НЕСКОЛЬКИХ терминов за один
+        проход по self.original_data. _show_row_action_menu раньше вызывал
+        _count_related_occurrences(term) по кругу для top_candidates[:10] —
+        10 независимых проходов по всем строкам (и внутри каждого —
+        пересборку blacklist-разбиения на строку) вместо одного
+        (ui-dialogs-validation/runtime/10)."""
+        term_keys = {str(t or '').strip().lower() for t in terms}
+        term_keys.discard('')
+        counts = {key: 0 for key in term_keys}
+        if not term_keys:
+            return counts
+
+        blacklist_partition = self._blacklist_partition()
+        for item in self.original_data:
+            candidates = self._collect_visible_candidates_for_item(item, blacklist_partition)['remaining_candidates']
+            candidate_keys = {candidate.lower() for candidate in candidates}
+            for key in term_keys & candidate_keys:
+                counts[key] += 1
+        return counts
+
     def _count_related_occurrences(self, term):
         term_key = (term or '').strip().lower()
         if not term_key:
             return 0
-
-        count = 0
-        for item in self.original_data:
-            candidates = self._collect_visible_candidates_for_item(item)['remaining_candidates']
-            if any(candidate.lower() == term_key for candidate in candidates):
-                count += 1
-        return count
+        return self._count_related_occurrences_batch([term_key]).get(term_key, 0)
 
     def _replace_term_in_context_html(self, html_fragment, term, replacement):
         pattern = re.compile(re.escape(term), re.IGNORECASE)
@@ -896,8 +965,9 @@ class UntranslatedFixerPage(ShellPage):
         if not term_key:
             return changed_groups
 
+        blacklist_partition = self._blacklist_partition()
         for item in self.original_data:
-            candidates = self._collect_visible_candidates_for_item(item)['remaining_candidates']
+            candidates = self._collect_visible_candidates_for_item(item, blacklist_partition)['remaining_candidates']
             if not any(candidate.lower() == term_key for candidate in candidates):
                 continue
 
@@ -1293,7 +1363,16 @@ class UntranslatedFixerPage(ShellPage):
         source_filter = self.source_filter_combo.currentData()
         
         self.filtered_indices = []
-        
+
+        # Разбиение blacklist и индекс глоссария строятся ОДИН раз на весь
+        # проход по строкам, а не заново для каждой строки/кандидата — иначе
+        # apply_filters (подключён к valueChanged/currentIndexChanged всех
+        # фильтров, т.е. срабатывает на каждый тик спинбокса) даёт
+        # квадратичную стоимость по строкам × кандидатам × (blacklist +
+        # размер глоссария) (ui-dialogs-validation/runtime/10).
+        blacklist_partition = self._blacklist_partition()
+        glossary_index = self.glossary_controller.build_index(self.project_glossary)
+
         for i, item in enumerate(self.original_data):
             if item.get('_deleted'):
                 continue
@@ -1304,8 +1383,8 @@ class UntranslatedFixerPage(ShellPage):
 
             # 1. Базовый фильтр по типу языка (по основному кандидату)
             if item.get('lang_tag') not in active_tags: continue
-            
-            payload = self._collect_visible_candidates_for_item(item)
+
+            payload = self._collect_visible_candidates_for_item(item, blacklist_partition)
             clean_text_lower = payload['clean_text_lower']
             remaining_candidates = payload['remaining_candidates']
             total_len, alien_chars, alien_ratio = payload['stats']
@@ -1336,7 +1415,7 @@ class UntranslatedFixerPage(ShellPage):
             item['_all_candidates'] = remaining_candidates
             item['_glossary_matches'] = [
                 candidate for candidate in remaining_candidates
-                if self._get_glossary_entries_for_term(candidate)
+                if self._get_glossary_entries_for_term(candidate, index=glossary_index)
             ]
             # ------------------------------------
 
@@ -1400,13 +1479,21 @@ class UntranslatedFixerPage(ShellPage):
             if txt != stored: self.original_data[idx]['new_context'] = txt
 
     def populate_table(self, indices):
-        self.table.blockSignals(True) 
-        
+        self.table.blockSignals(True)
+
         self.table.clearContents()
         self.table.setRowCount(0)
 
         self.table.setRowCount(len(indices))
-        
+
+        # Индекс глоссария строится один раз на всю страницу, а не на
+        # каждый термин каждой видимой строки внутри
+        # _get_glossary_match_summary -> _get_glossary_entries_for_term
+        # (ui-dialogs-validation/runtime/10, доработка): без него — полный
+        # линейный проход по project_glossary на каждый из до 3 терминов
+        # каждой строки на КАЖДУЮ перерисовку страницы.
+        glossary_index = self.glossary_controller.build_index(self.project_glossary)
+
         for row, idx in enumerate(indices):
             data = self.original_data[idx]
             
@@ -1437,7 +1524,7 @@ class UntranslatedFixerPage(ShellPage):
                 term_item.setForeground(QtGui.QColor("#2ECC71"))
                 tooltip_lines = ["Есть связанные записи в глоссарии:"]
                 for term in glossary_matches[:3]:
-                    tooltip_lines.append(self._get_glossary_match_summary(term))
+                    tooltip_lines.append(self._get_glossary_match_summary(term, index=glossary_index))
                 term_item.setToolTip("\n\n".join(line for line in tooltip_lines if line))
             
             # 2. Context
@@ -1548,9 +1635,15 @@ class UntranslatedFixerPage(ShellPage):
 
         glossary_menu = menu.addMenu("📘 Глоссарий и замены")
         if top_candidates:
-            for term in top_candidates[:10]:
-                related_count = self._count_related_occurrences(term)
-                existing_entries = self._get_glossary_entries_for_term(term)
+            menu_terms = top_candidates[:10]
+            # Один проход по всем строкам на всю пачку терминов и один
+            # индекс глоссария вместо 10 отдельных full-scan на открытие
+            # меню (ui-dialogs-validation/runtime/10).
+            related_counts = self._count_related_occurrences_batch(menu_terms)
+            glossary_index = self.glossary_controller.build_index(self.project_glossary)
+            for term in menu_terms:
+                related_count = related_counts.get(str(term or '').strip().lower(), 0)
+                existing_entries = self._get_glossary_entries_for_term(term, index=glossary_index)
                 submenu_title = f"{term} [{related_count}]"
                 if existing_entries:
                     submenu_title += f" | G:{len(existing_entries)}"
@@ -1824,23 +1917,13 @@ class UntranslatedFixerPage(ShellPage):
         exec_dialog(self, dialog)
 
     def _get_project_manager(self):
-        checked = set()
-        current_parent = getattr(self, '_validator_host', None)
-        while current_parent and id(current_parent) not in checked:
-            checked.add(id(current_parent))
-            project_manager = getattr(current_parent, 'project_manager', None)
-            if project_manager:
-                return project_manager
-            current_parent = current_parent.parent()
+        def has_project_manager(node):
+            return bool(getattr(node, 'project_manager', None))
 
-        current_parent = self.parent()
-        while current_parent and id(current_parent) not in checked:
-            checked.add(id(current_parent))
-            project_manager = getattr(current_parent, 'project_manager', None)
-            if project_manager:
-                return project_manager
-            current_parent = current_parent.parent()
-        return None
+        node = find_ancestor_by_predicate(getattr(self, '_validator_host', None), has_project_manager)
+        if node is None:
+            node = find_ancestor_by_predicate(self.parent(), has_project_manager)
+        return node.project_manager if node is not None else None
 
     def _delete_user_mark(self, data_index):
         item_data = self.original_data[data_index]
@@ -2235,12 +2318,11 @@ class UntranslatedFixerPage(ShellPage):
         self.update_table_view()
 
 
-class _UntranslatedFixerDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(UntranslatedFixerPage, name)
-
-
-class UntranslatedFixerDialog(QDialog, metaclass=_UntranslatedFixerDialogMeta):
+class UntranslatedFixerDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(UntranslatedFixerPage),
+):
     """Modal wrapper hosting UntranslatedFixerPage for the legacy exec() API."""
 
     navigate_to_chapter_requested = pyqtSignal(dict)
@@ -2259,12 +2341,6 @@ class UntranslatedFixerDialog(QDialog, metaclass=_UntranslatedFixerDialogMeta):
 
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
-
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
 
     def closeEvent(self, event):
         self.page.reject()
@@ -2290,7 +2366,7 @@ def build_translation_tasks_from_data_items(data_items, batch_size=50):
     return tasks_list
 
 
-class AITranslationPage(ShellPage):
+class AITranslationPage(TokenUsageTrackerMixin, ShellPage):
     """
     Адаптированная страница для сессии перевода недопереведенных фрагментов.
     Версия 6.0: 
@@ -2300,6 +2376,10 @@ class AITranslationPage(ShellPage):
     """
     result_ready = pyqtSignal(list)
     finished = pyqtSignal(int)
+    # pcluster-03: единственное реальное расхождение с
+    # ConsistencyValidatorPage._update_token_usage_label — текст тултипа.
+    _token_usage_tooltip_scope = "текущую AI-сессию"
+
     def __init__(
         self,
         tasks_payloads,
@@ -2333,6 +2413,11 @@ class AITranslationPage(ShellPage):
         self.is_session_active = False
         self._session_run_id = None
         self._owned_session_id = None
+        # Снимок общей очереди (app.task_manager == engine.task_manager),
+        # снятый перед первым clear_all_queues() этой страницы, — чтобы
+        # вернуть чужие задачи (главы главного окна) на место после
+        # завершения AI-сессии фиксера. None, пока ничего не сохранено.
+        self._preserved_queue_snapshot = None
         self._token_input_total = 0
         self._token_output_total = 0
         self._token_total = 0
@@ -2528,12 +2613,27 @@ class AITranslationPage(ShellPage):
 
     def _check_can_close(self):
         if self.is_session_active:
-            self._on_start_stop_clicked()
-            return False 
+            if self.engine and self.engine.session_id:
+                self._on_start_stop_clicked()
+                return False
+            # is_session_active выставляется оптимистично в
+            # _on_start_stop_clicked() ДО того, как движок реально подтвердит
+            # старт событием session_started (translation_engine.py молча
+            # игнорирует start_session_requested, если сессия уже занята
+            # кем-то другим). Если у движка нет session_id — нашего запуска
+            # не существует и session_started/session_finished для него не
+            # придут никогда: _on_start_stop_clicked() тоже не сделал бы
+            # ничего (ветка отправки manual_stop_requested требует
+            # engine.session_id), и страница осталась бы невыходимой
+            # навсегда. Разблокируем её сами и вернём чужую очередь на место.
+            self._abort_stuck_session_start()
 
-        if self.translated_results:
+        # В авто-режиме (suppress_popups) модальный вопрос показывать нельзя —
+        # диалог скрыт (dialog.hide()), и невидимое модальное окно повесило
+        # бы автоматический пайплайн; выход в этом случае всегда разрешён.
+        if self.translated_results and not self.suppress_popups:
             reply = QMessageBox.question(
-                self, 
+                self,
                 "Несохраненные результаты",
                 f"Есть непримененные переводы ({len(self.translated_results)} шт.).\n"
                 "Если вы закроете окно, они пропадут.\n\n"
@@ -2542,23 +2642,68 @@ class AITranslationPage(ShellPage):
                 QMessageBox.StandardButton.No
             )
             return reply == QMessageBox.StandardButton.Yes
-            
+
         return True
 
+    def _abort_stuck_session_start(self):
+        """Сбрасывает "зависшее" is_session_active, когда движок так и не
+        подтвердил старт этой сессии (engine.session_id пуст). Без этого
+        сброса страница становится невыходимой: can_leave()/_check_can_close
+        вечно видели бы is_session_active=True, а событие session_finished
+        с нашим _session_run_id никогда не придёт, потому что сессии с этим
+        run_id в движке никогда не было."""
+        self._set_ui_active(False)
+        self._session_run_id = None
+        self._owned_session_id = None
+        # getattr — на случай минимального тестового харнесса без этого
+        # метода (см. _on_global_event ниже); на боевом объекте метод есть
+        # всегда.
+        restore_queue = getattr(self, '_restore_preserved_queue', None)
+        if restore_queue:
+            restore_queue()
+
     def reject(self):
-        if self._check_can_close():
-            super().reject()
+        # ShellPage — это QWidget, а не QDialog: у него нет super().reject().
+        # Раньше это защищённое определение было мёртвым кодом — его
+        # затирало второе, безусловное def reject() в конце класса (см.
+        # accept()/reject() ниже), из-за чего «Прервать» во время активной
+        # сессии сразу закрывало страницу, не останавливая движок.
+        if not self._check_can_close():
+            return
+        self.result_ready.emit([])
+        self.finished.emit(0)
+        self.request_back.emit()
 
     def closeEvent(self, event):
-        if self.result() != QDialog.DialogCode.Accepted:
-            if not self._check_can_close():
-                event.ignore()
-                return
+        if not self._check_can_close():
+            event.ignore()
+            return
 
         self._disconnect_global_events()
         super().closeEvent(event)
 
+    def can_leave(self) -> bool:
+        # Пока AI-сессия фиксера активна, уход со страницы (кнопка "Назад"
+        # в шапке шелла, смена страницы и т.п.) должен быть запрещён так же,
+        # как и явное "Прервать" — иначе сессия становится осиротевшей
+        # фоновой (background_session=True) и никто её не останавливает.
+        #
+        # Важно: вето — на РЕАЛЬНУЮ сессию движка (engine.session_id), а не
+        # только на локальный флаг is_session_active. Флаг выставляется
+        # оптимистично в _on_start_stop_clicked() ДО ответа движка; если
+        # движок проигнорировал старт (сессия уже была занята и потом
+        # остановлена кем-то другим), session_id пуст, а session_started для
+        # нашего запуска не придёт никогда — иначе can_leave() вето бы
+        # навсегда и страницу нельзя было бы покинуть вообще ничем.
+        return not (self.is_session_active and self.engine and self.engine.session_id)
+
     def on_leave(self):
+        # Если can_leave() пропустил уход именно из-за "зависшего" запуска
+        # (see can_leave/_abort_stuck_session_start) — состояние страницы
+        # нужно всё равно привести в порядок и вернуть чужую очередь, пока
+        # страница ещё жива (после on_leave она будет удалена deleteLater).
+        if self.is_session_active and not (self.engine and self.engine.session_id):
+            self._abort_stuck_session_start()
         self._disconnect_global_events()
 
     def _disconnect_global_events(self):
@@ -2669,11 +2814,55 @@ class AITranslationPage(ShellPage):
             for i, payload in enumerate(self.tasks_payloads):
                 task = ('raw_text_translation', payload, prompt, f"Пакет {i+1}/{len(self.tasks_payloads)}")
                 tasks_to_add.append(task)
-            
+
+            if self._preserved_queue_snapshot is None:
+                # self.task_manager — общая очередь главного окна. Сохраняем
+                # то, что в ней уже лежит (главы, реально ждущие перевода —
+                # 'pending'/'held'), прежде чем clear_all_queues() ниже её
+                # сотрёт — иначе они теряются безвозвратно.
+                #
+                # Намеренно НЕ get_all_tasks_for_rebuild() (отдаёт ВСЕ задачи
+                # независимо от статуса): уже переведённые ('completed')
+                # главы при восстановлении через add_pending_tasks легли бы
+                # обратно как 'pending' и перевелись бы заново — то есть одна
+                # потеря данных менялась бы на другую, менее заметную. Главы
+                # с ошибкой ('failed') этим же способом тоже не воскресают —
+                # см. докстринг _restore_preserved_queue.
+                self._preserved_queue_snapshot = self.task_manager.get_all_pending_tasks()
             self.task_manager.clear_all_queues()
             self.task_manager.add_pending_tasks(tasks_to_add)
             
             self._post_event('start_session_requested', {'settings': settings})
+
+    def _restore_preserved_queue(self):
+        """Возвращает в общую очередь задачи, снятые в _on_start_stop_clicked.
+
+        Снимок берётся через get_all_pending_tasks() — только 'pending'/
+        'held'. Известные, сознательно принятые компромиссы этого способа
+        восстановления (полноценный fix потребовал бы нового API в
+        task_manager.py — тегирования задач фиксера run_id и точечного
+        удаления только своих строк, что вне разрешённых для этой правки
+        файлов):
+
+        - Главы со статусом 'completed' и 'failed' в снимок не попадают
+          вовсе (не воскресают ни как есть, ни как 'pending') — история
+          ошибок (task_errors) и частичные chunk_results для них теряются
+          вместе с самой строкой задачи. Здесь это лучше, чем раньше:
+          'completed' не переводится заново, а не превращается в 'pending'.
+        - chain_id/chain_index у восстановленных задач обнуляются (round-trip
+          через add_pending_tasks их не сохраняет) — последовательный
+          перевод (контекст предыдущей главы по цепочке) для них деградирует
+          до fallback-ветки для chain_id IS NULL.
+        - add_pending_tasks повторно прогоняет payload через
+          _normalize_payload → os.copy_to_mem, хотя payload в снимке уже
+          виртуальный ('mem://...'): вместо no-op создаётся вторая полная
+          копия исходного файла в memfs с вложенным путём, и каждый следующий
+          цикл старт/финиш добавляет ещё один уровень вложенности.
+        """
+        snapshot = self._preserved_queue_snapshot
+        self._preserved_queue_snapshot = None
+        if snapshot:
+            self.task_manager.add_pending_tasks([payload for _, payload in snapshot])
 
     @pyqtSlot(dict)
     def _on_global_event(self, event: dict):
@@ -2694,6 +2883,12 @@ class AITranslationPage(ShellPage):
             if self._owned_session_id and event_session_id != self._owned_session_id:
                 return
             self.task_manager.clear_all_queues()
+            # getattr вместо прямого вызова: некоторые существующие тесты
+            # гоняют этот обработчик на минимальном харнессе, привязывающем
+            # только часть методов класса, без _restore_preserved_queue.
+            restore_queue = getattr(self, '_restore_preserved_queue', None)
+            if restore_queue:
+                restore_queue()
             self._set_ui_active(False)
             self.finish_reason = data.get('reason', '')
             self._owned_session_id = None
@@ -2725,45 +2920,17 @@ class AITranslationPage(ShellPage):
                 return
             self._on_token_usage_updated(data)
 
-    def _reset_token_usage(self):
-        self._token_input_total = 0
-        self._token_output_total = 0
-        self._token_total = 0
-        self._update_token_usage_label()
-
-    @staticmethod
-    def _format_compact_tokens(value: int) -> str:
-        try:
-            value = int(value)
-        except (TypeError, ValueError):
-            value = 0
-        if value >= 1_000_000:
-            return f"{value / 1_000_000:.1f}M"
-        if value >= 1_000:
-            return f"{value / 1_000:.1f}K"
-        return str(value)
-
-    def _update_token_usage_label(self):
-        total = self._format_compact_tokens(self._token_total)
-        input_tokens = self._format_compact_tokens(self._token_input_total)
-        output_tokens = self._format_compact_tokens(self._token_output_total)
-        self.token_usage_label.setText(f"Токены: ~{total}")
-        self.token_usage_label.setToolTip(
-            f"Оценка токенов за текущую AI-сессию: всего ~{total}, "
-            f"вход ~{input_tokens}, выход ~{output_tokens}."
-        )
+    # _reset_token_usage / _update_token_usage_label: см.
+    # TokenUsageTrackerMixin (pcluster-03); _token_usage_tooltip_scope
+    # переопределён выше на уровне класса.
 
     def _on_token_usage_updated(self, data: dict):
-        try:
-            input_tokens = int((data or {}).get('input_tokens', 0) or 0)
-            output_tokens = int((data or {}).get('output_tokens', 0) or 0)
-            total_tokens = int((data or {}).get('total_tokens', input_tokens + output_tokens) or 0)
-        except (TypeError, ValueError):
-            return
-        self._token_input_total += max(0, input_tokens)
-        self._token_output_total += max(0, output_tokens)
-        self._token_total += max(0, total_tokens)
-        self._update_token_usage_label()
+        # Вызывается из _on_global_event ПОСЛЕ проверки
+        # _is_owned_session_event (см. выше) — фильтр владения сессией не
+        # трогаем. Само накопление (парсинг+клампинг+++) общее с
+        # ConsistencyValidatorPage — TokenUsageTrackerMixin (pcluster-03,
+        # issue №1 ревью).
+        self._accumulate_token_usage(data)
 
     def _set_ui_active(self, active: bool):
         self.is_session_active = active
@@ -2815,11 +2982,6 @@ class AITranslationPage(ShellPage):
     def accept(self):
         self.result_ready.emit(self.get_translated_results())
         self.finished.emit(1)
-        self.request_back.emit()
-
-    def reject(self):
-        self.result_ready.emit([])
-        self.finished.emit(0)
         self.request_back.emit()
 
 AITranslationDialog = AITranslationPage

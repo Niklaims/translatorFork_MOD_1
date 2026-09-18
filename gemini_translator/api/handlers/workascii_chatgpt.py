@@ -15,6 +15,7 @@ from ..errors import (
     TemporaryRateLimitError,
     ValidationFailedError,
 )
+from ...utils.text_sanitize import sanitize_path_segment
 
 
 class WorkAsciiChatGptApiHandler(BaseApiHandler):
@@ -122,8 +123,7 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
 
     @staticmethod
     def _safe_profile_segment(value: str) -> str:
-        text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value or "").strip())
-        return text.strip("_")[:48] or "default"
+        return sanitize_path_segment(value, strip_chars="_", max_length=48, default="default")
 
     def _resolve_profile_dir_for_slot(self, base_profile_dir):
         if not base_profile_dir or self.browser_profiles_count <= 1:
@@ -145,8 +145,10 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
     ):
         system_instruction = (self.worker.prompt_builder.system_instruction or "").strip() or None
 
+        slot_acquired = False
         try:
             await self._acquire_bridge_request_slot()
+            slot_acquired = True
             await self._ensure_bridge_ready()
             command_payload = {
                 "type": "translate",
@@ -176,10 +178,16 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
                 ),
             )
         except asyncio.CancelledError:
+            # Глобальный таймаут (asyncio.wait_for в base.py) или отмена пользователем:
+            # слот обязан вернуться, иначе _active_bridge_calls остаётся занятым навсегда
+            # и следующий запрос при периодическом перезапуске профиля виснет в acquire.
+            if slot_acquired:
+                await self._release_bridge_request_slot(success=False)
             await self._terminate_bridge()
             raise
         except Exception:
-            await self._release_bridge_request_slot(success=False)
+            if slot_acquired:
+                await self._release_bridge_request_slot(success=False)
             raise
 
         if response.get("ok"):

@@ -34,14 +34,29 @@ from .jobs import (
     tail_log,
     utc_now,
 )
-from .paths import daemon_file, ensure_state_dirs, validate_job_id
+from .paths import build_base_url, daemon_file, ensure_state_dirs, validate_job_id
 from .worker import cancel_process, run_job
 
 TOKEN_HEADER = "X-Translator-MCP-Token"
 TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
 PIPELINE_METADATA_KEYS = {"pipeline_parent", "pipeline_step", "pipeline_index", "pipeline_total"}
 SSE_KEEPALIVE_INTERVAL_SECONDS = 15.0
-SSE_QUEUE_POLL_INTERVAL_SECONDS = 0.1
+# Нижняя граница таймаута event_queue.get() в SSE-цикле — защита от нулевого
+# или отрицательного значения, если до следующего keepalive уже пора (см.
+# _serve_sse); НЕ период холостых пробуждений — тот определяется оставшимся
+# временем до keepalive и может быть значительно больше.
+SSE_QUEUE_MIN_WAIT_SECONDS = 0.05
+# Верхняя граница ожидания в select() перед проверкой флага shutdown в
+# accept-loop демона. Реальные запросы обрабатываются немедленно через
+# ThreadingHTTPServer.handle_request() — poll_interval влияет только на то,
+# как часто простаивающий демон просыпается впустую и с какой задержкой
+# он заметит команду stop(). 0.1с давало 10 пробуждений/с бессрочно, пока
+# демон жив (дни); 1с — секунда задержки на stop() не критична.
+DAEMON_IDLE_POLL_INTERVAL_SECONDS = 1.0
+# Сколько непрочитанного тела запроса демон дочитывает перед ответом (см.
+# Handler._discard_unread_request_body). Тело больше предела не читается:
+# ответ уходит сразу, как раньше.
+MAX_DISCARDED_REQUEST_BODY_BYTES = 64 * 1024 * 1024
 
 
 class _DaemonHTTPServer(ThreadingHTTPServer):
@@ -126,8 +141,7 @@ class McpDaemon:
 
     @property
     def base_url(self) -> str:
-        host = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
-        return f"http://{host}:{self.port}"
+        return build_base_url(self.host, self.port)
 
     def start_in_thread(self) -> None:
         self._ensure_server()
@@ -143,7 +157,7 @@ class McpDaemon:
     def serve_forever(self) -> None:
         self._ensure_server()
         assert self._server is not None
-        self._server.serve_forever(poll_interval=0.1)
+        self._server.serve_forever(poll_interval=DAEMON_IDLE_POLL_INTERVAL_SECONDS)
 
     def stop(self) -> None:
         server = self._server
@@ -866,6 +880,7 @@ class McpDaemon:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = "TranslatorMCP/0.1"
+            _request_body_consumed = False
 
             def do_GET(self) -> None:
                 self._dispatch("GET")
@@ -876,19 +891,34 @@ class McpDaemon:
             def log_message(self, format, *args) -> None:
                 return
 
+            def _request_token(self, parsed) -> str | None:
+                # SSE-транспорт открывается как обычный GET (EventSource-подобным
+                # клиентом), который не всегда умеет проставлять произвольные
+                # заголовки — поэтому токен принимаем и из query-параметра.
+                header_token = self.headers.get(TOKEN_HEADER)
+                if header_token:
+                    return header_token
+                query_token = parse_qs(parsed.query).get("token")
+                return query_token[0] if query_token else None
+
             def _dispatch(self, method: str) -> None:
                 try:
                     parsed = urlsplit(self.path)
                     path = parsed.path
+
+                    # /sse и /messages раньше обрабатывались ДО проверки токена —
+                    # любой локальный процесс получал полный доступ ко всем
+                    # MCP-инструментам демона без секрета. Теперь токен обязателен
+                    # и для них.
+                    if self._request_token(parsed) != daemon.token:
+                        self._send_json(401, {"ok": False, "error": "unauthorized"})
+                        return
+
                     if method == "GET" and path == "/sse":
                         self._serve_sse()
                         return
                     if method == "POST" and path in {"/messages", "/messages/", "/message"}:
                         self._handle_sse_message(parsed)
-                        return
-
-                    if self.headers.get(TOKEN_HEADER) != daemon.token:
-                        self._send_json(401, {"ok": False, "error": "unauthorized"})
                         return
 
                     if method == "GET" and path == "/status":
@@ -955,7 +985,15 @@ class McpDaemon:
 
             def _serve_sse(self) -> None:
                 session, event_queue = daemon._register_sse_session(self.headers.get("User-Agent"))
-                endpoint = f"{daemon.base_url}/messages?session_id={quote(session.id, safe='')}"
+                # Токен кладём прямо в endpoint-URL: клиент получает его только
+                # после того, как уже прошёл проверку токена на /sse, поэтому
+                # это не ослабляет защиту, а лишь избавляет клиентов без
+                # поддержки кастомных заголовков от ручной передачи токена.
+                endpoint = (
+                    f"{daemon.base_url}/messages"
+                    f"?session_id={quote(session.id, safe='')}"
+                    f"&token={quote(daemon.token, safe='')}"
+                )
                 try:
                     self.send_response(200)
                     self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -967,7 +1005,14 @@ class McpDaemon:
                     next_keepalive_at = time.monotonic() + SSE_KEEPALIVE_INTERVAL_SECONDS
                     while True:
                         try:
-                            payload = event_queue.get(timeout=SSE_QUEUE_POLL_INTERVAL_SECONDS)
+                            # Таймаут — не фиксированные 0.1с, а оставшееся до
+                            # следующего keepalive время: событие из очереди
+                            # (event_queue.put) будит get() мгновенно в любом
+                            # случае, а долгий сон при пустой очереди не
+                            # ухудшает отзывчивость доставки, только сокращает
+                            # число бесполезных пробуждений в простое.
+                            remaining = next_keepalive_at - time.monotonic()
+                            payload = event_queue.get(timeout=max(SSE_QUEUE_MIN_WAIT_SECONDS, remaining))
                         except Empty:
                             now = time.monotonic()
                             if now < next_keepalive_at:
@@ -1009,6 +1054,7 @@ class McpDaemon:
                 length = int(self.headers.get("Content-Length") or "0")
                 if length <= 0:
                     return {}
+                self._request_body_consumed = True
                 body = self.rfile.read(length).decode("utf-8")
                 try:
                     return json.loads(body)
@@ -1050,7 +1096,33 @@ class McpDaemon:
                     raise _HttpError(400, "request_id is required")
                 return request_id
 
+            def _discard_unread_request_body(self) -> None:
+                # Ответ без чтения тела POST (401, 400 до разбора, 404) закрывал
+                # соединение с непрочитанными байтами в сокете, а тело, пришедшее
+                # после ответа, упиралось в закрытый сокет. В обоих случаях ОС
+                # обрывает соединение сбросом, и Windows теряет уже отправленный
+                # ответ: клиент получает ConnectionAbortedError (WinError 10053)
+                # вместо 401. http.client шлёт заголовки и тело двумя send().
+                if self._request_body_consumed:
+                    return
+                self._request_body_consumed = True
+                try:
+                    remaining = int(self.headers.get("Content-Length") or "0")
+                except ValueError:
+                    return
+                if remaining > MAX_DISCARDED_REQUEST_BODY_BYTES:
+                    return
+                try:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(remaining, 64 * 1024))
+                        if not chunk:
+                            return
+                        remaining -= len(chunk)
+                except OSError:
+                    return
+
             def _send_json(self, status: int, payload: dict) -> None:
+                self._discard_unread_request_body()
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

@@ -11,84 +11,16 @@ This module provides classes for:
 import re
 import html
 from typing import Set, List, Tuple, Dict, Any
-from bs4 import BeautifulSoup, NavigableString, ProcessingInstruction, Comment, Declaration
 
 from gemini_translator.utils.html_text import extract_visible_text
+from gemini_translator.utils.cjk_ranges import UnicodeRanges
 
-
-# =============================================================================
-# CJK and Unicode Character Ranges
-# =============================================================================
-
-class UnicodeRanges:
-    """Comprehensive Unicode ranges for character classification."""
-    
-    # CJK Unified Ideographs (Chinese)
-    CJK_UNIFIED_IDEOGRAPHS = r'\u4e00-\u9fff'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_A = r'\u3400-\u4dbf'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_B = r'\U00020000-\U0002a6df'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_C = r'\U0002a700-\U0002b73f'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_D = r'\U0002b740-\U0002b81f'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_E = r'\U0002b820-\U0002ceaf'
-    CJK_UNIFIED_IDEOGRAPHS_EXT_F = r'\U0002ceb0-\U0002ebef'
-    CJK_COMPATIBILITY_IDEOGRAPHS = r'\uf900-\ufaff'
-    CJK_COMPATIBILITY_IDEOGRAPHS_SUPPLEMENT = r'\U0002f800-\U0002fa1f'
-    
-    # Japanese Hiragana and Katakana
-    HIRAGANA = r'\u3040-\u309f'
-    HIRAGANA_EXTENDED = r'\u1b001-\u1b11f'
-    KATAKANA = r'\u30a0-\u30ff'
-    KATAKANA_PHONETIC_EXTENSIONS = r'\u31f0-\u31ff'
-    KATAKANA_SMALL = r'\u3248-\u324f'
-    KATAKANA_EXTENDED = r'\u1b000-\u1b001'
-    
-    # Korean Hangul
-    HANGUL_SYLLABLES = r'\uac00-\ud7af'
-    HANGUL_JAMO = r'\u1100-\u11ff'
-    HANGUL_COMPATIBILITY_JAMO = r'\u3130-\u318f'
-    HANGUL_JAMO_EXTENDED_A = r'\ua960-\ua97f'
-    HANGUL_JAMO_EXTENDED_B = r'\ud7b0-\ud7ff'
-    
-    # Bopomofo (Zhuyin) - Used for Chinese phonetic notation
-    BOPOMOFO = r'\u3100-\u312f'
-    BOPOMOFO_EXTENDED = r'\u31a0-\u31bf'
-    
-    # Other CJK symbols and punctuation
-    CJK_SYMBOLS_AND_PUNCTUATION = r'\u3000-\u303f'
-    CJK_STROKES = r'\u31c0-\u31ef'
-    CJK_RADICALS_SUPPLEMENT = r'\u2e80-\u2eff'
-    KANGXI_RADICALS = r'\u2f00-\u2fdf'
-    IDEOGRAPHIC_DESCRIPTION_CHARACTERS = r'\u2ff0-\u2fff'
-    
-    # Combined pattern for all CJK characters (EXPANDED)
-    ALL_CJK_PATTERN = (
-        f'[{CJK_UNIFIED_IDEOGRAPHS}'
-        f'{CJK_UNIFIED_IDEOGRAPHS_EXT_A}'
-        f'{HIRAGANA}'
-        f'{KATAKANA}'
-        f'{HANGUL_SYLLABLES}'
-        f'{BOPOMOFO}'
-        f'{CJK_COMPATIBILITY_IDEOGRAPHS}'
-        f'{CJK_SYMBOLS_AND_PUNCTUATION}'
-        f'{KANGXI_RADICALS}'
-        f']'
-    )
-    
-    # Extended pattern including less common ranges
-    ALL_CJK_EXTENDED_PATTERN = (
-        f'[{CJK_UNIFIED_IDEOGRAPHS}'
-        f'{CJK_UNIFIED_IDEOGRAPHS_EXT_A}'
-        f'{CJK_UNIFIED_IDEOGRAPHS_EXT_B}'
-        f'{HIRAGANA}'
-        f'{HIRAGANA_EXTENDED}'
-        f'{KATAKANA}'
-        f'{KATAKANA_PHONETIC_EXTENSIONS}'
-        f'{HANGUL_SYLLABLES}'
-        f'{HANGUL_JAMO}'
-        f'{BOPOMOFO}'
-        f'{BOPOMOFO_EXTENDED}'
-        f']'
-    )
+# cluster-32 dedup: UnicodeRanges (CJK/Unicode range constants + ALL_CJK_PATTERN)
+# moved to gemini_translator/utils/cjk_ranges.py, the canonical source shared
+# by the other CJK-detection call sites. Re-imported here (not re-defined) so
+# existing imports of `UnicodeRanges` from this module (e.g.
+# validation_dialogs/__init__.py) keep working unchanged -- it is the same
+# class object.
 
 
 # =============================================================================
@@ -130,35 +62,31 @@ class HTMLCleaner:
         """
         return extract_visible_text(html_content)
 
-    @staticmethod
-    def get_body_text(html_content: str) -> str:
-        """
-        Extract text content from the body element only.
-        
-        Args:
-            html_content: Raw HTML content
-            
-        Returns:
-            Text content from body element
-        """
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-            body = soup.find('body')
-            
-            if body:
-                # Remove script and style elements
-                for tag in body(['script', 'style']):
-                    tag.decompose()
-                return body.get_text(separator=' ', strip=True)
-            
-            return soup.get_text(separator=' ', strip=True)
-        except Exception:
-            return html_content
-
 
 # =============================================================================
 # Word Exception Matcher
 # =============================================================================
+
+# re.IGNORECASE treats U+0130 (dotted capital I) and U+0131 (dotless i) as
+# equal to "i", while str.casefold() turns the first into "i" + U+0307 and
+# leaves the second alone. Folding both away makes every IGNORECASE match of an
+# ASCII phrase a plain substring of the folded text; checked against every
+# Unicode code point.
+_DOTLESS_I_TO_I = str.maketrans({"\u0131": "i"})
+
+
+def _fold_for_prefilter(value: str) -> str:
+    return value.casefold().replace("\u0307", "").translate(_DOTLESS_I_TO_I)
+
+
+def _prefilter_key(phrase: str) -> "str | None":
+    """The substring a text must contain for ``phrase`` to match, when it is known.
+
+    Only ASCII phrases get one, because the fold was verified for them. Any
+    other phrase is always handed to its regex.
+    """
+    return _fold_for_prefilter(phrase) if phrase.isascii() else None
+
 
 class WordExceptionMatcher:
     """
@@ -182,6 +110,8 @@ class WordExceptionMatcher:
         self.single_words: Set[str] = set()
         self.phrases: List[str] = []
         self._phrase_patterns: List[Tuple[str, re.Pattern]] = []
+        # Folded form of each phrase for the substring shortcut, or None to always try it.
+        self._phrase_keys: List["str | None"] = []
         
         self._compile_patterns(exceptions)
     
@@ -210,6 +140,7 @@ class WordExceptionMatcher:
         
         # Pre-compile phrase patterns for efficiency
         self._phrase_patterns = []
+        self._phrase_keys = []
         for phrase in self.phrases:
             pattern_str = (
                 self.UNICODE_WORD_BOUNDARY_START + 
@@ -219,6 +150,7 @@ class WordExceptionMatcher:
             try:
                 pattern = re.compile(pattern_str, re.IGNORECASE | re.UNICODE)
                 self._phrase_patterns.append((phrase, pattern))
+                self._phrase_keys.append(_prefilter_key(phrase))
             except re.error:
                 # Skip invalid patterns
                 pass
@@ -247,28 +179,18 @@ class WordExceptionMatcher:
         """
         result = text
         
-        for phrase, pattern in self._phrase_patterns:
+        # A phrase whose folded form is absent from the folded text cannot
+        # match, so its regex is skipped: most chapters contain none of them.
+        folded = None
+        for (phrase, pattern), key in zip(self._phrase_patterns, self._phrase_keys):
+            if key is not None:
+                if folded is None:
+                    folded = _fold_for_prefilter(text)
+                if key not in folded:
+                    continue
             result = pattern.sub(' ', result)
         
         return result
-    
-    def find_phrase_matches(self, text: str) -> List[str]:
-        """
-        Find all phrase exceptions that match in the text.
-        
-        Args:
-            text: Input text to search
-            
-        Returns:
-            List of matched phrases
-        """
-        matches = []
-        
-        for phrase, pattern in self._phrase_patterns:
-            if pattern.search(text):
-                matches.append(phrase)
-        
-        return matches
 
 
 # =============================================================================
@@ -301,10 +223,7 @@ class UntranslatedWordDetector:
     # CJK punctuation marks are common in titles/lists and should not be
     # treated as untranslated text when they appear by themselves.
     CJK_PUNCTUATION_PATTERN = re.compile(f'^[{UnicodeRanges.CJK_SYMBOLS_AND_PUNCTUATION}]+$')
-    
-    # Pattern for detecting any CJK (extended)
-    CJK_EXTENDED_PATTERN = re.compile(UnicodeRanges.ALL_CJK_EXTENDED_PATTERN)
-    
+
     # Pattern for single Latin character (should be ignored - common in ratings/grades)
     SINGLE_LATIN_PATTERN = re.compile(r'^[a-zA-Z]$')
     
@@ -378,61 +297,39 @@ class UntranslatedWordDetector:
         # Skip empty words
         if not word or len(word) < 1:
             return False
-        
+
         if self.CJK_PUNCTUATION_PATTERN.fullmatch(word):
             return False
 
-        # Check if it's a CJK character FIRST (always include, even single chars)
+        # Check the exception list BEFORE the CJK short-circuit below.
+        # _build_current_untranslated_exceptions (validation.py) fills this
+        # set with CJK residues extracted from the glossary's translation
+        # field, precisely so that adding a CJK term to the glossary can
+        # suppress an already-flagged chapter. If the CJK check ran first,
+        # an exception-listed CJK word would still be flagged -- see
+        # finding-ui-dialogs-validation_design_1-untranslated-detection-triplic
+        # review notes.
+        if self.exception_matcher.is_exception(word.lower()):
+            return False
+
+        # Check if it's a CJK character (always include, even single chars)
         if self.CJK_PATTERN.search(word):
             return True
-        
+
         # Skip single-character Latin letters (common in ratings/grades like "E", "A", "B")
         if self.SINGLE_LATIN_PATTERN.match(word):
             return False
-        
+
         # Skip rating patterns like A+, B-, S, etc.
         if self.RATING_PATTERN.match(word):
             return False
-        
+
         # For non-CJK words, apply length filter
         if len(word) < self.MIN_LATIN_WORD_LENGTH:
             return False
-        
-        # Check if word is in exception list
-        if self.exception_matcher.is_exception(word.lower()):
-            return False
-        
+
         return True
-    
-    def detect_in_text(self, text: str) -> List[str]:
-        """
-        Detect untranslated words in plain text (no HTML processing).
-        
-        Args:
-            text: Plain text to analyze
-            
-        Returns:
-            Sorted list of unique untranslated words
-        """
-        try:
-            # Remove phrase exceptions
-            text_without_phrases = self.exception_matcher.remove_phrase_exceptions(text)
-            
-            # Remove Cyrillic
-            no_cyrillic = self.CYRILLIC_PATTERN.sub(' ', text_without_phrases)
-            
-            # Get pure words
-            pure_words = self.PURE_WORD_PATTERN.sub(' ', no_cyrillic).split()
-            
-            # Filter words
-            untranslated = [w for w in pure_words if self._should_include_word(w)]
-            
-            return sorted(list(set(untranslated)), key=len, reverse=True)
-            
-        except Exception as e:
-            print(f"[UntranslatedWordDetector] Error in detect_in_text: {e}")
-            return []
-    
+
     def detect_mixed_script(self, translated_content: str) -> List[Dict[str, Any]]:
         """
         Detect CJK characters mixed within translated (Cyrillic) text.

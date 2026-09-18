@@ -21,12 +21,18 @@ import json
 import time
 import sqlite3
 import hashlib
+import secrets
 from collections import Counter
 import contextlib
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from PyQt6.QtCore import pyqtSlot, pyqtSignal, QObject, QThread, QTimer, Qt
+from PyQt6.QtCore import pyqtSlot, pyqtSignal, QObject, QTimer, Qt
 from PyQt6 import QtWidgets
 from ..api.config import SHARED_DB_URI
+from ..utils.qt_worker import _CallableThread
+from ..utils.text import truncate_log_details
+from .auto_workflow_helpers import extract_chapters_from_payload
 
 SNAPSHOT_STATUS_KEYS = ('pending', 'in_progress', 'failed', 'completed', 'held')
 SNAPSHOT_META_INT_KEYS = (
@@ -38,7 +44,6 @@ SNAPSHOT_META_INT_KEYS = (
     'recoverable_tasks',
     'saved_task_count',
 )
-MAX_LOG_DETAILS_CHARS = 16000
 UI_RAW_TEXT_PREVIEW_CHARS = 500
 
 
@@ -65,6 +70,28 @@ def build_queue_snapshot_meta(counts_by_status: dict, saved_at: float | None = N
         'recoverable_tasks': str(recoverable_tasks),
         'saved_task_count': str(saved_task_count),
     }
+
+
+def _write_compact_copy(conn: sqlite3.Connection, target_path: str) -> None:
+    """Пишет базу conn в target_path без пустых страниц и атомарно подменяет файл.
+
+    backup() переносит страницы как есть, вместе с освободившимися после
+    удаления задач, и снимок разрастается до пикового размера очереди. VACUUM
+    INTO пишет только живые данные. Прежний файл остаётся на месте, пока новый
+    не записан целиком.
+    """
+    temp_path = f"{target_path}.{secrets.token_hex(8)}.tmp"
+    try:
+        conn.execute("VACUUM INTO ?", (temp_path,))
+        # VACUUM INTO сам не делает fsync — так сказано в документации SQLite.
+        with open(temp_path, "rb+") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target_path)
+    finally:
+        try:
+            os.remove(temp_path)
+        except FileNotFoundError:
+            pass
 
 
 # --- Сжатие блобов переводов чанков (chunk_results.translated_content) ---
@@ -168,6 +195,56 @@ def _coerce_sort_number(value, default):
         return default
 
 
+QA_GATE_SCHEMA_VERSION = 1
+QA_OUTCOME_KINDS = frozenset({'completed', 'high_unresolved', 'deferred', 'cancelled'})
+
+
+@dataclass(frozen=True)
+class QaQueueOutcome:
+    """What quality control decided about one finished translation task."""
+
+    kind: str
+    chapter_ids: tuple = ()
+    reason: str = ''
+
+    def __post_init__(self):
+        if self.kind not in QA_OUTCOME_KINDS:
+            raise ValueError(f"Unsupported QA queue outcome: {self.kind}")
+        object.__setattr__(
+            self,
+            'chapter_ids',
+            tuple(dict.fromkeys(str(item) for item in self.chapter_ids if str(item).strip())),
+        )
+        object.__setattr__(self, 'reason', str(self.reason or '')[:500])
+
+    @classmethod
+    def completed(cls, chapter_ids=(), reason=''):
+        return cls('completed', tuple(chapter_ids), reason)
+
+    @classmethod
+    def high_unresolved(cls, chapter_ids=(), reason=''):
+        return cls('high_unresolved', tuple(chapter_ids), reason)
+
+    @classmethod
+    def deferred(cls, chapter_ids=(), reason=''):
+        return cls('deferred', tuple(chapter_ids), reason)
+
+    @classmethod
+    def cancelled(cls, chapter_ids=(), reason=''):
+        return cls('cancelled', tuple(chapter_ids), reason)
+
+
+@dataclass(frozen=True)
+class QaGateRecord:
+    """One unresolved high-risk quality finding for the review report."""
+
+    task_id: str
+    chapter_id: str
+    risk_level: str
+    reason: str
+    opened_at: str
+
+
 def _normalize_sort_key(priority, sequence):
     return (
         _coerce_sort_number(priority, SORT_NULL_PRIORITY),
@@ -188,6 +265,10 @@ class ChapterQueueManager(QObject):
     * Read: Мгновенные снапшоты (backup) в локальную память потока для UI,
       что обеспечивает неблокирующее чтение без конкуренции с воркерами.
     """
+
+    # Сколько ошибок фонового обновления кэша подряд терпим, прежде чем
+    # перестать перезапускать таймер самостоятельно (см. _recover_failed_worker).
+    _CACHE_UPDATE_MAX_CONSECUTIVE_FAILURES = 3
     
     _ui_update_requested = pyqtSignal()
     def __init__(self, event_bus=None, db_uri: str | None = None, main_connection=None):
@@ -220,6 +301,8 @@ class ChapterQueueManager(QObject):
         self._ui_state_list_cache = []
         self._is_updating_cache = False
         self._cache_update_worker = None
+        self._cache_failure_streak = 0
+        self._shut_down = False
 
         # Dirty-tracking state for active-session energy reduction.
         # _dirty_state_lock guards _dirty_task_ids and _structural_dirty only.
@@ -247,8 +330,32 @@ class ChapterQueueManager(QObject):
         # Воркер для фоновой очистки при завершении сессии
         self._cleanup_worker = None
         # Особый воркер для глоссария, чтобы не блокировать основной поток
-        self._glossary_cleanup_worker = None 
-       
+        self._glossary_cleanup_worker = None
+
+        # Виртуальные (memfs) копии исходных EPUB, созданные _normalize_payload
+        # для задач очереди. Без явного освобождения они живут в mem_fs до
+        # atexit — накапливаясь книга за книгой за весь сеанс приложения.
+        # Освобождаются в clear_all_queues(), где очередь опустошается целиком
+        # и без последующей вставки новых задач в том же вызове — момент, когда
+        # ни одна задача в БД больше не может ссылаться на эти пути.
+        #
+        # _virtual_epub_sources хранит virtual_path -> исходный реальный путь
+        # книги на диске (транзитивно, даже если копия снималась с уже
+        # виртуального пути — например, emerger нарезает главу на чанки из
+        # 'mem://…'). Эта запись НЕ стирается при освобождении: снимок общей
+        # очереди (AI-фиксер недоперевода) хранит уже нормализованный payload
+        # со СТАРЫМ виртуальным путём и восстанавливает его позже через
+        # add_pending_tasks -> _normalize_payload; без сохранённого реального
+        # пути такое повторное копирование было бы невозможно.
+        #
+        # _normalize_payload вызывается не только из GUI-потока — например,
+        # add_priority_tasks дёргается из воркера при разрезании главы на
+        # чанки (emerger_tasks.py) — поэтому оба словаря защищены одним
+        # замком с clear_all_queues/_release_tracked_virtual_epub_paths.
+        self._virtual_paths_lock = Lock()
+        self._active_virtual_epub_paths: set[str] = set()
+        self._virtual_epub_sources: dict[str, str] = {}
+
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(self._IDLE_UPDATE_INTERVAL_MS)
@@ -414,6 +521,26 @@ class ChapterQueueManager(QObject):
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_glossary_original ON glossary_results (original);")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS qa_gates (
+                    task_id TEXT NOT NULL,
+                    chapter_id TEXT NOT NULL,
+                    risk_level TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    opened_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    PRIMARY KEY (task_id, chapter_id)
+                );
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_qa_gates_unresolved"
+                " ON qa_gates (resolved_at, risk_level);"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_qa_gates_task ON qa_gates (task_id);")
+            current_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if current_version < QA_GATE_SCHEMA_VERSION:
+                conn.execute(f"PRAGMA user_version = {QA_GATE_SCHEMA_VERSION}")
     
     def clear_glossary_results(self):
         with self._get_write_conn() as conn:
@@ -426,15 +553,8 @@ class ChapterQueueManager(QObject):
             payload = {'message': message}
         details_text = payload.get('details_text')
         if isinstance(details_text, str):
-            payload['details_text'] = self._truncate_log_details(details_text)
+            payload['details_text'] = truncate_log_details(details_text)
         self._post_event('log_message', payload)
-
-    def _truncate_log_details(self, details_text: str) -> str:
-        normalized_text = details_text.strip()
-        if len(normalized_text) <= MAX_LOG_DETAILS_CHARS:
-            return normalized_text
-        omitted = len(normalized_text) - MAX_LOG_DETAILS_CHARS
-        return normalized_text[:MAX_LOG_DETAILS_CHARS].rstrip() + f"\n\n[details truncated: {omitted} chars omitted]"
 
     def _payload_for_ui(self, payload: tuple):
         if not isinstance(payload, tuple) or not payload:
@@ -545,26 +665,46 @@ class ChapterQueueManager(QObject):
         if len(payload_tuple) <= 1: return payload_tuple
         file_data = payload_tuple[1]
         virtual_path = None
+        source_path = file_data
         try:
-            if isinstance(file_data, str): virtual_path = os.copy_to_mem(file_data)
+            if isinstance(file_data, str):
+                virtual_path = os.copy_to_mem(source_path)
+                if not virtual_path:
+                    # source_path мог быть виртуальным путём, чью memfs-копию
+                    # уже освободил _release_tracked_virtual_epub_paths (см.
+                    # clear_all_queues) — copy_to_mem видит несуществующий
+                    # источник и возвращает None. Восстанавливаем копию из
+                    # запомненного исходного реального пути книги, иначе
+                    # снимок общей очереди фиксера восстановится с мёртвым
+                    # путём и упадёт при открытии файла.
+                    with self._virtual_paths_lock:
+                        fallback_source = self._virtual_epub_sources.get(source_path)
+                    if fallback_source and fallback_source != source_path:
+                        source_path = fallback_source
+                        virtual_path = os.copy_to_mem(source_path)
             elif isinstance(file_data, io.BytesIO):
                 file_data.seek(0)
                 virtual_path = os.write_bytes_to_mem(file_data.getvalue(), ".tmp")
-            if virtual_path: return (payload_tuple[0], virtual_path) + payload_tuple[2:]
+            if virtual_path:
+                with self._virtual_paths_lock:
+                    self._active_virtual_epub_paths.add(virtual_path)
+                    if isinstance(source_path, str):
+                        # Транзитивно указываем на исходный реальный путь: если
+                        # source_path сам уже был отслеженным виртуальным путём
+                        # (нарезка emerger'ом), унаследуем его реальный источник;
+                        # иначе source_path и есть реальный путь.
+                        self._virtual_epub_sources[virtual_path] = self._virtual_epub_sources.get(
+                            source_path, source_path
+                        )
+                    # Для BytesIO нет реального пути на диске — восстановить
+                    # такую копию после освобождения нечем, запись не заводим.
+                return (payload_tuple[0], virtual_path) + payload_tuple[2:]
         except AttributeError:
             self._log("[TaskManager WARN] Патч 'os' не применен. Файлы не будут виртуализированы.")
         return payload_tuple
 
     def _extract_chapters_from_payload(self, payload: tuple) -> list:
-        if not payload:
-            return []
-
-        task_type = payload[0]
-        if task_type in ('epub', 'epub_chunk') and len(payload) > 2:
-            return [payload[2]]
-        if task_type == 'epub_batch' and len(payload) > 2:
-            return list(payload[2])
-        return []
+        return extract_chapters_from_payload(payload)
 
     def _extract_save_targets_from_payload(self, payload: tuple) -> set[str] | None:
         if not payload or len(payload) <= 3 or not isinstance(payload[3], dict):
@@ -1542,8 +1682,181 @@ class ChapterQueueManager(QObject):
             conn.execute("DELETE FROM chunk_results")
             conn.execute("DELETE FROM task_errors")
             conn.execute("DELETE FROM tasks")
+        self._release_tracked_virtual_epub_paths()
         self._safe_request_ui_update()
-    
+
+    def _release_tracked_virtual_epub_paths(self) -> None:
+        """
+        Освобождает временные memfs-копии исходных EPUB, накопленные
+        _normalize_payload за время жизни очереди.
+
+        Вызывается там, где очередь только что опустошена целиком (без
+        последующей вставки новых задач в этом же вызове) — в этот момент ни
+        одна задача в БД больше не может ссылаться на отслеженные виртуальные
+        пути, так что их можно безопасно удалить, не дожидаясь выхода из
+        приложения (иначе они лежат в mem_fs до atexit — книга за книгой на
+        весь сеанс).
+
+        Само соответствие virtual_path -> реальный путь книги
+        (self._virtual_epub_sources) НЕ стирается: снимок общей очереди
+        (AI-фиксер недоперевода) хранит уже нормализованный payload со
+        старым виртуальным путём и восстановит его позже через
+        add_pending_tasks -> _normalize_payload, которому нужна эта запись,
+        чтобы пересоздать копию из настоящего файла книги.
+        """
+        with self._virtual_paths_lock:
+            if not self._active_virtual_epub_paths:
+                return
+            paths_to_release = tuple(self._active_virtual_epub_paths)
+            self._active_virtual_epub_paths.clear()
+        for virtual_path in paths_to_release:
+            try:
+                os.remove(virtual_path)
+            except Exception as exc:
+                # Патч 'os' может быть не применён (тогда это обычный
+                # os.remove без поддержки mem://), путь уже мог быть удалён
+                # другим путём, либо это вообще не memfs-путь — ни один из
+                # этих случаев не должен ронять очистку очереди, но след для
+                # отладки утечки стоит оставить.
+                self._log(f"[TaskManager DEBUG] Не удалось освободить memfs-копию {virtual_path}: {exc}")
+
+    def schema_has_table(self, table_name: str) -> bool:
+        """Report whether one table exists in the task database."""
+        rows = self._execute_light_read(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (str(table_name),),
+        )
+        return bool(rows)
+
+    @property
+    def schema_version(self) -> int:
+        """Return the migration version stamped on the task database."""
+        rows = self._execute_light_read("PRAGMA user_version")
+        return int(rows[0][0]) if rows else 0
+
+    def mark_task_qa_pending(self, task_id, chapter_ids=()) -> None:
+        """Hold a finished translation task until its quality check resolves."""
+        del chapter_ids  # Chapter identities travel with the outcome, not the hold.
+        info = self.update_task(task_id, new_status='qa_pending')
+        if info:
+            self.notify_task_dirty(task_id)
+
+    def resolve_task_qa(self, task_id, outcome) -> None:
+        """Apply one quality outcome to the queue, idempotently and atomically."""
+        if not isinstance(outcome, QaQueueOutcome):
+            raise TypeError("outcome must be a QaQueueOutcome")
+        if outcome.kind == 'high_unresolved':
+            for chapter_id in outcome.chapter_ids or ('unknown',):
+                self.open_qa_gate(task_id, chapter_id, outcome.reason, risk_level='high')
+            new_status = 'completed'
+        elif outcome.kind == 'cancelled':
+            new_status = 'qa_pending'
+        else:
+            for chapter_id in outcome.chapter_ids:
+                self.close_qa_gate(task_id, chapter_id, resolution=outcome.kind)
+            new_status = 'completed'
+        info = self.update_task(task_id, new_status=new_status)
+        if info:
+            self.notify_task_dirty(task_id)
+
+    def open_qa_gate(self, task_id, chapter_id: str, reason: str = '', risk_level: str = 'high') -> None:
+        """Open (or reopen) one unresolved quality gate for a chapter."""
+        with self._get_write_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO qa_gates (task_id, chapter_id, risk_level, reason, opened_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, chapter_id) DO UPDATE SET
+                    risk_level = excluded.risk_level,
+                    reason = excluded.reason,
+                    resolved_at = NULL,
+                    resolution = NULL
+                """,
+                (
+                    str(task_id),
+                    str(chapter_id),
+                    str(risk_level or 'high'),
+                    str(reason or '')[:500],
+                    datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                ),
+            )
+        self.notify_structural_change()
+
+    def close_qa_gate(self, task_id, chapter_id: str, resolution: str = 'resolved') -> None:
+        """Resolve one quality finding in the chapter report."""
+        with self._get_write_conn() as conn:
+            conn.execute(
+                "UPDATE qa_gates SET resolved_at = ?, resolution = ?"
+                " WHERE task_id = ? AND chapter_id = ? AND resolved_at IS NULL",
+                (
+                    datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    str(resolution or 'resolved')[:120],
+                    str(task_id),
+                    str(chapter_id),
+                ),
+            )
+        self.notify_structural_change()
+
+    def get_open_qa_gates(self) -> list:
+        """Return every unresolved quality gate, oldest first."""
+        rows = self._execute_light_read(
+            "SELECT task_id, chapter_id, risk_level, reason, opened_at FROM qa_gates"
+            " WHERE resolved_at IS NULL ORDER BY opened_at ASC, chapter_id ASC"
+        )
+        return [
+            QaGateRecord(
+                task_id=row['task_id'],
+                chapter_id=row['chapter_id'],
+                risk_level=row['risk_level'],
+                reason=row['reason'],
+                opened_at=row['opened_at'],
+            )
+            for row in rows
+        ]
+
+    def get_qa_pending_tasks(self) -> list:
+        """Return tasks whose quality check never finished, oldest first.
+
+        After a restart these are the only tasks whose QA is still owed; the
+        payload carries the chapters, so nothing extra has to be persisted.
+        """
+
+        rows = self._execute_light_read(
+            "SELECT task_id, payload FROM tasks WHERE status = 'qa_pending'"
+            " ORDER BY priority DESC, sequence ASC"
+        )
+        pending = []
+        for row in rows:
+            try:
+                payload = json.loads(row['payload'], object_hook=tuple_deserializer)
+            except (TypeError, ValueError):
+                continue
+            pending.append((row['task_id'], payload))
+        return pending
+
+    def has_blocking_qa_gate(self) -> bool:
+        """Report unresolved high QA risk for the session summary."""
+        return bool(
+            self._execute_light_read(
+                "SELECT 1 FROM qa_gates WHERE resolved_at IS NULL"
+                " AND risk_level = 'high' LIMIT 1"
+            )
+        )
+
+    def _has_managed_session_active(self) -> bool:
+        """Есть ли активная управляемая сессия (см. EventBus.has_managed_session_active).
+
+        Единая точка для предиката, ранее вручную скопированного в
+        is_finished и has_pending_tasks (core-a/design/1-managed-session-scan-4x).
+        Только канонический метод EventBus: заглушки шины без него считаются
+        «не управляемым режимом» (запасной ручной скан _data_store был бы
+        ещё одной копией предиката).
+        """
+        predicate = getattr(self.bus, 'has_managed_session_active', None)
+        if predicate is None:
+            return False
+        return predicate() is True
+
     def is_finished(self) -> bool:
         """
         Главный критерий завершения сессии.
@@ -1552,13 +1865,8 @@ class ChapterQueueManager(QObject):
         Возвращает True, только если работы нет НИГДЕ.
         """
         # 1. Проверка флага управляемой сессии (в памяти)
-        is_managed_active = False
-        if self.bus and hasattr(self.bus, '_data_store'):
-            for key in self.bus._data_store.keys():
-                if key.startswith('managed_session_active_') and self.bus.get_data(key) is True:
-                    is_managed_active = True
-                    break
-        
+        is_managed_active = self._has_managed_session_active()
+
         # Если мы в управляемом режиме — мы НЕ закончили, пока флаг висит.
         # Даже если в базе пусто (оркестратор готовит следующую задачу).
         if is_managed_active:
@@ -1567,8 +1875,13 @@ class ChapterQueueManager(QObject):
         # 2. Проверка базы данных (только если флага нет)
         # Игнорируем 'held', так как в обычном режиме это остатки Dry Run,
         # а в управляемом мы бы вышли выше по флагу.
-        rows = self._execute_light_read("SELECT 1 FROM tasks WHERE status IN ('pending', 'in_progress') LIMIT 1")
-        return not rows
+        rows = self._execute_light_read(
+            "SELECT 1 FROM tasks WHERE status IN ('pending', 'in_progress', 'qa_pending') LIMIT 1"
+        )
+        if not rows:
+            return True
+
+        return False
 
     # --- НАЧАЛО ВОССТАНОВЛЕННОГО БЛОКА КЭШИРОВАНИЯ ---
     @pyqtSlot()
@@ -1577,7 +1890,49 @@ class ChapterQueueManager(QObject):
         СЛОТ, который выполняется в ГЛАВНОМ потоке.
         Безопасно запускает таймер для отложенного обновления кэша.
         """
+        if getattr(self, "_shut_down", False):
+            return
         self._update_timer.start()
+
+    @property
+    def is_shut_down(self) -> bool:
+        return bool(getattr(self, "_shut_down", False))
+
+    def shutdown(self, wait_ms: int = 5000) -> None:
+        """Штатно выключить фоновое обновление кэша перед закрытием БД.
+
+        Останавливает таймер, дожидается работающего TaskDBWorker и запрещает
+        новые обновления: после этого закрывать соединение-якорь безопасно —
+        ни один поток больше не полезет в базу. Идемпотентно."""
+        self._shut_down = True
+        try:
+            self._update_timer.stop()
+        except RuntimeError:
+            pass  # C++-объект таймера уже удалён вместе с менеджером
+        workers = [self._cache_update_worker]
+        self._cache_update_worker = None
+        self._is_updating_cache = False
+        self._in_flight_snapshot = None
+        # Воркеры очистки сессии/глоссария и всё, что ещё числится в реестре
+        # с методом ЭТОГО менеджера в качестве цели: финиш redirect-прогона
+        # закрывает БД сразу после session_finished, пока
+        # _handle_session_finished_background ещё работает.
+        workers.append(getattr(self, "_cleanup_worker", None))
+        workers.append(getattr(self, "_glossary_cleanup_worker", None))
+        for candidate in list(TaskDBWorker._inflight):
+            target = getattr(candidate, "target_func", None)
+            if getattr(target, "__self__", None) is self:
+                workers.append(candidate)
+        seen = set()
+        for worker in workers:
+            if worker is None or id(worker) in seen:
+                continue
+            seen.add(id(worker))
+            try:
+                worker.wait(wait_ms)
+            except RuntimeError:
+                pass
+            TaskDBWorker._inflight.discard(worker)
     
     def notify_task_dirty(self, task_id):
         """Mark a single task as dirty. Thread-safe: callable from worker threads.
@@ -1607,7 +1962,7 @@ class ChapterQueueManager(QObject):
         Snapshots the dirty state under lock, resets it, and hands the snapshot
         to the worker. _in_flight_snapshot keeps the snapshot retrievable so
         _on_cache_updated can restore the dirty ids on worker failure."""
-        if self._is_updating_cache:
+        if self._is_updating_cache or getattr(self, "_shut_down", False):
             return
         with self._dirty_state_lock:
             snapshot = {
@@ -1619,9 +1974,17 @@ class ChapterQueueManager(QObject):
         self._in_flight_snapshot = snapshot
         self._is_updating_cache = True
         worker = TaskDBWorker(self._get_ui_state_list_background, snapshot)
-        worker.finished.connect(lambda: self._on_cache_updated(worker))
+        # Связанный метод (а не лямбда): Qt привязывает соединение к получателю,
+        # и после удаления менеджера сигнал уже никуда не доставляется.
+        worker.finished.connect(self._on_cache_worker_finished)
         self._cache_update_worker = worker
         worker.start()
+
+    def _on_cache_worker_finished(self):
+        worker = self._cache_update_worker
+        if worker is None:
+            return
+        self._on_cache_updated(worker)
 
     def get_ui_state_list(self) -> list:
         """Основной метод для UI. Возвращает кэш."""
@@ -1690,6 +2053,7 @@ class ChapterQueueManager(QObject):
             })
 
         self._last_cache_update_ns = time.monotonic_ns()
+        self._cache_failure_streak = 0
         self._is_updating_cache = False
         self._cache_update_worker = None
         self._in_flight_snapshot = None
@@ -1703,6 +2067,25 @@ class ChapterQueueManager(QObject):
             if snapshot:
                 for tid in snapshot["ids"]:
                     self._dirty_task_ids.add(tid)
+        streak = getattr(self, "_cache_failure_streak", 0) + 1
+        self._cache_failure_streak = streak
+        limit = getattr(
+            self,
+            "_CACHE_UPDATE_MAX_CONSECUTIVE_FAILURES",
+            ChapterQueueManager._CACHE_UPDATE_MAX_CONSECUTIVE_FAILURES,
+        )
+        if streak >= limit:
+            # Сломанная БД (файл пропал, in-memory база закрыта): без предела
+            # ретраев менеджер крутил бы таймер → воркер → ошибка каждые 100 мс.
+            # Dirty-состояние сохранено — следующий notify_* запустит новую попытку.
+            if streak == limit:
+                print(
+                    "[TaskManager] Обновление кэша задач приостановлено после "
+                    f"{streak} ошибок подряд; возобновится при следующем изменении очереди."
+                )
+            return
+        if getattr(self, "_shut_down", False):
+            return
         self._update_timer.start()
 
     def _restart_timer_if_dirty(self):
@@ -1714,7 +2097,7 @@ class ChapterQueueManager(QObject):
         not spin continuously and overheat the CPU."""
         with self._dirty_state_lock:
             needs_followup = bool(self._dirty_task_ids) or self._structural_dirty
-        if not needs_followup:
+        if not needs_followup or getattr(self, "_shut_down", False):
             return
         if self._session_active:
             elapsed_ns = time.monotonic_ns() - self._last_cache_update_ns
@@ -1932,7 +2315,7 @@ class ChapterQueueManager(QObject):
         
         # --- ИСПОЛЬЗУЕМ СОХРАНЕННОЕ ЗНАЧЕНИЕ СНАРУЖИ ---
         if rowcount > 0:
-            self._log(f"[TASK] స్త 'Заморожено' {rowcount} задач.")
+            self._log(f"[TASK] ❄️ 'Заморожено' {rowcount} задач.")
             self._safe_request_ui_update()
             
         return rowcount
@@ -2133,22 +2516,6 @@ class ChapterQueueManager(QObject):
         self._safe_request_ui_update()
         return True
     
-    def update_many(self, task_ids: list[uuid.UUID], new_status: str = None, new_priority: int = None):
-        if not task_ids: return
-        task_id_strs = [str(tid) for tid in task_ids]
-        updates, params = [], []
-        if new_status is not None: updates.append("status = ?"); params.append(new_status)
-        if new_priority is not None: updates.append("priority = ?"); params.append(new_priority)
-        if not updates: return
-        placeholders = ','.join('?' for _ in task_id_strs)
-        query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id IN ({placeholders})"
-        final_params = tuple(params + task_id_strs)
-        
-        with self._get_write_conn() as conn:
-            conn.execute(query, final_params)
-        
-        self._safe_request_ui_update()
-
     def has_pending_tasks(self) -> bool:
         """
         Проверяет, есть ли задачи в очереди или активна ли управляемая сессия.
@@ -2158,12 +2525,9 @@ class ChapterQueueManager(QObject):
             return True
         
         # Если в БД задач нет, проверяем флаг управляемой сессии в шине событий
-        if self.bus and hasattr(self.bus, '_data_store'):
-            # Ищем любой ключ, начинающийся с 'managed_session_active_'
-            for key in self.bus._data_store.keys():
-                if key.startswith('managed_session_active_') and self.bus.get_data(key) is True:
-                    return True
-        
+        if self._has_managed_session_active():
+            return True
+
         return False
     
     def get_first_pending_task_payload(self) -> tuple | None:
@@ -2212,7 +2576,7 @@ class ChapterQueueManager(QObject):
         
         # 3. Отправляем сигнал и лог ТОЛЬКО если что-то изменилось
         if updated_count > 0:
-            self._log(f"[TASK] స్త 'Заморожено' {updated_count} задач для пробного запуска.")
+            self._log(f"[TASK] ❄️ 'Заморожено' {updated_count} задач для пробного запуска.")
             self._safe_request_ui_update()
     
     def get_all_pending_tasks(self) -> list[tuple]:
@@ -2555,22 +2919,8 @@ class ChapterQueueManager(QObject):
             # ВАЖНО: Фиксируем изменения в клоне перед отправкой
             snapshot_conn.commit()
             
-            # 3. Сбрасываем модифицированный клон на диск
-            if os.path.exists(snapshot_path):
-                try:
-                    os.remove(snapshot_path)
-                except OSError:
-                    pass # Если файл занят, connect ниже выбросит ошибку, это ок
-            
-            # Подключаемся к файлу на диске
-            disk_conn = sqlite3.connect(snapshot_path)
-            
-            try:
-                # ВАЖНО: Выполняем backup БЕЗ обертки 'with disk_conn'.
-                # API бэкапа само управляет блокировками.
-                snapshot_conn.backup(disk_conn)
-            finally:
-                disk_conn.close()
+            # 3. Сбрасываем модифицированный клон на диск: компактно и атомарно
+            _write_compact_copy(snapshot_conn, snapshot_path)
                 
             if not quiet:
                 self._log(f"[DB] 💾 Очередь задач сохранена в '{os.path.basename(snapshot_path)}'.")
@@ -2755,17 +3105,46 @@ class ChapterQueueManager(QObject):
         finally:
             if disk_conn: disk_conn.close()
 
-class TaskDBWorker(QThread):
+class TaskDBWorker(_CallableThread):
+    """Фоновый поток для чтения БД очереди.
+
+    Пока поток работает, объект удерживается реестром класса (см. ``start``):
+    иначе менеджер, собранный сборщиком мусора с живым воркером, утянул бы за
+    собой и C++-объект QThread («Destroyed while thread is still running»)."""
+
+    _inflight: set = set()
+
     def __init__(self, target_func, *args, **kwargs):
         super().__init__()
         self.target_func = target_func
         self.args = args
         self.kwargs = kwargs
         self.result = None
+        self._registered = False
 
-    def run(self):
-        try:
-            self.result = self.target_func(*self.args, **self.kwargs)
-        except Exception as e:
-            print(f"[CRITICAL DB WORKER ERROR] Ошибка в фоновой задаче: {e}")
-            self.result = None
+    @classmethod
+    def inflight(cls) -> frozenset:
+        return frozenset(cls._inflight)
+
+    def start(self, *args, **kwargs):
+        if not self._registered:
+            self._registered = True
+            TaskDBWorker._inflight.add(self)
+            self.finished.connect(self._release)
+        super().start(*args, **kwargs)
+
+    def _release(self):
+        # finished доставляется очередью в поток-владелец уже после выхода из run();
+        # wait() здесь мгновенный и гарантирует, что ОС-поток присоединён.
+        self.wait(5000)
+        TaskDBWorker._inflight.discard(self)
+
+    def _call(self):
+        return self.target_func(*self.args, **self.kwargs)
+
+    def _on_success(self, result):
+        self.result = result
+
+    def _on_error(self, exc):
+        print(f"[CRITICAL DB WORKER ERROR] Ошибка в фоновой задаче: {exc}")
+        self.result = None

@@ -1,13 +1,14 @@
 import aiohttp
 import asyncio
-import json
 import time
 from ..base import BaseApiHandler
 from ..errors import (
-    ContentFilterError, NetworkError, LocationBlockedError, 
-    RateLimitExceededError, ModelNotFoundError, ValidationFailedError, 
+    ContentFilterError, NetworkError, LocationBlockedError,
+    RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
     TemporaryRateLimitError, PartialGenerationError
 )
+from . import _deepseek_common
+from ._sse_stream import SSEStreamInterrupted, parse_openai_compatible_sse_stream
 
 class DeepseekApiHandler(BaseApiHandler):
     """
@@ -16,40 +17,8 @@ class DeepseekApiHandler(BaseApiHandler):
 
     def _apply_deepseek_thinking_options(self, payload):
         model_config = self.worker.model_config if isinstance(self.worker.model_config, dict) else {}
-        configured_mode = str(model_config.get("deepseek_thinking") or "").strip().lower()
-        has_thinking_config = "thinkingLevel" in model_config or "min_thinking_budget" in model_config
-        supports_thinking = (
-            configured_mode in {"enabled", "disabled"}
-            or model_config.get("thinkingLevel") is not None
-            or (has_thinking_config and model_config.get("min_thinking_budget") is not False)
-        )
-        if not supports_thinking:
-            return
+        _deepseek_common.build_deepseek_thinking_options(payload, model_config, self.worker)
 
-        if configured_mode in {"enabled", "disabled"}:
-            thinking_enabled = configured_mode == "enabled"
-        else:
-            thinking_enabled = bool(getattr(self.worker, "thinking_enabled", False))
-
-        payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
-        if not thinking_enabled:
-            return
-
-        effort = (
-            getattr(self.worker, "thinking_level", None)
-            or model_config.get("default_reasoning_effort")
-            or model_config.get("min_thinking_budget")
-            or "high"
-        )
-        effort = str(effort).strip().lower()
-        if effort in {"max", "xhigh"}:
-            payload["reasoning_effort"] = "max"
-        else:
-            payload["reasoning_effort"] = "high"
-
-        # DeepSeek ignores sampling params in thinking mode; removing them keeps debug payloads honest.
-        payload.pop("temperature", None)
-    
     def setup_client(self, client_override=None, proxy_settings=None):
         super().setup_client(client_override, proxy_settings)
 
@@ -96,6 +65,10 @@ class DeepseekApiHandler(BaseApiHandler):
             "messages": messages,
             "stream": use_stream
         }
+        if use_stream and self.worker.provider_config.get("stream_usage"):
+            # Without this an OpenAI-compatible stream never says what it billed;
+            # with it the usage arrives in a last chunk with empty choices.
+            payload["stream_options"] = {"include_usage": True}
         temperature = self._temperature_payload_value()
         if temperature is not None:
             payload["temperature"] = temperature
@@ -116,11 +89,11 @@ class DeepseekApiHandler(BaseApiHandler):
             extra={"use_stream": use_stream, "allow_incomplete": allow_incomplete},
         )
 
-        # Цикл попыток на случай перегрузки серверов DeepSeek (503)
-        max_retries = 3
+        # Повторы при перегрузке серверов DeepSeek (503 здесь не редкость).
+        # Сама политика — в BaseApiHandler, общая с NVIDIA и OpenModel.
         retry_count = 0
 
-        while retry_count < max_retries:
+        while True:
             try:
                 async with session.post(self.base_url, headers=headers, json=payload) as response:
                     
@@ -134,16 +107,17 @@ class DeepseekApiHandler(BaseApiHandler):
                             extra={"http_status": response.status, "mode": "error"},
                         )
                         
-                        # Обработка перегрузки (API DeepSeek часто выдает 503 при высокой нагрузке)
-                        if response.status in [500, 502, 503]:
-                            wait_time = 15.0 * (retry_count + 1)
-                            log_msg = f"⏳ Сервер DeepSeek перегружен ({response.status}). Ждем {wait_time}с перед повтором."
-                            self.worker._post_event('log_message', {'message': log_msg})
-                            
-                            await asyncio.sleep(wait_time)
-                            retry_count += 1
-                            continue
-                        
+                        if self._is_server_overload_status(response.status):
+                            if await self._retry_after_server_overload(
+                                response.status, retry_count + 1, "DeepSeek"
+                            ):
+                                retry_count += 1
+                                continue
+                            raise NetworkError(
+                                "Не удалось получить ответ от DeepSeek из-за перегрузки серверов (Retry Limit).",
+                                delay_seconds=30,
+                            )
+
                         # Стандартные ошибки
                         if response.status == 401:
                             raise RateLimitExceededError(f"Неверный токен (…{self.worker.api_key[-4:]}) DeepSeek.")
@@ -174,42 +148,18 @@ class DeepseekApiHandler(BaseApiHandler):
                     
                     # Ветка А: СТРИМИНГ
                     if use_stream:
-                        collected_text = ""
-                        finish_reason = None
-                        raw_stream_lines = [] if (self._has_debug_trace() or debug) else None
-                        
                         try:
-                            async for line in response.content:
-                                line_str = line.decode('utf-8').strip()
-                                if raw_stream_lines is not None:
-                                    raw_stream_lines.append(line_str)
-                                if not line_str or line_str == 'data: [DONE]': 
-                                    continue
-                                
-                                if line_str.startswith('data: '):
-                                    json_str = line_str[6:]
-                                    try:
-                                        chunk = json.loads(json_str)
-                                        if 'choices' in chunk and chunk['choices']:
-                                            delta = chunk['choices'][0].get('delta', {})
-                                            content_part = delta.get('content', '')
-                                            if content_part:
-                                                collected_text += content_part
-                                            
-                                            f_reason = chunk['choices'][0].get('finish_reason')
-                                            if f_reason:
-                                                finish_reason = f_reason
-                                    except json.JSONDecodeError:
-                                        continue
-                        
-                        except Exception as stream_e:
-                            if collected_text:
-                                raise PartialGenerationError(
-                                    f"Обрыв стрима DeepSeek: {stream_e}", 
-                                    partial_text=collected_text,
-                                    reason="NETWORK_ERROR"
-                                )
-                            raise stream_e
+                            collected_text, finish_reason, raw_stream_lines = await parse_openai_compatible_sse_stream(
+                                response,
+                                capture_raw=(self._has_debug_trace() or debug),
+                                on_usage=self._remember_openai_usage,
+                            )
+                        except SSEStreamInterrupted as interrupted:
+                            raise PartialGenerationError(
+                                f"Обрыв стрима DeepSeek: {interrupted.original_error}",
+                                partial_text=interrupted.partial_text,
+                                reason="NETWORK_ERROR"
+                            ) from interrupted.original_error
 
                         if raw_stream_lines is not None:
                             self._debug_record_response(
@@ -237,6 +187,8 @@ class DeepseekApiHandler(BaseApiHandler):
                             status="http_200",
                             extra={"mode": "full", "http_status": response.status},
                         )
+                        # An answer cut by the length limit is billed as well.
+                        self._remember_openai_usage(result.get("usage"))
                         if 'choices' in result and result['choices']:
                             choice = result['choices'][0]
                             content = choice['message']['content']
@@ -275,5 +227,3 @@ class DeepseekApiHandler(BaseApiHandler):
                 import traceback
                 traceback.print_exc()
                 raise Exception(f"Критическая ошибка DeepSeek: {e}")
-        
-        raise NetworkError("Не удалось получить ответ от DeepSeek из-за перегрузки серверов (Retry Limit).", delay_seconds=30)

@@ -9,17 +9,21 @@
 # ---------------------------------------------------------------------------
 
 import os
+import posixpath
 import re
 import uuid
 import mimetypes
 import zipfile
+import zlib
 import html as html_lib
+from urllib.parse import unquote
 from xml.etree import ElementTree as ET
 from PyQt6.QtCore import Qt
 from defusedxml import ElementTree as SafeET
 
 from ..api import config as api_config
 from .helpers import estimate_gemini_tokens
+from .html_text import extract_visible_text_normalized
 
 EPUB_HEADING_TAGS = ("h1", "h2", "h3")
 CHAPTER_SIZE_CACHE_METRIC = "gemini_input_tokens"
@@ -77,7 +81,10 @@ def _extract_first_epub_heading_text_regex(html_content, include_title=False):
         tag_names.append("title")
 
     for tag_name in tag_names:
-        pattern = rf"<{tag_name}\b[^>]*>(.*?)</{tag_name}>"
+        # \s* перед ">" в закрывающем теге: HTML5 допускает пробелы там
+        # (`</h1 >`), и такой заголовок должен находиться так же, как его
+        # находит BS4-путь extract_first_epub_heading_text.
+        pattern = rf"<{tag_name}\b[^>]*>(.*?)</{tag_name}\s*>"
         match = re.search(pattern, str(html_content or ""), re.IGNORECASE | re.DOTALL)
         if not match:
             continue
@@ -338,7 +345,19 @@ class EpubUpdater:
 
         # --- Шаг 2: Чтение и модификация файлов в памяти ---
         modified_files = {}
-        
+
+        # Все переименования — одним скомпилированным регэкспом за один проход по файлу.
+        # Раньше на каждый файл архива перебирались все переименования (O(глав² × размер главы)):
+        # экспорт книги в 1000 глав блокировал интерфейс на ~12 секунд.
+        rename_pattern = None
+        if filename_replacement_map:
+            rename_pattern = re.compile(
+                "|".join(
+                    re.escape(old_name)
+                    for old_name in sorted(filename_replacement_map, key=len, reverse=True)
+                )
+            )
+
         with zipfile.ZipFile(self.original_epub_path, 'r') as original_zip:
             
             # Список всех файлов для поиска TOC
@@ -356,9 +375,11 @@ class EpubUpdater:
                     is_modified = False
                     
                     # 2.1 Глобальная замена имен файлов (для ссылок)
-                    for old_name, new_name in filename_replacement_map.items():
-                        if old_name in content_str:
-                            content_str = content_str.replace(old_name, new_name)
+                    if rename_pattern is not None:
+                        content_str, replaced_count = rename_pattern.subn(
+                            lambda match: filename_replacement_map[match.group(0)], content_str
+                        )
+                        if replaced_count:
                             is_modified = True
                     
                     # 2.2 Обновление TOC (NCX) и NAV (XHTML)
@@ -684,52 +705,161 @@ def get_epub_chapter_order(epub_path, return_method=False):
         print(f"[ERROR] Критическая ошибка при чтении порядка глав из {epub_path}: {e}")
         return ([], 'error') if return_method else []
 
+
+def find_opf_path(zip_file):
+    """
+    Определяет путь к content.opf внутри открытого EPUB (zipfile.ZipFile).
+
+    Сначала читает META-INF/container.xml и берёт full-path объявленного
+    там rootfile (источник истины по спецификации EPUB). full-path — это
+    IRI и может быть процентно-кодирован (например, 'OEBPS/My%20Book.opf'):
+    если сырое значение отсутствует в архиве, но раскодированное (unquote)
+    присутствует — возвращается раскодированное; иначе возвращается сырое
+    значение как есть (без гарантии, что оно существует в архиве).
+
+    Если container.xml отсутствует, повреждён или не содержит корректный
+    full-path — ищет любой файл с расширением .opf (регистронезависимо) по
+    всему архиву. Если таких файлов несколько (например, случайно
+    попавшая в архив резервная копия), детерминированно выбирает файл с
+    наименьшей глубиной вложенности (ближе к корню архива; при равенстве —
+    по алфавиту) и печатает предупреждение о неоднозначности, вместо
+    молчаливого выбора первого попавшегося в порядке namelist().
+
+    Поднимает FileNotFoundError, если OPF-файл не найден ни одним способом.
+    """
+    try:
+        container_content = zip_file.read("META-INF/container.xml")
+        container_root = SafeET.fromstring(container_content)
+        for elem in container_root.iter():
+            if elem.tag.endswith("rootfile"):
+                full_path = elem.attrib.get("full-path")
+                if full_path:
+                    if full_path in zip_file.namelist():
+                        return full_path
+                    decoded_full_path = unquote(full_path)
+                    if decoded_full_path in zip_file.namelist():
+                        return decoded_full_path
+                    return full_path
+    except Exception:
+        pass
+
+    candidates = [name for name in zip_file.namelist() if name.lower().endswith(".opf")]
+    if not candidates:
+        raise FileNotFoundError("Не удалось найти OPF-файл (content.opf) внутри EPUB.")
+
+    if len(candidates) > 1:
+        candidates.sort(key=lambda name: (name.count("/"), name))
+        print(
+            "[WARN] Найдено несколько .opf-файлов без валидного container.xml: "
+            f"{candidates}. Выбран ближайший к корню архива: {candidates[0]}."
+        )
+        return candidates[0]
+
+    return candidates[0]
+
+
+def parse_opf_package(zip_file):
+    """
+    Разбирает OPF-пакет найденного (через find_opf_path) EPUB.
+
+    Возвращает кортеж (opf_path, opf_dir, manifest, spine_idrefs):
+      - opf_path: путь к OPF-файлу внутри архива;
+      - opf_dir: директория OPF-файла внутри архива (posixpath);
+      - manifest: словарь {id: href}, href раскодирован через unquote(),
+        но ещё НЕ приведён к пути внутри zip (это делает
+        resolve_manifest_href_to_zip_path, т.к. href задан относительно
+        opf_dir);
+      - spine_idrefs: список idref в порядке элементов <spine>.
+    """
+    opf_path = find_opf_path(zip_file)
+    opf_dir = posixpath.dirname(opf_path)
+    opf_content = zip_file.read(opf_path)
+    opf_root = SafeET.fromstring(opf_content)
+    opf_ns = {'opf': 'http://www.idpf.org/2007/opf'}
+
+    manifest = {}
+    for item in opf_root.findall('.//opf:manifest/opf:item', opf_ns):
+        item_id = item.attrib.get('id')
+        href = item.attrib.get('href')
+        if item_id and href:
+            manifest[item_id] = unquote(href)
+
+    spine_idrefs = []
+    for itemref in opf_root.findall('.//opf:spine/opf:itemref', opf_ns):
+        idref = itemref.attrib.get('idref')
+        if idref:
+            spine_idrefs.append(idref)
+
+    return opf_path, opf_dir, manifest, spine_idrefs
+
+
+def resolve_manifest_href_to_zip_path(zip_file, opf_dir, href):
+    """
+    Строит путь внутри zip для href из OPF-манифеста, заданного относительно
+    opf_dir: приводит обратные слэши к прямым и схлопывает '..'/'.' через
+    posixpath-семантику (а не os.path.join, который на Windows дал бы
+    обратные слэши). Если получившийся путь отсутствует в архиве — пробует
+    найти запись, оканчивающуюся тем же basename (фолбэк для архивов с
+    неточными относительными путями).
+
+    Возвращает путь внутри zip либо None, если ничего не подошло.
+    """
+    normalized_href = href.replace("\\", "/")
+    full_path = posixpath.join(opf_dir, normalized_href) if opf_dir else normalized_href
+
+    parts = full_path.split("/")
+    resolved_parts = []
+    for part in parts:
+        if part == "..":
+            if resolved_parts:
+                resolved_parts.pop()
+        elif part not in ("", "."):
+            resolved_parts.append(part)
+    clean_path = "/".join(resolved_parts)
+
+    namelist = zip_file.namelist()
+    if clean_path in namelist:
+        return clean_path
+
+    basename = posixpath.basename(clean_path)
+    if basename:
+        for name in namelist:
+            if name.endswith(basename):
+                return name
+
+    return None
+
+
+def read_spine_html_order(zip_file):
+    """
+    Каноническая функция порядка html-файлов по OPF spine. Используется и
+    epub_tools._get_spine_order_from_zip, и
+    ui.dialogs.rulate_export.SimpleEpubReader.get_ordered_html_files —
+    вместо двух независимых реализаций одного и того же разбора.
+    """
+    opf_path, opf_dir, manifest, spine_idrefs = parse_opf_package(zip_file)
+
+    ordered_files = []
+    for idref in spine_idrefs:
+        href = manifest.get(idref)
+        if href is None:
+            continue
+        resolved = resolve_manifest_href_to_zip_path(zip_file, opf_dir, href)
+        if resolved is not None:
+            ordered_files.append(resolved)
+
+    return ordered_files
+
+
 def _get_spine_order_from_zip(epub_zip_file):
     """Внутренняя функция для извлечения порядка из открытого zip-файла."""
     try:
-        opf_path = None
-        opf_files = [f for f in epub_zip_file.namelist() if f.lower().endswith('.opf')]
-        
-        if len(opf_files) == 1:
-            opf_path = opf_files[0]
-        elif len(opf_files) > 1:
-            container_content = epub_zip_file.read('META-INF/container.xml')
-            root = SafeET.fromstring(container_content)
-            ns = {'cn': 'urn:oasis:names:tc:opendocument:xmlns:container'}
-            opf_path = root.find('.//cn:rootfile', ns).attrib['full-path']
-        
-        if not opf_path:
-            raise FileNotFoundError("OPF файл не найден.")
-
-        opf_dir = os.path.dirname(opf_path)
-        opf_content = epub_zip_file.read(opf_path)
-        opf_root = SafeET.fromstring(opf_content)
-        opf_ns = {'opf': 'http://www.idpf.org/2007/opf'}
-
-        manifest_items = {}
-        for item in opf_root.findall('.//opf:manifest/opf:item', opf_ns):
-            item_id = item.attrib.get('id')
-            href = item.attrib.get('href')
-            if item_id and href:
-                full_href = os.path.join(opf_dir, href)
-                manifest_items[item_id] = full_href
-
-        spine_order = []
-        for itemref in opf_root.findall('.//opf:spine/opf:itemref', opf_ns):
-            idref = itemref.attrib.get('idref')
-            if idref in manifest_items:
-                spine_order.append(manifest_items[idref])
-        
-        return spine_order
+        return read_spine_html_order(epub_zip_file)
     except (KeyError, ET.ParseError, FileNotFoundError, AttributeError) as e:
         print(f"[WARN] Не удалось прочитать spine из EPUB: {e}.")
         return None
-    
-    
-    
-    
-    
-    
+
+
 def calculate_potential_output_size(html_content, is_cjk):
     """
     Вычисляет потенциальный размер ответа модели на основе содержимого HTML.
@@ -803,15 +933,30 @@ def get_epub_chapter_sizes_with_cache(
         
         # Получаем список файлов внутри
         with zipfile.ZipFile(epub_path, 'r') as zf:
-            # Собираем список файлов и их сжатых размеров для контрольной суммы
+            # Собираем список файлов, их размеров и CRC32 содержимого для контрольной суммы.
+            # CRC32 берём из самого ZipInfo (он уже посчитан для каждой записи архива),
+            # поэтому чтение полного содержимого файлов здесь не требуется.
             chapter_info_list = [
-                (info.filename, info.file_size)
-                for info in zf.infolist() 
+                (info.filename, info.file_size, info.CRC)
+                for info in zf.infolist()
                 if info.filename.lower().endswith(('.html', '.xhtml', '.htm'))
             ]
-        
-        # Считаем чексумму по размерам файлов внутри архива
-        current_content_checksum = sum(size for _, size in chapter_info_list)
+
+        # Чексумма по размерам файлов внутри архива — сохраняем как раньше, для
+        # совместимости со старыми кэшами (формата до появления отпечатка ниже).
+        current_content_checksum = sum(size for _, size, _ in chapter_info_list)
+
+        # Отпечаток, чувствительный к правкам без изменения суммарной длины байт:
+        # сумма размеров не заметит, например, замену части текста главы на другой
+        # алфавит того же байтового размера, а CRC32 каждого файла — заметит.
+        # Используется как дополнительное условие доверия кэшу (см. ЭТАП 1 ниже),
+        # отдельно от content_checksum, чтобы не ломать чтение старых кэшей.
+        current_content_fingerprint = zlib.crc32(
+            ';'.join(
+                f'{fname}:{size}:{crc}'
+                for fname, size, crc in sorted(chapter_info_list)
+            ).encode('utf-8')
+        )
 
     except (zipfile.BadZipFile, FileNotFoundError) as e:
         print(f"[ERROR] Не удалось прочитать EPUB для создания отпечатка: {e}")
@@ -832,8 +977,9 @@ def get_epub_chapter_sizes_with_cache(
         )
         if (is_epub_identity_match and
             metadata.get('metric') == cache_metric and
-            int(metadata.get('version', 0) or 0) >= CHAPTER_SIZE_CACHE_VERSION):
-            
+            int(metadata.get('version', 0) or 0) >= CHAPTER_SIZE_CACHE_VERSION and
+            metadata.get('content_fingerprint') == current_content_fingerprint):
+
             cached_sizes = cache_data.get('sizes', {})
             
             # --- ЭТАП 2: SANITY CHECK (Выборочная проверка контента) ---
@@ -880,7 +1026,7 @@ def get_epub_chapter_sizes_with_cache(
     try:
         with zipfile.ZipFile(epub_path, 'r') as zf:
             # Перебираем сохраненный ранее список файлов
-            for fname, _ in chapter_info_list:
+            for fname, _, _ in chapter_info_list:
                 content_str = zf.read(fname).decode('utf-8', errors='ignore')
                 final_sizes[fname] = estimate_epub_chapter_input_size(content_str, task_size_unit)
     except Exception as e:
@@ -892,6 +1038,7 @@ def get_epub_chapter_sizes_with_cache(
             'epub_name': current_epub_name,
             'epub_size': current_epub_size,
             'content_checksum': current_content_checksum,
+            'content_fingerprint': current_content_fingerprint,
             'metric': cache_metric,
             'version': CHAPTER_SIZE_CACHE_VERSION
         },
@@ -922,10 +1069,11 @@ def get_chapter_fingerprint(epub_zip, internal_path):
         h_tag = soup.find(['h1', 'h2', 'h3'])
         h_text = extract_epub_heading_text(h_tag) if h_tag else ""
         
-        # 3. Чистая длина текста (без тегов)
-        clean_text = soup.get_text()
-        # Убираем лишние пробелы для более точного сравнения длины
-        clean_text = " ".join(clean_text.split())
+        # 3. Чистая длина текста (без тегов), канонический экстрактор
+        # (исключает script/style/head/title/meta и расставляет разделители
+        # между соседними тегами без пробелов — иначе `<p>A</p><p>B</p>`
+        # схлопнулось бы в "AB" вместо "A B").
+        clean_text = extract_visible_text_normalized(raw_content)
         
         return {
             'title': title_text,
@@ -951,9 +1099,7 @@ def compare_epubs_for_swap(old_epub_path, new_epub_path):
             
             old_chapters = get_epub_chapter_order(old_epub_path)
             new_chapters = get_epub_chapter_order(new_epub_path)
-            
-            new_chapters_set = set(new_chapters)
-            
+
             for path in new_chapters:
                 if path not in old_chapters:
                     results[path] = 'new'
@@ -985,32 +1131,3 @@ def compare_epubs_for_swap(old_epub_path, new_epub_path):
         return None
         
     return results
-
-
-def export_epub_to_json(epub_path, json_path=None):
-    """
-    Конвертирует EPUB в промежуточную JSON-модель книги.
-    Если указан json_path, сохраняет модель на диск.
-    """
-    from .epub_json import epub_to_json_model, save_json_model
-
-    book_model = epub_to_json_model(epub_path)
-    if json_path:
-        save_json_model(book_model, json_path)
-    return book_model
-
-
-def build_epub_from_json(book_json, output_path):
-    """
-    Собирает EPUB обратно из JSON-модели.
-    book_json может быть как путем к JSON-файлу, так и уже загруженным словарем.
-    """
-    from .epub_json import json_model_to_epub, load_json_model
-
-    if isinstance(book_json, (str, os.PathLike)):
-        book_model = load_json_model(book_json)
-    else:
-        book_model = book_json
-
-    json_model_to_epub(book_model, output_path)
-    return output_path

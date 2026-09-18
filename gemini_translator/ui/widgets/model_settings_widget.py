@@ -22,6 +22,7 @@ from ...api import config as api_config
 from ...utils import markdown_viewer
 from gemini_translator.ui import theme_manager
 from ..overlay_host import exec_dialog
+from ...core.event_bus_mixin import EventBusMixin
 
 CHATGPT_LOGIN_URL = "https://chatgpt.com/auth/login"
 CHATGPT_SIGNUP_URL = "https://chatgpt.com/auth/login?mode=signup"
@@ -33,6 +34,27 @@ MODEL_COMBO_POPUP_MIN_WIDTH = 460
 MODEL_COMBO_POPUP_MAX_WIDTH = 760
 MCP_MODEL_PLACEHOLDER = "Модель выбирает AI-приложение"
 MCP_MODEL_NAME = "MCP Client"
+
+
+def _resolve_initial_browse_dir(settings_manager, current_path: str) -> str:
+    """Общая часть выбора стартовой папки для диалогов QFileDialog.getExistingDirectory.
+
+    Если current_path уже указывает на существующую директорию, он и возвращается.
+    Иначе делается попытка получить папку из settings_manager: сперва
+    get_project_start_folder (если есть), иначе get_last_project_folder. Любая
+    ошибка settings_manager (или отсутствие обоих методов) даёт пустую строку.
+
+    Финальная валидация результата (запасной вариант на случай, если и это не
+    директория) у вызывающих кодов разная и намеренно оставлена на их стороне.
+    """
+    if current_path and os.path.isdir(current_path):
+        return current_path
+    try:
+        if hasattr(settings_manager, "get_project_start_folder"):
+            return settings_manager.get_project_start_folder() or ""
+        return settings_manager.get_last_project_folder() or ""
+    except Exception:
+        return ""
 
 
 class CustomModelDialog(QDialog):
@@ -258,15 +280,7 @@ class FreeDeepseekApiDialog(QDialog):
 
     def _browse_repo_dir(self):
         current_path = self._selected_repo_dir()
-        initial_dir = current_path if current_path and os.path.isdir(current_path) else ""
-        if not initial_dir:
-            try:
-                if hasattr(self.settings_manager, "get_project_start_folder"):
-                    initial_dir = self.settings_manager.get_project_start_folder() or ""
-                else:
-                    initial_dir = self.settings_manager.get_last_project_folder() or ""
-            except Exception:
-                initial_dir = ""
+        initial_dir = _resolve_initial_browse_dir(self.settings_manager, current_path or "")
         if not initial_dir or not os.path.isdir(initial_dir):
             initial_dir = os.path.expanduser("~")
 
@@ -390,7 +404,7 @@ class FreeDeepseekApiDialog(QDialog):
         super().closeEvent(event)
 
 
-class ModelSettingsWidget(QGroupBox):
+class ModelSettingsWidget(EventBusMixin, QGroupBox):
     """
     Виджет для инкапсуляции всех настроек, связанных с API-моделью.
     """
@@ -417,7 +431,6 @@ class ModelSettingsWidget(QGroupBox):
             raise RuntimeError("EventBus не найден.")
         self.bus = app.event_bus
         self._uses_topic_subscription = False
-        self._uses_broadcast_subscription = False
         self._provider_event_source_id = None
         self._mcp_mode = False
         self._mcp_restore_provider_id = None
@@ -1053,16 +1066,7 @@ class ModelSettingsWidget(QGroupBox):
 
     def _browse_workascii_directory(self, target_edit, caption: str):
         current_path = str(target_edit.text() or "").strip()
-        initial_dir = current_path if current_path and os.path.isdir(current_path) else ""
-
-        if not initial_dir:
-            try:
-                if hasattr(self.settings_manager, "get_project_start_folder"):
-                    initial_dir = self.settings_manager.get_project_start_folder() or ""
-                else:
-                    initial_dir = self.settings_manager.get_last_project_folder() or ""
-            except Exception:
-                initial_dir = ""
+        initial_dir = _resolve_initial_browse_dir(self.settings_manager, current_path)
 
         if initial_dir and not os.path.isdir(initial_dir):
             initial_dir = os.path.dirname(initial_dir)
@@ -1379,25 +1383,6 @@ class ModelSettingsWidget(QGroupBox):
             current_provider_id = getattr(self, '_current_provider_id', None)
             if updated_provider_id and updated_provider_id == current_provider_id:
                 self.set_available_models(updated_provider_id, fetch_async=False)
-
-    def _connect_to_bus(self):
-        if hasattr(self.bus, "subscribe"):
-            for topic in self._event_topics:
-                self.bus.subscribe(topic, self.on_event)
-            self._uses_topic_subscription = True
-        elif hasattr(self.bus, "event_posted"):
-            self.bus.event_posted.connect(self.on_event)
-            self._uses_broadcast_subscription = True
-
-    def _disconnect_from_bus(self):
-        try:
-            if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
-                for topic in self._event_topics:
-                    self.bus.unsubscribe(topic, self.on_event)
-            elif self._uses_broadcast_subscription and hasattr(self.bus, "event_posted"):
-                self.bus.event_posted.disconnect(self.on_event)
-        except (TypeError, RuntimeError, ValueError):
-            pass
 
     def closeEvent(self, event):
         self._disconnect_from_bus()

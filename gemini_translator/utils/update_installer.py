@@ -456,6 +456,7 @@ JOURNAL = @@JOURNAL@@
 ACK = @@ACK@@
 LOG = @@LOG@@
 COMMIT = @@COMMIT@@
+REPOSITORY = @@REPOSITORY@@
 PYTHON_ARGV = @@PYTHON_ARGV@@
 PIP_ARGV = @@PIP_ARGV@@
 IDENTITY_NAME = ".translator-update.json"
@@ -560,12 +561,16 @@ def main():
             pass
 
     try:
+        # identity.json копируется в журнал ДО фазы backup() отдельных файлов:
+        # если backup() упадёт на середине (нет места, антивирус держит файл),
+        # restore() должен найти уже сохранённую идентичность и восстановить
+        # её, а не стереть валидный identity_path как «нечего восстанавливать».
+        if os.path.isfile(identity_path):
+            shutil.copy2(identity_path, os.path.join(JOURNAL, "identity.json"))
         for rel, _member in entries:
             backup(rel)
         for rel in to_remove:
             backup(rel)
-        if os.path.isfile(identity_path):
-            shutil.copy2(identity_path, os.path.join(JOURNAL, "identity.json"))
 
         with zipfile.ZipFile(ZIP_PATH) as z:
             for rel, member in entries:
@@ -582,7 +587,8 @@ def main():
             except OSError:
                 pass
         with open(identity_path, "w", encoding="utf-8") as f:
-            json.dump({"schema": 1, "commit": COMMIT, "files": sorted(new_files)}, f,
+            json.dump({"schema": 2, "commit": COMMIT, "repository": REPOSITORY,
+                       "files": sorted(new_files)}, f,
                       ensure_ascii=False, indent=2)
         if os.path.isfile(os.path.join(ROOT, "requirements.txt")):
             pip = subprocess.run(PIP_ARGV, cwd=ROOT)
@@ -625,7 +631,8 @@ if __name__ == "__main__":
 
 
 def render_archive_helper(*, app_pid, zip_path, root, journal_dir, ack_path,
-                          log_path, commit_sha, python_argv, pip_argv) -> str:
+                          log_path, commit_sha, repository, python_argv,
+                          pip_argv) -> str:
     return _render(_ARCHIVE_HELPER_TEMPLATE, {
         "PID": int(app_pid),
         "WAIT_ITER": APP_EXIT_WAIT_S * 2,
@@ -636,13 +643,14 @@ def render_archive_helper(*, app_pid, zip_path, root, journal_dir, ack_path,
         "ACK": repr(str(ack_path)),
         "LOG": repr(str(log_path)),
         "COMMIT": repr(str(commit_sha)),
+        "REPOSITORY": repr(str(repository)),
         "PYTHON_ARGV": repr([str(a) for a in python_argv]),
         "PIP_ARGV": repr([str(a) for a in pip_argv]),
     })
 
 
 def prepare_source_archive(staged_zip, root, ctx: InstallContext,
-                           commit_sha: str) -> subprocess.Popen:
+                           commit_sha: str, repository: str) -> subprocess.Popen:
     """Готовит и запускает python-хелпер замены source-архива."""
     staging = staging_root()
     staging.mkdir(parents=True, exist_ok=True)
@@ -656,6 +664,7 @@ def prepare_source_archive(staged_zip, root, ctx: InstallContext,
         app_pid=ctx.app_pid, zip_path=str(staged_zip), root=str(root),
         journal_dir=str(staging / f"journal-{label}"), ack_path=str(ack_path),
         log_path=str(update_log_path()), commit_sha=commit_sha,
+        repository=repository,
         python_argv=[sys.executable, str(Path(root) / "main.py")],
         pip_argv=[sys.executable, "-m", "pip", "install", "-r",
                   str(Path(root) / "requirements.txt")])

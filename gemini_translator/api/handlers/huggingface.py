@@ -5,10 +5,11 @@ import time
 import traceback
 from ..base import BaseApiHandler
 from ..errors import (
-    ContentFilterError, NetworkError, LocationBlockedError, 
-    RateLimitExceededError, ModelNotFoundError, ValidationFailedError, 
+    ContentFilterError, NetworkError, LocationBlockedError,
+    RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
     TemporaryRateLimitError, PartialGenerationError
 )
+from ._sse_stream import SSEStreamInterrupted, parse_openai_compatible_sse_stream
 
 class HuggingFaceApiHandler(BaseApiHandler):
     """
@@ -123,44 +124,19 @@ class HuggingFaceApiHandler(BaseApiHandler):
                     
                     # Ветка А: СТРИМИНГ
                     if use_stream:
-                        collected_text = ""
-                        finish_reason = None
-                        raw_stream_lines = [] if (self._has_debug_trace() or debug) else None
-                        
                         try:
-                            async for line in response.content:
-                                line_str = line.decode('utf-8').strip()
-                                if raw_stream_lines is not None:
-                                    raw_stream_lines.append(line_str)
-                                if not line_str or line_str == 'data: [DONE]': 
-                                    continue
-                                
-                                if line_str.startswith('data: '):
-                                    json_str = line_str[6:] # Убираем "data: "
-                                    try:
-                                        chunk = json.loads(json_str)
-                                        if 'choices' in chunk and chunk['choices']:
-                                            delta = chunk['choices'][0].get('delta', {})
-                                            content_part = delta.get('content', '')
-                                            if content_part:
-                                                collected_text += content_part
-                                            
-                                            # Проверяем причину остановки
-                                            f_reason = chunk['choices'][0].get('finish_reason')
-                                            if f_reason:
-                                                finish_reason = f_reason
-                                    except json.JSONDecodeError:
-                                        continue
-                        
-                        except Exception as stream_e:
+                            collected_text, finish_reason, raw_stream_lines = await parse_openai_compatible_sse_stream(
+                                response,
+                                capture_raw=(self._has_debug_trace() or debug),
+                                on_usage=self._remember_openai_usage,
+                            )
+                        except SSEStreamInterrupted as interrupted:
                             # Если стрим оборвался, но мы что-то скачали — спасаем это!
-                            if collected_text:
-                                raise PartialGenerationError(
-                                    f"Обрыв стрима HF: {stream_e}", 
-                                    partial_text=collected_text,
-                                    reason="NETWORK_ERROR"
-                                )
-                            raise stream_e
+                            raise PartialGenerationError(
+                                f"Обрыв стрима HF: {interrupted.original_error}",
+                                partial_text=interrupted.partial_text,
+                                reason="NETWORK_ERROR"
+                            ) from interrupted.original_error
 
                         # Если стрим закончился нормально, проверяем finish_reason
                         if raw_stream_lines is not None:
@@ -190,6 +166,8 @@ class HuggingFaceApiHandler(BaseApiHandler):
                             status="http_200",
                             extra={"mode": "full", "http_status": response.status},
                         )
+                        # An answer cut by the length limit is billed as well.
+                        self._remember_openai_usage(result.get("usage"))
                         if 'choices' in result and result['choices']:
                             choice = result['choices'][0]
                             content = choice['message']['content']
@@ -212,6 +190,20 @@ class HuggingFaceApiHandler(BaseApiHandler):
                 # Это подавит трейсбек в консоли и отправит ошибку в штатный обработчик ретраев
                 error_msg = self._format_transport_error(e, "Hugging Face")
                 raise NetworkError(error_msg, delay_seconds=self.NETWORK_RETRY_DELAY) from e
+            except (
+                RateLimitExceededError,
+                ContentFilterError,
+                NetworkError,
+                PartialGenerationError,
+                ModelNotFoundError,
+                LocationBlockedError,
+                ValidationFailedError,
+                TemporaryRateLimitError,
+            ) as e:
+                # Доменные исключения пробрасываем как есть, не теряя тип и атрибуты
+                # (partial_text/reason/delay_seconds) -- их ждёт downstream-код
+                # (base.py:_process_exception_and_counters, error_analyzer.py, emerger_tasks.py).
+                raise e
             except Exception as e:
                 traceback.print_exc()
                 raise Exception(f"Критическая ошибка HF: {e}")

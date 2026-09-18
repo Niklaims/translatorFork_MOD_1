@@ -1,0 +1,554 @@
+"""The quality section must show the report and never act on a stale selection."""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PyQt6 import QtWidgets
+from PyQt6.QtCore import Qt
+
+from gemini_translator.qa.capabilities import QaCapabilitySettings
+from gemini_translator.qa.journal import QaJournal
+from gemini_translator.qa.models import ChapterMetrics, QaJournalEntry, RiskLevel
+from gemini_translator.qa.settings import QaSettings
+from gemini_translator.ui.dialogs.validation_dialogs import (
+    BookQaReportSnapshot,
+    TranslationQualityDialog,
+    quality_settings_view as settings_module,
+)
+
+
+@pytest.fixture(scope="module")
+def qt_app():
+    return QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+
+
+def _journal(repaired: bool = True) -> QaJournal:
+    journal = QaJournal.empty(book_id="book-1")
+    for index in range(6):
+        journal.upsert_metrics(
+            ChapterMetrics(
+                chapter_id=f"chapter-{index}",
+                source_language="zh",
+                target_language="ru",
+                source_chars=1000,
+                translated_chars=2900 + index * 20,
+                possible_gaps=index % 2,
+                glossary_conflicts=index % 3,
+                risk_level=RiskLevel.MEDIUM if index % 2 else RiskLevel.LOW,
+            )
+        )
+    if repaired:
+        journal.append(
+            QaJournalEntry(entry_id="e1", chapter_id="chapter-1", decision="fixed")
+        )
+        journal.append_repair({"patch_id": "p1", "chapter_id": "chapter-1"})
+    return journal
+
+
+def _dialog(qt_app, **kwargs) -> TranslationQualityDialog:
+    dialog = TranslationQualityDialog(**kwargs)
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    return dialog
+
+
+def test_progress_reports_real_counts(qt_app):
+    """A whole-book pass must show how far it actually is."""
+    dialog = _dialog(qt_app)
+
+    dialog.set_progress(2, 6, "chapter-2")
+
+    assert dialog.progress.maximum() == 6
+    assert dialog.progress.value() == 2
+    assert "chapter-2" in dialog.progress.format()
+
+
+def test_export_is_offered_only_when_there_is_a_report(qt_app):
+    """Exporting an empty report would hand the user four empty files."""
+    dialog = TranslationQualityDialog()
+
+    assert dialog.export_button.isEnabled() is False
+
+    dialog.set_report(BookQaReportSnapshot.from_journal(_journal()))
+    assert dialog.export_button.isEnabled() is True
+
+    dialog.set_busy(True)
+    assert dialog.export_button.isEnabled() is False
+
+
+def test_the_chunk_spin_offers_the_automatic_size(qt_app):
+    """Нижнее положение крутилки — «как при переводе», а не запрещённый ноль."""
+    dialog = _dialog(qt_app)
+
+    assert dialog.settings_view.language_chunk_spin.minimum() == 0
+    assert dialog.settings_view.language_chunk_spin.specialValueText()
+    dialog.settings_view.language_chunk_spin.setValue(0)
+
+    assert dialog.qa_settings().language_chunk_chars == 0
+
+
+def test_the_quality_window_carries_the_cometkiwi_address_both_ways(qt_app):
+    """Адрес ПК доходит из настроек до поля и обратно."""
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+            cometkiwi_endpoint="http://192.168.1.50:8765",
+        )
+    )
+
+    assert dialog.settings_view.cometkiwi_endpoint_edit.text() == "http://192.168.1.50:8765"
+
+    dialog.settings_view.cometkiwi_endpoint_edit.setText("  http://192.168.1.77:9000  ")
+
+    assert dialog.qa_settings().cometkiwi_endpoint == "http://192.168.1.77:9000"
+
+
+def test_an_empty_address_says_the_scoring_stays_on_this_machine(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    dialog.settings_view.cometkiwi_endpoint_edit.setText("")
+    dialog.settings_view.cometkiwi_check_button.click()
+
+    assert "на этом компьютере" in dialog.settings_view.cometkiwi_status_label.text()
+
+
+def test_typing_an_address_updates_the_readiness_the_dialog_shows(qt_app):
+    """Адрес вписан — окно не должно продолжать называть CometKiwi ненастроенным.
+
+    qa_settings() reads the widget directly, so a missing textChanged hookup is
+    invisible to the other tests. This one watches what the user actually sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+    emitted = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.settings_view.cometkiwi_endpoint_edit.setText("http://192.168.1.50:8765")
+
+    assert emitted, "typing an address must report a settings edit"
+    assert emitted[-1].cometkiwi_endpoint == "http://192.168.1.50:8765"
+    assert "cometkiwi" not in dialog.settings_view.capability_status_label.text()
+
+    dialog.settings_view.cometkiwi_endpoint_edit.setText("")
+
+    assert "cometkiwi" in dialog.settings_view.capability_status_label.text()
+
+
+def test_the_cometkiwi_model_and_licence_round_trip_through_the_dialog(qt_app):
+    """Имя модели и согласие с лицензией раньше менялись только правкой settings.json.
+
+    The constructor applies the settings to the widgets; qa_settings() used to
+    pass both values through from those settings, so the edits below are what
+    tells a widget-backed round trip from a pass-through.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            cometkiwi_model="wmt22-cometkiwi-da",
+            cometkiwi_license_accepted=True,
+        )
+    )
+
+    assert dialog.settings_view.cometkiwi_model_edit.text() == "wmt22-cometkiwi-da"
+    assert dialog.settings_view.cometkiwi_license_check.isChecked() is True
+    settings = dialog.qa_settings()
+    assert settings.cometkiwi_model == "wmt22-cometkiwi-da"
+    assert settings.cometkiwi_license_accepted is True
+
+    dialog.settings_view.cometkiwi_model_edit.setText("  wmt23-cometkiwi-da-xl  ")
+    dialog.settings_view.cometkiwi_license_check.setChecked(False)
+
+    settings = dialog.qa_settings()
+    assert settings.cometkiwi_model == "wmt23-cometkiwi-da-xl"
+    assert settings.cometkiwi_license_accepted is False
+
+
+def test_typing_a_cometkiwi_model_name_publishes_it(qt_app):
+    """The window saves only what settings_changed carries; an unreported edit is lost."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    emitted: list[QaSettings] = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.settings_view.cometkiwi_model_edit.setText("wmt22-cometkiwi-da")
+
+    assert emitted, "typing a model name must report a settings edit"
+    assert emitted[-1].cometkiwi_model == "wmt22-cometkiwi-da"
+
+
+def test_accepting_the_cometkiwi_licence_publishes_it(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    emitted: list[QaSettings] = []
+    dialog.settings_changed.connect(emitted.append)
+
+    dialog.settings_view.cometkiwi_license_check.setChecked(True)
+
+    assert emitted, "ticking the licence must report a settings edit"
+    assert emitted[-1].cometkiwi_license_accepted is True
+
+
+def test_the_licence_checkbox_names_the_licence_and_its_limit(qt_app):
+    """Согласие ничего не значит, если в подписи не сказано, с чем соглашаются."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    label = dialog.settings_view.cometkiwi_license_check.text()
+
+    assert "CC BY-NC-SA 4.0" in label
+    assert "некоммерческ" in label
+
+
+def _name_the_model(dialog: TranslationQualityDialog) -> None:
+    dialog.settings_view.cometkiwi_model_edit.setText("wmt22-cometkiwi-da")
+
+
+def _accept_the_licence(dialog: TranslationQualityDialog) -> None:
+    dialog.settings_view.cometkiwi_license_check.setChecked(True)
+
+
+@pytest.mark.parametrize(
+    "first, second",
+    [(_name_the_model, _accept_the_licence), (_accept_the_licence, _name_the_model)],
+    ids=["model-first", "licence-first"],
+)
+def test_cometkiwi_is_named_unconfigured_until_both_model_and_licence_are_set(
+    qt_app, first, second
+):
+    """Адрес вписан, но без модели и согласия с лицензией оценка всё равно выключена.
+
+    Either order: whichever of the two widgets is set last must be the one that
+    refreshes what the user sees.
+    """
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            capabilities=QaCapabilitySettings(cometkiwi_enabled=True),
+            cometkiwi_endpoint="http://192.168.1.50:8765",
+        )
+    )
+    assert "cometkiwi" in dialog.settings_view.capability_status_label.text()
+
+    first(dialog)
+
+    assert "cometkiwi" in dialog.settings_view.capability_status_label.text()
+
+    second(dialog)
+
+    assert "cometkiwi" not in dialog.settings_view.capability_status_label.text()
+
+
+# --- _check_cometkiwi_endpoint's network path, over a real socket ---------
+#
+# In PyQt6 an exception escaping a slot reaches sys.excepthook, and by default
+# Qt's qFatal() aborts the whole application. The except branches below are
+# what stand between a bad address and a crashed app, so they are exercised
+# against a real local HTTP server rather than only the empty-address early
+# return. Each server is a ThreadingHTTPServer bound to an OS-assigned port
+# ("127.0.0.1", 0), served from a daemon thread, and torn down through
+# shutdown() then server_close() — the same idiom test_cometkiwi_server.py
+# uses for the real server this dialog eventually talks to, redefined locally
+# per this task's instructions rather than imported from that test module.
+
+
+def _answering(status: int, body: bytes):
+    """Build a request handler that answers every GET with one fixed response."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            self.send_response(status)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
+            pass
+
+    return _Handler
+
+
+class _RealHealthServer:
+    """A real local HTTP server, for exercising the check's actual socket path."""
+
+    def __init__(self, handler_class) -> None:
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler_class)
+
+    def __enter__(self):
+        threading.Thread(target=self._httpd.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        return False
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+
+def test_check_reports_a_healthy_server_over_a_real_connection(qt_app):
+    body = json.dumps(
+        {
+            "schema_version": 1,
+            "model": "wmt22-cometkiwi-da",
+            "device": "cuda",
+            "loaded": True,
+        }
+    ).encode("utf-8")
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, body)) as server:
+        dialog.settings_view.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog.settings_view._check_cometkiwi_endpoint()
+
+    text = dialog.settings_view.cometkiwi_status_label.text()
+    assert "Связь есть" in text
+    assert "wmt22-cometkiwi-da" in text
+    assert "cuda" in text
+    assert "веса в памяти" in text
+
+
+def test_check_reports_an_unreachable_server(qt_app):
+    """Port 9 (discard) refuses at once, so this never waits out the timeout."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    dialog.settings_view.cometkiwi_endpoint_edit.setText("http://127.0.0.1:9")
+
+    dialog.settings_view._check_cometkiwi_endpoint()
+
+    assert "Сервер не отвечает" in dialog.settings_view.cometkiwi_status_label.text()
+
+
+def test_check_reports_an_unparseable_response(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"not json")) as server:
+        dialog.settings_view.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog.settings_view._check_cometkiwi_endpoint()
+
+    assert dialog.settings_view.cometkiwi_status_label.text() == "Ответ сервера не разобран."
+
+
+def test_check_reports_an_http_error_distinctly_from_unreachable(qt_app):
+    """A 404 from the wrong service must not be blamed on a firewall."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(404, b'{"error": "not_found"}')) as server:
+        dialog.settings_view.cometkiwi_endpoint_edit.setText(server.base_url)
+        dialog.settings_view._check_cometkiwi_endpoint()
+
+    text = dialog.settings_view.cometkiwi_status_label.text()
+    assert "ответил ошибкой 404" in text
+    assert "брандмауэр" not in text
+
+
+# --- the check takes scoring's route and names what actually went wrong ----
+
+
+def _health(model: str = "wmt22-cometkiwi-da") -> bytes:
+    return json.dumps(
+        {"schema_version": 1, "model": model, "device": "cuda", "loaded": True}
+    ).encode("utf-8")
+
+
+def _check(dialog: TranslationQualityDialog, address: str) -> str:
+    dialog.settings_view.cometkiwi_endpoint_edit.setText(address)
+    dialog.settings_view._check_cometkiwi_endpoint()
+    return dialog.settings_view.cometkiwi_status_label.text()
+
+
+def test_check_goes_straight_to_the_pc_whatever_proxy_is_configured(
+    qt_app, monkeypatch
+):
+    """Scoring's aiohttp session ignores proxies; a check that honoured them lied."""
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")
+    # urlopen() caches one opener, built from the environment of its first
+    # call; dropping it keeps this test from depending on the order tests run.
+    monkeypatch.setattr(urllib.request, "_opener", None)
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, _health())) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Связь есть: wmt22-cometkiwi-da на cuda, веса в памяти."
+
+
+@pytest.mark.parametrize("address", ["192.168.1.50:8765", "pc-in-the-hall"])
+def test_check_names_an_address_scoring_would_refuse_and_dials_nothing(
+    qt_app, monkeypatch, address
+):
+    """Scoring writes endpoint_invalid for these; the check used to blame a firewall."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+    attempts = []
+    real_open = urllib.request.OpenerDirector.open
+
+    def _recording_open(self, *args, **kwargs):
+        attempts.append(args)
+        return real_open(self, *args, **kwargs)
+
+    def _recording_connection(*args, **kwargs):
+        attempts.append(args)
+        raise OSError("the check must not open a connection")
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", _recording_open)
+    monkeypatch.setattr(socket, "create_connection", _recording_connection)
+
+    text = _check(dialog, address)
+
+    assert text == "Адрес не разобран: нужен вид http://host:port."
+    assert attempts == []
+
+
+def test_check_says_the_server_accepted_the_connection_but_never_answered(
+    qt_app, monkeypatch
+):
+    monkeypatch.setattr(settings_module, "COMETKIWI_CHECK_TIMEOUT_SECONDS", 0.3)
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    # listen() and never accept(): the kernel completes the handshake, so the
+    # connection is accepted, and nothing on the other side ever answers.
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        host, port = listener.getsockname()[:2]
+        text = _check(dialog, f"http://{host}:{port}")
+
+    assert text == "Сервер принял соединение, но не ответил за 0.3 с."
+
+
+def test_check_reports_json_that_is_not_an_object_as_unparsed(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"[1, 2]")) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Ответ сервера не разобран."
+
+
+def _hanging_up():
+    """Build a handler that reads each GET and closes without answering it."""
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+            self.close_connection = True
+
+        def log_message(self, format, *args):  # noqa: A002 - keep test output quiet
+            pass
+
+    return _Handler
+
+
+def test_check_reports_any_other_failure_without_its_exception_text(qt_app):
+    """http.client's RemoteDisconnected is neither a URLError nor a timeout."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_hanging_up()) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Проверка связи не удалась."
+
+
+def test_check_warns_when_the_pc_runs_another_model_than_the_settings_name(qt_app):
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(cometkiwi_model="wmt22-cometkiwi-da")
+    )
+
+    with _RealHealthServer(
+        _answering(200, _health(model="wmt23-cometkiwi-da-xl"))
+    ) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == (
+        "Связь есть: wmt23-cometkiwi-da-xl на cuda, веса в памяти. "
+        "Внимание: на ПК модель wmt23-cometkiwi-da-xl, "
+        "а в настройках — wmt22-cometkiwi-da."
+    )
+
+
+def test_check_cuts_each_model_name_in_the_warning_to_80_characters(qt_app):
+    dialog = TranslationQualityDialog(settings=QaSettings(cometkiwi_model="c" * 100))
+
+    with _RealHealthServer(_answering(200, _health(model="s" * 100))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text.endswith(
+        f" Внимание: на ПК модель {'s' * 80}, а в настройках — {'c' * 80}."
+    )
+
+
+@pytest.mark.parametrize(
+    "server_model, configured_model",
+    [
+        ("wmt22-cometkiwi-da", "wmt22-cometkiwi-da"),
+        ("wmt22-cometkiwi-da", ""),
+        ("", "wmt22-cometkiwi-da"),
+    ],
+)
+def test_check_warns_only_when_two_names_disagree(
+    qt_app, server_model, configured_model
+):
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(cometkiwi_model=configured_model)
+    )
+
+    with _RealHealthServer(_answering(200, _health(model=server_model))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text.startswith("Связь есть:")
+    assert "Внимание" not in text
+
+
+def test_a_model_name_from_the_network_is_shown_as_plain_text(qt_app):
+    """The server is unauthenticated: nothing it sends is rendered as markup."""
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, _health(model="<b>x</b>"))) as server:
+        text = _check(dialog, server.base_url)
+
+    assert "<b>x</b>" in text
+    assert dialog.settings_view.cometkiwi_status_label.textFormat() == Qt.TextFormat.PlainText
+
+
+def test_check_survives_json_nested_past_the_recursion_limit(qt_app):
+    """json.loads raises RecursionError, not ValueError, for pathological nesting.
+
+    The check runs in a Qt slot, where an escaping exception reaches the global
+    excepthook and quits the application, so a body any service on the network
+    could send must end as a sentence in the label, never as a crash.
+    """
+    dialog = TranslationQualityDialog(settings=QaSettings())
+
+    with _RealHealthServer(_answering(200, b"[" * 50_000)) as server:
+        text = _check(dialog, server.base_url)
+
+    assert text == "Ответ сервера не разобран."
+
+
+def test_check_chapter_emits_the_selected_chapter(qt_app):
+    """The action applies to what is selected, and to nothing when there is no report."""
+    seen: list[str] = []
+    empty = TranslationQualityDialog()
+    empty.check_chapter_requested.connect(seen.append)
+
+    empty._request_check_chapter()
+    assert seen == []
+
+    dialog = _dialog(qt_app)
+    dialog.check_chapter_requested.connect(seen.append)
+    dialog.select_chapter("chapter-2")
+    dialog._request_check_chapter()
+    assert seen == ["chapter-2"]
+

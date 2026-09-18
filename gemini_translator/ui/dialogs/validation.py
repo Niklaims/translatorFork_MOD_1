@@ -11,9 +11,25 @@ import importlib
 from bs4 import BeautifulSoup, NavigableString, ProcessingInstruction, Comment, Declaration
 import shutil
 from datetime import datetime
+from ...core import auto_workflow_helpers
+from ...utils import cjk_ranges
+from ...utils.document_importer import set_all_checked
+from ...utils.html_text import extract_visible_text_normalized
 from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path
 from ...utils.language_tools import LanguageDetector
-from ..wait_dialogs import show_when_slow
+from ..widgets.table_utils import NumericSortItem
+from ..widgets.ancestor_utils import find_ancestor_by_predicate
+from ..widgets.regex_syntax_highlighter import (
+    HTML_PALETTE_DARK,
+    HtmlSyntaxHighlighter,
+    RuleBasedSyntaxHighlighter,
+)
+from .menu_utils import (
+    PageDialogProxyMixin,
+    make_page_delegating_meta,
+    prompt_return_to_menu,
+    return_to_main_menu,
+)
 from ...utils.validation_cache import (
     build_detector_signature,
     build_file_fingerprint,
@@ -24,16 +40,20 @@ from ...utils.validation_cache import (
     restore_result_data,
 )
 from ...utils.text import (
+    _create_structural_fingerprint,
+    escape_html,
     find_stray_angle_bracket_snippets,
     find_unwrapped_body_text_snippets,
     is_well_formed_xml,
     repair_ai_html_artifacts,
 )
 from ...utils.glued_words import repair_glued_russian_words_in_html
-from ...utils.project_migrator import ProjectMigrator
+from ...utils.io_utils import atomic_write_text
 from ...utils.translation_versions import (
+    VALIDATED_SUFFIX,
     select_target_translation_version,
 )
+from ...qa.ratio_profiles import validation_ratio_presets
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
@@ -43,17 +63,18 @@ from PyQt6.QtWidgets import (
     QGridLayout, QProgressDialog
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QUrl, QRegularExpression
-from PyQt6.QtGui import QDesktopServices, QColor, QBrush, QSyntaxHighlighter, QTextCharFormat, QFont, QTextCursor
+from PyQt6.QtGui import QDesktopServices, QColor, QBrush, QTextCharFormat, QFont, QTextCursor
 from PyQt6 import QtCore, QtGui, QtWidgets, sip
 
 
-from ..widgets.preset_widget import PresetWidget
 from ..shell import ShellPage
 from ...api import config as api_config
 from gemini_translator.ui import theme_manager
+from .epub import run_project_migrator_sync
 from .validation_dialogs import UntranslatedWordDetector
 from .validation_dialogs.content_lru import ContentLru
 from ..overlay_host import exec_dialog
+from .word_exceptions_dialog import open_word_exceptions_manager
 from .validation_dialogs.untranslated_fixer_dialog import (
     AITranslationDialog,
     UntranslatedFixerDialog,
@@ -111,21 +132,8 @@ REGEX_COMMAS = re.compile(r'[,\uff0c\u3001\u060c]')
 # \u061b : Арабская точка с запятой ؛
 REGEX_COLONS_SEMIS = re.compile(r'[:;\uff1a\uff1b\u061b]')
 
-USER_PROBLEM_TERM_LABELS = {
-    'system': 'Системная',
-    'user': 'Пользовательская',
-}
-
 def _normalize_problem_term_text(raw_fragment):
-    if not raw_fragment:
-        return ""
-
-    try:
-        text = BeautifulSoup(raw_fragment, 'html.parser').get_text(" ", strip=True)
-    except Exception:
-        text = str(raw_fragment)
-
-    return re.sub(r'\s+', ' ', text).strip()
+    return extract_visible_text_normalized(raw_fragment)
 
 
 def _build_problem_term_preview(raw_html, start, end, radius=90):
@@ -255,10 +263,16 @@ class LargeTextInputDialog(QDialog):
             item_layout = QVBoxLayout(item_widget)
             item_layout.setContentsMargins(5, 5, 5, 5); item_layout.setSpacing(2)
             
-            escaped_title = item_data["title"].replace('<', '&lt;').replace('>', '&gt;')
+            escaped_title = escape_html(item_data["title"])
             title_label = QLabel(escaped_title)
-            
-            escaped_code = item_data["code"].replace('<', '&lt;').replace('>', '&gt;')
+            # escape_html(quote=True) превращает апострофы в '&#x27;', а
+            # QLabel.AutoText (по умолчанию) считает строку rich text
+            # только если в ней есть '<' или '&lt;' (Qt::mightBeRichText).
+            # Без явного RichText заголовки без '<' рендерились бы как
+            # обычный текст, показывая '&#x27;' пользователю буквально.
+            title_label.setTextFormat(Qt.TextFormat.RichText)
+
+            escaped_code = escape_html(item_data["code"])
             code_label = QLabel(f"<code>{escaped_code}</code>")
             code_label.setStyleSheet(f"background-color: {theme_manager.color('input_bg')}; padding: 4px; border-radius: 3px; font-family: Consolas, monospace;")
             code_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -329,24 +343,23 @@ class LargeTextInputDialog(QDialog):
     def get_text(self):
         return self.text_edit.toPlainText()
         
-class SortableChapterItem(QTableWidgetItem):
+class SortableChapterItem(NumericSortItem):
     """
     Кастомный элемент таблицы, который использует централизованную функцию
-    для извлечения числового ключа сортировки.
+    для извлечения числового ключа сортировки из internal_path (а не из
+    отображаемого текста ячейки). require_same_type=True сохраняет прежнюю
+    защиту: при сравнении с ячейкой другого типа — откат на текстовое
+    сравнение, а не попытка извлечь internal_path из чужого объекта.
     """
     def __init__(self, display_text, sort_key_path):
-        super().__init__(display_text)
+        super().__init__(
+            display_text,
+            key_fn=extract_number_from_path,
+            require_same_type=True,
+            same_type_as=SortableChapterItem,
+        )
         self.internal_path = sort_key_path
         # Мы больше не храним sort_value, так как __lt__ будет вычислять его на лету
-
-    def __lt__(self, other):
-        """
-        Переопределяем оператор "меньше чем" (<), который используется для сортировки.
-        """
-        if isinstance(other, SortableChapterItem):
-            # Вызываем универсальную функцию для обоих элементов
-            return extract_number_from_path(self) < extract_number_from_path(other)
-        return super().__lt__(other)
 
 class ChapterStatusDelegate(QtWidgets.QStyledItemDelegate):
     """
@@ -472,13 +485,7 @@ def _split_line_review_text(text: str) -> list[str]:
 
 
 def _line_review_visible_text(value) -> str:
-    if not value:
-        return ""
-    try:
-        text = BeautifulSoup(str(value), 'html.parser').get_text(" ", strip=True)
-    except Exception:
-        text = str(value)
-    return re.sub(r'\s+', ' ', text).strip()
+    return extract_visible_text_normalized(value)
 
 
 def retain_or_strip_heavy_fields(result, previous_data):
@@ -1258,13 +1265,9 @@ class AIRepairReviewPage(ShellPage):
         self.apply_button.setEnabled(selected > 0)
 
     def _set_all_checked(self, checked: bool):
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         self._populating_table = True
         try:
-            for row in range(self.table.rowCount()):
-                item = self.table.item(row, 0)
-                if item:
-                    item.setCheckState(state)
+            set_all_checked(self.table, checked)
         finally:
             self._populating_table = False
         self._update_selection_summary()
@@ -1375,12 +1378,11 @@ class AIRepairReviewPage(ShellPage):
         self.result_ready.emit(False)
 
 
-class _AIRepairReviewDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(AIRepairReviewPage, name)
-
-
-class AIRepairReviewDialog(QDialog, metaclass=_AIRepairReviewDialogMeta):
+class AIRepairReviewDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(AIRepairReviewPage),
+):
     """Modal wrapper hosting AIRepairReviewPage for the legacy exec() API."""
 
     def __init__(self, candidates, parent=None):
@@ -1394,12 +1396,6 @@ class AIRepairReviewDialog(QDialog, metaclass=_AIRepairReviewDialogMeta):
 
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
-
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
 
     def closeEvent(self, event):
         self.page.reject()
@@ -1454,7 +1450,7 @@ class StructureErrorsDialog(QDialog):
             description, error_msg = errors['malformed_xml']
             group_layout.addWidget(QLabel(f"<b>Описание:</b> {description}"))
             
-            error_label = QLabel(f"<b>Сообщение парсера:</b> <code>{error_msg.replace('<', '&lt;')}</code>")
+            error_label = QLabel(f"<b>Сообщение парсера:</b> <code>{escape_html(error_msg)}</code>")
             error_label.setWordWrap(True)
             group_layout.addWidget(error_label)
             
@@ -1470,7 +1466,7 @@ class StructureErrorsDialog(QDialog):
                 label = QLabel(CUSTOM_TAG_DESCRIPTIONS.get(tag, f"Неизвестный маркер: {tag}"))
                 label.setWordWrap(True)
                 find_button = QPushButton("Найти в коде")
-                find_button.setToolTip(f"Найти и выделить тег {tag.replace('<', '&lt;')} в редакторе")
+                find_button.setToolTip(f"Найти и выделить тег {escape_html(tag)} в редакторе")
                 find_button.clicked.connect(lambda checked, t=tag: (self.find_tag_in_code_requested.emit(t), self.accept()))
                 row_layout.addWidget(label, 1)
                 row_layout.addWidget(find_button, 0, Qt.AlignmentFlag.AlignRight)
@@ -1481,9 +1477,6 @@ class StructureErrorsDialog(QDialog):
             color = "red" if str(orig) != str(trans) else "green"
             return f'<li><b>{name}:</b> Оригинал: {orig}, Перевод: {trans} <font color="{color}">({ "Несовпадение" if str(orig) != str(trans) else "OK"})</font></li>'
 
-        def html_safe(value):
-            return str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        
         has_tag_errors = False
         tag_html = "<ul>"
         
@@ -1491,7 +1484,7 @@ class StructureErrorsDialog(QDialog):
             for tag, (orig_found, trans_found) in errors['fundamental_tags'].items():
                 if not (orig_found == trans_found):
                     has_tag_errors = True
-                    safe_tag = tag.replace('<', '&lt;').replace('>', '&gt;')
+                    safe_tag = escape_html(tag)
                     tag_html += format_line(f"Тег <code>{safe_tag}</code>", "Есть" if orig_found else "Нет", "Есть" if trans_found else "Нет")
         
         if 'unbalanced_p' in errors:
@@ -1502,13 +1495,13 @@ class StructureErrorsDialog(QDialog):
         if 'body_root_text' in errors:
             has_tag_errors = True
             snippets = errors['body_root_text']
-            preview = html_safe("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
+            preview = escape_html("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
             tag_html += format_line("Текст напрямую в &lt;body&gt;", "Нет", preview)
 
         if 'stray_angle_brackets' in errors:
             has_tag_errors = True
             snippets = errors['stray_angle_brackets']
-            preview = html_safe("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
+            preview = escape_html("; ".join(snippets) if isinstance(snippets, list) else str(snippets))
             tag_html += format_line("Лишние &lt; или &gt; вне тегов", "Нет", preview)
 
         for h in sorted(errors.get('headings', {}).keys()):
@@ -1536,60 +1529,13 @@ class StructureErrorsDialog(QDialog):
         details_layout.addStretch(1)
 
 
-class HtmlHighlighter(QSyntaxHighlighter):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self.highlightingRules = []
-
-        # Набор правил для подсветки
-        # Теги (<p>, <body>)
-        tagFormat = QTextCharFormat()
-        tagFormat.setForeground(QColor("#569CD6"))  # Более стандартный синий для тегов
-        self.highlightingRules.append((QRegularExpression(r"</?\w+"), tagFormat))
-        self.highlightingRules.append((QRegularExpression(r"[<>]"), tagFormat))
-
-
-        # Атрибуты (class, href)
-        attributeFormat = QTextCharFormat()
-        attributeFormat.setForeground(QColor("#9CDCFE"))  # Светло-голубой для атрибутов
-        self.highlightingRules.append((QRegularExpression(r'\s+([\w\-.:]+)\s*='), attributeFormat))
-
-        # Значения атрибутов ("my-class")
-        stringFormat = QTextCharFormat()
-        stringFormat.setForeground(QColor("#CE9178"))  # Оранжевый для строк
-        self.highlightingRules.append((QRegularExpression(r'"[^"]*"'), stringFormat))
-        self.highlightingRules.append((QRegularExpression(r"'[^']*'"), stringFormat))
-
-        # Комментарии <!-- ... -->
-        commentFormat = QTextCharFormat()
-        commentFormat.setForeground(QColor("#6A9955"))  # Зеленый для комментариев
-        commentFormat.setFontItalic(True)
-        self.highlightingRules.append((QRegularExpression(r"<!--.*?-->"), commentFormat))
-
-
-
-        # DOCTYPE
-        doctypeFormat = QTextCharFormat()
-        doctypeFormat.setForeground(QColor("#4EC9B0")) # Бирюзовый
-        self.highlightingRules.append((QRegularExpression(r'<!DOCTYPE[^>]+>', QRegularExpression.PatternOption.CaseInsensitiveOption), doctypeFormat))
-
-    def highlightBlock(self, text):
-        for pattern, format in self.highlightingRules:
-            iterator = pattern.globalMatch(text)
-            while iterator.hasNext():
-                match = iterator.next()
-                self.setFormat(match.capturedStart(), match.capturedLength(), format)
-
-class PunctuationHighlighter(QSyntaxHighlighter):
+class PunctuationHighlighter(RuleBasedSyntaxHighlighter):
     """
     Подсвечивает ключевые знаки препинания в отформатированном тексте
     для быстрой проверки правильности оформления диалогов и мыслей.
     """
     def __init__(self, parent=None):
         super().__init__(parent)
-
-        self.highlightingRules = []
 
         # Правило для длинных тире (прямая речь) - яркий, хорошо читаемый цвет
         dialogue_format = QTextCharFormat()
@@ -1613,20 +1559,14 @@ class PunctuationHighlighter(QSyntaxHighlighter):
         dash_format.setForeground(QColor("#D8BFD8")) # Светлая Лаванда (Thistle)
         self.highlightingRules.append((QRegularExpression("[-–]"), dash_format))
 
-    def highlightBlock(self, text):
-        # Применяем все правила к текущему блоку текста
-        for pattern, format in self.highlightingRules:
-            iterator = pattern.globalMatch(text)
-            while iterator.hasNext():
-                match = iterator.next()
-                self.setFormat(match.capturedStart(), match.capturedLength(), format)
+def _pipe_prefix_numeric_key(item):
+    """Ключ для колонки 'Длина': текст вида '150 | доп.инфо'."""
+    return float(item.text().split('|')[0].strip())
 
-class NumericTableWidgetItem(QTableWidgetItem):
-    def __lt__(self, other):
-        try:
-            return float(self.text().split('|')[0].strip()) < float(other.text().split('|')[0].strip())
-        except (ValueError, IndexError):
-            return super().__lt__(other)
+
+class NumericTableWidgetItem(NumericSortItem):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, key_fn=_pipe_prefix_numeric_key, **kwargs)
 
 
 # --- Поток для анализа ---
@@ -1635,19 +1575,6 @@ class ValidationThread(QThread):
     progress_update = pyqtSignal(str, int, int)
     analysis_finished = pyqtSignal(int, int)
 
-    
-    ERROR_PRIORITIES = {
-        "Недоперевод": 1,
-        "Повтор": 2,
-        "Нарушение XML-структуры": 3,
-        "Структурная ошибка": 4,
-        "Большой абзац": 5,
-        "Восстановлено изображение": 6,
-        "Откл": 7, # <-- Изменено название ключа
-        "Длина": 8,
-        "Ошибка парсинга": 99
-    }
-    
     def __init__(self, translated_folder, original_epub_path, checks_config, word_exceptions_set, project_manager, files_to_scan=None):
         super().__init__()
         self.translated_folder = translated_folder
@@ -1713,7 +1640,7 @@ class ValidationThread(QThread):
             # Fingerprints
             soup_orig = BeautifulSoup(original_content, 'html.parser')
             soup_trans = BeautifulSoup(translated_content, 'html.parser')
-            orig_fp, trans_fp = self._create_structural_fingerprint(soup_orig), self._create_structural_fingerprint(soup_trans)
+            orig_fp, trans_fp = _create_structural_fingerprint(soup_orig), _create_structural_fingerprint(soup_trans)
 
             for h in set(orig_fp['headings'].keys()) | set(trans_fp['headings'].keys()):
                 if orig_fp['headings'].get(h, 0) != trans_fp['headings'].get(h, 0):
@@ -1816,18 +1743,15 @@ class ValidationThread(QThread):
                 result_data['repeat_data'] = best_repeat_candidate # <-- СЫРОЕ ДАННОЕ: ('a', 15, True)
 
             # --- 6. Недоперевод ---
+            # finding-ui-dialogs-validation_design_1-untranslated-detection-triplic:
+            # единственный источник детекции -- канонический UntranslatedWordDetector.
+            # Раньше здесь же дублировался тот же проход собственным regex'ом с
+            # более слабым порогом (len<2) и узким CJK-диапазоном -- это давало
+            # ложные срабатывания на 2-буквенных латинских словах и расходилось
+            # с тем, что реально флагует детектор.
             if text_trans:
-                # Тут логика сложная, поэтому список слов собираем сразу, 
-                # но фильтровать его наличие будем в UI
                 untranslated_words_to_highlight = []
-                single_word_exceptions = {w for w in self.word_exceptions if ' ' not in w}
-                phrase_exceptions = [p for p in self.word_exceptions if ' ' in p]; phrase_exceptions.sort(key=len, reverse=True)
 
-                temp_text_trans = text_trans
-                for phrase in phrase_exceptions:
-                    pattern = r'\b' + re.escape(phrase) + r'\b'
-                    temp_text_trans = re.sub(pattern, ' ', temp_text_trans, flags=re.IGNORECASE)
-                
                 try:
                     detector = self._detector
                     if detector is None:
@@ -1841,17 +1765,6 @@ class ValidationThread(QThread):
                         )
                 except Exception as detect_error:
                     print(f"[Validator WARN] UntranslatedWordDetector error: {detect_error}")
-
-                no_cyrillic_text = re.sub(r'[а-яА-ЯёЁ]+', ' ', temp_text_trans)
-                pure_residue_text = re.sub(r'[\W\d_]+', ' ', no_cyrillic_text)
-                
-                for word in pure_residue_text.split():
-                    is_cjk = re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word)
-                    if len(word) < 2 and not is_cjk: continue
-                    if len(word) == 1 and re.fullmatch(r'[a-zA-Z]', word): continue
-                    if re.fullmatch(r'^[A-Sa-s][+-]?$', word): continue
-                    if word.lower() not in single_word_exceptions:
-                        untranslated_words_to_highlight.append(word)
 
                 if untranslated_words_to_highlight:
                     result_data['untranslated_words'] = sorted(list(set(untranslated_words_to_highlight)), key=len, reverse=True)
@@ -1919,12 +1832,6 @@ class ValidationThread(QThread):
         punct += len(REGEX_COLONS_SEMIS.findall(text))
 
         return digits, punct
-    
-    def _create_structural_fingerprint(self, soup):
-        fp = {'headings': {}, 'images': len(soup.find_all('img')), 'links': len(soup.find_all('a')), 'lists': len(soup.find_all(['ol', 'ul']))}
-        for h_tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-            fp['headings'][h_tag.name] = fp['headings'].get(h_tag.name, 0) + 1
-        return fp
     
     def _calculate_combined_deviation(self, orig_p, trans_p, dig_o, dig_t, punct_o, punct_t):
         """
@@ -2038,8 +1945,8 @@ class ValidationThread(QThread):
                         # Подгрузка validated версии для сравнения (если есть)
                         all_versions = project_manager.get_versions_for_original(internal_html_path)
                         validated_content = None
-                        if '_validated.html' in all_versions:
-                            v_path = os.path.join(self.translated_folder, all_versions['_validated.html'])
+                        if VALIDATED_SUFFIX in all_versions:
+                            v_path = os.path.join(self.translated_folder, all_versions[VALIDATED_SUFFIX])
                             if os.path.exists(v_path):
                                 with open(v_path, 'r', encoding='utf-8') as f:
                                     validated_content = f.read()
@@ -2078,6 +1985,51 @@ class ValidationThread(QThread):
     def stop(self):
         self._is_running = False
 
+# finding-ui-dialogs-validation_design_1-untranslated-detection-triplic:
+# build_detector_signature (utils/validation_cache.py) hashes only the
+# exceptions set. Bump this marker whenever the untranslated-word DETECTION
+# RULES themselves change (not just the exceptions), so is_snapshot_compatible
+# correctly rejects a validation-cache snapshot computed under the old rules
+# even when the EPUB and exceptions are unchanged. Without this, chapters
+# restored from a stale snapshot and chapters recalculated under new rules
+# would silently disagree within the same results table.
+UNTRANSLATED_DETECTOR_RULES_MARKER = "__untranslated_rules_v2__"
+
+
+class _LazyOriginalEpubZip:
+    """Ленивая обёртка над ``zipfile.ZipFile`` архива оригинала.
+
+    Настоящий ``zipfile.ZipFile`` (а значит и чтение центрального каталога
+    EPUB) открывается только на первый вызов :meth:`read` — то есть на
+    первый реальный промах кэша внутри батча (см.
+    ``_repair_ai_artifacts_for_selection``). Если ни одна строка прохода не
+    промахнула кэш, архив вообще не открывается. Дальше открытый хендл
+    переиспользуется для всех последующих промахов — вместо повторного
+    открытия архива на КАЖДЫЙ промах ограниченного LRU-кэша.
+    """
+
+    def __init__(self, epub_path):
+        self._epub_path = epub_path
+        self._zip = None
+        self._tried_open = False
+
+    def read(self, internal_path):
+        if not self._tried_open:
+            self._tried_open = True
+            if self._epub_path and os.path.exists(self._epub_path):
+                try:
+                    self._zip = zipfile.ZipFile(self._epub_path, 'r')
+                except Exception:
+                    self._zip = None
+        if self._zip is None:
+            raise FileNotFoundError(internal_path)
+        return self._zip.read(internal_path)
+
+    def close(self):
+        if self._zip is not None:
+            self._zip.close()
+
+
 # --- Главное окно диалога ---
 class TranslationValidatorPage(ShellPage):
 
@@ -2091,9 +2043,39 @@ class TranslationValidatorPage(ShellPage):
         ("problematic_or_changed", "Проблемные + измененные"),
     )
 
+    # Подписи статуса строки для колонки 3 таблицы результатов. Раньше этот
+    # словарь был продублирован дословно в reapply_filters и add_result
+    # (dups-gt_ui_dialogs_validation-01, finding …26-status-map-and-no-
+    # problem-dial) — единственный канонический источник теперь здесь.
+    STATUS_LABELS = {
+        "problem": "Проблема",
+        "neutral": "Проблем нет",
+        "ok": "Готов",
+        "delete": "На удаление",
+        "retry": "К переотправке",
+        "edited": "Редакт.",
+    }
+
+    # Watchdog для run_auto_untranslated_fixer: если движок отклонил команду
+    # старта скрытой AI-сессии фиксера недоперевода (is_starting/занятый
+    # session_id в translation_engine — например, пользователь вручную
+    # запустил перевод, пока в фоне ещё шёл автовалидатор), событие
+    # session_started для нашего запуска не придёт никогда, а вложенный
+    # QEventLoop без тайм-аута завис бы навсегда (ui-dialogs-validation/
+    # runtime/4-auto-fixer-nested-eventloop-no).
+    #
+    # Важно: это тайм-аут ТОЛЬКО на подтверждение старта движком, а не на всю
+    # AI-сессию целиком — код-ревью (ui_dialogs_validation_c) справедливо
+    # указал, что первая версия страховки мерила тайм-аутом всю сессию и
+    # обрывала бы совершенно легитимный, просто долгий проход фиксера
+    # (десятки глав, RPM-лимиты, ретраи). Как только dialog._owned_session_id
+    # выставлен (событие session_started дошло), обработчик тайм-аута сам
+    # ничего не делает, и wait_loop ждёт dialog.finished дальше без верхней
+    # границы.
+    AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS = 10 * 60 * 1000
+
     RATIO_PRESETS = {
-        "Алфавитный (A -> A)": (0.70, 1.80, "Ожидаемое соотношение перевод/оригинал для En/Fr/De -> Ru"),
-        "Иероглифический (象 -> A)": (2.80, 6.50, "Ожидаемое перевод/оригинал для Zh/Jp/Ko -> Ru; если меньше x2.8, это уже подозрительно"),
+        **validation_ratio_presets(),
         "Медиана ±20%": (-1.0, 0.20, "Отклонение от медианного значения по всем главам"),
         "Медиана ±25%": (-1.0, 0.25, "Отклонение от медианного значения по всем главам"),
         "Медиана ±30%": (-1.0, 0.30, "Отклонение от медианного значения по всем главам")
@@ -2137,6 +2119,22 @@ class TranslationValidatorPage(ShellPage):
         self._fixer_filter_state = None
         self._fixer_data_fingerprint = None
         self._fixer_stale_rows: set = set()  # строки, требующие пересчёта untranslated_words
+        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me (автопайплайн):
+        # одноразовый кеш последнего собранного payload помощника недоперевода —
+        # см. _collect_untranslated_fixer_payload_cached.
+        self._auto_untranslated_payload_cache = None
+
+        # Контроллер окна «Качество перевода» переживает закрытие самого
+        # диалога: проход по книге идёт в фоне и после закрытия окна, и
+        # обратные вызовы из QA-потока не должны попадать в удалённый
+        # Qt-объект (ui-dialogs-validation/runtime/17-qa-dialog-closed-mid-pass-call).
+        self._quality_controller = None
+        self._quality_pass_running = False
+        # Отпечаток настроек (модель/ключи/прокси), с которым в последний раз
+        # был собран РУЧНОЙ координатор проверки (не координатор активной
+        # сессии перевода — тот никогда не пересобирается этой страницей).
+        self._manual_quality_coordinator = None
+        self._manual_quality_snapshot = None
         
         app = QtWidgets.QApplication.instance()
         self.settings_manager = app.get_settings_manager() if hasattr(app, 'settings_manager') else None
@@ -2151,8 +2149,16 @@ class TranslationValidatorPage(ShellPage):
         self.initUI()
         
         # Настройка "раскрасчиков"
-        self.html_highlighter_orig = HtmlHighlighter(self.view_original.document())
-        self.html_highlighter_trans = HtmlHighlighter(self.view_translated.document())
+        self.html_highlighter_orig = HtmlSyntaxHighlighter(
+            self.view_original.document(),
+            palette=HTML_PALETTE_DARK,
+            highlight_partial_markup=True,
+        )
+        self.html_highlighter_trans = HtmlSyntaxHighlighter(
+            self.view_translated.document(),
+            palette=HTML_PALETTE_DARK,
+            highlight_partial_markup=True,
+        )
         self.punctuation_highlighter_orig = PunctuationHighlighter(self.view_original.document())
         self.punctuation_highlighter_trans = PunctuationHighlighter(self.view_translated.document())
         self._update_highlighters() # Вызываем один раз для установки начального состояния
@@ -2377,6 +2383,52 @@ class TranslationValidatorPage(ShellPage):
                 excluded_paths.add(internal_path)
         return excluded_paths
 
+    def _glossary_latin_residue_exceptions(self, exceptions_set, warn_context="исключений"):
+        """Пополняет ``exceptions_set`` латинскими "остатками" переводов из
+        project_glossary.json — общий блок для _get_effective_word_exceptions
+        и _build_current_untranslated_exceptions (обе читали файл, разбирали
+        dict-или-list и извлекали rus по одной и той же цепочке фолбэков
+        entry.get('rus') or entry.get('translation') or entry.get('target')).
+
+        Мутирует и возвращает ``exceptions_set`` (как и делали обе исходные
+        копии), чтобы вызывающему коду не нужно было менять свой стиль работы
+        с результатом. ``warn_context`` — единственное реальное различие между
+        копиями (текст предупреждения при ошибке чтения глоссария).
+        """
+        if not (self.project_manager and self.project_manager.project_folder):
+            return exceptions_set
+
+        glossary_path = os.path.join(self.project_manager.project_folder, "project_glossary.json")
+        if not os.path.exists(glossary_path):
+            return exceptions_set
+
+        try:
+            with open(glossary_path, 'r', encoding='utf-8') as f:
+                glossary_data = json.load(f)
+
+            cyrillic_pattern = re.compile(r'[а-яА-ЯёЁ]+')
+            cleanup_pattern = re.compile(r'[\W\d_]+')
+            iterator = glossary_data if isinstance(glossary_data, list) else glossary_data.values()
+
+            for entry in iterator:
+                if not isinstance(entry, dict):
+                    continue
+
+                rus = entry.get('rus') or entry.get('translation') or entry.get('target') or ''
+                if not rus:
+                    continue
+
+                no_cyrillic_str = cyrillic_pattern.sub(' ', rus)
+                pure_residue_str = cleanup_pattern.sub(' ', no_cyrillic_str)
+                for word in pure_residue_str.strip().split():
+                    word_lower = word.lower()
+                    if len(word_lower) >= 2:
+                        exceptions_set.add(word_lower)
+        except Exception as e:
+            print(f"[Validator WARN] Не удалось прочитать глоссарий для {warn_context}: {e}")
+
+        return exceptions_set
+
     def _get_effective_word_exceptions(self):
         if self.settings_manager:
             exceptions_text = self.settings_manager.get_last_word_exceptions_text()
@@ -2391,39 +2443,13 @@ class TranslationValidatorPage(ShellPage):
             if line.strip() and not line.strip().startswith('#')
         }
 
-        if self.project_manager and self.project_manager.project_folder:
-            glossary_path = os.path.join(self.project_manager.project_folder, "project_glossary.json")
-            if os.path.exists(glossary_path):
-                try:
-                    with open(glossary_path, 'r', encoding='utf-8') as f:
-                        glossary_data = json.load(f)
-
-                    cyrillic_pattern = re.compile(r'[а-яА-ЯёЁ]+')
-                    cleanup_pattern = re.compile(r'[\W\d_]+')
-                    iterator = glossary_data if isinstance(glossary_data, list) else glossary_data.values()
-
-                    for entry in iterator:
-                        rus = ''
-                        if isinstance(entry, dict):
-                            rus = entry.get('rus') or entry.get('translation') or entry.get('target') or ''
-
-                        if not rus:
-                            continue
-
-                        no_cyrillic_str = cyrillic_pattern.sub(' ', rus)
-                        pure_residue_str = cleanup_pattern.sub(' ', no_cyrillic_str)
-                        for word in pure_residue_str.strip().split():
-                            w_lower = word.lower()
-                            if len(w_lower) >= 2:
-                                exceptions_set.add(w_lower)
-                except Exception as e:
-                    print(f"[Validator WARN] Не удалось прочитать глоссарий для исключений: {e}")
-
-        return exceptions_set
+        return self._glossary_latin_residue_exceptions(exceptions_set, warn_context="исключений")
 
     def _load_validation_snapshot_state(self):
         self.current_epub_fingerprint = build_file_fingerprint(self.original_epub_path)
-        self.current_detector_signature = build_detector_signature(self._get_effective_word_exceptions())
+        self.current_detector_signature = build_detector_signature(
+            set(self._get_effective_word_exceptions()) | {UNTRANSLATED_DETECTOR_RULES_MARKER}
+        )
 
         if not self.project_manager:
             self.validation_snapshot_entries = {}
@@ -2685,7 +2711,62 @@ class TranslationValidatorPage(ShellPage):
         main_layout.addWidget(self._create_group5_actions())
 
         return main_group
-    
+
+    def _append_result_row(
+        self,
+        row_pos,
+        internal_path,
+        target_rel_path,
+        is_validated_present,
+        data,
+        needs_analysis,
+        *,
+        placeholder_text,
+    ):
+        """Строит одну строку таблицы результатов и всю связанную с ней
+        бухгалтерию (results_data/path_row_map/dirty_files/скрытие готовых).
+
+        Общая часть циклов _populate_initial_table и
+        _smart_reload_table_preserving_data (dups-gt_ui_dialogs_validation-01,
+        finding …12-table-row-build-loop-copy). ``placeholder_text`` — единственное
+        сознательно сохранённое различие между вызывающими ("Ожидание..." при
+        первичной загрузке против "..." при умной перезагрузке); отзывчивость
+        интерфейса (processEvents/setUpdatesEnabled) первичной загрузки остаётся
+        снаружи, в самом цикле _populate_initial_table, и не переносится на
+        умную перезагрузку — это отдельное поведенческое решение, не часть
+        устраняемого дублирования.
+        """
+        self.table_results.insertRow(row_pos)
+
+        display_text = f"{os.path.basename(internal_path)}"
+        if is_validated_present:
+            display_text += " [Готов]"
+        else:
+            display_text += f" -> {os.path.basename(target_rel_path)}"
+
+        display_path_item = SortableChapterItem(display_text, internal_path)
+        display_path_item.setData(Qt.ItemDataRole.UserRole, is_validated_present)
+        self.table_results.setItem(row_pos, 0, display_path_item)
+
+        current_reasons, _ = self._calculate_status_for_data(data)
+        self._set_problem_cell(row_pos, data, current_reasons)
+        len_text = (
+            f"{data.get('len_orig', 0)} | {data.get('len_trans', 0)}"
+            if data.get('has_cached_analysis')
+            else "- | -"
+        )
+        self.table_results.setItem(row_pos, 2, NumericTableWidgetItem(len_text))
+        self.table_results.setItem(row_pos, 3, QTableWidgetItem(placeholder_text))
+
+        self.results_data[row_pos] = data
+        self.path_row_map[internal_path] = row_pos
+
+        if needs_analysis:
+            self.dirty_files.add(internal_path)
+
+        if is_validated_present and not self.check_revalidate_ok.isChecked():
+            self.table_results.setRowHidden(row_pos, True)
+
     def _populate_initial_table(self):
         """
         Заполняет таблицу всеми файлами.
@@ -2726,7 +2807,6 @@ class TranslationValidatorPage(ShellPage):
         ordered_originals, _ = get_epub_chapter_order(self.original_epub_path, return_method=True)
         row_pos = 0
         
-        from ...api import config as api_config
         was_sorting_enabled = self.table_results.isSortingEnabled()
         self.table_results.setSortingEnabled(False)
         self.table_results.setUpdatesEnabled(False)
@@ -2748,47 +2828,24 @@ class TranslationValidatorPage(ShellPage):
                 continue
             
             full_path = os.path.join(self.translated_folder, target_rel_path)
-            
+
             # Данные
             data_placeholder, needs_analysis = self._build_row_data_for_file(
                 internal_path,
                 full_path,
                 is_validated_present,
             )
-            
-            self.table_results.insertRow(row_pos)
-            
-            # Колонка 0
-            display_text = f"{os.path.basename(internal_path)}"
-            if is_validated_present: display_text += " [Готов]"
-            else: display_text += f" -> {os.path.basename(target_rel_path)}"
 
-            display_path_item = SortableChapterItem(display_text, internal_path)
-            display_path_item.setData(Qt.ItemDataRole.UserRole, is_validated_present)
-            self.table_results.setItem(row_pos, 0, display_path_item)
-            
-            # Колонка 1, 2, 3
-            current_reasons, _ = self._calculate_status_for_data(data_placeholder)
-            self._set_problem_cell(row_pos, data_placeholder, current_reasons)
-            len_text = (
-                f"{data_placeholder.get('len_orig', 0)} | {data_placeholder.get('len_trans', 0)}"
-                if data_placeholder.get('has_cached_analysis')
-                else "- | -"
+            self._append_result_row(
+                row_pos,
+                internal_path,
+                target_rel_path,
+                is_validated_present,
+                data_placeholder,
+                needs_analysis,
+                placeholder_text="Ожидание...",
             )
-            self.table_results.setItem(row_pos, 2, NumericTableWidgetItem(len_text))
-            self.table_results.setItem(row_pos, 3, QTableWidgetItem("Ожидание..."))
-            
-            self.results_data[row_pos] = data_placeholder
-            self.path_row_map[internal_path] = row_pos
-            
-            # Помечаем как "Грязный" (нужен анализ)
-            if needs_analysis:
-                self.dirty_files.add(internal_path)
-            
-            # Скрываем строку сразу, если это готовый файл, а галочка выключена
-            if is_validated_present and not self.check_revalidate_ok.isChecked():
-                self.table_results.setRowHidden(row_pos, True)
-            
+
             row_pos += 1
 
         if self._is_destroyed():
@@ -2966,27 +3023,402 @@ class TranslationValidatorPage(ShellPage):
     
         self.btn_analyze = QPushButton("🚀 Начать проверку"); self.btn_analyze.clicked.connect(self.start_analysis)
         self.btn_exceptions_manager = QPushButton("Списки исключений…"); self.btn_exceptions_manager.clicked.connect(self._open_exceptions_manager)
+        self.btn_translation_quality = QPushButton("🎯 Качество перевода")
+        self.btn_translation_quality.setToolTip(
+            "Отчёт контроля качества: полнота перевода, языковые дефекты, термины "
+            "и статистика книги. Здесь же — ручная проверка, исправление и откат."
+        )
+        self.btn_translation_quality.clicked.connect(self.open_translation_quality_dialog)
         
         layout.addStretch()
         layout.addWidget(self.btn_sync_project) # <-- Добавляем в layout
         layout.addWidget(self.btn_analyze)
         layout.addWidget(self.btn_exceptions_manager)
+        layout.addWidget(self.btn_translation_quality)
         layout.addStretch()
         return container
+
+    def open_translation_quality_dialog(self):
+        """Open the translation quality report for the current project."""
+        from .validation_dialogs.translation_quality_dialog import (
+            TranslationQualityDialog,
+        )
+
+        settings_manager = self._quality_settings_manager()
+        if settings_manager is None:
+            QMessageBox.warning(
+                self,
+                "Качество перевода",
+                "Настройки приложения недоступны, отчёт открыть нельзя.",
+            )
+            return
+        qa_settings = settings_manager.get_qa_settings()
+        dialog = TranslationQualityDialog(
+            self,
+            settings=qa_settings,
+            key_counter=self._quality_key_counter(settings_manager),
+            book_title=self._quality_book_title(),
+            model_choices=self._quality_model_choices(settings_manager),
+        )
+        dialog.settings_changed.connect(settings_manager.save_qa_settings)
+        dialog.set_status(qa_settings.embedding_setup_problem() or "Готово.")
+        controller = self._quality_controller_instance()
+        controller.attach(dialog)
+        # Проход, начатый из прошлого открытия окна, мог не завершиться:
+        # отражаем это сразу, а не только когда придёт следующий сигнал.
+        dialog.set_busy(self._quality_pass_running)
+        # Build the runtime now, so the window can say at once whether a pass
+        # is possible instead of letting a button do nothing.
+        self._quality_setup_problem = ""
+        if self._quality_coordinator() is None:
+            dialog.set_status(
+                self._quality_setup_problem
+                or "Проверка сейчас недоступна."
+            )
+        exec_dialog(self, dialog)
+
+    def _quality_controller_instance(self):
+        """Return the page's one quality controller, building it on first use.
+
+        The QA runtime keeps working on a book long after the dialog that
+        started it is closed — that continuation is intentional. Parenting
+        the controller to the *dialog* used to make Qt destroy it the moment
+        the window closed, so the pass's next progress callback (arriving
+        later, from the QA thread) reached into a deleted C++ object and
+        raised RuntimeError instead of updating a report
+        (ui-dialogs-validation/runtime/17-qa-dialog-closed-mid-pass-call).
+        Parenting it to this page — which outlives any single quality
+        dialog — and reusing that same instance across re-opens keeps it
+        alive for as long as the pass runs, and lets a freshly reopened
+        window learn a pass is still going instead of showing "не занят"
+        for one that is quietly still spending API keys in the background.
+        """
+        controller = self._quality_controller
+        if controller is not None:
+            return controller
+        from .validation_dialogs.translation_quality_controller import (
+            TranslationQualityController,
+        )
+
+        controller = TranslationQualityController(
+            coordinator_provider=self._quality_coordinator,
+            journal_loader=self._quality_journal,
+            gates_provider=self._quality_open_gates,
+            event_builder=self._quality_events,
+            parent=self,
+        )
+        controller.busy_changed.connect(self._on_quality_pass_busy_changed)
+        self._quality_controller = controller
+        return controller
+
+    def _on_quality_pass_busy_changed(self, busy: bool) -> None:
+        """Track whether a pass is running independently of any open dialog."""
+        self._quality_pass_running = bool(busy)
+
+    def _quality_log(self, message: str) -> None:
+        """Send a line of a manual check into the quality window's log.
+
+        Only what the handlers say comes here — keys resting, the server
+        failing.  Chapters reach the log through the controller with all
+        their changes, and the coordinator's reports of them would repeat it.
+        """
+        controller = getattr(self, "_quality_controller", None)
+        if controller is not None:
+            controller.note(message)
+
+    def _quality_settings_manager(self):
+        app = QApplication.instance()
+        getter = getattr(app, "get_settings_manager", None)
+        if callable(getter):
+            return getter()
+        return getattr(app, "settings_manager", None)
+
+    @staticmethod
+    def _quality_key_counter(settings_manager):
+        """Count a provider's working embedding keys for the quality window."""
+        from ...qa.assembly import embedding_key_counts
+
+        def count(provider_id: str, model_id: str) -> tuple[int, int]:
+            return embedding_key_counts(settings_manager, provider_id, model_id)
+
+        return count
+
+    @staticmethod
+    def _quality_model_choices(settings_manager):
+        """What «Модель проверки» offers: the models of the book's own service."""
+        from ...qa.assembly import qa_model_choices
+
+        try:
+            return qa_model_choices(settings_manager)
+        except Exception:  # noqa: BLE001 - without a list the row stays hidden
+            return None
+
+    def _quality_book_title(self) -> str:
+        """The project folder's name, which is the book's name on disk."""
+        project_manager = getattr(self, "project_manager", None)
+        folder = str(getattr(project_manager, "project_folder", "") or "")
+        return os.path.basename(os.path.normpath(folder)) if folder else ""
+
+    def _quality_coordinator(self):
+        """Return the session's QA runtime, or build one for this project.
+
+        Checking a book translated yesterday is the ordinary case for a quality
+        report, and there is no session to borrow a runtime from.  A session's
+        own coordinator is never replaced: it knows the model and keys that
+        session is running on.
+
+        A coordinator *this window* built manually is a different matter: it
+        used to be kept forever, so changing the checking model, keys or
+        proxy in settings and reopening the window silently kept using the
+        stale runtime built before the change
+        (ui-dialogs-validation/runtime/13-manual-qa-coordinator-stale). That
+        one — and only that one, never a live session's — is rebuilt when its
+        settings snapshot no longer matches what is configured now.
+
+        Two review corrections on that rebuild, both about not destroying a
+        coordinator that is still doing real work:
+
+        * A pass in flight is never torn down out from under itself. Whether
+          settings changed or not, a coordinator this page still considers
+          busy (``_quality_pass_running``) or that still has scheduled checks
+          (``_pending``) is returned as-is; the rebuild — if settings really
+          did change — happens on the next call, once the pass has ended.
+        * The replacement is built *before* anything happens to the one that
+          works. Detaching first and asking questions later meant a build
+          that failed after the old coordinator was already gone (all keys of
+          the new model briefly red, say) left the window with nothing —
+          exactly the moment the user reaches for "Остановить". Nothing here
+          calls ``detach_chapter_qa_coordinator`` directly any more; that is
+          ``attach_chapter_qa_coordinator``'s job, and it only runs once
+          ``_build_manual_quality_coordinator`` is convinced a replacement is
+          possible at all.
+        """
+        app = QApplication.instance()
+        existing = getattr(app, "qa_coordinator", None)
+        manual = getattr(self, "_manual_quality_coordinator", None)
+        if existing is not None and existing is not manual:
+            return existing
+        if existing is not None and existing is manual:
+            if self._quality_pass_running or self._coordinator_is_busy(existing):
+                return existing
+            settings_manager = self._quality_settings_manager()
+            current_snapshot = self._manual_quality_settings_snapshot(settings_manager)
+            if current_snapshot is not None and current_snapshot == getattr(
+                self, "_manual_quality_snapshot", None
+            ):
+                return existing
+            rebuilt = self._build_manual_quality_coordinator(app)
+            if rebuilt is not None:
+                return rebuilt
+            # Couldn't build the replacement. If nothing detached the coordinator
+            # we already had (attach_chapter_qa_coordinator only does that once it
+            # is sure the new one will exist), it is still there and still works.
+            if getattr(app, "qa_coordinator", None) is existing:
+                return existing
+            return None
+        return self._build_manual_quality_coordinator(app)
+
+    @staticmethod
+    def _coordinator_is_busy(coordinator) -> bool:
+        """Best-effort peek at whether a coordinator still has work scheduled.
+
+        ``_pending`` is a private detail of ``ChapterQaCoordinator``, read
+        here only as an extra safety net alongside ``_quality_pass_running``
+        (which already tracks busy/idle through the controller's own signal).
+        A coordinator that does not expose it — a test double, say — is
+        simply never treated as busy by this particular check.
+        """
+        try:
+            return bool(getattr(coordinator, "_pending", None))
+        except Exception:  # noqa: BLE001 - an unreadable pending set is not proof of work
+            return False
+
+    def _manual_quality_settings_snapshot(self, settings_manager):
+        """A comparable fingerprint of what a manual coordinator would run on.
+
+        Deliberately NOT ``green_keys()``: that answers which of the
+        configured keys currently have quota left, which is runtime health,
+        not a setting.  A key tripping its daily limit mid-pass used to
+        change this fingerprint with nothing the user touched, so the very
+        next call to :meth:`_quality_coordinator` read it as "settings
+        changed" and tore down the live pass that key belonged to
+        (ui-dialogs-validation/runtime/13-manual-qa-coordinator-stale,
+        review correction). The fingerprint instead covers everything a
+        manual build actually freezes into the coordinator: provider, model,
+        every key *configured* for that provider (healthy or not), the
+        proxy, the project's own epub, and the rest of the QA settings.
+
+        Not the keys themselves (no reason to keep a second copy of secrets
+        around) — a digest, so two builds with the same keys compare equal
+        without this attribute holding anything sensitive.
+        """
+        from ...qa.assembly import resolve_manual_qa_model
+
+        project_manager = getattr(self, "project_manager", None)
+        if settings_manager is None or project_manager is None:
+            return None
+        qa_settings = settings_manager.get_qa_settings()
+        provider, model_name = resolve_manual_qa_model(settings_manager, qa_settings)
+        if not provider or not model_name:
+            return None
+        keys = self._configured_keys_for_provider(settings_manager, provider)
+        keys_digest = hashlib.sha256(
+            "\n".join(sorted(str(key) for key in keys)).encode("utf-8", "surrogatepass")
+        ).hexdigest()
+        proxy_settings = settings_manager.load_proxy_settings()
+        try:
+            proxy_marker = json.dumps(proxy_settings, sort_keys=True, default=str)
+        except TypeError:
+            proxy_marker = repr(proxy_settings)
+        epub_path = str(getattr(self, "original_epub_path", "") or "")
+        return (provider, model_name, keys_digest, proxy_marker, epub_path, qa_settings)
+
+    @staticmethod
+    def _configured_keys_for_provider(settings_manager, provider_id: str) -> tuple[str, ...]:
+        """Every key configured for a provider, healthy or not.
+
+        Unlike ``qa.assembly.green_keys`` this never asks
+        ``is_key_limit_active`` — a settings fingerprint must move only when
+        the user actually changes something, not when a key's quota does.
+        """
+        if settings_manager is None or not provider_id:
+            return ()
+        try:
+            statuses = settings_manager.load_key_statuses() or ()
+        except Exception:  # noqa: BLE001 - unreadable statuses mean no fingerprint
+            return ()
+        keys: list[str] = []
+        for key_info in statuses:
+            if str(key_info.get("provider") or "") != str(provider_id):
+                continue
+            key = str(key_info.get("key") or "").strip()
+            if key and key not in keys:
+                keys.append(key)
+        return tuple(keys)
+
+    def _build_manual_quality_coordinator(self, app):
+        from ...qa.assembly import (
+            aiohttp_session_factory,
+            attach_chapter_qa_coordinator,
+            detect_source_language,
+            embedding_keys_for_session,
+            green_keys,
+            manual_session_settings,
+            resolve_manual_qa_model,
+        )
+        from ...qa.handler_factory import build_qa_handler_factory
+        from ...qa.key_pool import QaKeyPool
+
+        settings_manager = self._quality_settings_manager()
+        project_manager = getattr(self, "project_manager", None)
+        if app is None or settings_manager is None or project_manager is None:
+            self._quality_setup_problem = (
+                "Проект не открыт, проверять нечего."
+            )
+            return None
+        qa_settings = settings_manager.get_qa_settings()
+        provider, model_name = resolve_manual_qa_model(settings_manager, qa_settings)
+        if not provider or not model_name:
+            self._quality_setup_problem = (
+                "Не удалось определить модель проверки: нет ни модели последнего "
+                "перевода, ни ключей ни у одного сервиса."
+            )
+            return None
+        keys = green_keys(settings_manager, provider, model_name)
+        if not keys:
+            self._quality_setup_problem = (
+                f"У провайдера «{provider}» нет свободных ключей для модели "
+                f"«{model_name}»."
+            )
+            return None
+        proxy_settings = settings_manager.load_proxy_settings()
+        reasons: list[str] = []
+        try:
+            key_pool = QaKeyPool(
+                keys, model_id=model_name, settings_manager=settings_manager
+            )
+            coordinator = attach_chapter_qa_coordinator(
+                app,
+                project_manager=project_manager,
+                settings_manager=settings_manager,
+                handler_factory=build_qa_handler_factory(
+                    settings_manager=settings_manager,
+                    key_pool=key_pool,
+                    session_settings=manual_session_settings(
+                        settings_manager, proxy_settings
+                    ),
+                    log=self._quality_log,
+                ),
+                session_id="manual",
+                api_keys_by_provider=embedding_keys_for_session(provider, list(keys)),
+                session_factory=aiohttp_session_factory(proxy_settings),
+                translation_provider=provider,
+                translation_model=model_name,
+                epub_path=str(getattr(self, "original_epub_path", "") or ""),
+                source_language_resolver=detect_source_language,
+                stop_requested=lambda: key_pool.seconds_until_available() is None,
+                on_unavailable=reasons.append,
+            )
+        except Exception as error:  # noqa: BLE001 - a report never crashes the window
+            self._quality_setup_problem = f"Проверку не удалось собрать: {error}"
+            return None
+        if coordinator is None:
+            # The assembly names its own reason. A refusal that names none is
+            # no proof the checks are off, and saying so sent the user to
+            # settings that were already on.
+            self._quality_setup_problem = (
+                reasons[-1] if reasons else "Проверка сейчас недоступна."
+            )
+        else:
+            self._manual_quality_coordinator = coordinator
+            self._manual_quality_snapshot = self._manual_quality_settings_snapshot(
+                settings_manager
+            )
+        return coordinator
+
+    def _quality_journal(self):
+        from ...qa.journal import QaJournal
+
+        project_manager = getattr(self, "project_manager", None)
+        if project_manager is None:
+            return QaJournal.empty(book_id="book")
+        path = project_manager.get_translation_qa_journal_path()
+        if not path.exists():
+            return QaJournal.empty(book_id=str(project_manager.project_folder))
+        return QaJournal.load(path)
+
+    @staticmethod
+    def _quality_open_gates():
+        task_manager = getattr(QApplication.instance(), "task_manager", None)
+        if task_manager is None or not hasattr(task_manager, "get_open_qa_gates"):
+            return ()
+        return tuple(task_manager.get_open_qa_gates())
+
+    def _quality_events(self, chapter_ids=None):
+        from ...qa.assembly import build_manual_events
+
+        project_manager = getattr(self, "project_manager", None)
+        if project_manager is None:
+            return ()
+        return build_manual_events(
+            project_manager=project_manager,
+            epub_path=str(getattr(self, "original_epub_path", "") or ""),
+            chapter_ids=chapter_ids,
+        )
     
     def _set_tooltips(self):
         """Централизованно устанавливает все всплывающие подсказки для виджетов."""
         
         # Группа 1: Основные проверки
         structure_tooltip = "Проверяет соответствие ключевых тегов (<html>, <body>), заголовков (<h1>-<h6>), изображений и списков.\nТакже проверяет баланс тегов <p>."
-        self.check_structure.setToolTip(structure_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
+        self.check_structure.setToolTip(escape_html(structure_tooltip))
         ai_repair_tooltip = (
             "Исправляет типовые ошибки ИИ в HTML: дублированные части тегов, лишние символы < или >, "
             "текст напрямую внутри body без p, потерянную обёртку body, баланс p и склеенные русские слова. "
             "Имена сверяются с глоссарием, неоднозначные склейки остаются без изменений, "
             "а каждое исправление показывается перед применением."
         )
-        self.btn_fix_ai_artifacts.setToolTip(ai_repair_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
+        self.btn_fix_ai_artifacts.setToolTip(escape_html(ai_repair_tooltip))
         
         self.check_untranslated.setToolTip("Включить/выключить проверку на недоперевод.")
         self.btn_fix_untranslated.setToolTip("Ищет в переводе латинские слова (3+ букв) и иероглифы, которые также присутствуют в оригинале.\nОткрывает диалог для пакетного исправления, если что-то найдено.")
@@ -2995,7 +3427,7 @@ class TranslationValidatorPage(ShellPage):
         
         # Группа 2: Настраиваемые проверки
         simplification_tooltip = "Проверяет, не было ли утеряно форматирование. Срабатывает, если количество тегов <p> и <br>\nв переводе отличается от оригинала больше, чем на указанный процент."
-        self.check_simplification.setToolTip(simplification_tooltip.replace('<', '&lt;').replace('>', '&gt;'))
+        self.check_simplification.setToolTip(escape_html(simplification_tooltip))
         self.simplification_threshold_spinbox.setToolTip("Максимально допустимое отклонение (по абзацам, цифрам или пунктуации) от оригинала.\n"
                                                      "Например, 30% позволит пропустить небольшие погрешности.")
         
@@ -3076,10 +3508,6 @@ class TranslationValidatorPage(ShellPage):
         self.btn_mark_ok = QPushButton("✅ Пометить как готовый"); self.btn_mark_ok.clicked.connect(lambda: self.mark_selected_rows('mark_ok'))
         self.btn_retry_selected = QPushButton("🔄 Пометить к переотправке"); self.btn_retry_selected.clicked.connect(lambda: self.mark_selected_rows('retry')); self.btn_retry_selected.setVisible(self.retry_is_available)
         self.btn_reset_marks = QPushButton("🚫 Снять пометки"); self.btn_reset_marks.clicked.connect(self.reset_selected_marks)
-        self.btn_show_editor_tab = QPushButton("Редактор")
-        self.btn_show_editor_tab.clicked.connect(self._show_editor_tab)
-        self.btn_show_editor_tab.setEnabled(False)
-        self.btn_show_editor_tab.setVisible(False)
         self.btn_prev_item = QPushButton("↑"); self.btn_prev_item.setFixedSize(28, 28); self.btn_prev_item.clicked.connect(self._go_to_previous_item); self.btn_prev_item.setEnabled(False)
         self.btn_next_item = QPushButton("↓"); self.btn_next_item.setFixedSize(28, 28); self.btn_next_item.clicked.connect(self._go_to_next_item); self.btn_next_item.setEnabled(False)
         for btn in [self.btn_mark_delete, self.btn_mark_ok, self.btn_retry_selected, self.btn_reset_marks, self.btn_prev_item, self.btn_next_item]:
@@ -3304,7 +3732,7 @@ class TranslationValidatorPage(ShellPage):
 
         status_item = self.table_results.item(row, 3)
         if status_item:
-            status_item.setText("Редакт.")
+            status_item.setText(self.STATUS_LABELS["edited"])
 
         self.update_row_color(row, 'edited')
         self._fixer_stale_rows.add(row)
@@ -3312,26 +3740,22 @@ class TranslationValidatorPage(ShellPage):
     def _get_ai_repair_protected_terms(self):
         protected_terms = set()
 
-        current = self
-        visited = set()
-        for _ in range(10):
-            if current is None or id(current) in visited:
-                break
-            visited.add(id(current))
-            glossary_widget = getattr(current, "glossary_widget", None)
-            if glossary_widget and hasattr(glossary_widget, "get_glossary"):
-                try:
-                    commit_editor = getattr(glossary_widget, "commit_active_editor", None)
-                    if callable(commit_editor):
-                        commit_editor()
-                    protected_terms.update(
-                        ai_repair_protected_terms_from_glossary(glossary_widget.get_glossary())
-                    )
-                except Exception as exc:
-                    print(f"[Validator WARN] Не удалось получить термины из редактора: {exc}")
-                break
-            parent_getter = getattr(current, "parent", None)
-            current = parent_getter() if callable(parent_getter) else None
+        def has_glossary_widget(node):
+            glossary_widget = getattr(node, "glossary_widget", None)
+            return bool(glossary_widget and hasattr(glossary_widget, "get_glossary"))
+
+        owner = find_ancestor_by_predicate(self, has_glossary_widget, max_depth=10)
+        if owner is not None:
+            glossary_widget = owner.glossary_widget
+            try:
+                commit_editor = getattr(glossary_widget, "commit_active_editor", None)
+                if callable(commit_editor):
+                    commit_editor()
+                protected_terms.update(
+                    ai_repair_protected_terms_from_glossary(glossary_widget.get_glossary())
+                )
+            except Exception as exc:
+                print(f"[Validator WARN] Не удалось получить термины из редактора: {exc}")
 
         project_folder = getattr(getattr(self, "project_manager", None), "project_folder", None)
         if project_folder:
@@ -3363,66 +3787,130 @@ class TranslationValidatorPage(ShellPage):
         ambiguous_glued_words = []
         protected_terms = TranslationValidatorPage._get_ai_repair_protected_terms(self)
 
-        for row in rows:
-            data = self.results_data.get(row)
-            if not isinstance(data, dict):
-                continue
+        # При пустом выделении и включённом «Показать все файлы» это может
+        # быть вся книга — сотни глав синхронно на GUI-потоке. Прогресс-
+        # диалог не только показывает ход дела и даёт отменить длинный
+        # проход по нажатию «Отмена», но и сам пампит цикл событий на каждом
+        # setValue() (тот же приём, что и в _on_consistency_check), так что
+        # интерфейс не выглядит подвисшим между главами.
+        progress = None
+        if len(rows) > 1:
+            progress = QProgressDialog(
+                "Автоправка ошибок ИИ...", "Отмена", 0, len(rows), self
+            )
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(300)
 
-            try:
-                original_html = self._ensure_row_original_html_loaded(row)
-                translated_html = self._ensure_row_translated_html_loaded(row)
-                if not translated_html:
-                    unchanged_count += 1
+        # Ленивая обёртка вместо безусловного открытия ZipFile архива
+        # оригинала в начале прохода: реальный zipfile.ZipFile создаётся
+        # только на первый фактический промах кэша (см. _LazyOriginalEpubZip
+        # ниже) и переиспользуется для всех остальных промахов — вместо
+        # повторного открытия архива на каждый промах ограниченного LRU-кэша
+        # (24 главы), но и без лишней платы за чтение центрального каталога
+        # большого EPUB на частом сценарии «одна строка» или «все главы уже
+        # в original_content_cache», когда до архива дело вообще не доходит.
+        original_epub_zip = _LazyOriginalEpubZip(self.original_epub_path)
+
+        canceled = False
+        processed_count = len(rows)
+        try:
+            for index, row in enumerate(rows):
+                if progress is not None:
+                    progress.setValue(index)
+                    if progress.wasCanceled():
+                        canceled = True
+                        processed_count = index
+                        break
+
+                data = self.results_data.get(row)
+                if not isinstance(data, dict):
                     continue
 
-                chapter_name = os.path.basename(
-                    data.get('internal_html_path') or data.get('path') or f"row {row}"
-                )
-                repaired_html = repair_ai_html_artifacts(
-                    original_html,
-                    translated_html,
-                    protected_terms=protected_terms,
-                )
-                _, remaining_glued_candidates = repair_glued_russian_words_in_html(
-                    repaired_html,
-                    protected_terms=protected_terms,
-                )
-                chapter_ambiguous = [
-                    {"chapter": chapter_name, "candidate": candidate}
-                    for candidate in remaining_glued_candidates
-                    if not candidate.confident
-                ]
-                ambiguous_glued_words.extend(chapter_ambiguous)
-                if repaired_html != translated_html:
-                    segments, changes = build_line_review_segments(translated_html, repaired_html)
-                    if changes:
-                        warning = ai_repair_candidate_warning(translated_html, repaired_html)
-                        ambiguity_preview = format_ambiguous_glued_word_preview(chapter_ambiguous)
-                        review_candidates.append({
-                            "row": row,
-                            "chapter": chapter_name,
-                            "original_html": translated_html,
-                            "repaired_html": repaired_html,
-                            "segments": segments,
-                            "changes": changes,
-                            "warning": warning,
-                            "notes": (
-                                "Неоднозначные склейки оставлены без изменений:\n"
-                                + ambiguity_preview
-                                if ambiguity_preview
-                                else ""
-                            ),
-                        })
+                try:
+                    original_html = self._ensure_row_original_html_loaded(row, original_epub_zip)
+                    translated_html = self._ensure_row_translated_html_loaded(row)
+                    if not translated_html:
+                        unchanged_count += 1
+                        continue
+
+                    chapter_name = os.path.basename(
+                        data.get('internal_html_path') or data.get('path') or f"row {row}"
+                    )
+                    repaired_html = repair_ai_html_artifacts(
+                        original_html,
+                        translated_html,
+                        protected_terms=protected_terms,
+                    )
+                    _, remaining_glued_candidates = repair_glued_russian_words_in_html(
+                        repaired_html,
+                        protected_terms=protected_terms,
+                    )
+                    chapter_ambiguous = [
+                        {"chapter": chapter_name, "candidate": candidate}
+                        for candidate in remaining_glued_candidates
+                        if not candidate.confident
+                    ]
+                    ambiguous_glued_words.extend(chapter_ambiguous)
+                    if repaired_html != translated_html:
+                        segments, changes = build_line_review_segments(translated_html, repaired_html)
+                        if changes:
+                            warning = ai_repair_candidate_warning(translated_html, repaired_html)
+                            ambiguity_preview = format_ambiguous_glued_word_preview(chapter_ambiguous)
+                            review_candidates.append({
+                                "row": row,
+                                # internal_html_path строки на МОМЕНТ сбора
+                                # кандидата — прогресс-диалог пампит цикл
+                                # событий на каждом setValue() (см. выше), и
+                                # за время долгого прохода таблица результатов
+                                # может быть перестроена (например,
+                                # _smart_reload_table_preserving_data после
+                                # фоновой синхронизации), из-за чего индекс
+                                # row к моменту применения правки в
+                                # apply_review_result будет указывать уже на
+                                # ДРУГУЮ главу. Сверяем это поле перед
+                                # применением, а не полагаемся на голый row.
+                                "internal_html_path": data.get('internal_html_path'),
+                                "chapter": chapter_name,
+                                "original_html": translated_html,
+                                "repaired_html": repaired_html,
+                                "segments": segments,
+                                "changes": changes,
+                                "warning": warning,
+                                "notes": (
+                                    "Неоднозначные склейки оставлены без изменений:\n"
+                                    + ambiguity_preview
+                                    if ambiguity_preview
+                                    else ""
+                                ),
+                            })
+                        else:
+                            unchanged_count += 1
                     else:
                         unchanged_count += 1
-                else:
-                    unchanged_count += 1
-            except Exception as exc:
-                chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
-                errors.append(f"{chapter_name}: {exc}")
+                except Exception as exc:
+                    chapter_name = os.path.basename(data.get('internal_html_path') or data.get('path') or f"row {row}")
+                    errors.append(f"{chapter_name}: {exc}")
+        finally:
+            if progress is not None:
+                progress.setValue(len(rows))
+                # Прогресс-диалог создаётся заново на каждый запуск
+                # автоправки; без явного close()/deleteLater() каждый такой
+                # запуск оставлял бы на долгоживущей странице валидатора ещё
+                # один скрытый дочерний QProgressDialog (autoReset/autoClose
+                # его только прячут, не уничтожают).
+                progress.close()
+                progress.deleteLater()
+            original_epub_zip.close()
+
+        cancel_note = ""
+        if canceled:
+            cancel_note = (
+                f"Проход прерван (нажата «Отмена»): обработаны только "
+                f"{processed_count} из {len(rows)} строк, результат — только по ним.\n\n"
+            )
 
         if not review_candidates:
-            message = "Автоправка не нашла изменений для выбранных строк."
+            message = cancel_note + "Автоправка не нашла изменений для выбранных строк."
             if ambiguous_glued_words:
                 message += (
                     f"\n\nНайдено неоднозначных склеек: {len(ambiguous_glued_words)}. "
@@ -3441,6 +3929,9 @@ class TranslationValidatorPage(ShellPage):
             unchanged_count,
             errors,
             ambiguous_glued_words,
+            canceled=canceled,
+            processed_count=processed_count,
+            total_count=len(rows),
         )
 
     def _push_ai_repair_review_page(
@@ -3450,9 +3941,39 @@ class TranslationValidatorPage(ShellPage):
         unchanged_count,
         errors,
         ambiguous_glued_words=None,
+        canceled=False,
+        processed_count=None,
+        total_count=None,
     ):
         ambiguous_glued_words = list(ambiguous_glued_words or [])
         page = AIRepairReviewPage(review_candidates, self)
+
+        # Проход по строкам мог быть прерван кнопкой «Отмена» в прогресс-
+        # диалоге (см. _repair_ai_artifacts_for_selection): candidates,
+        # unchanged_count и errors в этом случае посчитаны только по
+        # обработанной части. Без явной пометки страница ревью и все
+        # сообщения ниже выглядели бы так, будто прошли ВСЕ строки —
+        # пользователь не узнал бы, что часть глав вообще не проверялась.
+        cancel_note = ""
+        if canceled:
+            cancel_note = (
+                f"Проход был прерван («Отмена»): обработаны только "
+                f"{processed_count} из {total_count} строк — ниже показаны "
+                "предложения только по ним.\n\n"
+            )
+
+        # Индекс строки на момент сбора кандидата (см. комментарий у
+        # "internal_html_path" в _repair_ai_artifacts_for_selection):
+        # прогресс-диалог пампит цикл событий на каждом setValue(), и за
+        # время долгого прохода таблица результатов может быть перестроена
+        # (например, _smart_reload_table_preserving_data после фоновой
+        # синхронизации). Если к моменту применения строка row указывает уже
+        # на другую главу, применять к ней правку нельзя — сверяем это здесь,
+        # а не полагаемся на голый числовой индекс.
+        expected_internal_path_by_row = {
+            candidate["row"]: candidate.get("internal_html_path")
+            for candidate in review_candidates
+        }
 
         def apply_review_result(accepted, page=page):
             if not accepted:
@@ -3462,14 +3983,25 @@ class TranslationValidatorPage(ShellPage):
 
             approved_html_by_row = page.selected_html_by_row()
             if not approved_html_by_row:
-                QMessageBox.information(self, "Автоправка", "Не выбрано ни одной строки для применения.")
+                QMessageBox.information(
+                    self, "Автоправка", cancel_note + "Не выбрано ни одной строки для применения."
+                )
                 page.request_back.emit()
                 return
 
             changed_rows = []
+            skipped_retargeted_rows = []
             for row, selected_html in approved_html_by_row.items():
                 data = self.results_data.get(row)
                 if not isinstance(data, dict):
+                    continue
+                expected_internal_path = expected_internal_path_by_row.get(row)
+                if expected_internal_path and data.get('internal_html_path') != expected_internal_path:
+                    # Строка row сейчас относится к другой главе, чем та,
+                    # для которой была построена правка, — таблицу успели
+                    # перестроить во время прохода. Применить правку по
+                    # такому индексу — значит молча испортить НЕ ту главу.
+                    skipped_retargeted_rows.append(row)
                     continue
                 current_html = self._ensure_row_translated_html_loaded(row)
                 if selected_html == current_html:
@@ -3484,12 +4016,17 @@ class TranslationValidatorPage(ShellPage):
                 self.reapply_filters()
                 self.update_comparison_view()
                 scope_text = "выделенных строках" if used_selection else "видимых строках"
-                message = (
+                message = cancel_note + (
                     f"Применено к главам: {len(changed_rows)} в {scope_text}.\n"
                     f"Глав с предложениями: {len(review_candidates)}.\n"
                     f"Без изменений: {unchanged_count}.\n\n"
                     "Проверьте результат справа и нажмите «Сохранить изменения»."
                 )
+                if skipped_retargeted_rows:
+                    message += (
+                        f"\n\nПропущено из-за перестройки таблицы во время прохода: "
+                        f"{len(skipped_retargeted_rows)}. Повторите автоправку для этих строк."
+                    )
                 if ambiguous_glued_words:
                     message += (
                         f"\n\nНеоднозначных склеек пропущено: {len(ambiguous_glued_words)}.\n"
@@ -3501,7 +4038,12 @@ class TranslationValidatorPage(ShellPage):
                         message += f"\n... и ещё {len(errors) - 5}."
                 QMessageBox.information(self, "Автоправка завершена", message)
             else:
-                message = "Подтверждённые строки не изменили текущий текст."
+                message = cancel_note + "Подтверждённые строки не изменили текущий текст."
+                if skipped_retargeted_rows:
+                    message += (
+                        f"\n\nПропущено из-за перестройки таблицы во время прохода: "
+                        f"{len(skipped_retargeted_rows)}. Повторите автоправку для этих строк."
+                    )
                 if errors:
                     message += "\n\nОшибки:\n" + "\n".join(errors[:5])
                 QMessageBox.information(self, "Автоправка", message)
@@ -3669,12 +4211,16 @@ class TranslationValidatorPage(ShellPage):
             if not versions:
                 continue
                 
-            # Выбираем версию. Приоритет: пустой суффикс (основная) -> первый попавшийся
-            # TODO: Можно добавить выбор версии
-            rel_path = versions.get('')
-            if not rel_path and versions:
-                rel_path = next(iter(versions.values()))
-                
+            # Выбираем ту же версию, что показана в таблице валидатора и уйдёт
+            # в сборку EPUB: приоритет _validated, иначе лучшая по mtime,
+            # с исключением IGNORED_VERSION_SUFFIXES (см. select_target_translation_version).
+            # База пути — та же project_folder, от которой чуть ниже строится
+            # full_path: разные базы для выбора версии и для чтения файла
+            # молча выбрали бы не ту версию, если они когда-нибудь разойдутся.
+            rel_path, _is_validated_present = select_target_translation_version(
+                versions, project_folder
+            )
+
             if not rel_path:
                 continue
                 
@@ -3838,7 +4384,6 @@ class TranslationValidatorPage(ShellPage):
             ratio_min, ratio_max = self._get_current_ratio_bounds()
         
         max_paragraph_limit = self.max_paragraph_spinbox.value()
-        simplification_limit = self.simplification_threshold_spinbox.value() / 100.0
         repeats_limit = self.repeating_chars_spinbox.value()
         
         # Определяем, какие проверки вообще включены
@@ -3988,9 +4533,8 @@ class TranslationValidatorPage(ShellPage):
         self.table_results.setSortingEnabled(False)
         self.table_results.setUpdatesEnabled(False)
 
-        status_map = {'problem': "Проблема", 'neutral': "Проблем нет", 'ok': "Готов", 'delete': "На удаление", 'retry': "К переотправке", 'edited': "Редакт."}
         show_all = self.check_show_all.isChecked()
-        
+
         current_bounds = self._get_current_ratio_bounds()
 
         for row in range(self.table_results.rowCount()):
@@ -4015,8 +4559,8 @@ class TranslationValidatorPage(ShellPage):
                 item_3 = QTableWidgetItem("")
                 self.table_results.setItem(row, 3, item_3)
             
-            item_3.setText(status_map.get(visual_status, visual_status))
-            
+            item_3.setText(self.STATUS_LABELS.get(visual_status, visual_status))
+
             self.update_row_color(row, visual_status)
 
             # 4. Скрываем/Показываем строку
@@ -4038,43 +4582,8 @@ class TranslationValidatorPage(ShellPage):
         self.lbl_status.setText(f"Отображено записей: {visible_rows}")
       
     def _open_exceptions_manager(self):
-        if not self.settings_manager:
-            QMessageBox.warning(self, "Ошибка", "Менеджер настроек не инициализирован.")
-            return
-
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Менеджер списков слов-исключений")
-        dialog.setMinimumSize(700, 500)
-        layout = QVBoxLayout(dialog)
-
-        # Создаем и настраиваем PresetWidget для нашей задачи
-        # --- ИЗМЕНЕНИЯ ЗДЕСЬ ---
-        exceptions_widget = PresetWidget(
-            parent=dialog,
-            preset_name="Список исключений", # <-- Указываем имя
-            default_prompt_func=api_config.default_word_exceptions,
-            load_presets_func=self.settings_manager.load_word_exceptions_presets,
-            save_presets_func=self.settings_manager.save_word_exceptions_presets,
-            get_last_text_func=self.settings_manager.get_last_word_exceptions_text
-        )
-        exceptions_widget.load_last_session_state()
-        layout.addWidget(exceptions_widget)
-
-        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        ok_button = button_box.button(QDialogButtonBox.StandardButton.Ok)
-        ok_button.setText("Принять и закрыть")
-        
-        cancel_button = button_box.button(QDialogButtonBox.StandardButton.Cancel)
-        cancel_button.setText("Отмена")
-        
-        button_box.accepted.connect(dialog.accept)
-        button_box.rejected.connect(dialog.reject)
-        layout.addWidget(button_box)
-
-        if exec_dialog(self, dialog) == QDialog.DialogCode.Accepted:
-            # --- Сохраняем и имя пресета, и текст ---
-            exceptions_widget.save_last_session_state()
-            self.settings_manager.save_last_word_exceptions_text(exceptions_widget.get_prompt())
+        prompt = open_word_exceptions_manager(self, self.settings_manager)
+        if prompt is not None:
             self._load_validation_snapshot_state()
             self._refresh_previous_problem_paths()
             self._update_analyze_button_state()
@@ -4186,26 +4695,13 @@ class TranslationValidatorPage(ShellPage):
         if not self.project_manager:
             return
 
-        from ...utils.project_migrator import ProjectMigrator, SyncThread
+        run_project_migrator_sync(
+            self, self.project_manager, self.translated_folder, self.original_epub_path,
+            "Синхронизация", "Идет анализ проекта…\nПожалуйста, подождите.",
+            self._on_validator_sync_finished,
+        )
 
-        self.wait_dialog = QMessageBox(self)
-        self.wait_dialog.setWindowTitle("Синхронизация")
-        self.wait_dialog.setText("Идет анализ проекта…\nПожалуйста, подождите.")
-        self.wait_dialog.setStandardButtons(QMessageBox.StandardButton.NoButton)
-        self.wait_dialog.setModal(True)
-        
-        migrator = ProjectMigrator(self.translated_folder, self.original_epub_path, self.project_manager)
-        
-        # --- ИЗМЕНЕНИЕ: Передаем `self` в качестве родителя для QMessageBox ---
-        self.sync_thread = SyncThread(migrator, parent_widget=self)
-        
-        # --- ИЗМЕНЕНИЕ: Подключаем только финальный сигнал ---
-        self.sync_thread.finished_sync.connect(self._on_validator_sync_finished)
 
-        self.sync_thread.start()
-        show_when_slow(self.wait_dialog)
-        
-    
     def _on_validator_sync_finished(self, is_project_ready, message):
         if hasattr(self, 'wait_dialog') and self.wait_dialog:
             self.wait_dialog.accept()
@@ -4284,37 +4780,15 @@ class TranslationValidatorPage(ShellPage):
                 needs_analysis = True
                 self._invalidate_analysis_for_data(data)
 
-            self.table_results.insertRow(row_pos)
-
-            display_text = f"{os.path.basename(internal_path)}"
-            if is_validated_present:
-                display_text += " [Готов]"
-            else:
-                display_text += f" -> {os.path.basename(target_rel_path)}"
-
-            display_path_item = SortableChapterItem(display_text, internal_path)
-            display_path_item.setData(Qt.ItemDataRole.UserRole, is_validated_present)
-            self.table_results.setItem(row_pos, 0, display_path_item)
-
-            current_reasons, _ = self._calculate_status_for_data(data)
-            self._set_problem_cell(row_pos, data, current_reasons)
-
-            len_text = (
-                f"{data.get('len_orig', 0)} | {data.get('len_trans', 0)}"
-                if data.get('has_cached_analysis')
-                else "- | -"
+            self._append_result_row(
+                row_pos,
+                internal_path,
+                target_rel_path,
+                is_validated_present,
+                data,
+                needs_analysis,
+                placeholder_text="...",
             )
-            self.table_results.setItem(row_pos, 2, NumericTableWidgetItem(len_text))
-            self.table_results.setItem(row_pos, 3, QTableWidgetItem("..."))
-
-            self.results_data[row_pos] = data
-            self.path_row_map[internal_path] = row_pos
-
-            if needs_analysis:
-                self.dirty_files.add(internal_path)
-
-            if is_validated_present and not self.check_revalidate_ok.isChecked():
-                self.table_results.setRowHidden(row_pos, True)
 
             row_pos += 1
         
@@ -4483,18 +4957,10 @@ class TranslationValidatorPage(ShellPage):
         self.btn_fix_untranslated.setEnabled(False)
         exceptions_set = self._get_effective_word_exceptions()
         
+        # ValidationThread реально читает только 'revalidate_ok' — остальные пороги
+        # применяются позже, в UI (_calculate_status_for_data), по текущим значениям спинбоксов.
         config = {
-            'check_structure': True, 
-            'check_length_ratio': True,
-            'show_all': self.check_show_all.isChecked(),
             'revalidate_ok': self.check_revalidate_ok.isChecked(),
-            'check_simplification': True,
-            'check_untranslated': True,
-            'check_paragraph_size': True,
-            'max_paragraph_size': self.max_paragraph_spinbox.value(),
-            'simplification_threshold': self.simplification_threshold_spinbox.value() / 100.0,
-            'check_repeating_chars': True,
-            'repeating_chars_threshold': self.repeating_chars_spinbox.value()
         }
         
         # Запуск потока только для targets
@@ -4532,7 +4998,7 @@ class TranslationValidatorPage(ShellPage):
             self.view_translated.setFocus()
         else:
             # 4. Если по какой-то причине тег не найден, сообщаем об этом
-            QMessageBox.information(self, "Не найдено", f"Не удалось найти тег {tag_to_find.replace('<', '&lt;')} в коде.")
+            QMessageBox.information(self, "Не найдено", f"Не удалось найти тег {escape_html(tag_to_find)} в коде.")
 
     def _find_result_row_by_internal_path(self, internal_path):
         if not internal_path:
@@ -4550,17 +5016,7 @@ class TranslationValidatorPage(ShellPage):
 
     @staticmethod
     def _normalize_navigation_search_text(value, *, html_to_text=False, limit=300):
-        text = str(value or "")
-        if html_to_text:
-            try:
-                text = BeautifulSoup(text, 'html.parser').get_text(" ", strip=True)
-            except Exception:
-                pass
-
-        text = re.sub(r'\s+', ' ', text).strip()
-        if len(text) > limit:
-            text = text[:limit].rstrip()
-        return text
+        return extract_visible_text_normalized(value, from_html=html_to_text, limit=limit)
 
     def _navigation_search_candidates(self, payload, *, raw_html=False):
         values = []
@@ -4677,7 +5133,7 @@ class TranslationValidatorPage(ShellPage):
             self.results_data[row]['status'] = 'retry'
             status_item = self.table_results.item(row, 3)
             if status_item:
-                status_item.setText("К переотправке")
+                status_item.setText(self.STATUS_LABELS["retry"])
             self.update_row_color(row, 'retry')
             marked_count += 1
 
@@ -4752,7 +5208,10 @@ class TranslationValidatorPage(ShellPage):
                 for chapter_path in chapters_to_scan:
                     content = epub_zip.read(chapter_path).decode('utf-8', 'ignore')
                     # Используем регулярку для быстрого подсчета всех CJK символов
-                    cjk_chars_in_chapter = re.findall(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', content)
+                    # cluster-32 dedup: диапазон теперь один источник истины --
+                    # gemini_translator.utils.cjk_ranges.CORE_CJK_CHAR_RE (то же
+                    # самое множество символов, что и раньше).
+                    cjk_chars_in_chapter = cjk_ranges.CORE_CJK_CHAR_RE.findall(content)
                     cjk_char_count += len(cjk_chars_in_chapter)
                     
                     if cjk_char_count >= 100:
@@ -4819,9 +5278,7 @@ class TranslationValidatorPage(ShellPage):
         self._set_problem_cell(row_pos, result, current_reasons)
 
         # 4. Применение статуса и цвета
-        status_map = {'problem': "Проблема", 'neutral': "Проблем нет", 'ok': "Готов", 'delete': "На удаление", 'retry': "К переотправке", 'edited': "Редакт."}
-
-        self.table_results.item(row_pos, 3).setText(status_map.get(visual_status, visual_status))
+        self.table_results.item(row_pos, 3).setText(self.STATUS_LABELS.get(visual_status, visual_status))
         self.update_row_color(row_pos, visual_status)
         
         # 5. Видимость
@@ -4839,7 +5296,6 @@ class TranslationValidatorPage(ShellPage):
         """
         try:
             # --- ИЗМЕНЕНИЕ: Используем универсальный список суффиксов ---
-            from ...api import config as api_config
             
             for f in os.listdir(self.translated_folder):
                 for suffix in api_config.all_translated_suffixes():
@@ -4860,9 +5316,6 @@ class TranslationValidatorPage(ShellPage):
         if self._is_destroyed():
             return
 
-        from ...api import config as api_config
-        VALIDATED_SUFFIX = "_validated.html"
-        
         known_problem_internal_paths = {data['internal_html_path'] for data in self.results_data.values()}
         processed_count = 0
         errors = []
@@ -4915,11 +5368,16 @@ class TranslationValidatorPage(ShellPage):
         if not self.is_code_view:
             return
 
-        selected_rows = list(set(item.row() for item in self.table_results.selectedItems()))
-        if not selected_rows:
+        # ВАЖНО: строка должна вычисляться ТЕМ ЖЕ способом, что и в
+        # update_comparison_view/toggle_code_view (selected_items[0].row()),
+        # иначе при множественном выделении (например, ctrl-клик сначала по
+        # нижней, потом по верхней строке) редактор покажет одну главу, а
+        # правка запишется в results_data другой — молча портя чужой перевод.
+        selected_items = self.table_results.selectedItems()
+        if not selected_items:
             return
-    
-        row = selected_rows[0]
+
+        row = selected_items[0].row()
     
         if row in self.results_data:
             # 1. Сохраняем "истинный" код из редактора в наш буфер
@@ -4929,7 +5387,7 @@ class TranslationValidatorPage(ShellPage):
             if not self.results_data[row].get('is_edited', False):
                 self.results_data[row]['is_edited'] = True
                 # Обновляем статус в таблице, чтобы было видно
-                self.table_results.item(row, 3).setText("Редакт.")
+                self.table_results.item(row, 3).setText(self.STATUS_LABELS["edited"])
                 self.update_row_color(row, 'edited')
             
             # 3. Активируем кнопку сохранения, так как есть несохраненные изменения
@@ -5078,9 +5536,8 @@ class TranslationValidatorPage(ShellPage):
         # --- УПРОЩЕНИЕ: Убираем логику сохранения отсюда ---
         # if self.is_code_view and old_row != -1 …
         
-        selected_rows = list(set(item.row() for item in self.table_results.selectedItems()))
-        if hasattr(self, 'btn_show_editor_tab'):
-            self.btn_show_editor_tab.setEnabled(bool(selected_rows))
+        selected_items = self.table_results.selectedItems()
+        selected_rows = list(set(item.row() for item in selected_items))
         self._update_translation_find_replace_state()
 
         # … (остальной код метода без изменений) …
@@ -5095,14 +5552,17 @@ class TranslationValidatorPage(ShellPage):
             # Кнопка сохранения НЕ деактивируется, так как могут быть другие измененные файлы
             return
 
-        row = selected_rows[0]
-        
+        # ВАЖНО: та же строка, что покажет update_comparison_view ниже
+        # (selected_items[0].row()) — иначе кнопка "сравнить с готовой" и
+        # т.п. будут рассчитаны для одной главы, а редактор покажет другую.
+        row = selected_items[0].row()
+
         # --- НАЧАЛО КЛЮЧЕВОГО ИЗМЕНЕНИЯ ---
         data = self.results_data.get(row, {})
         # Проверяем, не является ли текущий файл сам по себе "готовым"
-        is_current_file_the_validated_one = data.get('path', '').endswith('_validated.html')
+        is_current_file_the_validated_one = data.get('path', '').endswith(VALIDATED_SUFFIX)
         versions = self.project_manager.get_versions_for_original(data.get('internal_html_path')) if self.project_manager else {}
-        has_validated_version = '_validated.html' in (versions or {})
+        has_validated_version = VALIDATED_SUFFIX in (versions or {})
         
         # Кнопку показываем, только если есть готовая версия И мы смотрим НЕ на нее
         should_show_button = has_validated_version and not is_current_file_the_validated_one
@@ -5125,16 +5585,22 @@ class TranslationValidatorPage(ShellPage):
 
     def mark_selected_rows(self, status):
         selected_rows = sorted(list(set(item.row() for item in self.table_results.selectedItems())))
-        
-        status_map = {
-            'delete': ("На удаление", "delete"),
-            'mark_ok': ("Готов", "ok"),
-            'retry': ("К переотправке", "retry")
+
+        # Ключи действия -> внутренний статус (структура иная, чем у
+        # STATUS_LABELS, так как ключ здесь — имя действия кнопки, а не
+        # внутренний статус); сами подписи теперь берутся из канонического
+        # STATUS_LABELS, а не дублируются здесь литералами
+        # (dups-gt_ui_dialogs_validation-01, finding …26).
+        action_to_status = {
+            'delete': "delete",
+            'mark_ok': "ok",
+            'retry': "retry",
         }
-        
-        if status not in status_map: return
-        
-        display_text, internal_status = status_map[status]
+
+        if status not in action_to_status: return
+
+        internal_status = action_to_status[status]
+        display_text = self.STATUS_LABELS[internal_status]
 
         for row in selected_rows:
             if row in self.results_data:
@@ -5179,9 +5645,31 @@ class TranslationValidatorPage(ShellPage):
         for row, data in files_to_save:
             filepath = data['path']
             try:
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(data['translated_html'])
-                
+                # ui-dialogs-validation/runtime/12-non-atomic-chapter-and-glossar:
+                # прямой open(path, 'w') усекает файл сразу при открытии, так что
+                # сбой посреди записи (диск переполнен, процесс убит) оставляет
+                # на диске усечённую/пустую главу, хотя data['is_edited'] ниже
+                # уже сбрасывается. atomic_write_text пишет во временный файл и
+                # заменяет целевой только после успешной записи (os.replace).
+                #
+                # atomic_write_text (в отличие от прежнего open(path, 'w'))
+                # молча создаёт недостающие родительские папки (mkdir внутри
+                # atomic_write_bytes) — если папка главы пропала (проект
+                # перемещён/почищен при открытом окне), раньше пользователь
+                # получал громкую ошибку и правка не терялась (is_edited
+                # оставался True); молчаливое воссоздание папки увело бы файл
+                # мимо структуры проекта и тихо сбросило is_edited. Проверяем
+                # папку заранее, чтобы сохранить прежнее поведение отказа.
+                chapter_dir = os.path.dirname(filepath)
+                if chapter_dir and not os.path.isdir(chapter_dir):
+                    raise FileNotFoundError(f"Папка главы не найдена: {chapter_dir}")
+                # atomic_write_text кодирует текст без трансляции '\n' в
+                # os.linesep (как и chapter_editor.py) — на Windows содержимое
+                # глав, сохранённых отсюда, теперь LF вместо CRLF; это
+                # осознанное выравнивание с уже принятым в проекте хелпером,
+                # а не побочный эффект.
+                atomic_write_text(filepath, data['translated_html'])
+
                 data['is_edited'] = False
                 data['status'] = 'neutral'
                 self._invalidate_analysis_for_data(data)
@@ -5218,16 +5706,41 @@ class TranslationValidatorPage(ShellPage):
             self.btn_save_changes.setEnabled(False)
 
         return saved_count
-    
+
+    def _offer_remaining_good_files_dialog(self, title, text, show_button_text, auto_button_text):
+        """Показывает вопрос "что делать с оставшимися файлами" и выполняет
+        выбранное действие.
+
+        Общая часть двух дословно совпадавших блоков в apply_changes и
+        on_analysis_finished (dups-gt_ui_dialogs_validation-01, finding
+        …26-status-map-and-no-problem-dial); заголовок/текст/подписи кнопок
+        "Показать…"/"Автоматически…" — единственное сохранённое различие
+        между вызывающими, поэтому они переданы параметрами, а не зашиты
+        внутрь.
+        """
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle(title)
+        msg_box.setText(text)
+        msg_box.setIcon(QMessageBox.Icon.Question)
+
+        btn_show = msg_box.addButton(show_button_text, QMessageBox.ButtonRole.AcceptRole)
+        btn_auto = msg_box.addButton(auto_button_text, QMessageBox.ButtonRole.ActionRole)
+        msg_box.addButton("Ничего не делать", QMessageBox.ButtonRole.RejectRole)
+
+        msg_box.exec()
+
+        if msg_box.clickedButton() == btn_show:
+            self.check_show_all.setChecked(True)
+            self.start_analysis()
+        elif msg_box.clickedButton() == btn_auto:
+            self.auto_process_good_files()
+
     @pyqtSlot()
     def apply_changes(self):
         if not self.project_manager:
             QMessageBox.warning(self, "Критическая ошибка", "Менеджер проекта не инициализирован.")
             return
 
-        VALIDATED_SUFFIX = "_validated.html"
-        from ...api import config as api_config
-        
         # 1. Собираем ID (пути) файлов, которые нужно обработать.
         paths_to_process = set()
         actions_map = {} # path -> status
@@ -5341,17 +5854,12 @@ class TranslationValidatorPage(ShellPage):
 
         # Проверка на оставшиеся файлы
         if self.table_results.rowCount() == 0 and not self.check_show_all.isChecked() and self._are_any_translated_files_left():
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Проблемные файлы обработаны"); msg_box.setText("Что делать с оставшимися 'хорошими' файлами?")
-            msg_box.setIcon(QMessageBox.Icon.Question)
-            btn_show = msg_box.addButton("Показать для проверки", QMessageBox.ButtonRole.AcceptRole)
-            btn_auto = msg_box.addButton("Автоматически пометить 'Готовыми'", QMessageBox.ButtonRole.ActionRole)
-            btn_cancel = msg_box.addButton("Ничего не делать", QMessageBox.ButtonRole.RejectRole)
-            msg_box.exec()
-            if msg_box.clickedButton() == btn_show:
-                self.check_show_all.setChecked(True); self.start_analysis()
-            elif msg_box.clickedButton() == btn_auto:
-                self.auto_process_good_files()
+            self._offer_remaining_good_files_dialog(
+                "Проблемные файлы обработаны",
+                "Что делать с оставшимися 'хорошими' файлами?",
+                "Показать для проверки",
+                "Автоматически пометить 'Готовыми'",
+            )
 
 
 
@@ -5398,23 +5906,12 @@ class TranslationValidatorPage(ShellPage):
         
         # Добавляем новую проверку: self._are_any_translated_files_left()
         if self.table_results.rowCount() == 0 and not self.check_show_all.isChecked() and self._are_any_translated_files_left():
-        
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Проблем не найдено")
-            msg_box.setText("Первичная проверка не нашла проблемных файлов. Что вы хотите сделать?")
-            msg_box.setIcon(QMessageBox.Icon.Question)
-
-            btn_show = msg_box.addButton("Показать все для ручной проверки", QMessageBox.ButtonRole.AcceptRole)
-            btn_auto = msg_box.addButton("Считать все 'Готовыми' и переместить", QMessageBox.ButtonRole.ActionRole)
-            btn_cancel = msg_box.addButton("Ничего не делать", QMessageBox.ButtonRole.RejectRole)
-
-            msg_box.exec()
-
-            if msg_box.clickedButton() == btn_show:
-                self.check_show_all.setChecked(True)
-                self.start_analysis()
-            elif msg_box.clickedButton() == btn_auto:
-                self.auto_process_good_files()
+            self._offer_remaining_good_files_dialog(
+                "Проблем не найдено",
+                "Первичная проверка не нашла проблемных файлов. Что вы хотите сделать?",
+                "Показать все для ручной проверки",
+                "Считать все 'Готовыми' и переместить",
+            )
 
     def _ensure_row_translated_html_loaded(self, row_index):
         result_data = self.results_data.get(row_index)
@@ -5444,7 +5941,14 @@ class TranslationValidatorPage(ShellPage):
         self.translated_content_cache[file_path] = translated_html
         return translated_html
 
-    def _ensure_row_original_html_loaded(self, row_index):
+    def _ensure_row_original_html_loaded(self, row_index, epub_zip=None):
+        """Возвращает оригинальный HTML главы, читая архив EPUB при промахе кэша.
+
+        ``epub_zip`` — необязательный уже открытый ``zipfile.ZipFile``: пакетные
+        проходы по многим строкам (см. _repair_ai_artifacts_for_selection)
+        передают один и тот же открытый архив на весь проход вместо того,
+        чтобы открывать его заново на каждый промах ограниченного LRU-кэша.
+        """
         result_data = self.results_data.get(row_index)
         if not isinstance(result_data, dict):
             return ""
@@ -5459,10 +5963,16 @@ class TranslationValidatorPage(ShellPage):
 
         if internal_path in self.original_content_cache:
             original_html = self.original_content_cache[internal_path]
+        elif epub_zip is not None:
+            try:
+                original_html = epub_zip.read(internal_path).decode('utf-8', errors='ignore')
+            except Exception:
+                original_html = ""
+            self.original_content_cache[internal_path] = original_html
         elif self.original_epub_path and os.path.exists(self.original_epub_path):
             try:
-                with zipfile.ZipFile(self.original_epub_path, 'r') as epub_zip:
-                    original_html = epub_zip.read(internal_path).decode('utf-8', errors='ignore')
+                with zipfile.ZipFile(self.original_epub_path, 'r') as own_epub_zip:
+                    original_html = own_epub_zip.read(internal_path).decode('utf-8', errors='ignore')
             except Exception:
                 original_html = ""
             self.original_content_cache[internal_path] = original_html
@@ -5486,7 +5996,7 @@ class TranslationValidatorPage(ShellPage):
             validated_content = self.validated_content_cache[internal_path]
         elif self.project_manager:
             versions = self.project_manager.get_versions_for_original(internal_path) or {}
-            validated_rel_path = versions.get('_validated.html')
+            validated_rel_path = versions.get(VALIDATED_SUFFIX)
             if validated_rel_path:
                 validated_path = os.path.join(self.translated_folder, validated_rel_path)
                 validated_content = self._read_text_file(validated_path) or ""
@@ -5663,7 +6173,13 @@ class TranslationValidatorPage(ShellPage):
                         'target': target_object,
                         'is_orphan': is_orphan_flag,
                         'row_index': row_index,
-                        'soup_ref': soup,
+                        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me:
+                        # 'soup_ref' нигде не читается (soup и так доступен через
+                        # soup_cache[row_index]) — мёртвая лишняя ссылка на дерево
+                        # bs4, дословно упомянутая в находке как одна из живых
+                        # ссылок, удерживающих деревья в памяти. Убрана; сама по
+                        # себе память не освобождает (soup_cache всё ещё жив), но
+                        # больше не вводит в заблуждение и не плодит лишних ссылок.
                         'internal_html_path': internal_path,
                     })
 
@@ -5675,59 +6191,29 @@ class TranslationValidatorPage(ShellPage):
         return list(grouped_data_map.values()), soup_cache
 
     def _build_current_untranslated_exceptions(self):
-        if self.settings_manager:
-            exceptions_text = self.settings_manager.get_last_word_exceptions_text()
-            if not exceptions_text.strip():
-                exceptions_text = api_config.default_word_exceptions()
-        else:
-            exceptions_text = api_config.default_word_exceptions()
-
-        exceptions_set = {
-            line.strip().lower()
-            for line in exceptions_text.splitlines()
-            if line.strip() and not line.strip().startswith('#')
-        }
-
-        if self.project_manager and self.project_manager.project_folder:
-            glossary_path = os.path.join(self.project_manager.project_folder, "project_glossary.json")
-            if os.path.exists(glossary_path):
-                try:
-                    with open(glossary_path, 'r', encoding='utf-8') as f:
-                        glossary_data = json.load(f)
-
-                    cyrillic_pattern = re.compile(r'[а-яА-ЯёЁ]+')
-                    cleanup_pattern = re.compile(r'[\W\d_]+')
-                    iterator = glossary_data if isinstance(glossary_data, list) else glossary_data.values()
-
-                    for entry in iterator:
-                        if not isinstance(entry, dict):
-                            continue
-
-                        rus = entry.get('rus') or entry.get('translation') or entry.get('target') or ''
-                        if not rus:
-                            continue
-
-                        no_cyrillic_str = cyrillic_pattern.sub(' ', rus)
-                        pure_residue_str = cleanup_pattern.sub(' ', no_cyrillic_str)
-
-                        for word in pure_residue_str.strip().split():
-                            word_lower = word.lower()
-                            if len(word_lower) < 2:
-                                continue
-                            exceptions_set.add(word_lower)
-                except Exception as e:
-                    print(f"[Validator WARN] Не удалось прочитать глоссарий для пересчёта исключений: {e}")
-
-        return exceptions_set
+        # dups-gt_ui_dialogs_validation-01, finding …9-word-exceptions-
+        # builder-copy: раньше этот метод дословно повторял тело
+        # _get_effective_word_exceptions (чтение settings_manager ->
+        # api_config.default_word_exceptions -> разбор строк с фильтром '#'
+        # и lower()). Единственная разница между копиями была в тексте
+        # warn_context для предупреждения при ошибке чтения глоссария, так
+        # что теперь это тонкий вызов канонического метода с тем же
+        # контекстом.
+        return self._get_effective_word_exceptions()
 
     def _recalculate_untranslated_words_for_rows(self, affected_rows):
+        # finding-ui-dialogs-validation_design_1-untranslated-detection-triplic:
+        # используем тот же канонический UntranslatedWordDetector, что и
+        # ValidationThread._analyze_html_content, вместо собственного прохода
+        # (BeautifulSoup.get_text + узкий regex, порог len<2, без фильтра
+        # рейтингов/одиночных латинских букв) -- он расходился с первичным
+        # анализом и пропускал часть того, что детектор считает недопереводом
+        # (например, CJK Ext-A символы).
         if not affected_rows:
             return
 
         word_exceptions = self._build_current_untranslated_exceptions()
-        single_word_exceptions = {w for w in word_exceptions if ' ' not in w}
-        phrase_exceptions = [p for p in word_exceptions if ' ' in p]
-        phrase_exceptions.sort(key=len, reverse=True)
+        detector = UntranslatedWordDetector(word_exceptions)
 
         for row_idx in affected_rows:
             result_data = self.results_data.get(row_idx)
@@ -5739,33 +6225,10 @@ class TranslationValidatorPage(ShellPage):
                 result_data.pop('untranslated_words', None)
                 continue
 
-            text_trans = BeautifulSoup(translated_html, 'html.parser').get_text(" ")
-            if not text_trans:
-                result_data.pop('untranslated_words', None)
-                continue
+            untranslated_words = detector.detect(translated_html)
 
-            temp_text_trans = text_trans
-            for phrase in phrase_exceptions:
-                pattern = r'\b' + re.escape(phrase) + r'\b'
-                temp_text_trans = re.sub(pattern, ' ', temp_text_trans, flags=re.IGNORECASE)
-
-            no_cyrillic_text = re.sub(r'[а-яА-ЯёЁ]+', ' ', temp_text_trans)
-            pure_residue_text = re.sub(r'[\W\d_]+', ' ', no_cyrillic_text)
-
-            untranslated_words_to_highlight = []
-            for word in pure_residue_text.split():
-                is_cjk = re.search(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]', word)
-                if len(word) < 2 and not is_cjk:
-                    continue
-                if word.lower() not in single_word_exceptions:
-                    untranslated_words_to_highlight.append(word)
-
-            if untranslated_words_to_highlight:
-                result_data['untranslated_words'] = sorted(
-                    list(set(untranslated_words_to_highlight)),
-                    key=len,
-                    reverse=True,
-                )
+            if untranslated_words:
+                result_data['untranslated_words'] = untranslated_words
             else:
                 result_data.pop('untranslated_words', None)
 
@@ -5859,7 +6322,7 @@ class TranslationValidatorPage(ShellPage):
                 self.results_data[row_idx]['is_edited'] = True
                 status_item = self.table_results.item(row_idx, 3)
                 if status_item:
-                    status_item.setText("Редакт.")
+                    status_item.setText(self.STATUS_LABELS["edited"])
                 self.update_row_color(row_idx, 'edited')
 
         self._recalculate_untranslated_words_for_rows(affected_rows)
@@ -5910,10 +6373,7 @@ class TranslationValidatorPage(ShellPage):
 
     @staticmethod
     def _truncate_auto_trace_text(text, limit: int = 4000):
-        normalized = str(text or "").strip()
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[: max(0, limit - 16)].rstrip() + "\n...[truncated]..."
+        return auto_workflow_helpers.truncate_auto_trace_text(text, limit=limit)
 
     def _format_auto_untranslated_trace_details(
         self,
@@ -5923,6 +6383,16 @@ class TranslationValidatorPage(ShellPage):
         max_payloads: int = 3,
         text_limit: int = 4000,
     ):
+        # dups-gt_ui_dialogs_validation-01, finding …6-truncate-auto-trace-
+        # copy (вторая половина): по форме вывода ("Промпт/Запрос N/Ответ N/
+        # ... скрыто N") этот метод похож на
+        # auto_workflow_helpers.compose_auto_trace_details, но входные
+        # данные структурно другие — здесь prompt_text + отдельные списки
+        # request_payloads/response_payloads, там список trace-словарей с
+        # phase/metadata. Объединение потребовало бы флага-переключателя
+        # формы входа без реальной пользы, поэтому сознательно оставлено
+        # отдельным методом; общая truncate-логика уже вынесена в
+        # _truncate_auto_trace_text -> auto_workflow_helpers.
         blocks = []
         prompt_block = self._truncate_auto_trace_text(prompt_text, text_limit)
         if prompt_block:
@@ -5946,18 +6416,58 @@ class TranslationValidatorPage(ShellPage):
 
         return "\n\n".join(blocks)
 
+    def _collect_untranslated_fixer_payload_cached(self, target_internal_paths=None):
+        # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me
+        # (перенос из волны 2, остаток находки 7 — автопайплайн):
+        # build_auto_untranslated_request_details собирает payload только
+        # ради текста трассировки для лога, а следом run_auto_untranslated_fixer
+        # тут же собирал его заново — двойной полный BeautifulSoup-парсинг всех
+        # флагованных глав на GUI-потоке при каждом точечном фиксе недоперевода
+        # в авто-режиме. Обе точки вызова в setup.py используют один и тот же
+        # target_internal_paths подряд без изменений results_data между ними,
+        # так что второй сбор — чистое дублирование первого. Одноразовый кеш
+        # (ключ — набор путей глав) переиспользует уже собранный payload и
+        # сразу забывается, чтобы не отдать устаревшие данные, если между
+        # вызовами всё же что-то изменится или run_ вызван без предшествующего
+        # build_ (совместимость — тогда просто собираем как раньше).
+        cache_key = frozenset(target_internal_paths or ())
+        cached = self._auto_untranslated_payload_cache
+        # Кеш одноразовый в любом случае -- забываем сразу при первом же
+        # обращении (совпал ключ или нет), чтобы несвязанный вызов с другим
+        # набором путей не оставил старый payload (и его bs4-деревья) висеть
+        # в памяти до следующего случайного совпадения ключа.
+        self._auto_untranslated_payload_cache = None
+        if cached is not None and cached[0] == cache_key:
+            return cached[1], cached[2]
+
+        data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
+            target_internal_paths=target_internal_paths,
+            show_feedback=False,
+        )
+        return data_for_dialog, soup_cache
+
     def build_auto_untranslated_request_details(
         self,
         target_internal_paths=None,
         batch_size: int = 50,
     ):
         try:
-            data_for_dialog, _ = self._collect_untranslated_fixer_payload(
+            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
                 target_internal_paths=target_internal_paths,
                 show_feedback=False,
             )
             if not data_for_dialog:
+                self._auto_untranslated_payload_cache = None
                 return ""
+
+            # Сохраняем собранный payload для последующего run_auto_untranslated_fixer
+            # с тем же набором глав, чтобы не парсить книгу ещё раз (см.
+            # _collect_untranslated_fixer_payload_cached).
+            self._auto_untranslated_payload_cache = (
+                frozenset(target_internal_paths or ()),
+                data_for_dialog,
+                soup_cache,
+            )
 
             indexed_items = list(enumerate(data_for_dialog))
             tasks_list = build_translation_tasks_from_data_items(indexed_items, batch_size=batch_size)
@@ -5980,9 +6490,11 @@ class TranslationValidatorPage(ShellPage):
         request_details_text = ""
         response_details_text = ""
         try:
-            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload(
+            # Одноразовый кеш payload: build_auto_untranslated_request_details
+            # уже собрал его для текста трассировки, повторный полный сбор
+            # здесь не нужен (см. _collect_untranslated_fixer_payload_cached).
+            data_for_dialog, soup_cache = self._collect_untranslated_fixer_payload_cached(
                 target_internal_paths=target_internal_paths,
-                show_feedback=False,
             )
             if not data_for_dialog:
                 return {
@@ -6065,7 +6577,56 @@ class TranslationValidatorPage(ShellPage):
 
             wait_loop = QtCore.QEventLoop()
             dialog.finished.connect(wait_loop.quit)
+
+            # Watchdog на СТАРТ (см. AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS):
+            # без него команда старта, проигнорированная движком, оставляла бы
+            # этот цикл событий крутиться вечно без единого шанса продолжить
+            # или хотя бы завершить автопайплайн с ошибкой. Срабатывает,
+            # ТОЛЬКО если событие session_started так и не пришло к моменту
+            # тика — если сессия реально стартовала (dialog._owned_session_id
+            # уже выставлен), обработчик ничего не делает, и ждём
+            # dialog.finished дальше без верхней границы, чтобы не оборвать
+            # легитимный долгий перевод.
+            timed_out = {'flag': False}
+
+            def _on_auto_fixer_wait_timeout(timed_out=timed_out, wait_loop=wait_loop, dialog=dialog):
+                if getattr(dialog, '_owned_session_id', None) is not None:
+                    return
+                timed_out['flag'] = True
+                wait_loop.quit()
+
+            safety_timer = QtCore.QTimer()
+            safety_timer.setSingleShot(True)
+            safety_timer.timeout.connect(_on_auto_fixer_wait_timeout)
+            safety_timer.start(self.AUTO_UNTRANSLATED_FIXER_START_TIMEOUT_MS)
+
             wait_loop.exec()
+            safety_timer.stop()
+
+            if timed_out['flag']:
+                # Страница так и не подтвердила старт — гасим её тем же
+                # путём, что и обычное «Прервать» (reject -> _check_can_close
+                # -> _abort_stuck_session_start), чтобы сбросить
+                # is_session_active и вернуть на место чужую очередь задач
+                # (_preserved_queue_snapshot), которую страница могла успеть
+                # отложить перед стартом. Голый deleteLater() эту очистку
+                # пропускал бы. reject() — метод боевой AITranslationPage;
+                # на минимальном тестовом дубле его может не быть.
+                try:
+                    dialog.reject()
+                except Exception:
+                    pass
+                dialog.deleteLater()
+                return {
+                    'success': False,
+                    'groups_found': len(data_for_dialog),
+                    'error': (
+                        "Сессия автофиксера недоперевода не стартовала за отведённое "
+                        "время (похоже, движок отклонил команду старта)."
+                    ),
+                    'request_details_text': request_details_text,
+                    'response_details_text': response_details_text,
+                }
 
             results = dialog.get_translated_results()
             response_details_text = self._format_auto_untranslated_trace_details(
@@ -6152,14 +6713,16 @@ class TranslationValidatorPage(ShellPage):
 
     def _open_untranslated_fixer(self, initial_source_filter='all'):
         try:
-            system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
-            user_items = self._build_user_problem_terms_payload()
-            data_for_dialog = system_items + user_items
-            if not data_for_dialog:
-                QMessageBox.information(self, "Все чисто", "Не найдено контекстов для исправления.")
-                return
-
-            # Быстро пересчитаем недопереводы для строк, отредактированных вручную
+            # ui-dialogs-validation/runtime/7-fixer-soup-cache-whole-book-me:
+            # раньше payload сначала собирался целиком (полный BeautifulSoup-
+            # парсинг всех флагованных глав), а если находились stale-строки —
+            # пересчитывался И СОБИРАЛСЯ ЗАНОВО целиком ещё раз, отбрасывая
+            # первый результат. На книге с сотнями флагованных глав это
+            # двойной полный синхронный парсинг на GUI-потоке. Устаревшие
+            # строки вычисляются и пересчитываются здесь ДО сбора payload —
+            # это не требует парсинга (только просмотр results_data), так что
+            # сбор payload происходит ровно один раз, уже с актуальными
+            # untranslated_words.
             stale = list(self._fixer_stale_rows)
             # Добавляем строки с is_edited, если они ещё не в stale
             stale_set = set(stale)
@@ -6169,9 +6732,13 @@ class TranslationValidatorPage(ShellPage):
             if stale:
                 self._recalculate_untranslated_words_for_rows(stale)
                 self._fixer_stale_rows.clear()
-                # Повторно собираем данные с обновлёнными словами
-                system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
-                data_for_dialog = system_items + user_items
+
+            system_items, soup_cache = self._collect_untranslated_fixer_payload(show_feedback=False)
+            user_items = self._build_user_problem_terms_payload()
+            data_for_dialog = system_items + user_items
+            if not data_for_dialog:
+                QMessageBox.information(self, "Все чисто", "Не найдено контекстов для исправления.")
+                return
 
             # Вычисить fingerprint для определения, изменились ли данные
             new_fp = self._compute_fixer_data_fingerprint(data_for_dialog)
@@ -6209,14 +6776,42 @@ class TranslationValidatorPage(ShellPage):
 
         self._fixer_data_fingerprint = new_fp
 
+        # ui-dialogs-validation/runtime/9-glossary-update-rescans-whole-:
+        # снимок действующих исключений детектора «до» открытия фиксера.
+        # _recalculate_untranslated_words_for_rows зависит ТОЛЬКО от этого
+        # набора (word_exceptions -> UntranslatedWordDetector, других входов
+        # у детектора нет) — если правка глоссария из фиксера (в т.ч. отмена
+        # или добавление и тут же удаление термина) не изменила итоговый
+        # набор, полный пересчёт по всем главам книги ниже можно безопасно
+        # пропустить. getattr — чтобы не требовать этот метод от лёгких
+        # тестовых дублей страницы (см. _ValidatorHarness в
+        # test_validator_nested_pages.py, где has_glossary_updates() всегда
+        # False и снимок не используется).
+        get_word_exceptions = getattr(self, '_get_effective_word_exceptions', None)
+        word_exceptions_before = (
+            frozenset(get_word_exceptions()) if callable(get_word_exceptions) else None
+        )
+
+        def _word_exceptions_actually_changed():
+            # Снимок недоступен (нет метода на self) -> не можем поручиться,
+            # что ничего не изменилось, поэтому ведём себя как раньше (всегда
+            # считаем изменённым и пересчитываем).
+            if word_exceptions_before is None:
+                return True
+            get_word_exceptions_after = getattr(self, '_get_effective_word_exceptions', None)
+            if not callable(get_word_exceptions_after):
+                return True
+            return frozenset(get_word_exceptions_after()) != word_exceptions_before
+
         def apply_fixer_result(accepted, page=page):
             try:
                 self._fixer_filter_state = page.save_filter_state()
 
                 glossary_updated = page.has_glossary_updates()
+                glossary_exceptions_changed = glossary_updated and _word_exceptions_actually_changed()
 
                 if not accepted:
-                    if glossary_updated:
+                    if glossary_exceptions_changed:
                         self._recalculate_untranslated_words_for_rows(list(self.results_data.keys()))
                         self.reapply_filters()
                         self._recalc_untranslated_stats_ui()
@@ -6233,7 +6828,7 @@ class TranslationValidatorPage(ShellPage):
                     )
                     self._fixer_data_fingerprint = None
 
-                if glossary_updated:
+                if glossary_exceptions_changed:
                     self._recalculate_untranslated_words_for_rows(list(self.results_data.keys()))
                     self.reapply_filters()
                     self._recalc_untranslated_stats_ui()
@@ -6242,11 +6837,13 @@ class TranslationValidatorPage(ShellPage):
 
                 if not changes:
                     if glossary_updated:
-                        QMessageBox.information(
-                            self,
-                            "Глоссарий обновлён",
+                        message = (
                             "Изменения в project_glossary.json сохранены. Список недопереводов пересчитан."
+                            if glossary_exceptions_changed
+                            else "Изменения в project_glossary.json сохранены. "
+                            "Набор исключений не изменился — пересчёт недопереводов не потребовался."
                         )
+                        QMessageBox.information(self, "Глоссарий обновлён", message)
                     return
 
                 if page.should_save_immediately():
@@ -6295,6 +6892,14 @@ class TranslationValidatorPage(ShellPage):
         # --- КОНЕЦ ИСПРАВЛЕНИЙ ---
 
     def can_leave(self) -> bool:
+        # Пока крутится вложенный цикл ожидания ниже, Qt продолжает
+        # обрабатывать события — повторный клик по "Назад" вызовет can_leave()
+        # ещё раз, а NavigationController.pop() не защищён от повторного
+        # входа: второй pop() дойдёт до тела поверх ещё не завершившегося
+        # первого и повредит стек навигации (двойной removeWidget/disconnect).
+        # Не пускаем такой реентрантный вызов, пока не решена судьба первого.
+        if getattr(self, "_awaiting_analysis_thread_stop", False):
+            return False
         if self.analysis_thread is not None and self.analysis_thread.isRunning():
             answer = QMessageBox.question(
                 self, "Выход",
@@ -6306,20 +6911,81 @@ class TranslationValidatorPage(ShellPage):
                 return False
             self.analysis_thread.stop()
             if not self.analysis_thread.wait(1000):
-                self.analysis_thread.terminate()
+                # ВНИМАНИЕ: terminate() здесь раньше применялся к потоку,
+                # который почти всегда в этот момент выполняет CPU-bound
+                # Python-код (BeautifulSoup, re, детектор языка) под GIL.
+                # Снятие потока в такой момент может унести с собой
+                # захваченный внутренний мьютекс GIL и намертво подвесить
+                # процесс — это хуже, чем не завершившаяся вовремя проверка.
+                # Вместо этого ждём штатного завершения (флаг _is_running уже
+                # снят stop()), не блокируя цикл событий, чтобы страницу
+                # можно было безопасно удалить только после реальной
+                # остановки потока.
+                self._awaiting_analysis_thread_stop = True
+                try:
+                    # Вложенный цикл ниже доставляет очередные сигналы потока
+                    # (result_found/progress_update/analysis_finished) слотам
+                    # ЭТОЙ, уходящей страницы. analysis_finished успевает
+                    # выполнить on_analysis_finished (снапшот, возможный
+                    # модальный диалог "Проблем не найдено" с перезапуском
+                    # анализа) ещё до того, как страницу уберут со стека —
+                    # отключаем сигналы заранее, чтобы этого не происходило.
+                    for signal_name, slot in (
+                        ("result_found", getattr(self, "add_result", None)),
+                        ("progress_update", getattr(self, "update_status", None)),
+                        ("analysis_finished", getattr(self, "on_analysis_finished", None)),
+                    ):
+                        signal = getattr(self.analysis_thread, signal_name, None)
+                        if signal is None or slot is None:
+                            continue
+                        try:
+                            signal.disconnect(slot)
+                        except TypeError:
+                            pass
+                    wait_loop = QtCore.QEventLoop()
+                    self.analysis_thread.finished.connect(wait_loop.quit)
+                    if self.analysis_thread.isRunning():
+                        wait_loop.exec()
+                finally:
+                    self._awaiting_analysis_thread_stop = False
+        if getattr(self, "_quality_pass_running", False):
+            # Уйти со страницы валидатора обычно означает её удаление
+            # (NavigationController.pop() -> deleteLater()) — а контроллер
+            # ручной проверки качества висит на НЕЙ (см.
+            # _quality_controller_instance), не на диалоге. Если проход всё
+            # ещё идёт, следующий callback из QA-потока обратится к уже
+            # уничтоженному Qt-объекту и упадёт RuntimeError — то же самое,
+            # из-за чего появился _quality_controller_instance, только на
+            # уровень выше (ui-dialogs-validation/runtime/17). Полноценная
+            # защита — try/except вокруг повторного on_done в
+            # core/chapter_qa_coordinator.py (вне зоны этой правки); здесь —
+            # минимум: спросить пользователя и, если он согласен уйти,
+            # попросить проход остановиться, а не удалять страницу молча.
+            answer = QMessageBox.question(
+                self, "Выход",
+                "Ручная проверка качества перевода ещё не завершена. "
+                "Прервать и выйти?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return False
+            controller = getattr(self, "_quality_controller", None)
+            cancel = getattr(controller, "cancel", None)
+            if callable(cancel):
+                cancel()
         return True
 
 
-class _ValidatorDialogMeta(type(QDialog)):
-    """Metaclass that delegates unknown class-level attribute lookups to
-    TranslationValidatorPage, so that tests which borrow unbound methods via
-    ``TranslationValidatorDialog._some_method`` keep working after the rename."""
-
-    def __getattr__(cls, name):
-        return getattr(TranslationValidatorPage, name)
-
-
-class TranslationValidatorDialog(QDialog, metaclass=_ValidatorDialogMeta):
+class TranslationValidatorDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    # make_page_delegating_meta delegates unknown class-level attribute
+    # lookups to TranslationValidatorPage, so that tests which borrow
+    # unbound methods via ``TranslationValidatorDialog._some_method`` keep
+    # working after the rename.
+    metaclass=make_page_delegating_meta(TranslationValidatorPage),
+):
     """Thin window wrapper hosting TranslationValidatorPage (preserves the old API)."""
 
     def __init__(self, translated_folder, original_epub_path, parent=None, retry_enabled=True, project_manager=None):
@@ -6345,17 +7011,18 @@ class TranslationValidatorDialog(QDialog, metaclass=_ValidatorDialogMeta):
         layout.addWidget(self.page)
         self.page.request_back.connect(self.accept)
 
-    def __getattr__(self, name):
-        # Delegate unknown attributes to the page so old callers/tests
-        # (e.g. dialog.check_show_all) keep working transparently.
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
-
     def closeEvent(self, event):
         # MOVED VERBATIM from the old dialog, with self.<x> -> self.page.<x>
         # for analysis_thread and retry_is_available.
+
+        # См. комментарий в TranslationValidatorPage.can_leave: пока крутится
+        # вложенный цикл ожидания ниже, Qt продолжает обрабатывать события —
+        # повторное закрытие окна (второй клик/Alt+F4) вызовет closeEvent ещё
+        # раз поверх ещё не завершившегося первого вызова. Игнорируем такой
+        # реентрантный вызов, пока не решена судьба первого.
+        if getattr(self.page, "_awaiting_analysis_thread_stop", False):
+            event.ignore()
+            return
 
         # 1. Проверка потока
         if self.page.analysis_thread and self.page.analysis_thread.isRunning():
@@ -6374,28 +7041,48 @@ class TranslationValidatorDialog(QDialog, metaclass=_ValidatorDialogMeta):
 
             self.page.analysis_thread.stop()
             if not self.page.analysis_thread.wait(1000):
-                self.page.analysis_thread.terminate()
+                # См. комментарий в TranslationValidatorPage.can_leave: не
+                # используем terminate() — на CPU-bound Python-потоке это
+                # может намертво подвесить процесс. Ждём штатного завершения.
+                self.page._awaiting_analysis_thread_stop = True
+                try:
+                    # Отключаем сигналы потока от слотов уходящей страницы —
+                    # иначе on_analysis_finished (снапшот, модальный диалог,
+                    # возможный перезапуск анализа) выполнится на странице,
+                    # которую вот-вот закроют.
+                    for signal_name, slot in (
+                        ("result_found", getattr(self.page, "add_result", None)),
+                        ("progress_update", getattr(self.page, "update_status", None)),
+                        ("analysis_finished", getattr(self.page, "on_analysis_finished", None)),
+                    ):
+                        signal = getattr(self.page.analysis_thread, signal_name, None)
+                        if signal is None or slot is None:
+                            continue
+                        try:
+                            signal.disconnect(slot)
+                        except TypeError:
+                            pass
+
+                    wait_loop = QtCore.QEventLoop()
+                    self.page.analysis_thread.finished.connect(wait_loop.quit)
+                    if self.page.analysis_thread.isRunning():
+                        wait_loop.exec()
+                finally:
+                    self.page._awaiting_analysis_thread_stop = False
 
         # 2. Логика выхода в меню (только если retry недоступен, т.е. автономный режим)
         if not self.page.retry_is_available:
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Завершение работы")
-            msg_box.setText("Вы хотите закрыть приложение или вернуться в главное меню?")
-            msg_box.setIcon(QMessageBox.Icon.Question)
+            action = prompt_return_to_menu(self)
 
-            btn_menu = msg_box.addButton("Вернуться в меню", QMessageBox.ButtonRole.ActionRole)
-            btn_exit = msg_box.addButton("Выйти из программы", QMessageBox.ButtonRole.DestructiveRole)
-            btn_cancel = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
-
-            msg_box.exec()
-            clicked = msg_box.clickedButton()
-
-            if clicked == btn_cancel:
+            if action == "cancel":
                 event.ignore()
                 return
-            elif clicked == btn_menu:
-                # Устанавливаем спецкод для перезагрузки цикла в main.py
-                QApplication.exit(2000)  # EXIT_CODE_REBOOT
+            elif action == "menu":
+                # Перезапускаем цикл main.py через канонический
+                # return_to_main_menu() (dups-gt_ui_dialogs_validation-01,
+                # finding …15-legacy-dialog-wrappers-x3) вместо литерала
+                # QApplication.exit(2000).
+                return_to_main_menu()
                 event.accept()
             else:
                 # Обычный выход

@@ -41,9 +41,14 @@ def test_version_ordering():
 # --- Build identity + channel detection (Task 2) ---
 
 
-def _identity():
+def _identity(repository="example/project"):
     from gemini_translator.utils import updater as u
-    return u.BuildIdentity(u.parse_version_tag("v10.5.21"), "v10.5.21", "a" * 40)
+    return u.BuildIdentity(
+        u.parse_version_tag("v10.5.21"),
+        "v10.5.21",
+        "a" * 40,
+        repository,
+    )
 
 
 @pytest.mark.parametrize("exe,identity,expected", [
@@ -75,13 +80,33 @@ def test_read_build_identity_validates(monkeypatch, tmp_path):
     p = tmp_path / u.BUILD_IDENTITY_FILENAME
     monkeypatch.setattr(u.api_config, "get_resource_path", lambda name: p)
     assert u.read_build_identity() is None  # файла нет
-    p.write_text('{"schema":1,"version":"10.5.21","tag":"v10.5.21","commit":"%s"}' % ("a" * 40))
+    p.write_text(
+        '{"schema":2,"version":"10.5.21","tag":"v10.5.21",'
+        '"commit":"%s","repository":"example/project"}' % ("a" * 40)
+    )
     ident = u.read_build_identity()
     assert ident.tag == "v10.5.21" and ident.version.is_final
-    p.write_text('{"schema":1,"version":"10.5.21","tag":"v10.9.9","commit":"%s"}' % ("a" * 40))
+    assert ident.repository == "example/project"
+    p.write_text(
+        '{"schema":1,"version":"10.5.21","tag":"v10.5.21","commit":"%s"}'
+        % ("a" * 40)
+    )
+    assert u.read_build_identity() is None  # легаси-сборка не знает свой канал
+    p.write_text(
+        '{"schema":2,"version":"10.5.21","tag":"v10.9.9",'
+        '"commit":"%s","repository":"example/project"}' % ("a" * 40)
+    )
     assert u.read_build_identity() is None  # тег и версия расходятся
-    p.write_text('{"schema":1,"version":"10.6.0-rc1","tag":"v10.6.0-rc1","commit":"%s"}' % ("a" * 40))
+    p.write_text(
+        '{"schema":2,"version":"10.6.0-rc1","tag":"v10.6.0-rc1",'
+        '"commit":"%s","repository":"example/project"}' % ("a" * 40)
+    )
     assert u.read_build_identity() is None  # не финальная версия
+    p.write_text(
+        '{"schema":2,"version":"10.5.21","tag":"v10.5.21",'
+        '"commit":"%s","repository":"not a repo"}' % ("a" * 40)
+    )
+    assert u.read_build_identity() is None
     p.write_text("not json")
     assert u.read_build_identity() is None
 
@@ -90,10 +115,16 @@ def test_read_archive_identity(tmp_path):
     from gemini_translator.utils import updater as u
     assert u.read_archive_identity(tmp_path) is None
     (tmp_path / u.ARCHIVE_IDENTITY_FILENAME).write_text(
-        '{"schema":1,"commit":"%s","files":["main.py"]}' % ("b" * 40))
+        '{"schema":2,"commit":"%s","repository":"example/project",'
+        '"files":["main.py"]}' % ("b" * 40))
     ident = u.read_archive_identity(tmp_path)
     assert ident["commit"] == "b" * 40
-    (tmp_path / u.ARCHIVE_IDENTITY_FILENAME).write_text('{"schema":1,"commit":"short"}')
+    assert ident["repository"] == "example/project"
+    (tmp_path / u.ARCHIVE_IDENTITY_FILENAME).write_text(
+        '{"schema":1,"commit":"%s","files":["main.py"]}' % ("b" * 40))
+    assert u.read_archive_identity(tmp_path) is None
+    (tmp_path / u.ARCHIVE_IDENTITY_FILENAME).write_text(
+        '{"schema":2,"commit":"short","repository":"example/project"}')
     assert u.read_archive_identity(tmp_path) is None
 
 
@@ -243,6 +274,9 @@ def test_checker_release_update_available(qtbot, monkeypatch):
     assert info.asset.name == "GeminiTranslator-Setup.exe"
     assert info.asset.sha256 == "a" * 64
     assert info.suppress_id == "v10.5.22"
+    assert checker._session_factory().calls[0].startswith(
+        "https://api.github.com/repos/example/project/"
+    )
 
 
 def test_checker_release_no_update_on_equal(qtbot, monkeypatch):
@@ -315,15 +349,17 @@ def test_checker_release_network_exception_is_error(qtbot, monkeypatch):
         checker.run()
 
 
-def test_checker_development_manual_announce(qtbot, monkeypatch):
+def test_checker_development_build_has_no_implicit_repository(qtbot, monkeypatch):
     u, checker = _make_release_checker(
         monkeypatch,
         [("releases/latest", FakeResponse(json_data=_release_payload(tag="v99.0.0",
                                                                      with_manifest=False)))],
         channel="DEVELOPMENT", identity=False)
-    with qtbot.waitSignal(checker.update_available, timeout=2000) as blocker:
+    session = checker._session_factory()
+    with qtbot.waitSignal(checker.error_occurred, timeout=2000) as blocker:
         checker.run()
-    assert blocker.args[0].manual
+    assert "источник" in blocker.args[0].lower()
+    assert session.calls == []
 
 
 def _git_checker(monkeypatch, responses):
@@ -397,30 +433,41 @@ def _archive_checker(monkeypatch, identity, routes):
     return u, u.UpdateChecker(manual=True, session_factory=lambda: session)
 
 
-def test_checker_archive_unknown_identity_is_manual(qtbot, monkeypatch):
+def test_checker_archive_unknown_identity_is_error(qtbot, monkeypatch):
     u, checker = _archive_checker(monkeypatch, None, [])
-    with qtbot.waitSignal(checker.update_available, timeout=2000) as blocker:
+    with qtbot.waitSignal(checker.error_occurred, timeout=2000) as blocker:
         checker.run()
-    info = blocker.args[0]
-    assert info.kind == "archive" and info.manual
+    assert "источник" in blocker.args[0].lower()
 
 
 def test_checker_archive_update_available_pins_sha(qtbot, monkeypatch):
     sha = "e" * 40
     u, checker = _archive_checker(
-        monkeypatch, {"schema": 1, "commit": "d" * 40},
+        monkeypatch, {
+            "schema": 2,
+            "commit": "d" * 40,
+            "repository": "primalrin/translatorFork_MOD",
+        },
         [("commits/main", FakeResponse(json_data={"sha": sha, "commit": {"message": "msg"}}))])
     with qtbot.waitSignal(checker.update_available, timeout=2000) as blocker:
         checker.run()
     info = blocker.args[0]
     assert info.kind == "archive" and not info.manual
     assert info.suppress_id == sha and info.zip_url.endswith(f"/zipball/{sha}")
+    assert info.repository == "primalrin/translatorFork_MOD"
+    assert checker._session_factory().calls == [
+        "https://api.github.com/repos/primalrin/translatorFork_MOD/commits/main"
+    ]
 
 
 def test_checker_archive_no_update(qtbot, monkeypatch):
     sha = "e" * 40
     u, checker = _archive_checker(
-        monkeypatch, {"schema": 1, "commit": sha},
+        monkeypatch, {
+            "schema": 2,
+            "commit": sha,
+            "repository": "primalrin/translatorFork_MOD",
+        },
         [("commits/main", FakeResponse(json_data={"sha": sha}))])
     with qtbot.waitSignal(checker.no_update, timeout=2000):
         checker.run()
@@ -428,7 +475,11 @@ def test_checker_archive_no_update(qtbot, monkeypatch):
 
 def test_checker_archive_api_error(qtbot, monkeypatch):
     u, checker = _archive_checker(
-        monkeypatch, {"schema": 1, "commit": "d" * 40},
+        monkeypatch, {
+            "schema": 2,
+            "commit": "d" * 40,
+            "repository": "primalrin/translatorFork_MOD",
+        },
         [("commits/main", FakeResponse(status_code=500))])
     with qtbot.waitSignal(checker.error_occurred, timeout=2000):
         checker.run()
@@ -568,5 +619,3 @@ def test_build_updater_session_disabled_or_none():
             return {"enabled": False, "type": "SOCKS5", "host": "h", "port": 1}
 
     assert u.build_updater_session(SM()).proxies == {}
-
-

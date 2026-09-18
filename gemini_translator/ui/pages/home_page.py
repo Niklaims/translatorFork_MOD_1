@@ -14,6 +14,7 @@ from PyQt6 import QtCore, QtWidgets
 import os
 import sys
 from gemini_translator.ui.shell import ShellPage
+from gemini_translator.ui.widgets.proxy_status import render_proxy_status
 from gemini_translator.utils import updater as upd
 
 # (icon, title, description, tool_id, is_large)
@@ -283,21 +284,7 @@ class HomePage(ShellPage):
         self._update_proxy_display(settings)
 
     def _update_proxy_display(self, settings: dict) -> None:
-        enabled = bool(settings.get("enabled", False))
-        proxy_type = str(settings.get("type") or "SOCKS5")
-        host = str(settings.get("host") or "")
-        port = str(settings.get("port") or "")
-        user = str(settings.get("user") or "")
-
-        if enabled and host and port:
-            self.proxy_status_label.setText(f"Прокси: {proxy_type}://{host}:{port}")
-            tooltip_lines = [f"Тип: {proxy_type}", f"Хост: {host}", f"Порт: {port}"]
-            if user:
-                tooltip_lines.append(f"Пользователь: {user}")
-            self.proxy_status_label.setToolTip("\n".join(tooltip_lines))
-        else:
-            self.proxy_status_label.setText("Прокси: выключен")
-            self.proxy_status_label.setToolTip("Сетевые запросы идут без прокси.")
+        render_proxy_status(self.proxy_status_label, settings)
 
     # --- Обновления --------------------------------------------------------
     #
@@ -380,7 +367,7 @@ class HomePage(ShellPage):
             return
         if info.manual:
             import webbrowser
-            webbrowser.open(info.manual_url or upd.RELEASES_PAGE)
+            webbrowser.open(info.manual_url)
             return
         if info.kind == "release":
             self._start_release_download(info)
@@ -483,6 +470,12 @@ class HomePage(ShellPage):
 
     def _prepare_release_install(self, info, staged_path):
         from gemini_translator.utils import update_installer as inst
+        if not self._page_allows_close():
+            self._abort_update_for_page_veto(
+                "install aborted: current page vetoed close before the "
+                "detached install helper started (unsaved changes or a "
+                "running worker)")
+            return
         self._set_update_state(upd.UpdateState.PREPARING)
         channel = upd.detect_update_channel()
         ctx = self._install_context(f"v{info.title_version}")
@@ -503,19 +496,30 @@ class HomePage(ShellPage):
 
     def _prepare_archive_install(self, info, staged_path):
         from gemini_translator.utils import update_installer as inst
+        if not self._page_allows_close():
+            self._abort_update_for_page_veto(
+                "install aborted: current page vetoed close before the "
+                "detached install helper started (unsaved changes or a "
+                "running worker)")
+            return
         self._set_update_state(upd.UpdateState.PREPARING)
         ctx = self._install_context(info.commit[:12])
 
         def job():
             inst.prepare_source_archive(staged_path, upd.project_root(), ctx,
-                                        commit_sha=info.commit)
+                                        commit_sha=info.commit,
+                                        repository=info.repository)
             return None
 
         self._run_prepare_worker(job)
 
     def _run_prepare_worker(self, job):
         self._update_worker = upd.FunctionWorker(job, self)
-        self._update_worker.done.connect(lambda _result: self._begin_exit())
+        # Страница уже опрошена в _prepare_release_install/_prepare_archive_install
+        # ДО запуска этого воркера — не спрашиваем повторно (иначе модальный
+        # диалог несохранённых данных мог бы показаться дважды).
+        self._update_worker.done.connect(
+            lambda _result: self._begin_exit(already_confirmed=True))
         self._update_worker.failed.connect(self._on_prepare_failed)
         self._update_worker.start()
 
@@ -547,6 +551,14 @@ class HomePage(ShellPage):
 
         def on_done(_result):
             progress.close()
+            # Страницу опрашиваем ДО запуска второй копии процесса — иначе
+            # при вето обе копии оказались бы открыты одновременно поверх
+            # одних и тех же настроек/БД очереди (см. code review g25).
+            if not self._page_allows_close():
+                self._abort_update_for_page_veto(
+                    "git update aborted: current page vetoed close before "
+                    "restart (unsaved changes or a running worker)")
+                return
             from PyQt6.QtCore import QProcess
             if not QProcess.startDetached(sys.executable, sys.argv):
                 self._set_update_state(upd.UpdateState.IDLE)
@@ -555,7 +567,7 @@ class HomePage(ShellPage):
                     "Код обновлён, но перезапустить программу не удалось. "
                     "Закройте и откройте её вручную.")
                 return
-            self._begin_exit()
+            self._begin_exit(already_confirmed=True)
 
         def on_failed(err):
             progress.close()
@@ -568,17 +580,70 @@ class HomePage(ShellPage):
 
     # -- штатное завершение --
 
-    def _begin_exit(self):
+    def _page_allows_close(self):
+        """Опрашивает текущую страницу навигации: можно ли прервать её работу.
+
+        Апдейтер обязан спросить это ДО любого необратимого шага —
+        запуска detached-хелпера установки или перезапуска процесса на
+        git-обновлении, — иначе вето живого воркера или несохранённых
+        настроек/глоссария молча теряется вместе с данными (см. code
+        review g25).
+        """
+        window = self.window()
+        page = None
+        if window is not None:
+            navigation = getattr(window, "navigation", None)
+            if navigation is not None:
+                page = navigation.current_page()
+        if page is not None and hasattr(page, "_prepare_for_close"):
+            return page._prepare_for_close()
+        return True
+
+    def _abort_update_for_page_veto(self, reason):
+        """Откатывает обновление после вето страницы на закрытие.
+
+        Возвращает апдейтер в IDLE (иначе кнопка "Проверить обновления"
+        замирает до конца сеанса, а check_for_updates() молча выходит на
+        guard'е "state is not IDLE") и сообщает об этом пользователю, а не
+        только пишет строку в лог.
+        """
+        from gemini_translator.utils.update_installer import log_update_event
+        log_update_event(reason)
+        self._set_update_state(upd.UpdateState.IDLE)
+        QtWidgets.QMessageBox.information(
+            self, "Обновление отложено",
+            "Обновление отложено: на текущей странице есть незавершённая "
+            "операция или несохранённые изменения. Завершите её и запустите "
+            "проверку обновлений снова.")
+
+    def _begin_exit(self, already_confirmed=False):
         """Штатный выход: настройки, воркеры и туннели успевают завершиться.
 
         Хелпер ждёт завершения нашего PID; если пользователь отменил закрытие
         (ловушка closeEvent), хелпер увидит живой процесс и откажется от
         установки, ничего не тронув.
+
+        MainShell.closeEvent пропускает диалог подтверждения и опрос текущей
+        страницы, когда видит ``is_updating`` (чтобы автообновление не
+        застревало на "Вы точно хотите выйти?"). Поэтому вето текущей
+        страницы (живой воркер, несохранённые настройки/глоссарий) нужно
+        спросить ЗДЕСЬ, до того как этот флаг выставлен — иначе оно молча
+        пропадает вместе с данными. ``already_confirmed=True`` пропускает
+        повторный опрос, когда вызывающий уже спросил страницу раньше (до
+        запуска detached-хелпера установки или перезапуска процесса) —
+        иначе модальный диалог несохранённых данных мог бы показаться
+        дважды подряд.
         """
+        if not already_confirmed and not self._page_allows_close():
+            self._abort_update_for_page_veto(
+                "shutdown aborted: current page vetoed close "
+                "(unsaved changes or a running worker)")
+            return
+
         from gemini_translator.utils.update_installer import log_update_event
+        window = self.window()
         self._set_update_state(upd.UpdateState.EXITING)
         self.btn_check_update.setEnabled(False)
-        window = self.window()
         if window is not None:
             window.setProperty("is_updating", True)
 

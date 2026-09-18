@@ -2,21 +2,27 @@
 import runpy
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 _BUILD_CONFIG = runpy.run_path(str(Path(SPECPATH) / "pyinstaller_config.py"))
 LAZY_HANDLER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_HANDLER_HIDDEN_IMPORTS"]
 LAZY_SERVER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_SERVER_HIDDEN_IMPORTS"]
+QA_RUNTIME_HIDDEN_IMPORTS = [
+    "gemini_translator.qa.book_metrics",
+    "razdel",
+]
 
-datas = [('config', 'config'), ('README.md', '.'), ('gemini_translator/scripts/chatgpt_workascii_bridge.cjs', 'gemini_translator/scripts'), ('gemini_translator/scripts/chatgpt_profile_launcher.cjs', 'gemini_translator/scripts'), ('qidian_rulate/tags.txt', 'qidian_rulate'), ('ranobelib/__init__.py', 'ranobelib'), ('ranobelib/api_upload.py', 'ranobelib'), ('ranobelib/constants.py', 'ranobelib'), ('ranobelib/dependencies.py', 'ranobelib'), ('ranobelib/dialogs.py', 'ranobelib'), ('ranobelib/main.py', 'ranobelib'), ('ranobelib/main_window.py', 'ranobelib'), ('ranobelib/models.py', 'ranobelib'), ('ranobelib/parsers.py', 'ranobelib'), ('ranobelib/ranobelib-upload.mjs', 'ranobelib'), ('ranobelib/ranobelib_uploader_v12.py', 'ranobelib'), ('ranobelib/utils.py', 'ranobelib'), ('ranobelib/workers.py', 'ranobelib')]
+datas = [('config', 'config'), ('gemini_translator/config/translation_qa_prompts.json', 'gemini_translator/config'), ('README.md', '.'), ('gemini_translator/scripts/chatgpt_workascii_bridge.cjs', 'gemini_translator/scripts'), ('gemini_translator/scripts/chatgpt_profile_launcher.cjs', 'gemini_translator/scripts'), ('qidian_rulate/tags.txt', 'qidian_rulate'), ('ranobelib/__init__.py', 'ranobelib'), ('ranobelib/api_upload.py', 'ranobelib'), ('ranobelib/constants.py', 'ranobelib'), ('ranobelib/dependencies.py', 'ranobelib'), ('ranobelib/dialogs.py', 'ranobelib'), ('ranobelib/main.py', 'ranobelib'), ('ranobelib/main_window.py', 'ranobelib'), ('ranobelib/models.py', 'ranobelib'), ('ranobelib/parsers.py', 'ranobelib'), ('ranobelib/ranobelib-upload.mjs', 'ranobelib'), ('ranobelib/utils.py', 'ranobelib'), ('ranobelib/workers.py', 'ranobelib')]
 datas += collect_data_files('PyQt6')
 datas += collect_data_files('certifi')
 datas += collect_data_files('docx')
-datas += collect_data_files('emoji')
 datas += collect_data_files('jieba')
 datas += collect_data_files('lxml')
 datas += collect_data_files('werkzeug')
+# Qoder CLI (~100 МБ) в сборку не кладётся: хендлер скачивает его при первом
+# запросе к Qoder и сверяет с хешем из RECORD пакета, поэтому нужны его метаданные.
+datas += copy_metadata('qoder-agent-sdk')
 
 # Идентичность релизной сборки: CI генерирует файл до PyInstaller.
 # Локальная сборка без него — DEVELOPMENT-канал, автообновление выключено.
@@ -39,6 +45,7 @@ a = Analysis(
         'qoder_agent_sdk',
         *LAZY_HANDLER_HIDDEN_IMPORTS,
         *LAZY_SERVER_HIDDEN_IMPORTS,
+        *QA_RUNTIME_HIDDEN_IMPORTS,
     ],
     hookspath=[],
     hooksconfig={},

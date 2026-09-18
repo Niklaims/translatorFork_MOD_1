@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 from types import SimpleNamespace
 
-from PyQt6 import QtWidgets
+from PyQt6 import QtCore, QtWidgets
 
 from gemini_translator.api import config as api_config
 from gemini_translator.ui.dialogs.glossary_dialogs import ai_generation as ai_generation_module
@@ -655,6 +655,104 @@ class _HardStopHarness:
         self.cleanup_calls.append(keep_recovery_file)
 
 
+class _RestartQueueTaskManager:
+    def __init__(self):
+        self.tasks = [(object(), ("epub", "/tmp/book.epub", "Text/one.xhtml"))]
+        self.glossary_results_cleared = 0
+
+    def has_pending_tasks(self):
+        return bool(self.tasks)
+
+    def get_all_pending_tasks(self):
+        return list(self.tasks)
+
+    def clear_glossary_results(self):
+        self.glossary_results_cleared += 1
+
+
+class _RestartSessionHarness:
+    _start_session = GenerationSessionPage._start_session
+
+    def __init__(self, epub_path):
+        self._is_glossary_rebuilding = False
+        self._glossary_rebuild_worker = None
+        self._glossary_queue_ready = True
+        self._pending_session_start_request = None
+        self.engine = SimpleNamespace(session_id=None)
+        self.task_manager = _RestartQueueTaskManager()
+        self.epub_path = epub_path
+        self.glossary_widget = SimpleNamespace(
+            commit_active_editor=lambda: None,
+            get_glossary=lambda: [],
+        )
+        self.pipeline_run = None
+        self.tabs = SimpleNamespace(
+            count=lambda: 1,
+            setCurrentIndex=lambda _index: None,
+        )
+        self.log_widget = SimpleNamespace(clear=lambda: None)
+        self.prompt_widget = SimpleNamespace(
+            get_prompt=lambda: "prompt",
+            get_current_preset_name=lambda: "preset",
+        )
+        self.settings_manager = SimpleNamespace(
+            save_last_glossary_prompt_text=lambda _prompt: None,
+            save_last_glossary_prompt_preset_name=lambda _name: None,
+        )
+        self.sequential_mode_checkbox = SimpleNamespace(isChecked=lambda: False)
+        self.instances_spin = SimpleNamespace(value=lambda: 2)
+        self.events = []
+        self.rebuild_requests = 0
+
+    def _get_all_processed_chapters(self):
+        return set()
+
+    def _set_ui_active(self, _active):
+        return None
+
+    def _save_persistent_ui_settings(self):
+        return None
+
+    def _get_common_settings(self):
+        return {
+            "api_keys": ["test-key"],
+            "model_config": {"id": "test-model"},
+            "initial_glossary_list": [],
+            "glossary_generation_prompt": "prompt",
+        }
+
+    def get_merge_mode(self):
+        return "supplement"
+
+    def _rebuild_glossary_tasks(self):
+        self.rebuild_requests += 1
+
+    def _post_event(self, event_name, data):
+        self.events.append((event_name, data))
+
+
+class _GenerationSessionEventHarness:
+    _on_global_event = GenerationSessionPage._on_global_event
+
+    def __init__(self):
+        self._active_generation_session_id = "new-session"
+        self.is_session_active = True
+        self._session_finished_successfully = False
+        self.pipeline_finish_reasons = []
+
+    def _handle_pipeline_log_event(self, _data):
+        return None
+
+    def _calculate_optimal_batch_size(self):
+        return None
+
+    def _set_ui_active(self, _active):
+        return None
+
+    def _handle_pipeline_session_finished(self, reason):
+        self.pipeline_finish_reasons.append(reason)
+
+
 class _ProviderComboStub:
     def __init__(self):
         self.currentIndexChanged = _SignalStub()
@@ -917,6 +1015,68 @@ class AiGlossaryGenerationTests(unittest.TestCase):
         settings = harness._get_common_settings()
 
         self.assertTrue(settings["prevent_sleep_during_translation"])
+
+    def test_glossary_generation_common_settings_identify_session_kind(self):
+        settings = _GenerationSettingsHarness()._get_common_settings()
+
+        self.assertEqual(settings["session_kind"], "glossary_generation")
+
+    def test_restart_rebuilds_queue_if_translation_tasks_replaced_glossary_tasks(self):
+        with tempfile.NamedTemporaryFile(suffix=".epub") as epub_file:
+            harness = _RestartSessionHarness(epub_file.name)
+
+            harness._start_session()
+
+        self.assertEqual(harness.rebuild_requests, 1)
+        self.assertEqual(harness.events, [])
+        self.assertIsNotNone(harness._pending_session_start_request)
+        self.assertEqual(harness.task_manager.glossary_results_cleared, 0)
+
+    def test_successful_rebuild_resumes_pending_restart(self):
+        harness = _PipelinePreparationHarness()
+        pending_settings = {
+            "session_kind": "glossary_generation",
+            "num_instances": 2,
+        }
+        harness._pending_session_start_request = (pending_settings, True)
+
+        harness.finish_preparation({"ok": True, "task_count": 3, "is_any_cjk": False})
+
+        self.assertEqual(harness.session_start_calls, 1)
+        self.assertEqual(
+            harness.started_session_settings,
+            [(pending_settings, True)],
+        )
+
+    def test_empty_rebuild_does_not_loop_pending_restart(self):
+        harness = _PipelinePreparationHarness()
+        harness._pending_session_start_request = (
+            {"session_kind": "glossary_generation"},
+            False,
+        )
+
+        harness.finish_preparation({"ok": True, "task_count": 0, "is_any_cjk": False})
+
+        self.assertEqual(harness.session_start_calls, 0)
+        self.assertIsNone(harness._pending_session_start_request)
+
+    def test_stale_session_finished_does_not_unlock_new_generation_session(self):
+        harness = _GenerationSessionEventHarness()
+
+        with patch.object(QtCore.QMetaObject, "invokeMethod"):
+            harness._on_global_event(
+                {
+                    "event": "session_finished",
+                    "session_id": "old-session",
+                    "data": {
+                        "reason": "Остановлено пользователем",
+                        "session_id_log": "old-session",
+                    },
+                }
+            )
+
+        self.assertFalse(hasattr(harness, "_shutdown_reason"))
+        self.assertEqual(harness.pipeline_finish_reasons, [])
 
     def test_auto_new_terms_limit_has_practical_floor(self):
         harness = _GenerationSettingsHarness()

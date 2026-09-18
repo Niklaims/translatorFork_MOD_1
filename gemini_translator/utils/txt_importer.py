@@ -1,6 +1,8 @@
 # gemini_translator/utils/txt_importer.py
 
+import html
 import os
+from pathlib import Path
 import re
 import unicodedata
 from collections import Counter, defaultdict
@@ -12,16 +14,18 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QLineEdit, QGroupBox
 )
 from PyQt6.QtCore import Qt, QTimer
+from .document_importer import _read_text_with_fallbacks
 from .epub_tools import EpubCreator
 from .language_tools import LanguageDetector
+# NumericSortItem намеренно НЕ импортируется здесь на верхнем уровне:
+# gemini_translator/utils — слой utils, а gemini_translator.ui.widgets — слой
+# ui с жадным __init__.py (тянет 14 виджет-модулей). Импорт ниже локальный,
+# внутри _refresh_toc_table — единственного места использования.
 
 
-try:
-    from recognizers_text import Culture
-    from recognizers_number import recognize_number
-    HAS_RECOGNIZERS = True
-except ImportError:
-    HAS_RECOGNIZERS = False
+# Общий шим совместимости emoji/recognizers-text, см.
+# gemini_translator/utils/recognizers_shim.py
+from .recognizers_shim import Culture, recognize_number, RECOGNIZERS_AVAILABLE as HAS_RECOGNIZERS
 
 
 CJK_CHAPTER_NUMBER_REGEX = r'[0-9零一二三四五六七八九十百千万两]+'
@@ -152,8 +156,13 @@ def smart_replace_number_in_title(title, new_number_int):
             # Находим самое левое вхождение
             leftmost = min(results, key=lambda x: x.start)
             start = leftmost.start
-            end = leftmost.end
-            return title[:start] + str(new_number_int) + title[end:]
+            # ВАЖНО: у recognizers-text-number ModelResult.end — индекс
+            # ПОСЛЕДНЕГО символа найденного числа (включительно), а не
+            # exclusive-конец среза. Резать нужно по длине leftmost.text,
+            # иначе последний символ числа остаётся в результате
+            # ('Глава 5' -> 'Глава 95' вместо 'Глава 9').
+            end_exclusive = start + len(leftmost.text)
+            return title[:start] + str(new_number_int) + title[end_exclusive:]
 
     # --- 3. FALLBACK: ОБЫЧНЫЕ ЦИФРЫ ---
     # Если библиотека не подключена или ничего не нашла (например "Chapter One" без библиотеки)
@@ -238,7 +247,6 @@ class TxtChapterAnalyzer:
     """
     def __init__(self, text_content):
         self.lines = text_content.splitlines()
-        self.total_char_count = len(text_content)
         # Пре-расчет длин строк (с учетом \n, которого нет в splitlines)
         self.line_lengths = [len(l) + 1 for l in self.lines] 
 
@@ -474,7 +482,6 @@ class TxtChapterAnalyzer:
             return []
 
         indent_pattern = re.compile(r'^\s*[\u3000\s]{1,2}')
-        current_char_idx = 0
         
         # Предварительный расчет смещений символов для каждой строки (чтобы не считать в цикле)
         # char_offsets[i] = индекс символа начала строки i
@@ -619,30 +626,16 @@ class TxtChapterAnalyzer:
             'max_snippet': max_chap['content_snippet'],
             'avg': total_len / len(valid_chapters_info)
         }
-    
-    def split_into_chapters(self, marker_word=None, context=None, custom_regex=None) -> list:
-        # Этот метод больше не используется напрямую Wizard'ом во второй фазе, 
-        # но оставлен для совместимости или быстрой генерации.
-        chapters_lines, titles = self._split_by_marker(marker_word, context, custom_regex)
-        chapters_data = []
-        for title, lines in zip(titles, chapters_lines):
-            content = "".join(lines)
-            if content.strip():
-                chapters_data.append((title, content))
-        return chapters_data
-
-
-
 
 
 class ChapterViewerDialog(QDialog):
     """Диалог для просмотра содержимого главы и ручного разделения."""
-    def __init__(self, chapter_lines, start_line_idx, parent=None):
+    def __init__(self, chapter_lines, first_line_idx, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Просмотр главы")
         self.resize(700, 600)
         self.lines = chapter_lines
-        self.start_line_idx = start_line_idx # Глобальный индекс первой строки этой главы
+        self.first_line_idx = first_line_idx # Глобальный индекс строки chapter_lines[0]
         self.selected_split_index = None # Глобальный индекс, если выбрали
         self.selected_split_text = None
 
@@ -693,27 +686,13 @@ class ChapterViewerDialog(QDialog):
             QtWidgets.QMessageBox.warning(self, "Ошибка", "Нельзя сделать пустую строку заголовком.")
             return
 
-        # Глобальный индекс строки = start_line_idx + (offset + 1, так как строка заголовка исключена из lines в Viewer)
-        # НО: в Viewer мы передаем `lines` как "тело главы".
-        # Значит, row 0 в Viewer - это `start_line_idx + 1` (следующая после заголовка).
-        global_idx = self.start_line_idx + 1 + row
+        # row 0 в Viewer — строка first_line_idx. У обычной главы это строка после заголовка,
+        # у предисловия заголовка нет, и показ начинается прямо со строки 0.
+        global_idx = self.first_line_idx + row
         
         self.selected_split_index = global_idx
         self.selected_split_text = text
         self.accept()
-
-
-class SortableTableWidgetItem(QTableWidgetItem):
-    """Ячейка, которая умеет правильно сортировать числа."""
-    def __lt__(self, other):
-        try:
-            # Пытаемся сравнить как числа (удаляя пробелы и запятые)
-            val1 = float(self.text().replace(' ', '').replace(',', '').replace('симв.', ''))
-            val2 = float(other.text().replace(' ', '').replace(',', '').replace('симв.', ''))
-            return val1 < val2
-        except ValueError:
-            # Если не вышло — как текст
-            return super().__lt__(other)
 
 
 class TxtImportWizardDialog(QDialog):
@@ -729,8 +708,12 @@ class TxtImportWizardDialog(QDialog):
         self.generated_epub_path = None
         
         try:
-            with open(txt_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Многокодировочное чтение (BOM/UnicodeDammit/перебор
+            # cp1251-и-т.п.), как у .md/.html в общем импортёре документов —
+            # раньше здесь был единственный open(..., encoding='utf-8'),
+            # который сразу закрывал мастер на не-UTF-8 дампах
+            # (utils-io/bugs/3-txtimp-strict-utf8-read).
+            content = _read_text_with_fallbacks(Path(txt_path))
             self.analyzer = TxtChapterAnalyzer(content)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка чтения файла", f"Не удалось прочитать файл:\n{e}")
@@ -847,7 +830,8 @@ class TxtImportWizardDialog(QDialog):
         self.toc_table.setHorizontalHeaderLabels(["Заголовок главы", "Размер (симв.)", "Индекс (симв.)", "№ Строки"])
         self.toc_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.toc_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
-        self.toc_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        # Shift/Ctrl выделяют несколько глав, чтобы удалять их одним нажатием
+        self.toc_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.toc_table.doubleClicked.connect(self.open_chapter_viewer)
         
         # ВКЛЮЧАЕМ СОРТИРОВКУ
@@ -856,8 +840,11 @@ class TxtImportWizardDialog(QDialog):
         layout.addWidget(self.toc_table)
         
         tools_layout = QHBoxLayout()
-        btn_del = QPushButton("Удалить главу")
-        btn_del.setToolTip("Удаляет метку главы. Текст объединяется с предыдущей главой.")
+        btn_del = QPushButton("Удалить выбранные")
+        btn_del.setToolTip(
+            "Удаляет метки выделенных глав. Их текст объединяется с предыдущей главой.\n"
+            "Shift+щелчок выделяет главы подряд, Ctrl+щелчок добавляет главу к выделению."
+        )
         btn_del.clicked.connect(self.delete_selected_chapter)
         
         btn_view = QPushButton("Просмотр / Разделить...")
@@ -963,7 +950,9 @@ class TxtImportWizardDialog(QDialog):
             self.structure_data.append({
                 'line_idx': 0,
                 'title': "Начало / Предисловие",
-                'char_idx': 0
+                'char_idx': 0,
+                # Предисловие узнаём по флагу: название можно переименовать в таблице
+                'is_preamble': True,
             })
         
         self.structure_data.extend(boundaries)
@@ -975,9 +964,33 @@ class TxtImportWizardDialog(QDialog):
         self.layout_stack.setCurrentWidget(self.page_regex)
 
     # --- ЛОГИКА СТРАНИЦЫ 2 (TOC) ---
+    def _update_titles_from_table(self):
+        # Название, исправленное прямо в ячейке, есть только в таблице. PyQt отдаёт
+        # из UserRole копию словаря главы, поэтому главу в self.structure_data
+        # ищем по равенству с этой копией, а не меняем саму копию.
+        items = [self.toc_table.item(row, 0) for row in range(self.toc_table.rowCount())]
+        for item in items:
+            snapshot = item.data(Qt.ItemDataRole.UserRole)
+            if not snapshot or item.text() == snapshot['title']:
+                continue
+            for chapter in self.structure_data:
+                if chapter == snapshot:
+                    chapter['title'] = item.text()
+                    # Иначе строку уже не найти по равенству, если таблица не пересобирается
+                    # (generate_epub, после которого пользователь остался в мастере)
+                    item.setData(Qt.ItemDataRole.UserRole, chapter)
+                    break
+
     def _refresh_toc_table(self):
+        # Локальный импорт (см. комментарий у верхних импортов модуля):
+        # utils не должен тянуть весь пакет gemini_translator.ui.widgets на
+        # уровне модуля ради одного класса, нужного только здесь.
+        from ..ui.widgets.table_utils import NumericSortItem
+
         # Отключаем сортировку во время обновления, иначе строки будут прыгать при вставке
         self.toc_table.setSortingEnabled(False)
+        # Пересборка идёт из self.structure_data: без этого названия из ячеек пропадут
+        self._update_titles_from_table()
         self.toc_table.setRowCount(0)
         
         # Базовый список всегда должен быть отсортирован по физическому расположению (строкам)
@@ -994,38 +1007,41 @@ class TxtImportWizardDialog(QDialog):
             
             # 1. Title (Обычный Item)
             t_item = QTableWidgetItem(item_data['title'])
-            # ВАЖНО: Сохраняем ссылку на сам словарь данных в ячейку. 
-            # Это позволит найти правильную главу даже если таблица отсортирована.
+            # ВАЖНО: Сохраняем данные главы в ячейку, чтобы найти её даже в отсортированной
+            # таблице. PyQt хранит и отдаёт копию словаря, а не ссылку на item_data.
             t_item.setData(Qt.ItemDataRole.UserRole, item_data)
             self.toc_table.setItem(i, 0, t_item)
             
-            # 2. Size (SortableItem для чисел)
-            s_item = SortableTableWidgetItem(f"{size:,}")
+            # 2. Size (NumericSortItem для чисел)
+            s_item = NumericSortItem(f"{size:,}")
             s_item.setData(Qt.ItemDataRole.UserRole, item_data) # Дублируем данные на всякий случай
             self.toc_table.setItem(i, 1, s_item)
-            
-            # 3. Char Index (SortableItem)
-            c_item = SortableTableWidgetItem(f"{item_data['char_idx']:,}")
+
+            # 3. Char Index (NumericSortItem)
+            c_item = NumericSortItem(f"{item_data['char_idx']:,}")
             self.toc_table.setItem(i, 2, c_item)
-            
-            # 4. Line No (SortableItem)
-            l_item = SortableTableWidgetItem(str(current_line_idx + 1))
+
+            # 4. Line No (NumericSortItem)
+            l_item = NumericSortItem(str(current_line_idx + 1))
             self.toc_table.setItem(i, 3, l_item)
             
         # Включаем сортировку обратно
         self.toc_table.setSortingEnabled(True)
             
     def delete_selected_chapter(self):
-        row = self.toc_table.currentRow()
-        if row < 0: return
-        
-        # Получаем данные из скрытого хранилища (UserRole), так как индекс row 
-        # может не совпадать с индексом в списке self.structure_data из-за сортировки
-        item = self.toc_table.item(row, 0)
-        target_data = item.data(Qt.ItemDataRole.UserRole)
-        
-        if target_data in self.structure_data:
-            self.structure_data.remove(target_data)
+        # Получаем данные из скрытого хранилища (UserRole), так как номер строки таблицы
+        # может не совпадать с индексом в списке self.structure_data из-за сортировки.
+        # PyQt возвращает копию словаря, поэтому главу ищем по равенству, а не по ссылке.
+        targets = [
+            self.toc_table.item(index.row(), 0).data(Qt.ItemDataRole.UserRole)
+            for index in self.toc_table.selectionModel().selectedRows()
+        ]
+        removed = False
+        for target_data in targets:
+            if target_data in self.structure_data:
+                self.structure_data.remove(target_data)
+                removed = True
+        if removed:
             self._refresh_toc_table()
 
     def open_chapter_viewer(self):
@@ -1051,12 +1067,12 @@ class TxtImportWizardDialog(QDialog):
         if real_index + 1 < len(self.structure_data):
             next_idx = self.structure_data[real_index + 1]['line_idx']
             
-        is_preamble = (start_idx == 0 and target_data['title'] in ["Начало / Предисловие", "Начало / Метаданные"])
+        is_preamble = target_data.get('is_preamble', False)
         content_start = start_idx if is_preamble else start_idx + 1
         
         chapter_lines = self.analyzer.lines[content_start : next_idx]
         
-        dlg = ChapterViewerDialog(chapter_lines, start_idx, self)
+        dlg = ChapterViewerDialog(chapter_lines, content_start, self)
         dlg.setWindowTitle(f"Глава: {target_data['title']}")
         
         if dlg.exec():
@@ -1065,6 +1081,10 @@ class TxtImportWizardDialog(QDialog):
                 new_title = dlg.selected_split_text
                 char_idx = sum(self.analyzer.line_lengths[:new_idx])
                 
+                if new_idx == start_idx:
+                    # Заголовком стала первая строка предисловия: текста до неё нет,
+                    # и пустое предисловие не должно остаться второй главой на этой строке
+                    del self.structure_data[real_index]
                 self.structure_data.append({
                     'line_idx': new_idx,
                     'title': new_title,
@@ -1078,17 +1098,8 @@ class TxtImportWizardDialog(QDialog):
             return
 
         # --- ИСПРАВЛЕНИЕ 1: БЕЗОПАСНОЕ ОБНОВЛЕНИЕ ЗАГОЛОВКОВ ---
-        # Мы не полагаемся на порядок строк (row index), а берем ссылку на данные из ячейки.
-        for row in range(self.toc_table.rowCount()):
-            item = self.toc_table.item(row, 0) # Ячейка с названием
-            new_title_text = item.text()
-            
-            # Получаем ссылку на словарь данных, привязанный к этой строке
-            data_dict = item.data(Qt.ItemDataRole.UserRole)
-            
-            # Обновляем заголовок в самом словаре
-            if data_dict:
-                data_dict['title'] = new_title_text
+        # Названия, исправленные в таблице, переносим в self.structure_data
+        self._update_titles_from_table()
 
         # Теперь сортируем структуру физически по порядку строк в файле,
         # чтобы в книге главы шли правильно, даже если в таблице их отсортировали по размеру.
@@ -1111,7 +1122,7 @@ class TxtImportWizardDialog(QDialog):
                 # Конец этой главы = начало следующей (или конец файла)
                 end = self.structure_data[i+1]['line_idx'] if i+1 < len(self.structure_data) else total_lines
                 
-                is_preamble = (start == 0 and item['title'] in ["Начало / Предисловие", "Начало / Метаданные"])
+                is_preamble = item.get('is_preamble', False)
                 
                 # Если не предисловие, то start-строка — это заголовок, берем контент с start+1
                 content_start = start if is_preamble else start + 1
@@ -1159,10 +1170,10 @@ class TxtImportWizardDialog(QDialog):
             # --- ИСПРАВЛЕНИЕ 2: УМНАЯ НУМЕРАЦИЯ ---
             if self.chk_force_renumber.isChecked():
                 renumbered = []
-                for idx, (title, content) in enumerate(final_chapters, 1):
-                    # Пропускаем перенумерацию, если это явно Предисловие
-                    # (можно настроить логику, но обычно предисловия не нумеруют как "1")
-                    if title in ["Начало / Предисловие", "Начало / Метаданные"]:
+                # Предисловие (оно всегда первое) не нумеруем и не считаем: главы после него идут с 1
+                first_number = 0 if self.structure_data[0].get('is_preamble', False) else 1
+                for idx, (title, content) in enumerate(final_chapters, first_number):
+                    if idx == 0:
                         renumbered.append((title, content))
                         continue
 
@@ -1177,16 +1188,21 @@ class TxtImportWizardDialog(QDialog):
                 # Пропускаем совсем пустые главы, если они случайно образовались
                 if not content.strip() and not title: continue
                 
-                # Экранирование HTML внутри текста не нужно, если content чистый текст, 
-                # но EpubCreator обычно сам оборачивает. Здесь мы делаем базовую разметку.
+                # Файл объявлен как application/xhtml+xml (epub_tools.py), поэтому
+                # заголовок и текст обязаны быть экранированы: '&', '<', '>' в сыром
+                # TXT-тексте (имена вида "Tom & Jerry", сравнения "a < b") иначе
+                # делают главу невалидным XML.
                 # strip() у каждой строки нужен, чтобы убрать лишние пробелы.
-                paragraphs = '\n\n'.join([f'<p>{line.strip()}</p>' for line in content.splitlines() if line.strip()])
-                
+                safe_title = html.escape(title, quote=True)
+                paragraphs = '\n\n'.join(
+                    [f'<p>{html.escape(line.strip(), quote=True)}</p>' for line in content.splitlines() if line.strip()]
+                )
+
                 html_content = f"""<?xml version='1.0' encoding='utf-8'?>
 <html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>{title}</title></head>
+<head><title>{safe_title}</title></head>
 <body>
-<h1>{title}</h1>
+<h1>{safe_title}</h1>
 {paragraphs}
 </body></html>"""
                 creator.add_chapter(f"chapter_{i+1}.xhtml", html_content, title)

@@ -55,6 +55,8 @@ from .worker_helpers.emerger_tasks import EmergencyTask
 
 from .worker_helpers.task_factory import get_task_processor_class
 
+from .event_bus_mixin import EventBusMixin
+
 
 _DEBUG_OPERATION_CONTEXT = contextvars.ContextVar("worker_debug_operation_context", default={})
 WORKER_IDLE_WAKE_TIMEOUT_SECONDS = 2.0
@@ -71,7 +73,7 @@ DEFAULT_TASK_STREAM_MODE = {
 #  ЕДИНЫЙ УНИВЕРСАЛЬНЫЙ КЛАСС-ВОРКЕР
 # ============================================================================
 
-class UniversalWorker:
+class UniversalWorker(EventBusMixin):
     
     def __init__(self, **kwargs):
         
@@ -116,25 +118,42 @@ class UniversalWorker:
         else:
             self.bus.event_posted.emit(event)
 
-    def _connect_to_bus(self):
-        if hasattr(self.bus, "subscribe"):
-            for topic in self._event_topics:
-                self.bus.subscribe(topic, self.on_event)
-            self._uses_topic_subscription = True
-        else:
-            self.bus.event_posted.connect(self.on_event)
+    def notify_translation_ready(self, task_info, saved_records):
+        """Hand saved chapters to translation QA without ever breaking translation.
 
-    def _disconnect_from_bus(self):
-        if not getattr(self, 'bus', None):
+        The worker knows nothing about quality control beyond this call: it
+        reports what it wrote, and the coordinator decides whether the queue may
+        continue. Any failure here is logged and ignored.
+        """
+        coordinator = getattr(QtWidgets.QApplication.instance(), 'qa_coordinator', None)
+        if coordinator is None or not task_info or not saved_records:
             return
         try:
-            if getattr(self, '_uses_topic_subscription', False) and hasattr(self.bus, "unsubscribe"):
-                for topic in getattr(self, '_event_topics', ()):
-                    self.bus.unsubscribe(topic, self.on_event)
-            elif hasattr(self.bus, "event_posted"):
-                self.bus.event_posted.disconnect(self.on_event)
-        except (TypeError, RuntimeError, ValueError):
-            pass
+            from .chapter_qa_coordinator import TranslationReadyEvent
+
+            task_id = str(task_info[0])
+            payload = task_info[1] if len(task_info) > 1 else ()
+            epub_path = str(payload[1]) if isinstance(payload, (list, tuple)) and len(payload) > 1 else ''
+            events = tuple(
+                TranslationReadyEvent(
+                    task_id=task_id,
+                    chapter_id=str(record['original_internal_path']),
+                    source_path=str(record['original_internal_path']),
+                    translated_path=str(record['output_path']),
+                    source_language='auto',
+                    target_language='ru',
+                    fingerprint=str(record.get('fingerprint', '')),
+                    epub_path=epub_path,
+                )
+                for record in saved_records
+                if isinstance(record, dict) and record.get('output_path')
+            )
+            if events:
+                coordinator.submit(task_id, events)
+        except Exception as exc:
+            self._post_event('log_message', {
+                'message': f"[QA WARN] Не удалось передать главу на проверку качества: {exc}"
+            })
 
     def notify(self):
         """Будит асинхронный цикл воркера без активного polling."""
@@ -446,10 +465,21 @@ class UniversalWorker:
         Основной метод воркера. Управляет event loop'ом, проактивно создает
         сессию и запускает основной цикл обработки задач.
         """
-        import logging
-        logging.getLogger('aiohttp').setLevel(logging.DEBUG)
-        logging.getLogger('aiohttp_socks').setLevel(logging.DEBUG)
-        
+        # ПРИМЕЧАНИЕ: раньше здесь безусловно включался DEBUG для глобальных
+        # логгеров 'aiohttp'/'aiohttp_socks' (общих на весь процесс, а не
+        # локальных для этого воркера) без восстановления уровня — один
+        # legacy-воркер навсегда включал подробный лог для всех последующих
+        # сессий и не-legacy HTTP-провайдеров. Try/finally save-restore на
+        # уровне отдельного воркера тоже не работает корректно: при
+        # перекрывающихся legacy-воркерах (обычный сценарий — по одному на
+        # ключ, до 32 браузерных профилей) порядок A.start -> B.start ->
+        # A.end -> B.end приводит к тому, что A восстанавливает уровень,
+        # который B уже успел перезаписать на DEBUG, а B восстанавливает
+        # DEBUG — глобальный уровень остаётся DEBUG навсегда, то есть тот же
+        # дефект. Ни один код в репозитории не полагается на DEBUG именно
+        # для aiohttp/aiohttp_socks, поэтому оставленная отладочная
+        # инструментация просто убрана: воркер больше не трогает уровни
+        # этих глобальных логгеров.
         loop = None
         try:
             # 1. Создаем и "захватываем" event loop для этого потока

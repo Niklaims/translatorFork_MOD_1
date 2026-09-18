@@ -44,7 +44,6 @@ class EpubCleaner:
     
     # Regex patterns (compiled once for performance)
     RE_HEADER_TAG = re.compile(r'<(h[1-6]|title)[^>]*>.*?</\1>', re.DOTALL | re.IGNORECASE)
-    RE_ESCAPE_SPECIAL = re.compile(r'([\\^$.|?*+(){}[\]])')
     
     def __init__(self, epub_path: str):
         """
@@ -237,9 +236,6 @@ class EpubCleaner:
     
     def _apply_global_fixes(self, all_files_content: Dict[str, bytes]) -> None:
         """Apply global fixes like link updates and attribute removal."""
-        if not BS4_AVAILABLE:
-            BeautifulSoup = None
-        
         for filename, content_bytes in all_files_content.items():
             modified_content = content_bytes
             

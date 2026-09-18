@@ -3,13 +3,14 @@
 import os
 import zipfile
 
-from .base_processor import BaseTaskProcessor
+from .base_processor import BaseTaskProcessor, _notify_translation_ready
 from gemini_translator.api.errors import ValidationFailedError, PartialGenerationError
 from gemini_translator.utils.epub_json import (
     build_html_document_model,
     estimate_translation_noise,
 )
 from gemini_translator.utils.epub_tools import normalize_epub_chapter_heading_to_h1
+from gemini_translator.utils.io_utils import atomic_write_text
 from gemini_translator.utils.translated_paths import build_translated_output_path
 from gemini_translator.utils.text import (
     process_body_tag, is_content_effectively_empty, clean_html_content,
@@ -123,7 +124,7 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
                     return_parts=False,
                     body_content_only=False
                 )
-                self.worker.response_parser.process_and_save_single_file(
+                saved_record = self.worker.response_parser.process_and_save_single_file(
                     translated_body_content=translated_body,
                     original_full_content=original_content,
                     prefix_html=prefix_html,
@@ -132,6 +133,7 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
                     original_internal_path=internal_chapter_path,
                     version_suffix=version_suffix
                 )
+                _notify_translation_ready(self.worker, task_info, [saved_record])
                 self.worker._post_event('log_message', {
                     'message': (
                         f"[JSON EPUB] '{os.path.basename(internal_chapter_path)}': "
@@ -225,7 +227,7 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
                 raw_response or cleaned_response
             )
 
-        self.worker.response_parser.process_and_save_single_file(
+        saved_record = self.worker.response_parser.process_and_save_single_file(
             translated_body_content=restored_body,
             original_full_content=original_content,
             prefix_html=prefix_html,
@@ -234,6 +236,7 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
             original_internal_path=internal_chapter_path,
             version_suffix=version_suffix
         )
+        _notify_translation_ready(self.worker, task_info, [saved_record])
 
         success_payload = self._build_success_payload(
             details_text=raw_response or cleaned_response,
@@ -244,8 +247,9 @@ class EpubSingleFileProcessor(BaseTaskProcessor):
 
     def _copy_original_as_result(self, out_path, content, internal_path, suffix):
         """Копирует оригинал на диск и регистрирует его в проекте."""
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(content)
+        # Атомарная запись (temp-файл + os.replace): сбой посреди записи не
+        # должен оставлять усечённую копию главы на диске.
+        atomic_write_text(out_path, content)
         if self.project_manager:
             relative_path = os.path.relpath(out_path, self.project_manager.project_folder)
             self.project_manager.register_translation(

@@ -1,5 +1,6 @@
 import os
 import copy
+import hashlib
 import re
 
 from bs4 import BeautifulSoup, Comment, NavigableString
@@ -13,6 +14,7 @@ from gemini_translator.utils.epub_json import (
     render_document_html,
 )
 from gemini_translator.utils.batch_markers import find_boundary_markers
+from gemini_translator.utils.io_utils import atomic_write_text
 from gemini_translator.utils.text import (
     prettify_html,
     clean_html_content,
@@ -474,11 +476,6 @@ class ResponseParser:
                     extracted_block_raw = translated_full_text[start_pos:end_pos].strip()
                     
                     # 1. Получаем "сырой" контент от AI
-                    extracted_body_only = clean_html_content(extracted_block_raw, is_html=True)
-                    if not extracted_body_only:
-                        report['failed'].append((chapter_path, "Пустой контент (body)"))
-                        continue
-                    
                     raw_body_from_ai = clean_html_content(extracted_block_raw, is_html=True)
                     if not raw_body_from_ai:
                         report['failed'].append((chapter_path, "Пустой контент (body)"))
@@ -551,9 +548,10 @@ class ResponseParser:
         if use_prettify:
             final_html_to_write = prettify_html(final_html_to_write)
         
-        # 2. Записываем файл на диск
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write(final_html_to_write)
+        # 2. Записываем файл на диск атомарно (temp-файл + os.replace):
+        # без этого сбой процесса/питания посреди записи оставляет главу
+        # усечённой/повреждённой (core-b/bugs/4-chapter-output-write-not-atomi).
+        atomic_write_text(output_path, final_html_to_write)
             
         # 3. Регистрируем в карте проекта
         if self.project_manager:
@@ -563,6 +561,16 @@ class ResponseParser:
                 version_suffix=version_suffix,
                 translated_relative_path=relative_path
             )
+
+        # 4. Возвращаем структурную запись о сохранённой главе: она нужна
+        # контролю качества, который не имеет права читать виджеты.
+        return {
+            'output_path': output_path,
+            'original_internal_path': original_internal_path,
+            'version_suffix': version_suffix,
+            'fingerprint': hashlib.sha256(final_html_to_write.encode('utf-8')).hexdigest(),
+            'translated_chars': len(final_html_to_write),
+        }
     
     def _find_boundary_markers(self, text, chapter_count=None):
         return find_boundary_markers(text, chapter_count=chapter_count)

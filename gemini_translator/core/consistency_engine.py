@@ -36,6 +36,8 @@ from .worker_helpers.content_filter_fallback import (
 from ..api.factory import get_api_handler_class
 from ..api import config as api_config
 from ..utils.text import repair_json_string
+from ..utils.helpers import safe_int
+from .handler_cleanup import cleanup_provider_handler
 
 logger = logging.getLogger(__name__)
 
@@ -401,45 +403,37 @@ class _ConsistencyMockWorker:
         self.api_key = api_key_value
         self.worker_id = api_key_value
         self.model_id = self.model_config.get("id", default_model_name)
-        self.max_concurrent_requests = self._safe_int(
+        self.max_concurrent_requests = safe_int(
             config.get("max_concurrent_requests", self.model_config.get("max_concurrent_requests", 1)),
             default=1,
             minimum=1,
         )
         self.workascii_workspace_name = str(config.get("workascii_workspace_name", "") or "").strip()
-        self.workascii_workspace_index = self._safe_int(
+        self.workascii_workspace_index = safe_int(
             config.get("workascii_workspace_index", 1),
             default=1,
             minimum=1,
         )
-        self.workascii_timeout_sec = self._safe_int(
+        self.workascii_timeout_sec = safe_int(
             config.get("workascii_timeout_sec", 1800),
             default=1800,
             minimum=60,
         )
         self.workascii_headless = bool(config.get("workascii_headless", False))
         self.workascii_profile_template_dir = str(config.get("workascii_profile_template_dir", "") or "").strip()
-        self.workascii_refresh_every_requests = self._safe_int(
+        self.workascii_refresh_every_requests = safe_int(
             config.get("workascii_refresh_every_requests", 0),
             default=0,
             minimum=0,
         )
         self.debug_logging_enabled = bool(config.get("debug_logging_enabled", False))
         self.debug_operation_filters = str(config.get("debug_operation_filters", "") or "").strip()
-        self.debug_max_log_mb = self._safe_int(
+        self.debug_max_log_mb = safe_int(
             config.get("debug_max_log_mb", 128),
             default=128,
             minimum=1,
         )
         self.prompt_builder.system_instruction = config.get("system_prompt")
-
-    @staticmethod
-    def _safe_int(value: Any, default: int, minimum: int) -> int:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            parsed = default
-        return max(minimum, parsed)
 
     @property
     def is_cancelled(self):
@@ -1256,59 +1250,27 @@ class ConsistencyEngine(QObject):
                 )
                 continue
 
-            # 2. Формирование промпта
-            prompt = self._build_analysis_prompt(chunk, config)
-
-            # 3. Вызов API с ротацией ключей
+            # 2-4. Формирование промпта, вызов API с ротацией ключей, трейс,
+            # парсинг и накопление результата — общая логика с параллельным
+            # (fast_proofread) путём, см. _analyze_chunk_request /
+            # _handle_analysis_response.
             try:
-                self._emit_log_message(
-                    f"[Analysis] Чанк {i + 1}/{total_chunks}: {self._format_chunk_label(chunk)}"
-                )
-                response_text = self._call_api_with_transient_chunk_retry(
-                    prompt,
+                prompt, response_text = self._analyze_chunk_request(
+                    chunk,
                     config,
                     active_keys,
-                    retry_label=f"анализа (чанк {i + 1}/{total_chunks})",
+                    chunk_index=i,
+                    total_chunks=total_chunks,
                 )
-                self._record_request_response_trace(
-                    phase='analysis',
+                self._handle_analysis_response(
+                    chunk=chunk,
+                    chunk_index=i,
+                    total_chunks=total_chunks,
+                    mode=mode,
+                    config=config,
                     prompt=prompt,
-                    response=response_text,
-                    chapter_names=[ch.get('name', '') for ch in chunk if isinstance(ch, dict)],
-                    metadata={
-                        'chunk_index': i + 1,
-                        'total_chunks': total_chunks,
-                        'mode': mode,
-                        'consistency_mode': config.get("consistency_mode"),
-                    },
+                    response_text=response_text,
                 )
-
-                # 4. Валидация и парсинг JSON
-                analysis_result = self._parse_ai_response(response_text)
-                if analysis_result and config.get("consistency_mode") == FAST_PROOFREAD_MODE:
-                    analysis_result = self._filter_fast_proofread_result(analysis_result)
-
-                if analysis_result:
-                    # Накапливаем проблемы
-                    chunk_problems = analysis_result.get('problems', [])
-                    for prob in chunk_problems:
-                        prob['chunk_index'] = i
-                        # Привязываем проблему к главе
-                        chapter_name = prob.get('chapter', '')
-                        if chapter_name not in self.chapter_problems_map:
-                            self.chapter_problems_map[chapter_name] = []
-                        self.chapter_problems_map[chapter_name].append(prob)
-                    
-                    self.all_problems.extend(chunk_problems)
-
-                    # Обновляем глоссарий сессии (если не двухпроходный, или добавляем новое)
-                    self.glossary_session.update_from_response(
-                        analysis_result.get('glossary_update', {}),
-                        analysis_result.get('context_summary', {})
-                    )
-
-                    self._mark_chunk_completed("analysis", chunk)
-                    self.chunk_analyzed.emit(analysis_result)
 
             except Exception as e:
                 error_text = self._sanitize_exception_message(e)
@@ -2322,21 +2284,25 @@ class ConsistencyEngine(QObject):
         return loop.run_until_complete(awaitable)
 
     def _cleanup_handler(self, handler) -> None:
-        cleanup = getattr(handler, "_close_thread_session_internal", None)
-        if not callable(cleanup):
+        # Дешёвый sync-гейт до входа в event-loop machinery: если у handler'а
+        # нечего закрывать, не трогаем get_worker_loop()/temp_loop вовсе
+        # (см. cluster-44 review issues[1]).
+        if not callable(getattr(handler, "_close_thread_session_internal", None)):
             return
 
+        coro = cleanup_provider_handler(handler, logger)
         try:
-            result = cleanup()
+            self._run_handler_awaitable(coro)
         except Exception as e:
-            logger.warning("Failed to start handler cleanup: %s", e)
-            return
-
-        if inspect.isawaitable(result):
-            try:
-                self._run_handler_awaitable(result)
-            except Exception as e:
-                logger.warning("Failed to cleanup handler resources: %s", e)
+            # cleanup_provider_handler сама никогда не бросает — но
+            # self._run_handler_awaitable (get_worker_loop/new_event_loop/
+            # run_until_complete) может, и раньше эти ошибки тоже
+            # проглатывались с логированием (см. cluster-44 review
+            # issues[0]). coro.close() — чтобы не оставлять
+            # "coroutine was never awaited" в случаях, когда coro не успела
+            # запуститься до исключения.
+            coro.close()
+            logger.warning("Failed to cleanup handler resources: %s", e)
 
     def _get_current_thread_handler_cache(self) -> Dict[tuple, Dict[str, Any]]:
         thread_id = threading.get_ident()
@@ -2678,10 +2644,6 @@ class ConsistencyEngine(QObject):
             'next_chunk_focus': [],
         }
         return filtered
-
-    def get_problems_for_chapter(self, chapter_name: str) -> List[Dict[str, Any]]:
-        """Возвращает список проблем для конкретной главы."""
-        return self.chapter_problems_map.get(chapter_name, [])
 
     def get_glossary_summary(self) -> Dict[str, Any]:
         """Возвращает текущее состояние глоссария сессии."""

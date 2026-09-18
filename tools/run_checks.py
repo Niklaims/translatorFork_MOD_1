@@ -61,6 +61,12 @@ def _run(label: str, command: list[str]) -> int:
     creationflags = _subprocess_creationflags()
     if creationflags:
         run_kwargs["creationflags"] = creationflags
+    env = dict(os.environ)
+    # Qt на Windows по умолчанию шлёт qWarning/qFatal в отладчик, а не в
+    # stderr — без этого аварийный выход pytest остаётся немым в логе CI.
+    env.setdefault("QT_FORCE_STDERR_LOGGING", "1")
+    env.setdefault("PYTHONFAULTHANDLER", "1")
+    run_kwargs["env"] = env
     completed = subprocess.run(command, **run_kwargs)
     output = completed.stdout or ""
     if output:
@@ -113,21 +119,25 @@ def main(argv: list[str] | None = None) -> int:
         )
     ]
 
-    if not args.skip_tests:
-        checks.append(
-            (
-                "ruff runtime safety",
-                [
-                    sys.executable,
-                    "-m",
-                    "ruff",
-                    "check",
-                    ".",
-                    "--select",
-                    RUFF_RUNTIME_RULES,
-                ],
-            )
+    # "ruff runtime safety" — статический линт, pytest ему не нужен, поэтому
+    # он выполняется всегда; --skip-tests отключает только сам pytest, как и
+    # описано в help-тексте флага.
+    checks.append(
+        (
+            "ruff runtime safety",
+            [
+                sys.executable,
+                "-m",
+                "ruff",
+                "check",
+                ".",
+                "--select",
+                RUFF_RUNTIME_RULES,
+            ],
         )
+    )
+
+    if not args.skip_tests:
         pytest_args = list(args.pytest_args)
         if pytest_args[:1] == ["--"]:
             pytest_args = pytest_args[1:]

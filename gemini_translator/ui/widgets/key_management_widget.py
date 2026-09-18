@@ -14,6 +14,7 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 import time
 import threading
 from ..overlay_host import exec_dialog
+from ...core.event_bus_mixin import EventBusMixin
 
 
 MCP_PROVIDER_ID = "__mcp_server__"
@@ -108,7 +109,7 @@ class ProviderChoiceDialog(QDialog):
         return self.combo_box.currentText()
 
 
-class KeyManagementWidget(QWidget):
+class KeyManagementWidget(EventBusMixin, QWidget):
     active_keys_changed = pyqtSignal()
 
     def __init__(self, settings_manager: SettingsManager, parent=None, distribution_group_widget=None, current_active_keys=None, server_manager=None):
@@ -127,7 +128,6 @@ class KeyManagementWidget(QWidget):
                 current_active_keys)
 
         self._uses_topic_subscription = False
-        self._uses_broadcast_subscription = False
         # Подписываемся только на события, которые реально обрабатываем,
         # чтобы не будить виджет на каждый широковещательный лог во время перевода.
         self._event_topics = (
@@ -152,25 +152,6 @@ class KeyManagementWidget(QWidget):
 
         self.init_ui()
         self._load_and_refresh_keys()
-
-    def _connect_to_bus(self):
-        if hasattr(self.bus, "subscribe"):
-            for topic in self._event_topics:
-                self.bus.subscribe(topic, self.on_event)
-            self._uses_topic_subscription = True
-        elif hasattr(self.bus, "event_posted"):
-            self.bus.event_posted.connect(self.on_event)
-            self._uses_broadcast_subscription = True
-
-    def _disconnect_from_bus(self):
-        try:
-            if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
-                for topic in self._event_topics:
-                    self.bus.unsubscribe(topic, self.on_event)
-            elif self._uses_broadcast_subscription and hasattr(self.bus, "event_posted"):
-                self.bus.event_posted.disconnect(self.on_event)
-        except (TypeError, RuntimeError, ValueError):
-            pass
 
     def closeEvent(self, event):
         self._disconnect_from_bus()
@@ -903,25 +884,11 @@ class KeyManagementWidget(QWidget):
             self._remember_active_keys_for_provider(provider_id)
         # --- [PATCH END] ---
 
-        loaded_statuses = self.settings_manager.load_key_statuses()
-        updated_statuses = []
-        changed = False
-
-        for key_info in loaded_statuses:
-            if 'status_by_model' in key_info:
-                for model_id in key_info['status_by_model']:
-                    if not self.settings_manager.is_key_limit_active(key_info, model_id):
-                        if key_info['status_by_model'][model_id].get("exhausted_at") is not None:
-                            changed = True
-                            key_info['status_by_model'][model_id]["exhausted_at"] = None
-                            key_info['status_by_model'][model_id]["exhausted_level"] = 0
-            updated_statuses.append(key_info)
-
-        if changed:
-            self.settings_manager.save_key_statuses(updated_statuses)
-            updated_statuses = self.settings_manager.load_key_statuses()
-
-        self._populate_available_keys_list(updated_statuses)
+        # load_key_statuses() сама обслуживает лимиты: истёкшие блокировки
+        # снимаются в SQLite до материализации записей. Снимать их здесь и
+        # сохранять снимок обратно больше не нужно — и небезопасно, потому что
+        # за время показа диалога воркер мог выставить новую блокировку.
+        self._populate_available_keys_list(self.settings_manager.load_key_statuses())
 
     def _create_key_list_item(self, key_info: dict) -> QtWidgets.QListWidgetItem:
         key = key_info["key"]
@@ -1387,20 +1354,11 @@ class KeyManagementWidget(QWidget):
     def set_session_mode(self, is_session_active):
         """Переводит виджет в режим активной сессии (блокирует элементы управления)."""
         self._is_session_active = is_session_active
-        from PyQt6.QtWidgets import QPushButton, QLineEdit, QComboBox, QAbstractItemView
-        
+        from PyQt6.QtWidgets import QPushButton, QLineEdit, QComboBox
+
         for widget in self.findChildren(QPushButton):
             widget.setEnabled(not is_session_active)
         for widget in self.findChildren(QLineEdit):
             widget.setEnabled(not is_session_active)
         for widget in self.findChildren(QComboBox):
             widget.setEnabled(not is_session_active)
-            
-        if hasattr(self, 'key_table'):
-            if is_session_active:
-                if not hasattr(self, '_original_edit_triggers'):
-                    self._original_edit_triggers = self.key_table.editTriggers()
-                self.key_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            else:
-                if hasattr(self, '_original_edit_triggers'):
-                    self.key_table.setEditTriggers(self._original_edit_triggers)

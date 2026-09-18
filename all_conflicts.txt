@@ -1,0 +1,509 @@
+=== FILE: gemini_translator/api/base.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+        provider = (getattr(self.worker, "model_config", {}) or {}).get("provider", "")
+        if not provider:
+            if "gemini" in type(self).__name__.lower():
+                provider = "gemini"
+            else:
+                provider = "openrouter"
+
+        if provider.lower() == "gemini":
+            from ..utils.helpers import estimate_gemini_tokens
+            input_tokens = estimate_gemini_tokens(prompt)
+            output_tokens = estimate_gemini_tokens(response_text)
+        else:
+            from ..utils.helpers import estimate_openrouter_tokens
+            input_tokens = estimate_openrouter_tokens(prompt)
+            output_tokens = estimate_openrouter_tokens(response_text)
+
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "estimated": True,
+            "model_id": getattr(self.worker, "model_id", None),
+            "provider": provider,
+        }
+=======
+        reported = token_usage.reported()
+        if reported:
+            return self._token_usage_event(reported, estimated=False)
+        input_tokens = estimate_gemini_tokens(prompt)
+        output_tokens = estimate_gemini_tokens(response_text)
+        return self._token_usage_event(
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            estimated=True,
+        )
+
+    def _publish_token_usage(self, usage) -> None:
+        try:
+            # Looked up on the module at call time: the nolib bridge replaces it.
+            token_usage.publish_token_usage(usage, getattr(self.worker, "_post_event", None))
+        except Exception:
+            # Accounting never fails the request it accounts for.
+            pass
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 2 ---
+<<<<<<< HEAD
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, read_bufsize=1048576 * 10)
+=======
+        # trust_env=False (явно): единственный источник прокси — proxy_settings
+        # приложения (см. _build_connector выше и qa/assembly.aiohttp_session_factory),
+        # переменные окружения HTTP_PROXY/HTTPS_PROXY (trust_env читает только их и
+        # ~/.netrc, не системный прокси Windows/macOS) не должны молча подменять маршрут —
+        # тот же принцип, что и в utils/updater.build_updater_session.
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=False)
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/api/config.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+=======
+_CUSTOM_PROVIDER_MODELS = {}
+# Модели, отклонённые проверкой при последней загрузке пользовательских настроек.
+_CUSTOM_MODEL_VALIDATION_ERRORS = []
+_DYNAMIC_PROVIDER_MODELS_LOCK = threading.Lock()
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 2 ---
+<<<<<<< HEAD
+=======
+def _normalize_custom_provider_models(custom_provider_models) -> dict:
+    global _CUSTOM_MODEL_VALIDATION_ERRORS
+    _CUSTOM_MODEL_VALIDATION_ERRORS = []
+
+    if not isinstance(custom_provider_models, dict):
+        return {}
+
+    normalized = {}
+    for provider_id, models in custom_provider_models.items():
+        provider_key = str(provider_id or "").strip()
+        if not provider_key or not isinstance(models, dict):
+            continue
+
+        normalized_models = {}
+        for display_name, model_config in models.items():
+            model_name = str(display_name or "").strip()
+            if not model_name:
+                continue
+
+            if isinstance(model_config, dict):
+                next_config = deepcopy(model_config)
+            else:
+                next_config = {"id": str(model_config or "").strip()}
+
+            model_id = str(next_config.get("id") or "").strip()
+            if not model_id:
+                model_id = model_name
+
+            next_config["id"] = model_id
+
+            # Данные ввёл человек: чиним здесь, иначе строка в поле лимита
+            # доедет до воркера. Саму модель не выбрасываем — исчезнувшая из
+            # списка модель выглядит как потеря данных, и объяснить её в
+            # интерфейсе сейчас негде. Убираем только негодные поля.
+            next_config, field_errors = sanitize_model_config(next_config)
+            for field_error in field_errors:
+                _CUSTOM_MODEL_VALIDATION_ERRORS.append({
+                    "provider": provider_key,
+                    "model": model_name,
+                    "error": field_error,
+                })
+                _logger.warning(
+                    "Пользовательская модель «%s» провайдера «%s»: %s. "
+                    "Поле проигнорировано, применится значение провайдера.",
+                    model_name, provider_key, field_error,
+                )
+            if not next_config:
+                continue
+
+            next_config["user_defined"] = True
+            normalized_models[model_name] = next_config
+
+        if normalized_models:
+            normalized[provider_key] = normalized_models
+
+    return normalized
+
+
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 3 ---
+<<<<<<< HEAD
+def _fetch_local_models_json(url: str, api_key: str | None = None) -> tuple[bool, object | None]:
+    if requests is None:
+=======
+def _fetch_local_models_json(url: str) -> tuple[bool, object | None]:
+    if _ensure_requests_module() is None:
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 4 ---
+<<<<<<< HEAD
+def _post_local_models_json(url: str, payload: dict, api_key: str | None = None) -> tuple[bool, object | None]:
+    if requests is None:
+=======
+def _post_local_models_json(url: str, payload: dict) -> tuple[bool, object | None]:
+    if _ensure_requests_module() is None:
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 5 ---
+<<<<<<< HEAD
+    if not _local_model_discovery_enabled() or requests is None:
+        return True, static_models
+=======
+    if not _local_model_discovery_enabled() or _ensure_requests_module() is None:
+        return static_models
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/api/handlers/openrouter.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+                    e = NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")
+                    e.raw_package_text = response_text
+                    raise e
+=======
+                    raise NetworkError(f"Ошибка ({response.status}): {response_text[:150]}")
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/ui/widgets/chapter_list_widget.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+        return get_task_display_texts(task_payload, chapter_widget=self)
+=======
+        display_text = "Потерянная задача..."
+        tooltip_text = ""
+        if not task_payload:
+            return display_text, tooltip_text
+
+        task_type = task_payload[0]
+
+        try:
+            # --- Пакеты (Glossary и EPUB) ---
+            if task_type in ("glossary_batch_task", "epub_batch"):
+                content_data = task_payload[2] if len(task_payload) > 2 else []
+
+                prefix = "✨ Пакет глоссария" if task_type == "glossary_batch_task" else "📦 Пакет"
+                display_text = f"{prefix} из {len(content_data)} глав"
+                if content_data:
+                    display_text += f" (начиная с '{os.path.basename(str(content_data[0]))}')"
+                display_text += self._char_suffix_for_chapters(content_data)
+
+                tooltip_header = "Главы для генерации глоссария:\n" if task_type == "glossary_batch_task" else "Содержимое пакета:\n"
+                tooltip_text = tooltip_header + "\n".join(map(str, content_data))
+                char_suffix = self._char_suffix_for_chapters(content_data)
+                if char_suffix:
+                    tooltip_text += f"\n\nРазмер пакета: {char_suffix.strip(' ·')}"
+
+            # --- Одиночная глава EPUB ---
+            elif task_type == "epub":
+                epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
+                chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
+
+                original_filename = os.path.basename(epub_path)
+                display_text = f"📄 HTML: {os.path.basename(chapter_path)}"
+                char_suffix = self._char_suffix_for_chapters([chapter_path])
+                if char_suffix:
+                    display_text += char_suffix
+                tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+                if char_suffix:
+                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
+
+            # --- Часть главы (чанк) EPUB ---
+            elif task_type == "epub_chunk":
+                epub_path = str(task_payload[1]) if len(task_payload) > 1 else "???"
+                chapter_path = str(task_payload[2]) if len(task_payload) > 2 else "???"
+                chunk_index = task_payload[4] if len(task_payload) > 4 else -1
+                total_chunks = task_payload[5] if len(task_payload) > 5 else -1
+
+                original_filename = os.path.basename(epub_path)
+                display_text = f"🧩 ЧАНК {chunk_index + 1}/{total_chunks} из '{os.path.basename(chapter_path)}'"
+                char_suffix = self._char_suffix_for_chapters([chapter_path])
+                if char_suffix:
+                    display_text += char_suffix
+                tooltip_text = f"EPUB: {original_filename}\nHTML: {chapter_path}"
+                if char_suffix:
+                    tooltip_text += f"\nРазмер главы: {char_suffix.strip(' ·')}"
+
+            # --- Прямой перевод текста (НОВЫЙ БЛОК) ---
+            elif task_type == "raw_text_translation":
+                # task_payload[3] - это title
+                title = task_payload[3] if len(task_payload) > 3 and task_payload[3] else "Прямой перевод"
+                # task_payload[2] - это сам текст
+                text_content = task_payload[2] if len(task_payload) > 2 else ""
+
+                display_text = f"✨ {title}"
+                # Показываем первые 100 символов в подсказке
+                tooltip_text = text_content[:100] + ('...' if len(text_content) > 100 else '')
+
+            # --- Обработчик для всех остальных, неизвестных типов ---
+            else:
+                display_text = f"Задача типа: '{task_type}'"
+                tooltip_text = str(task_payload)
+
+        except (IndexError, TypeError) as e:
+            # Защитный блок на случай, если payload придет поврежденным
+            display_text = f"Ошибка отображения задачи ({task_type})"
+            tooltip_text = f"Некорректный payload: {task_payload}\nОшибка: {e}"
+
+        return display_text, tooltip_text
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 2 ---
+<<<<<<< HEAD
+    get_display_texts = staticmethod(get_task_display_texts)
+    get_status_display_info = staticmethod(get_task_status_display_info)
+=======
+        final_status_key = status
+        if status == 'success' and is_glossary_task:
+            final_status_key = 'glossary_success'
+        elif status == 'error':
+            error_types = details.get('errors', {}).keys()
+            if 'CONTENT_FILTER' in error_types: final_status_key = 'error_filter'
+            elif 'NETWORK' in error_types: final_status_key = 'error_network'
+            elif 'VALIDATION' in error_types: final_status_key = 'error_validation'
+            else: final_status_key = 'error'
+
+        status_map = {
+            'success': ("✅ Успешно", "#2ECC71"),
+            'glossary_success': ("✅ Сгенерировано", "#1ABC9C"),
+            'error': ("❌ Ошибка", "#E74C3C"),
+            'error_filter': ("🛡️ Фильтр", "#9B59B6"),
+            'error_network': ("🔌 Сеть лежит!", "#E67E22"),
+            'error_validation': ("📋 Невалидно!", "#F39C12"),
+            'in_progress': ("🔄 В работе…", "#3498DB"),
+            'pending': ("⏳ Ожидание…", self.palette().color(QtGui.QPalette.ColorRole.Text).name()),
+            'held': ("❄️ Заморожено", "#7F8C8D"),
+            'completion': ("✍️ До-генерация…", "#F39C12")
+        }
+
+        return status_map.get(final_status_key, (f"❓ {final_status_key}", "#FFFFFF"))
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/ui/widgets/log_widget.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+MAX_DETAIL_TEXT_CHARS = 250000
+=======
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/utils/glossary_tools.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+
+    def get_glossary_as_json_str(self):
+        """Возвращает глоссарий как отформатированную JSON строку."""
+        return json.dumps(self.global_glossary, ensure_ascii=False, indent=4)
+
+    def set_glossary_from_json_str(self, json_str):
+        """Обновляет глоссарий из JSON строки."""
+        try:
+            self.global_glossary = json.loads(json_str)
+            return True
+        except json.JSONDecodeError:
+            return False
+
+    def add_custom_words(self, new_terms: dict):
+        """Динамически добавляет новые термины в глоссарий и обновляет сервисы."""
+        if not new_terms or not isinstance(new_terms, dict):
+            return
+
+        added_count = 0
+        added_terms = {}
+        for term, data in new_terms.items():
+            if term not in self.global_glossary:
+                self.global_glossary[term] = data
+                added_terms[term] = data
+                added_count += 1
+
+        if added_count > 0:
+            print(f"[ContextManager] Добавлено {added_count} новых терминов (из {len(new_terms)}). Перекомпиляция Regex-сервиса…")
+            self.regex_service = GlossaryRegexService(self.global_glossary)
+
+            if self.similarity_map is not None and getattr(self, 'glossary_logic', None):
+                glossary_list = [{'original': k, **(v if isinstance(v, dict) else {'rus': v})} for k, v in self.global_glossary.items()]
+                self.similarity_map = self.glossary_logic.build_similarity_map(glossary_list, getattr(self, 'fuzzy_threshold', 100), self.use_jieba_for_glossary)
+
+            if self.chinese_processor:
+                self.chinese_processor.add_custom_words(added_terms)
+
+=======
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/utils/helpers.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+    def __init__(self, provider="gemini"):
+        self.provider = provider
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
+        self.tokens_per_minute = []
+        self.session_start_time = time.time()
+        self.last_minute_check = time.time()
+=======
+    def __init__(self):
+>>>>>>> rasteo/main
+
+=== FILE: gemini_translator/utils/settings.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+        self._migrate_keys_in_cache()
+=======
+        self._apply_custom_provider_models_to_runtime()
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 2 ---
+<<<<<<< HEAD
+        self._check_and_reset_limits_in_cache()
+=======
+        Файл делят несколько окон приложения, то есть разные процессы. Чтение,
+        склейка и запись идут под межпроцессным замком: иначе окно, прочитавшее
+        диск раньше нашей записи, затрёт её своей, а наша следующая склейка
+        примет затёртое значение за чужую правку, и изменение пропадёт насовсем.
+        """
+        with interprocess_lock(
+            self._settings_lock_path, timeout=SETTINGS_LOCK_TIMEOUT_SECONDS
+        ) as locked:
+            if not locked:
+                self._warn_saving_without_lock()
+            self._merge_with_disk_and_write_unsafe()
+
+    def _warn_saving_without_lock(self):
+        if self._warned_about_missing_lock:
+            return
+        self._warned_about_missing_lock = True
+        logger.warning(
+            "Не удалось занять замок файла настроек %s за %.1f с. Настройки сохранены "
+            "без него: если открыто другое окно приложения, его последние правки "
+            "могут потеряться.",
+            self.config_file,
+            SETTINGS_LOCK_TIMEOUT_SECONDS,
+        )
+
+    def _merge_with_disk_and_write_unsafe(self):
+        disk_data = self._load_unsafe()
+        if "api_keys_with_status" in disk_data:
+            disk_data["api_keys_with_status"] = [
+                _strip_key_runtime_fields(item) for item in disk_data["api_keys_with_status"]
+            ]
+        self._apply_custom_provider_models_to_runtime()
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 3 ---
+<<<<<<< HEAD
+    def _merge_disk_timestamps(self, disk_data):
+        """Вспомогательный метод: объединяет таймстампы из файла с текущим кэшем."""
+        disk_keys = disk_data.get('api_keys_with_status', [])
+        mem_keys = self._cache.get('api_keys_with_status', [])
+        
+        # Создаем карту для быстрого сопоставления ключей в памяти
+        mem_key_map = {k['key']: k for k in mem_keys}
+
+        for disk_k in disk_keys:
+            key_str = disk_k.get('key')
+            # Если такой ключ есть у нас в памяти
+            if key_str in mem_key_map:
+                mem_k = mem_key_map[key_str]
+                
+                disk_models = disk_k.get('status_by_model', {})
+                mem_models = mem_k.get('status_by_model', {})
+                
+                # Проходим по моделям внутри ключа
+                for model_id, disk_stats in disk_models.items():
+                    # Если модель есть и у нас, мержим списки
+                    if model_id in mem_models:
+                        disk_reqs = set(disk_stats.get('requests', []))
+                        mem_stats = mem_models[model_id]
+                        mem_reqs = set(mem_stats.get('requests', []))
+                        
+                        # Объединение множеств (исключает дубликаты)
+                        if not disk_reqs.issubset(mem_reqs):
+                            # Сортируем, чтобы хронология была красивой
+                            mem_stats['requests'] = sorted(list(mem_reqs | disk_reqs))
+                    
+                    # Если в памяти этой модели еще нет (например, использовалась в другом окне), 
+                    # можно теоретически добавить, но для безопасности лучше не трогать структуру кэша,
+                    # так как мы только "обогащаем" существующие данные.
+                    
+=======
+    def _apply_custom_provider_models_to_runtime(self):
+        # Файл, в котором ключа нет (например, project_settings.json проекта),
+        # не имеет права обнулять глобальный реестр custom-моделей пользователя.
+        # Применяем только явно объявленное значение.
+        if "custom_provider_models" not in self._cache:
+            return
+        api_config.set_custom_provider_models(self._cache["custom_provider_models"])
+    
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 4 ---
+<<<<<<< HEAD
+    def get_api_keys_for_provider(self, provider_id: str) -> list[str]:
+        with self.file_lock:
+            return [item['key'] for item in self._cache.get('api_keys_with_status', []) if item.get('provider') == provider_id]
+
+    def save_api_keys(self, keys_list):
+        key_statuses = [{"key": key, "provider": "gemini", "status_by_model": {}} for key in keys_list]
+        return self.save_key_statuses(key_statuses)
+
+=======
+>>>>>>> rasteo/main
+
+
+--- CONFLICT 5 ---
+<<<<<<< HEAD
+    def get_active_models_for_provider(self, provider_id: str) -> list[str] | None:
+        with self.file_lock:
+            active_models = self._cache.get("active_models", {})
+            val = active_models.get(provider_id)
+            return deepcopy(val) if val is not None else None
+
+    def save_active_models_for_provider(self, provider_id: str, active_ids: list[str]):
+        with self.file_lock:
+            active_models = deepcopy(self._cache.get("active_models", {}))
+            active_models[provider_id] = active_ids
+            self._cache["active_models"] = active_models
+        self._save_requested.emit()
+        return True
+
+=======
+    def add_custom_provider_model(self, provider_id, display_name, model_config):
+        with self.file_lock:
+            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
+            provider_key = str(provider_id or "").strip()
+            model_name = str(display_name or "").strip()
+            if not provider_key or not model_name:
+                return False
+            provider_models = custom_models.setdefault(provider_key, {})
+            provider_models[model_name] = deepcopy(model_config or {})
+            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
+            self._save_to_disk_unsafe()
+        return True
+>>>>>>> rasteo/main
+
+=== FILE: qidian_rulate/workers.py ===
+--- CONFLICT 1 ---
+<<<<<<< HEAD
+        return False
+=======
+        try:
+            page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+            return True
+        except Exception:
+            return False
+>>>>>>> rasteo/main
+

@@ -147,8 +147,8 @@ call :build_app_base "ПОЛНОСТЬЮ ПОРТАТИВНАЯ"
 --collect-data="emoji" ^
 --collect-data="jieba" ^
 --collect-data="lxml" ^
---collect-data="qoder_agent_sdk" ^
---collect-data="werkzeug"
+--collect-data="werkzeug" ^
+--copy-metadata="qoder-agent-sdk"
 call :build_app_end
 goto :eof
 
@@ -164,8 +164,8 @@ call :build_app_base "ГИБРИДНАЯ"
 --collect-data="emoji" ^
 --collect-data="jieba" ^
 --collect-data="lxml" ^
---collect-data="qoder_agent_sdk" ^
---collect-data="werkzeug"
+--collect-data="werkzeug" ^
+--copy-metadata="qoder-agent-sdk"
 call :build_app_end
 goto :eof
 
@@ -181,8 +181,8 @@ call :build_app_base "ПРОДВИНУТАЯ"
 --collect-data="emoji" ^
 --collect-data="jieba" ^
 --collect-data="lxml" ^
---collect-data="qoder_agent_sdk" ^
---collect-data="werkzeug"
+--collect-data="werkzeug" ^
+--copy-metadata="qoder-agent-sdk"
 call :build_app_end
 goto :eof
 
@@ -261,8 +261,8 @@ call :build_app_base "ИНСТАЛЛЯТОР"
 --collect-data="emoji" ^
 --collect-data="jieba" ^
 --collect-data="lxml" ^
---collect-data="qoder_agent_sdk" ^
---collect-data="werkzeug"
+--collect-data="werkzeug" ^
+--copy-metadata="qoder-agent-sdk"
 if %ERRORLEVEL% NEQ 0 (
     call :build_app_end
     goto :eof

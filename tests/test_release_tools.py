@@ -25,11 +25,17 @@ def test_generate_build_identity_happy(tmp_path, version_file):
     out = tmp_path / "update-build.json"
     rc = generate_build_identity.main([
         "--tag", "v10.5.22", "--commit", "a" * 40,
+        "--repository", "Rasteo123/translatorFork_MOD",
         "--output", str(out), "--version-file", str(version_file)])
     assert rc == 0
     data = json.loads(out.read_text())
-    assert data == {"schema": 1, "version": "10.5.22", "tag": "v10.5.22",
-                    "commit": "a" * 40}
+    assert data == {
+        "schema": 2,
+        "version": "10.5.22",
+        "tag": "v10.5.22",
+        "commit": "a" * 40,
+        "repository": "Rasteo123/translatorFork_MOD",
+    }
 
 
 @pytest.mark.parametrize("args_over", [
@@ -38,6 +44,7 @@ def test_generate_build_identity_happy(tmp_path, version_file):
 ])
 def test_generate_build_identity_rejects(tmp_path, version_file, args_over, capsys):
     args = {"--tag": "v10.5.22", "--commit": "a" * 40,
+            "--repository": "Rasteo123/translatorFork_MOD",
             "--output": str(tmp_path / "o.json"), "--version-file": str(version_file)}
     args.update(args_over)
     argv = [x for pair in args.items() for x in pair]
@@ -52,8 +59,24 @@ def test_generate_build_identity_rejects_prerelease_version(tmp_path, capsys):
     vf.write_text('__version__ = "10.6.0-rc1"\n')
     rc = generate_build_identity.main([
         "--tag", "v10.6.0-rc1", "--commit", "a" * 40,
+        "--repository", "Rasteo123/translatorFork_MOD",
         "--output", str(tmp_path / "o.json"), "--version-file", str(vf)])
     assert rc == 1
+
+
+@pytest.mark.parametrize("repository", ["", "owner", "owner/repo/extra", "bad owner/repo"])
+def test_generate_build_identity_rejects_invalid_repository(
+    tmp_path, version_file, repository, capsys
+):
+    rc = generate_build_identity.main([
+        "--tag", "v10.5.22",
+        "--commit", "a" * 40,
+        "--repository", repository,
+        "--output", str(tmp_path / "o.json"),
+        "--version-file", str(version_file),
+    ])
+    assert rc == 1
+    assert "RELEASE-GATE:" in capsys.readouterr().err
 
 
 def test_verify_release_tag_happy(tmp_path, version_file):
@@ -159,14 +182,51 @@ def test_inject_archive_identity(tmp_path):
     with zipfile.ZipFile(zpath, "w") as z:
         z.writestr("main.py", "print('x')")
         z.writestr("gemini_translator/version.py", "__version__ = '10.5.22'")
-    rc = inject_archive_identity.main(["--zip", str(zpath), "--commit", "d" * 40])
+    rc = inject_archive_identity.main([
+        "--zip", str(zpath),
+        "--commit", "d" * 40,
+        "--repository", "Rasteo123/translatorFork_MOD",
+    ])
     assert rc == 0
     with zipfile.ZipFile(zpath) as z:
         data = json.loads(z.read(".translator-update.json"))
+    assert data["schema"] == 2
     assert data["commit"] == "d" * 40
+    assert data["repository"] == "Rasteo123/translatorFork_MOD"
     assert data["files"] == ["gemini_translator/version.py", "main.py"]
     # повторная инъекция — отказ, а не дубль записи
-    assert inject_archive_identity.main(["--zip", str(zpath), "--commit", "d" * 40]) == 1
+    assert inject_archive_identity.main([
+        "--zip", str(zpath),
+        "--commit", "d" * 40,
+        "--repository", "Rasteo123/translatorFork_MOD",
+    ]) == 1
+
+
+def test_inject_archive_identity_uses_the_current_origin(tmp_path, monkeypatch):
+    import subprocess
+    import zipfile
+    import inject_archive_identity
+
+    zpath = tmp_path / "source.zip"
+    with zipfile.ZipFile(zpath, "w") as archive:
+        archive.writestr("main.py", "print('x')")
+
+    real_run = inject_archive_identity.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if argv == ["git", "remote", "get-url", "origin"]:
+            return subprocess.CompletedProcess(argv, 0, "git@github.com:primalrin/translatorFork_MOD.git\n", "")
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(inject_archive_identity.subprocess, "run", fake_run)
+    assert inject_archive_identity.main([
+        "--zip", str(zpath),
+        "--commit", "d" * 40,
+    ]) == 0
+
+    with zipfile.ZipFile(zpath) as archive:
+        data = json.loads(archive.read(".translator-update.json"))
+    assert data["repository"] == "primalrin/translatorFork_MOD"
 
 
 def test_generate_manifest_rejects_tag_version_mismatch(tmp_path, version_file):

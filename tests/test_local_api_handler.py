@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -7,10 +8,16 @@ from gemini_translator.api.handlers.local import LocalApiHandler
 
 
 class _DummyResponse:
+    """Эмулирует ответ requests как для нестримингового пути (.json()), так
+    и для потокового (.iter_lines()) -- call_api по умолчанию вызывается с
+    use_stream=True, поэтому большинству тестов нужен потоковый разбор."""
+
     status_code = 200
     text = ""
 
     def __init__(self, finish_reason="stop", content="ok"):
+        self._finish_reason = finish_reason
+        self._content = content
         self._payload = {
             "choices": [
                 {
@@ -22,6 +29,14 @@ class _DummyResponse:
 
     def json(self):
         return self._payload
+
+    def iter_lines(self, decode_unicode=True):
+        if self._content:
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": self._content}}]})
+        yield "data: " + json.dumps(
+            {"choices": [{"delta": {}, "finish_reason": self._finish_reason}]}
+        )
+        yield "data: [DONE]"
 
 
 class _WorkerStub:
@@ -58,7 +73,7 @@ class LocalApiHandlerTests(unittest.TestCase):
         handler, _worker = self._make_handler()
         captured_payloads = []
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             captured_payloads.append(json)
             return _DummyResponse()
 
@@ -72,7 +87,7 @@ class LocalApiHandlerTests(unittest.TestCase):
         handler, _worker = self._make_handler({"max_output_tokens": 10000})
         captured_payloads = []
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             captured_payloads.append(json)
             return _DummyResponse()
 
@@ -87,7 +102,7 @@ class LocalApiHandlerTests(unittest.TestCase):
         worker.temperature_override_enabled = False
         captured_payloads = []
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             captured_payloads.append(json)
             return _DummyResponse()
 
@@ -101,7 +116,7 @@ class LocalApiHandlerTests(unittest.TestCase):
         handler, _worker = self._make_handler()
         captured_headers = []
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             captured_headers.append(headers)
             return _DummyResponse()
 
@@ -117,7 +132,7 @@ class LocalApiHandlerTests(unittest.TestCase):
         handler.setup_client(SimpleNamespace(api_key="__free_deepseek_session__"))
         captured_headers = []
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             captured_headers.append(headers)
             return _DummyResponse()
 
@@ -130,7 +145,7 @@ class LocalApiHandlerTests(unittest.TestCase):
     def test_length_finish_reason_raises_partial_with_limit_source(self):
         handler, worker = self._make_handler()
 
-        def fake_post(url, headers=None, json=None, proxies=None, timeout=None):
+        def fake_post(url, headers=None, json=None, proxies=None, timeout=None, stream=None):
             return _DummyResponse(finish_reason="length", content='{"broken":')
 
         with patch("gemini_translator.api.handlers.local.requests.Session.post", side_effect=fake_post):

@@ -6,7 +6,7 @@ import re
 from ..base import BaseApiHandler
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError, 
-    RateLimitExceededError, ModelNotFoundError, ValidationFailedError, 
+    RateLimitExceededError, ApiAccessError, ModelNotFoundError, ValidationFailedError,
     TemporaryRateLimitError, PartialGenerationError
 )
 
@@ -150,7 +150,7 @@ class GeminiApiHandler(BaseApiHandler):
                     )
                     if debug:
                         print(f"--- GEMINI DEBUG ERROR RESPONSE ---\n{raw_error_text}\n-----------------------------------")
-                    await self._handle_error_response(response, None)
+                    await self._handle_error_response(response)
 
                 # --- ВЕТКА 1: ПРОФЕССИОНАЛЬНЫЙ СТРИМИНГ ---
                 if use_stream:
@@ -194,6 +194,8 @@ class GeminiApiHandler(BaseApiHandler):
                                             partial_text=collected_text,
                                             reason=error_status # Теперь причиной будет "INTERNAL" или код ошибки
                                         )
+
+                                    self._remember_gemini_usage(chunk_data)
 
                                     # --- 2. Стандартная обработка ---
                                     if chunk_data.get('promptFeedback', {}).get('blockReason'):
@@ -258,6 +260,7 @@ class GeminiApiHandler(BaseApiHandler):
                     
                     # И только потом парсим из памяти
                     response_data = json.loads(raw_response_bytes)
+                    self._remember_gemini_usage(response_data)
                     
                     if response_data.get('promptFeedback', {}).get('blockReason'):
                         raise ContentFilterError(f"Блокировка на уровне промпта: {response_data['promptFeedback']['blockReason']}")
@@ -294,7 +297,29 @@ class GeminiApiHandler(BaseApiHandler):
             traceback.print_exc()
             raise Exception(f"Критическая ошибка при работе с Gemini REST API: {e}")
      
-    async def _handle_error_response(self, response, response_json_arg):
+    def _remember_gemini_usage(self, response_data):
+        """Take usageMetadata; stream chunks repeat it with running totals.
+
+        Thinking tokens are billed as output, so they are counted as output
+        and reported once more as its thinking share.
+        """
+        usage = response_data.get("usageMetadata") if isinstance(response_data, dict) else None
+        if not isinstance(usage, dict):
+            return
+        prompt_tokens = self._usage_count(usage.get("promptTokenCount"))
+        candidate_tokens = self._usage_count(usage.get("candidatesTokenCount"))
+        if prompt_tokens is None and candidate_tokens is None:
+            return
+        thinking_tokens = self._usage_count(usage.get("thoughtsTokenCount"))
+        self._remember_token_usage(
+            prompt_tokens or 0,
+            (candidate_tokens or 0) + (thinking_tokens or 0),
+            self._usage_count(usage.get("totalTokenCount")),
+            self._usage_count(usage.get("cachedContentTokenCount")),
+            thinking_tokens,
+        )
+
+    async def _handle_error_response(self, response):
         # 1. Получаем тело ошибки максимально надежно
         error_dict = {}
         error_text_raw = ""
@@ -328,10 +353,19 @@ class GeminiApiHandler(BaseApiHandler):
         # 401/403: Permissions
         if response.status in [401, 403]:
             if "user location" in error_str: raise LocationBlockedError("Геоблокировка Gemini.")
-            if any(x in error_str for x in ["suspended", "api key", "permission"]): 
-                raise RateLimitExceededError(f"Ошибка доступа ({response.status}): {error_message}")
+            if "suspended" in error_str:
+                raise ApiAccessError(
+                    f"Ошибка доступа ({response.status}): {error_message}"
+                )
+            if self._is_key_credential_rejection(error_str):
+                raise RateLimitExceededError(
+                    f"Ключ …{self.worker.api_key[-4:]} не принят сервисом "
+                    f"({response.status}): {error_message}"
+                )
+            if any(x in error_str for x in ["api key", "permission"]):
+                raise ApiAccessError(f"Ошибка доступа ({response.status}): {error_message}")
             if "model" in error_str: raise ModelNotFoundError(f"Модель недоступна: {error_message}")
-            raise RateLimitExceededError(f"Ошибка доступа ({response.status}): {error_message}")
+            raise ApiAccessError(f"Ошибка доступа ({response.status}): {error_message}")
         if response.status in [404]:
             if "model" in error_str: raise ModelNotFoundError(f"Модель недоступна: {error_message}")
         
@@ -386,9 +420,30 @@ class GeminiApiHandler(BaseApiHandler):
         if is_model_error:
             raise ModelNotFoundError(f"Модель недоступна: {error_message}")
         if error_status in {'PERMISSION_DENIED', 'UNAUTHENTICATED'}:
-            raise RateLimitExceededError(f"Ошибка доступа Gemini stream: {error_message}")
+            if "suspended" in error_str:
+                raise ApiAccessError(
+                    f"Ошибка доступа Gemini stream: {error_message}"
+                )
+            if self._is_key_credential_rejection(error_str):
+                raise RateLimitExceededError(
+                    f"Ключ …{self.worker.api_key[-4:]} не принят сервисом: "
+                    f"{error_message}"
+                )
+            raise ApiAccessError(f"Ошибка доступа Gemini stream: {error_message}")
 
         raise NetworkError(f"Gemini stream error ({error_status}): {error_message}", delay_seconds=25)
+
+    @staticmethod
+    def _is_key_credential_rejection(error_text: str) -> bool:
+        return any(
+            marker in error_text
+            for marker in (
+                "invalid authentication credential",
+                "expected oauth 2 access token",
+                "api key not valid",
+                "invalid api key",
+            )
+        )
 
     def _extract_retry_delay(self, error_details: dict, error_message: str) -> int | None:
         """

@@ -67,19 +67,12 @@ UPPERCASE_CHARS = f'{UPPERCASE_RU}{UPPERCASE_EN}'
 # Все буквы любого регистра
 ALL_LETTER_CHARS = f'{LOWERCASE_CHARS}{UPPERCASE_CHARS}'
 
-TAGS_FOR_NEW_LINE = [
-    "</p>", "</div>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>",
-    "</li>", "</blockquote>", "</pre>", "</tr>", "</th>", "</td>"
-]
-
 SPLIT_DASH = r'\s*</p>\s*<p[^>]*>\s*' # 'r' можно ставить до или после 'f'
 TAG_STRIPPER = re.compile(r'<[^>]+>')
 
 CJK_UNSPACED_RE = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff]')
 SPACED_SCRIPTS_RE = re.compile(r'[a-zA-Zа-яА-Я\uac00-\ud7a3]')
 
-BR_HR_PATTERN = re.compile(r'<(br|hr)\s*/?>', flags=re.IGNORECASE)
-NEWLINES_PATTERN = re.compile(r'(\s*\n\s*){3,}')
 PUNCTUATION_CLEANUP_PATTERN = re.compile(r'[?!]{2,}')
 CLEANUP_PATTERN = re.compile(
     # Находим необязательные пробелы до запятой
@@ -93,22 +86,13 @@ CLEANUP_PATTERN = re.compile(
     # Находим необязательные пробелы ПОСЛЕ троеточия
     fr'\s*'
 )
-END_DASH_TO_ELLIPSIS_PATTERN = re.compile(fr'\s*[{DASH_CHARS}]+\s*</p>')
 TAG_NEWLINE_PATTERN = re.compile(r'(</(p|h1|div)>)')
 COMMA_MERGE_PATTERN = re.compile(fr'([{COMMA_CHARS}])\s*</p>\s*<p[^>]*>')
 END_DASH_CANDIDATE_PATTERN = re.compile(fr'\s*[{DASH_CHARS}]+\s*</p>')
 FORBIDDEN_CHARS_BEFORE_DASH = ALL_LETTER_CHARS + COMMA_CHARS
 
-# Находит ЛЮБОЕ тире (или группу), которое упирается в знак препинания.
-# Включает: точку, запятую (все виды), двоеточие, точку с запятой, вопросы, восклицания и закрывающую кавычку.
-# Игнорирует открывающие кавычки.
-DASH_BEFORE_PUNCTUATION_PATTERN = re.compile(
-    fr'\s*[{DASH_CHARS}]+\s*'       # Захват тире и пробелов вокруг
-    fr'(?=[{COMMA_CHARS}.:;?!»])'   # Lookahead: дальше идет знак препинания
-)
-
-# Чистит артефакт "…." (троеточие + точка), который образуется после замены "—." -> "….".
-# Превращает его в чистое троеточие "…". Остальные знаки (…, …? …!) легальны.
+# Чистит артефакт "… ." (троеточие + точка) в чистое троеточие "…".
+# Остальные знаки (…, …? …!) легальны.
 ELLIPSIS_DOT_CLEANUP_PATTERN = re.compile(fr'{ELLIPSIS_CHAR}\s*\.')
 
 # --- ПАТТЕРН РАЗРЫВА ДИАЛОГОВ ---
@@ -123,6 +107,113 @@ DIALOGUE_SPLIT_PATTERN = re.compile(
 )
 
 
+MAX_LOG_DETAILS_CHARS = 16000
+
+
+def truncate_log_details(text: str, limit: int = MAX_LOG_DETAILS_CHARS) -> str:
+    """Обрезает текст деталей лог-сообщения до `limit` символов.
+
+    Единая реализация для UI (LogWidget) и core (ChapterQueueManager):
+    обе стороны показывают/хранят один и тот же формат деталей лога и должны
+    обрезать его одинаково, чтобы не расходиться в поведении.
+    """
+    normalized_text = text.strip()
+    if len(normalized_text) <= limit:
+        return normalized_text
+    omitted = len(normalized_text) - limit
+    return normalized_text[:limit].rstrip() + f"\n\n[details truncated: {omitted} chars omitted]"
+
+
+def split_csv(text: str, *, delimiters: str = r"[,;\n]+", dedupe: bool = False) -> list[str]:
+    """Разбить строку на список непустых элементов, обрезав пробелы у каждого.
+
+    Три места в проекте разбирали "CSV-подобный" список (ключи API, теги,
+    жанры) собственной копией одной и той же по сути операции и разошлись
+    в деталях. Это единая реализация; различия — явные аргументы, чтобы
+    каждый вызывающий сохранял ровно своё прежнее поведение при миграции.
+
+    ``delimiters`` — regex-класс разделителей. По умолчанию запятая, ';' и
+    перенос строки (поведение provider_orchestrator._split_csv и
+    ranobelib._split_csv_text). qidian_rulate_creator._split_csv никогда не
+    считала ';' разделителем — для неё нужно передать ``delimiters=r"[,\\n]+"``.
+
+    ``dedupe=True`` убирает повторы, сохраняя порядок первого появления
+    (поведение qidian_rulate_creator._split_csv, где список — это теги/жанры
+    и повтор бессмыслен). По умолчанию (``False``) повторы сохраняются —
+    так вели себя provider_orchestrator (списки ключей/temperature) и
+    ranobelib (rulate_genres/rulate_tags).
+    """
+    items = [item.strip() for item in re.split(delimiters, text or "") if item.strip()]
+    if not dedupe:
+        return items
+    result: list[str] = []
+    for item in items:
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def format_duration(seconds, *, round_minutes: bool = False,
+                     unit_spacing: str = " ", seconds_unit: str = "сек",
+                     dash_on_negative: bool = False) -> str:
+    """Render a duration in seconds as a short human-readable Russian phrase.
+
+    Two call sites in the project format the same quantity — seconds
+    remaining — independently of each other, and disagree on rounding and
+    on whether a space separates a number from its unit. This is the single
+    implementation; the differences are explicit keyword arguments so each
+    caller keeps exactly its previous wording.
+
+    ``round_minutes=True`` rounds a sub-hour duration to the nearest minute
+    (a remainder of 30s or more rounds up) instead of showing the leftover
+    seconds — the way a person waiting on a background task reads an ETA.
+    Note this rounding is purely arithmetic on the raw remainder: a duration
+    that rounds up to a full 60 minutes prints "60 мин", not "1 ч 00 мин".
+
+    ``unit_spacing`` is the string placed between a number and its unit
+    ("ч"/"мин"/"сек"); pass "" for compact forms like "5мин".
+
+    ``seconds_unit`` picks the word used for a sub-minute duration ("с" or
+    "сек").
+
+    ``dash_on_negative`` says what a negative duration renders as: ``False``
+    (default) treats it as zero, ``True`` renders it as "—" (an
+    unknown/finished ETA).
+    """
+    if seconds < 0:
+        if dash_on_negative:
+            return "—"
+        seconds = 0
+    total = int(seconds)
+    sp = unit_spacing
+
+    if total < 60:
+        return f"{total}{sp}{seconds_unit}"
+
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+
+    if hours:
+        return f"{hours}{sp}ч {minutes:02d}{sp}мин"
+
+    if round_minutes:
+        if secs >= 30:
+            minutes += 1
+        return f"{minutes}{sp}мин"
+
+    return f"{minutes}{sp}мин {secs:02d}{sp}сек"
+
+
+# Маскируем только то, что действительно начинается как тег: «</», «<!»
+# (комментарии/doctype), «<?» или «<» + буква. Голый «<» перед пробелом,
+# переносом строки, цифрой или кириллицей — это текст, а не тег; раньше
+# `<[^>]+>` тянул от него всё до ближайшего «>» (то есть до закрывающего
+# </p>), пряча настоящий текст от пунктуационных правил, из-за чего
+# initial_cleanup не была идемпотентной (регрессия
+# tests/test_fix_typography_stray_lt_idempotent.py).
+_MASKABLE_TAG_PATTERN = re.compile(r'</?[A-Za-z!?][^>]*>')
+
+
 def _mask_html_tags(text: str, token_prefix: str):
     tag_map = {}
 
@@ -131,7 +222,7 @@ def _mask_html_tags(text: str, token_prefix: str):
         tag_map[key] = match.group(0)
         return key
 
-    return re.sub(r'<[^>]+>', mask_callback, text), tag_map
+    return _MASKABLE_TAG_PATTERN.sub(mask_callback, text), tag_map
 
 
 # Ключи масок имеют вид "\0PREFIX_N\0" (TAG/B_TAG/TAG_INIT/TAG_FIN).
@@ -146,17 +237,6 @@ def _restore_masked_segments(text: str, segment_map: dict[str, str]) -> str:
     return _MASK_TOKEN_PATTERN.sub(
         lambda m: segment_map.get(m.group(0), m.group(0)), text
     )
-
-DASH_TO_ELLIPSIS_PATTERN = re.compile(
-    # ЗАХВАТЫВАЕМ (Группа 1): тире и пробелы вокруг него, которые нужно заменить
-    fr'(\s*[{DASH_CHARS}]+\s*)'
-    
-    # УСЛОВИЕ (Просмотр вперёд): дальше должен быть разрыв абзаца, за которым
-    # следует либо (ещё одно тире) ИЛИ (заглавная буква)
-    fr'(?=\s*</p>\s*<p[^>]*>\s*'
-    fr'(?:[{DASH_CHARS}]|[{UPPERCASE_CHARS}]))'
-)
-
 
 # --- "УМНЫЕ" ПАТТЕРНЫ СЛИЯНИЯ (ФИНАЛЬНАЯ, ОТЛАЖЕННАЯ ВЕРСИЯ) ---
 REMARK_MERGE_PATTERN = re.compile(
@@ -260,36 +340,20 @@ P_ATTR_SEARCH = re.compile(r'<p(\s+[^>]*?)?>', re.IGNORECASE)
 RAW_AMPERSAND_PATTERN = re.compile(r'&(?!(?:[a-zA-Z][a-zA-Z0-9]*|#\d+|#x[0-9a-fA-F]+);)')
 
 # --- MARKDOWN CLEANUP PATTERNS ---
-# 1. Проверка на сепаратор: строка состоит ТОЛЬКО из звезд, пробелов и тире
+# Проверка на сепаратор: строка состоит ТОЛЬКО из звезд, пробелов и тире
 IS_SEPARATOR_PATTERN = re.compile(r'^[\s*—–−_+=#-]+$')
 
-# 2. Поиск текстового контента между тегами: (>)(контент)(<)
-TEXT_NODE_PATTERN = re.compile(r'(>)([^<]+)(<)')
-
-# 3. Валидные Markdown пары
-MD_BOLD_ITALIC_PATTERN = re.compile(r'(?<!\*)\*\*\*([^\*\n]+?)\*\*\*(?!\*)')
-MD_BOLD_PATTERN = re.compile(r'(?<!\*)\*\*([^\*\n]+?)\*\*(?!\*)')
-MD_ITALIC_PATTERN = re.compile(r'(?<!\*)\*([^\*\n]+?)\*(?!\*)')
-
-# 4. Мусорные звезды (одиночки на границах)
-# Удаляем звезды, если у них есть пробел (или граница строки) хотя бы с одной стороны.
-# (?<!\S) - слева пустота или пробел.
-# (?!\S)  - справа пустота или пробел.
-MD_GARBAGE_STARS_PATTERN = re.compile(r'(?<!\S)\*+|\*+(?!\S)')
-# ---------------------------------------------------------------
-
-# 1. Анализ НАЧАЛА абзаца
-START_DASH_PATTERN = re.compile(fr'^(\s*(?:<[^>]+>\s*)*)([{DASH_CHARS}]+)')
-# 2. Токенизация и проход
+# Токенизация и проход
 TOKEN_PATTERN = re.compile(
     fr'(\0B_TAG_\d+\0)|([{ALL_QUOTES}])|([{DASH_CHARS}]+)'
     .replace('{DASH_CHARS}', DASH_CHARS)
 )
 
-# Находит тире (любого вида) сразу после открывающей кавычки (с пробелами или без).
-# « — Текст -> «… Текст
-# «-Текст -> «…Текст
-START_QUOTE_DASH_PATTERN = re.compile(fr'([«„])\s*[{DASH_CHARS}]+')
+# Находит тире (любого вида) сразу после открывающей кавычки (с пробелами или без)
+# вместе с пробелами после него, чтобы убрать лишнее тире:
+# « — Текст -> «Текст
+# «-Текст -> «Текст
+START_QUOTE_DASH_PATTERN = re.compile(fr'([«„])\s*[{DASH_CHARS}]+\s*')
 
 # --- ПАТТЕРНЫ ДЛЯ ЛОГИКИ РАЗДЕЛЕНИЯ И ФИНАЛИЗАЦИИ ---
 
@@ -308,15 +372,9 @@ CAPITALIZATION_FIX_PATTERN = re.compile(
 
 # 2. FIX END PUNCTUATION (ЧИСТОТА КОНЦОВКИ)
 # Запятая в конце абзаца (перед опциональной кавычкой и </p>)
-END_COMMA_FIX_PATTERN = re.compile(fr',\s*(?=[»“"”]*\s*</p>)')
-
 # Отсутствие знака препинания в конце абзаца (Буква/Цифра -> Кавычка -> </p>)
 # Исключает ситуации, когда знак уже есть.
 MISSING_DOT_PATTERN = re.compile(fr'(?<=[{ALL_LETTER_CHARS}0-9])(?=[»“"”]*\s*</p>)')
-
-# Находит " это" (с пробелом перед ним) и границей слова после.
-# Регистр неважен (ЭТО, это, Это).
-ETO_LOOKAHEAD_PATTERN = re.compile(r'^\s*это\b', re.IGNORECASE)
 
 # Соединяет диалог, разорванный после знака препинания.
 # Включает логику: Точка -> Запятая, Троеточие -> Троеточие.
@@ -352,23 +410,18 @@ def dialogue_splitter_with_attributes(match: re.Match) -> str:
     colon = match.group(3)
     return f"{opening_tag}{text_before_colon}{colon}</p>{opening_tag}"
 
-def ellipsis_replacer(match: re.Match) -> str:
+def attribution_merge_replacer(match: re.Match) -> str:
     """
-    Заменяет найденное тире на троеточие.
-    Добавляет пробел после, только если за тире не следует тег </p>.
+    Склеивает реплику с оторванными словами автора: «— Я хотел</p><p>— сказал он».
+    После слова или закрывающей кавычки ставит запятую («— Я хотел, — сказал он»),
+    как требует пунктуация прямой речи; после прочих знаков — только пробел.
+    Раньше на этом месте появлялось «…».
     """
-    # Получаем весь текст ПОСЛЕ найденного тире
-    text_after = match.string[match.end():]
-    
-    # Проверяем, начинается ли этот текст с пробелов, за которыми идет </p>
-    # re.match проверяет строку с самого начала
-    if re.match(r'\s*</p>', text_after):
-        # Если да, то пробел не нужен. Возвращаем только троеточие.
-        return ELLIPSIS_CHAR
-    else:
-        # Во всех остальных случаях добавляем пробел.
-        return f'{ELLIPSIS_CHAR} '
-        
+    text_before = TAG_STRIPPER.sub("", match.string[max(0, match.start() - 200):match.start()]).rstrip()
+    if text_before and re.match(fr'[{ALL_LETTER_CHARS}0-9{DETECT_CLOSE_QUOTES})]', text_before[-1]):
+        return f', {match.group(1)}'
+    return f' {match.group(1)}'
+
 def smart_end_dash_replacer(match: re.Match) -> str:
     """
     Интеллектуальная замена тире в конце абзаца.
@@ -470,10 +523,16 @@ def cleanup_replacer(match: re.Match) -> str:
 
 
 def is_well_formed_xml(content: str, validate=False) -> bool:
-    """Проверяет, является ли строка валидным XML, используя строгий парсер lxml.etree."""
+    """Проверяет, является ли строка валидным XML, используя строгий парсер lxml.etree.
+
+    Контент здесь — недоверенный EPUB-текст (из исходника или от модели),
+    поэтому парсер явно запрещает резолвинг внешних сущностей и сетевые
+    обращения (защита от XXE/SSRF при разборе DOCTYPE).
+    """
     try:
         # etree.fromstring выбрасывает исключение при малейшем нарушении структуры XML
-        etree.fromstring(content.encode('utf-8'))
+        parser = etree.XMLParser(resolve_entities=False, no_network=True)
+        etree.fromstring(content.encode('utf-8'), parser=parser)
         if validate:
             return True, None
         return True
@@ -800,11 +859,52 @@ def clean_glossary_garbage(html_content):
     # Возвращаем строку (bs4 сам закроет теги если что-то было сломано)
     return str(soup)
     
+_FIN_MASK = r'\0TAG_FIN_\d+\0'
+_BLOCK_TAG_START = re.compile(
+    r'</?(?:p|div|h[1-6]|li|blockquote|br|hr|ul|ol|table|tr|td|th|section|article|body|html)\b',
+    re.IGNORECASE,
+)
+
+
+def _tighten_quote_spacing(content: str, tag_map: dict[str, str]) -> str:
+    """
+    Убирает пробелы внутри кавычек: после «„» и «„», перед «»» и перед «“»,
+    которая закрывает «„». Пробел, поставленный моделью у кавычки ("Привет "),
+    иначе доживал до книги как «„Привет “». Работает по тексту под масками
+    TAG_FIN: маски строчных тегов в зазоре сохраняются, через блочный тег
+    (границу абзаца) правило не перескакивает.
+    """
+    gap = fr'(?:[ \t ]|{_FIN_MASK})*[ \t ](?:[ \t ]|{_FIN_MASK})*'
+
+    def crosses_block(text):
+        return any(_BLOCK_TAG_START.match(tag_map.get(key, '')) for key in re.findall(_FIN_MASK, text))
+
+    def masks_of(text):
+        return ''.join(re.findall(_FIN_MASK, text))
+
+    def after_opening(m):
+        return m.group(0) if crosses_block(m.group(2)) else m.group(1) + masks_of(m.group(2))
+
+    def before_closing(m):
+        return m.group(0) if crosses_block(m.group(1)) else masks_of(m.group(1)) + m.group(2)
+
+    def inner_pair(m):
+        if crosses_block(m.group(0)):
+            return m.group(0)
+        return f'„{m.group(1)}{masks_of(m.group(2))}“'
+
+    content = re.sub(fr'([«„])({gap})', after_opening, content)
+    content = re.sub(fr'({gap})(»)', before_closing, content)
+    content = re.sub(fr'„([^„“«»]{{0,500}}?)({gap})“', inner_pair, content)
+    return content
+
+
 def finalize_cleanup(html_content: str) -> str:
     """
     Финальная зачистка:
     1. Лечит "сросшиеся" диалоги (Контекстный Митоз или BR).
-    2. Превращает выжившие тире в конце абзацев в троеточия.
+    2. Убирает тире в конце абзаца после знака препинания; после слова или
+       запятой тире оборванной реплики остаётся (многоточий не сочиняем).
     3. Расставляет пробелы вокруг троеточий.
     """
     content = html_content
@@ -852,8 +952,8 @@ def finalize_cleanup(html_content: str) -> str:
         content
     )
     
-    # 1. Нагло меняем конечное тире на троеточие
-    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*</p>', f'{ELLIPSIS_CHAR}</p>', content)
+    # 1. Конечное тире: после знака препинания убираем, после слова оставляем
+    content = END_DASH_CANDIDATE_PATTERN.sub(smart_end_dash_replacer, content)
     
     # 2. ЗАЧИСТКА ХАОСА
 
@@ -867,7 +967,10 @@ def finalize_cleanup(html_content: str) -> str:
     content = re.sub(fr'({ELLIPSIS_CHAR})(?=[{ALL_LETTER_CHARS}])', r'\1 ', content)
     content = re.sub(fr'([{DASH_CHARS}])\s*{ELLIPSIS_CHAR}\s+(?=[{ALL_LETTER_CHARS}])', r'\1 …', content)
     content = re.sub(fr'([{DASH_CHARS}])\s*{ELLIPSIS_CHAR}', r'\1 …', content)
-    
+
+    # 4. Пробелы внутри кавычек: «„Привет “» -> «„Привет“»
+    content = _tighten_quote_spacing(content, tag_map)
+
     # --- ПЕРЕНОС: Работа с регистром теперь под защитой маски ---
     content = re.sub(CAPITALIZE_PATTERN, capitalize_sentence, content)
     content = re.sub(fr'([!?.])(?:{ELLIPSIS_CHAR})', r'\1', content)
@@ -888,8 +991,8 @@ def finalize_cleanup(html_content: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Безопасное удаление тире (перед </p>)
-    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*</p>', f'{ELLIPSIS_CHAR}</p>', content)
+    # Безопасное удаление тире (перед </p>): склейка тегов могла подвести новое
+    content = END_DASH_CANDIDATE_PATTERN.sub(smart_end_dash_replacer, content)
     
     # Список тегов, которые требуют изоляции (блочные)
     # ВАЖНО: Теги вроде <b>, <span>, <a>, <em> СЮДА НЕ ВХОДЯТ, они инлайновые.
@@ -922,7 +1025,7 @@ def finalize_cleanup(html_content: str) -> str:
     )
 
     # --- ЭТАП 3: ТОЧЕЧНАЯ КОРРЕКЦИЯ (SMART SPLIT) ---
-    content = END_COMMA_FIX_PATTERN.sub(ELLIPSIS_CHAR, content)
+    # Запятая в конце абзаца остаётся запятой (раньше становилась «…»).
     content = MISSING_DOT_PATTERN.sub('.', content)
 
     content, tag_map = _mask_html_tags(content, "TAG_FIN")
@@ -971,6 +1074,10 @@ def capitalize_sentence(match):
     sign = match.group(1)      # Знак (! ? .)
     separator = match.group(2) # То, что между знаком и буквой (пробелы, тире)
     letter = match.group(3)    # Сама буква
+
+    # После !/? слова автора за тире продолжаются со строчной буквы.
+    if sign in "!?" and any(dash in separator for dash in DASH_CHARS):
+        return match.group(0)
 
     # --- УЛУЧШЕННАЯ ЗАЩИТА ССЫЛОК И ФАЙЛОВ ---
     if sign == '.' and not separator:
@@ -1102,9 +1209,9 @@ def prettify_html(html_content: str) -> str:
     content = MISSING_SPACE_PATTERN.sub(handle_missing_space, content)
     
     content = ELLIPSIS_CHAOS_PATTERN.sub(ELLIPSIS_CHAR, content) # Здесь .. -> … безопасно для путей
-    content = DASH_BEFORE_PUNCTUATION_PATTERN.sub(ELLIPSIS_CHAR, content)
     content = ELLIPSIS_DOT_CLEANUP_PATTERN.sub(ELLIPSIS_CHAR, content)
-    content = START_QUOTE_DASH_PATTERN.sub(r'\1…', content)
+    # Тире сразу после открывающей кавычки лишнее; раньше оно становилось «…».
+    content = START_QUOTE_DASH_PATTERN.sub(r'\1', content)
     
     # ВОЗВРАЩАЕМ ТЕГИ ОБРАТНО
     content = _restore_masked_segments(content, tag_map)
@@ -1123,10 +1230,10 @@ def prettify_html(html_content: str) -> str:
     content = LETTER_MERGE_PATTERN.sub(' ', content)
     content = COMMA_LOWERCASE_MERGE_PATTERN.sub(r'\1 ', content)
     
-    # Обрывы и троеточия
-    content = DASH_TO_ELLIPSIS_PATTERN.sub(ellipsis_replacer, content)
+    # Обрывы. Тире оборванной реплики остаётся тире: многоточия ставит только
+    # автор, иначе читатель принимает их за его привычку.
     content = CLEANUP_PATTERN.sub(cleanup_replacer, content)
-    content = FINAL_MERGE_PATTERN.sub(rf'{ELLIPSIS_CHAR} \1', content)
+    content = FINAL_MERGE_PATTERN.sub(attribution_merge_replacer, content)
     content = SUB_MERGE_PATTERN.sub(r' \1 ', content)
     content = END_DASH_CANDIDATE_PATTERN.sub(smart_end_dash_replacer, content)
     
@@ -1580,8 +1687,7 @@ def refine_typography_in_html(html_content: str) -> str:
     content = re.sub(r'<[^>]+>', mask_callback, html_content)
     content = process_markdown_segment(content)
     content = re.sub(r'<[^>]+>', mask_callback, content)
-    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*(?=»)', ELLIPSIS_CHAR, content)
-    
+
     # --- ЭТАП 2: РЕНТГЕН ---
     def get_context_char(text, pos, direction, skip_spaces=False):
         """
@@ -1622,6 +1728,29 @@ def refine_typography_in_html(html_content: str) -> str:
             return char
         return '\n'
 
+    # Тире перед закрывающей «»»: после слова это обрыв реплики («Она
+    # поранилась-»), тире остаётся как написано и прячется от разбора ниже,
+    # иначе он разнесёт его пробелами; после знака препинания («Нет! —»)
+    # тире лишнее. Раньше здесь всегда ставилось «…».
+    def dash_before_closing_quote(m):
+        prev_sign = get_context_char(content, m.start(), -1, skip_spaces=True)
+        if not re.match(fr'[{ALL_LETTER_CHARS}0-9]', prev_sign):
+            return ''
+        key = f"\0TAG_{len(tag_map)}\0"
+        tag_map[key] = m.group(0).rstrip()
+        return key
+
+    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*(?=»)', dash_before_closing_quote, content)
+    # Тире с пробелом перед знаком препинания («Баллы —?», «<em>РРРР </em>–!»)
+    # висит в воздухе: убираем вместе с пробелами, маски строчных тегов между
+    # ними сохраняем. Прижатое к слову («одно-,») остаётся, см. «Г».
+    content = re.sub(
+        fr'[ \t ]+(?:\0TAG_\d+\0)*[ \t ]*[{DASH_CHARS}]+[ \t ]*'
+        fr'(?=(?:\0TAG_\d+\0)*[,.:;?!])',
+        lambda m: ''.join(re.findall(r'\0TAG_\d+\0', m.group(0))),
+        content,
+    )
+
     # --- ЭТАП 3: ОБРАБОТКА ---
     # Глобальный признак: ИИ использует оператор после запятой хоть раз в документе.
 
@@ -1659,13 +1788,12 @@ def refine_typography_in_html(html_content: str) -> str:
             
             # А. АКТИВАЦИЯ ДИАЛОГА
             if prev_sign in '\n.!?…:':
+                # Слова автора внутри кавычек: «Стой! – крикнул он». Раньше
+                # после тире вставлялось «…», и следующее тире видело его
+                # только на втором проходе.
                 if quote_depth > 0:
-                    next_c = get_context_char(content, m.end()-1, 1, skip_spaces=True)
-                    if next_c not in f'{ELLIPSIS_CHAR}': 
-                        return f'– {ELLIPSIS_CHAR} '
-                    else:
-                        return f'– '
-                
+                    return '– '
+
                 dialogue_active = True
                 if '─' in dash_seq: dialogue_started_by_operator = True
                 return '— '
@@ -1692,6 +1820,15 @@ def refine_typography_in_html(html_content: str) -> str:
             if bool(re.match(fr'[{ALL_LETTER_CHARS}0-9]', prev_c)) and bool(re.match(fr'[{ALL_LETTER_CHARS}0-9]', next_c)):
                 if prev_c.isdigit() and next_c.isdigit(): return '–'
                 return '-'
+
+            # Г. ОБРЫВ СЛОВА: тире прижато к слову, дальше знак препинания,
+            # закрывающая кавычка или конец абзаца («одно-, двух-», «Ты че-»,
+            # «„Я поранилась-“»). Оставляем как написано: раньше такие тире
+            # успевали стать «…», а разрядка дала бы «одно – ,».
+            if re.match(fr'[{ALL_LETTER_CHARS}0-9]', prev_c) and (
+                next_c in ',.:;?!\n' or next_c in DETECT_CLOSE_QUOTES
+            ):
+                return dash_seq
 
             return ' – '
 
@@ -1969,6 +2106,24 @@ def _scan_stray_angle_brackets(html_content: str, collect_limit: int = 0) -> tup
     return "".join(result), snippets
 
 
+def escape_html(value) -> str:
+    """Escape ``value`` for safe inclusion in Qt rich-text/HTML.
+
+    Canonical replacement for the several ad hoc ``.replace('<', '&lt;')``
+    chains that used to live next to each call site: unlike those partial
+    escapes, this also escapes ``&``, ``>`` and quote characters, so an
+    already-escaped entity or a bare ``&`` in the input cannot produce
+    broken markup.
+
+    WARNING: uses ``value or ""`` (inherited from the original ``_escape``
+    copies), so ANY falsy value -- ``None``, ``0``, ``0.0``, ``False``,
+    ``""`` -- becomes an empty string, not its string form. Do not use this
+    for numbers that may legitimately be zero; convert them to ``str``
+    yourself first (e.g. ``escape_html(str(count))``).
+    """
+    return html.escape(str(value or ""), quote=True)
+
+
 def escape_stray_angle_brackets(html_content: str) -> str:
     """
     Escapes literal < and > characters that are not part of real HTML/XML tags.
@@ -2164,7 +2319,15 @@ def split_text_into_chunks(text, target_size, search_window, min_chunk_size):
         # 6. Если "скаут" ничего не нашел или нашел слишком близко, режем по идеальной точке "по-живому"
         if split_pos == -1 or split_pos <= current_pos:
             split_pos = ideal_split_pos
-        
+
+        # 6a. Граница не имеет права откатываться назад: если предыдущий разрез уже
+        # обогнал идеальную точку этого шага, этот разрез пропускаем. Иначе следующий
+        # чанк повторно захватил бы уже отданный кусок текста (перехлёст на стыке).
+        if split_pos <= current_pos:
+            continue
+        if split_pos >= text_len:
+            break
+
         # 7. Отрезаем чанк и обновляем позицию
         chunks.append(text[current_pos:split_pos])
         current_pos = split_pos
@@ -2282,13 +2445,10 @@ def prettify_html_for_ai(html_content: str) -> str:
     
     BLOCK_TAGS_CHECK = re.compile(fr'^</?(?:{structural_tags_str})\b', re.IGNORECASE)
 
-    # --- PYTHONIC LOGIC ---
-    def needs_ellipsis(text_fragment):
-        clean = text_fragment.rstrip()
-        if not clean: return False
-        return clean[-1].isalpha()
-
     # --- ЭТАП 3: МИТОЗ (Разделение) ---
+    # Разрезанные части не помечаются многоточиями: модель переводила эти «…»,
+    # и читатель видел их там, где у автора был просто перенос строки
+    # (у иероглифов isalpha() истинно, так что метка вставала почти везде).
     def mitosis_callback(m):
         opening = m.group(1)
         tag = m.group(2)
@@ -2305,20 +2465,7 @@ def prettify_html_for_ai(html_content: str) -> str:
         use_nesting = tag_lower in ['div', 'blockquote', 'li', 'section', 'article', 'td', 'th']
 
         res = []
-        for j, p in enumerate(parts):
-            current_p = p
-            
-            # Троеточия (начало)
-            if j > 0:
-                first_l = re.search(r'[^\W\d_]', current_p) 
-                if first_l and first_l.group().islower() and not current_p.startswith('…'):
-                    current_p = "…" + current_p
-            
-            # Троеточия (конец)
-            if j < len(parts) - 1:
-                if needs_ellipsis(current_p):
-                    current_p = current_p + "…"
-                    
+        for current_p in parts:
             if use_nesting:
                 # Вкладываем в <p> внутри текущего контейнера
                 res.append(f"<p>{current_p}</p>")
@@ -2354,21 +2501,11 @@ def prettify_html_for_ai(html_content: str) -> str:
     # --- ЭТАП 4: ОБЕРТКА СИРОТ ---
     lines = [line.strip() for line in content.split('\n') if line.strip()]
     wrapped_lines = []
-    total = len(lines)
 
-    for i, line in enumerate(lines):
+    for line in lines:
         is_block = bool(BLOCK_TAGS_CHECK.match(line))
-        
+
         if not is_block:
-            if i == 0:
-                first_letter = re.search(r'[^\W\d_]', line)
-                if first_letter and first_letter.group().islower():
-                    line = "…" + line
-            
-            if i == total - 1:
-                if needs_ellipsis(line):
-                    line = line + "…"
-            
             line = f"<p>{line}</p>"
         
         wrapped_lines.append(line)
@@ -2377,7 +2514,6 @@ def prettify_html_for_ai(html_content: str) -> str:
 
     # 5. Финальная чистка
     content = COMMA_MERGE_PATTERN.sub(r'\1 ', content)
-    content = END_DASH_TO_ELLIPSIS_PATTERN.sub('…</p>', content)
     content = TAG_NEWLINE_PATTERN.sub(r'\1\n', content)
     
     return re.sub(r'\n{2,}', '\n', content).strip()
@@ -2692,15 +2828,8 @@ def create_glossary_span(original: str, rus: str) -> str:
     safe_translation = html.escape(rus)
     
     return f'<span class="glossary-term" title="{safe_original}">{safe_translation}</span>'
-   
-   
-# Паттерн находит:
-# Группа 1: Экранированные скобки {{ или }}
-# Группа 2: Валидный плейсхолдер {ключ} (захватывая ключ в группу 3)
-# Группа 4: Одиночные { или }
-FORMAT_PATTERN = re.compile(r"(\{\{|\}\})|(\{([a-zA-Z_][a-zA-Z0-9_]*)\})|([\{\}])")
-    
-    
+
+
 def safe_format(template_string: str, **kwargs) -> str:
     """
     Безопасно форматирует строку.
@@ -3509,7 +3638,11 @@ def validate_html_structure(original_html, translated_html):
         for display_name, search_string in tags_to_check.items():
             trans_has_body_wrapper = bool(re.search(r'<body\b', trans_lower)) and bool(re.search(r'</body>', trans_lower))
             if (search_string in orig_lower) and not (search_string in trans_lower) and not trans_has_body_wrapper:
-                return False, f"Потерян фундаментальный тег {display_name.replace('<', '&lt;')}. Ответ API поврежден.", final_translated_html
+                # display_name (например "<html>") идёт в чисто текстовые
+                # приёмники (log_message, RuntimeError) -- не rich text,
+                # поэтому здесь его не экранируют, как и остальные reason'ы
+                # этой функции (см. "<body>...</body>" выше).
+                return False, f"Потерян фундаментальный тег {display_name}. Ответ API поврежден.", final_translated_html
 
         # ПРОВЕРКА 2.2: Умный баланс тегов <p> через Regex
         p_open_pat = r'<p(?:\s|>)'

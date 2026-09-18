@@ -15,6 +15,7 @@ from PyQt6.QtGui import QColor
 from gemini_translator.ui.widgets.common_widgets import NoScrollComboBox
 from gemini_translator.ui.shell import ShellPage
 from .custom_widgets import ExpandingTextEditDelegate, SmartTextEdit
+from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 
 # --- Аннотация типа для избежания циклического импорта ---
 from typing import TYPE_CHECKING
@@ -24,6 +25,148 @@ if TYPE_CHECKING:
 # --- Глобальные переменные, которые нужны этому диалогу ---
 # Предполагаем, что они будут переданы из главного файла
 PYMORPHY_AVAILABLE = False # Как заглушка
+
+
+def apply_sub_table_edit_to_pending(table, item, pending_changes, baseline_lookup):
+    """Каноническая логика «правка ячейки таблицы под-терминов -> pending_changes».
+
+    Общая часть между ComplexOverlapResolverPage._on_sub_table_item_changed и
+    CoreTermAnalyzerPage._on_sub_table_item_changed (pcluster-38): pending_changes
+    хранит значение как кортеж (current_term, current_data), столбец 0 меняет
+    сам термин, столбцы 1/2 — поля 'rus'/'note'. Способ получения baseline-записи
+    для термина, ещё не попавшего в pending_changes, у вызывающих сторон разный
+    (O(1) dict.get против линейного поиска по списку) — он передаётся через
+    `baseline_lookup(original_term_id) -> dict` и остаётся на стороне вызывающего
+    кода без изменений.
+    """
+    row, col = item.row(), item.column()
+    if col not in (0, 1, 2):
+        return
+
+    id_item = table.item(row, 0)
+    if not id_item:
+        return
+    original_term_id = id_item.data(Qt.ItemDataRole.UserRole)
+
+    current_term, current_data = pending_changes.get(
+        original_term_id,
+        (original_term_id, baseline_lookup(original_term_id).copy())
+    )
+
+    if col == 0:
+        current_term = item.text()
+    elif col == 1:
+        current_data['rus'] = item.text()
+    elif col == 2:
+        current_data['note'] = item.text()
+
+    pending_changes[original_term_id] = (current_term, current_data)
+
+
+class WizardStepMixin:
+    """Каноническая машина состояний пошагового режима «Визард».
+
+    Общая часть между ComplexOverlapResolverPage и ReverseConflictResolverPage
+    (dups-gt_ui_dialogs_glossary_dialogs_conflict_reso-06, находка
+    .../3-conflict-resolvers-duplicated-): обе страницы гоняют один и тот же
+    цикл start_wizard_mode/end_wizard_mode/wizard_go_next/wizard_go_prev/
+    _show_wizard_step поверх QListWidget с элементами конфликтов.
+
+    Единственное реальное расхождение между копиями — то, как элемент списка
+    хранит свой идентификатор: ComplexOverlapResolverPage кладёт id термина в
+    Qt.ItemDataRole.UserRole, а ReverseConflictResolverPage вообще не
+    выставляет UserRole и использует сам текст элемента как ключ. Это не
+    отдельная ветка поведения, а один и тот же приём с запасным вариантом —
+    см. `_wizard_item_key`.
+
+    Подкласс обязан предоставить:
+      - свойство `wizard_list_widget` — QListWidget с элементами визарда;
+      - свойство `wizard_checked_keys` — set с ключами уже отмеченных
+        "проверено" элементов;
+    а также завести (как и раньше) виджеты top_controls_stack,
+    normal_mode_widget, wizard_mode_widget, checked_checkbox,
+    wizard_progress_label, wizard_prev_button, wizard_next_button — их имена
+    совпадали у обеих копий, поэтому здесь не абстрагируются.
+    """
+
+    wizard_mode_active = False
+    wizard_queue = None
+    wizard_current_index = -1
+
+    @property
+    def wizard_list_widget(self):
+        raise NotImplementedError
+
+    @property
+    def wizard_checked_keys(self):
+        raise NotImplementedError
+
+    @staticmethod
+    def _wizard_item_key(item):
+        """Ключ элемента списка: id термина из UserRole, либо, если он не
+        выставлен (ReverseConflictResolverPage), сам текст элемента."""
+        key = item.data(Qt.ItemDataRole.UserRole)
+        return item.text() if key is None else key
+
+    def start_wizard_mode(self):
+        list_widget = self.wizard_list_widget
+        checked = self.wizard_checked_keys
+        keys = [self._wizard_item_key(list_widget.item(i)) for i in range(list_widget.count())]
+        self.wizard_queue = [key for key in keys if key not in checked]
+
+        if not self.wizard_queue:
+            QMessageBox.information(self, "Все готово", "Все конфликты в этом списке уже помечены как проверенные.")
+            return
+
+        self.wizard_mode_active = True
+        self.wizard_current_index = 0
+
+        list_widget.setEnabled(False)
+        self.top_controls_stack.setCurrentWidget(self.wizard_mode_widget)
+
+        self._show_wizard_step()
+
+    def end_wizard_mode(self):
+        self.wizard_mode_active = False
+        self.wizard_queue = []
+        self.wizard_current_index = -1
+
+        self.wizard_list_widget.setEnabled(True)
+        self.top_controls_stack.setCurrentWidget(self.normal_mode_widget)
+
+    def wizard_go_next(self):
+        # Сохраняем и помечаем текущий как проверенный
+        self.checked_checkbox.setChecked(True)
+
+        if self.wizard_current_index < len(self.wizard_queue) - 1:
+            self.wizard_current_index += 1
+            self._show_wizard_step()
+        else:
+            QMessageBox.information(self, "Завершено", "Вы просмотрели все оставшиеся конфликты.")
+            self.end_wizard_mode()
+
+    def wizard_go_prev(self):
+        # Просто переходим назад, ПРЕДВАРИТЕЛЬНО СОХРАНИВ ИЗМЕНЕНИЯ
+        if self.wizard_current_index > 0:
+            self.wizard_current_index -= 1
+            self._show_wizard_step()
+
+    def _show_wizard_step(self):
+        if not self.wizard_mode_active or not self.wizard_queue:
+            return
+
+        self.wizard_progress_label.setText(f"Шаг {self.wizard_current_index + 1} из {len(self.wizard_queue)}")
+        self.wizard_prev_button.setEnabled(self.wizard_current_index > 0)
+        self.wizard_next_button.setText("Далее >" if self.wizard_current_index < len(self.wizard_queue) - 1 else "Завершить")
+
+        term_to_show = self.wizard_queue[self.wizard_current_index]
+
+        list_widget = self.wizard_list_widget
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if self._wizard_item_key(item) == term_to_show:
+                list_widget.setCurrentItem(item)
+                break
 
 
 def _get_checked_color(widget):
@@ -39,13 +182,14 @@ def _get_checked_color(widget):
     return QtGui.QColor(r, g, b)
 
 
-class ComplexOverlapResolverPage(ShellPage):
+class ComplexOverlapResolverPage(WizardStepMixin, ShellPage):
     """
     Супер-диалог для разрешения наложений с двумя режимами:
     1. Общий вид (свободная навигация по списку).
     2. Пошаговый режим "Визард" (проход по нерешенным проблемам).
     """
     page_title = "Наложения"
+    preferred_window_size = (1200, 800)
     result_ready = pyqtSignal(bool)
 
     def __init__(self, overlap_groups, inverted_groups, original_glossary, pymorphy_available, parent=None):
@@ -56,17 +200,13 @@ class ComplexOverlapResolverPage(ShellPage):
         self.pending_changes = {}
         self.deleted_terms = set()
         self.checked_terms = set()
-        self.pymorphy_available = pymorphy_available 
-        # --- Состояние для пошагового режима ---
-        self.wizard_mode_active = False
-        self.wizard_terms = []
-        self.wizard_current_index = -1
-        
+        self.pymorphy_available = pymorphy_available
+
         self.view_mode = 'short_to_long'
         self.show_translations_mode = True  # <--- НОВЫЙ ФЛАГ: По умолчанию показываем переводы
         
         self.setWindowTitle("Шаг 3: Комплексное разрешение наложений")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(900, 520)
         self.init_ui()
 
     def init_ui(self):
@@ -248,69 +388,19 @@ class ComplexOverlapResolverPage(ShellPage):
 
 
 
-    def start_wizard_mode(self):
-        # Собираем только непроверенные термины для визарда
-        self.wizard_terms = []
-        for i in range(self.left_list.count()):
-            item = self.left_list.item(i)
-            # ИЗМЕНЕНИЕ: Сравниваем ID
-            term_id = item.data(Qt.ItemDataRole.UserRole)
-            if term_id not in self.checked_terms:
-                self.wizard_terms.append(term_id)
-        
-        if not self.wizard_terms:
-            QMessageBox.information(self, "Все готово", "Все конфликты в этом списке уже помечены как проверенные.")
-            return
-            
-        self.wizard_mode_active = True
-        self.wizard_current_index = 0
-        
-        self.left_list.setEnabled(False) 
-        self.top_controls_stack.setCurrentWidget(self.wizard_mode_widget)
-        
-        self._show_wizard_step()
+    # --- Пятёрка методов пошагового режима «Визард» (start_wizard_mode,
+    # end_wizard_mode, wizard_go_next, wizard_go_prev, _show_wizard_step)
+    # унаследована от WizardStepMixin — она полностью общая с
+    # ReverseConflictResolverPage, см. dups-gt_ui_dialogs_glossary_dialogs_
+    # conflict_reso-06. Здесь остаётся только специфика этой страницы:
+    # какой список и какой набор "проверенных" ключей использовать.
+    @property
+    def wizard_list_widget(self):
+        return self.left_list
 
-    def end_wizard_mode(self):
-        self.wizard_mode_active = False
-        self.wizard_terms = []
-        self.wizard_current_index = -1
-        
-        self.left_list.setEnabled(True) # Разблокируем список
-        self.top_controls_stack.setCurrentWidget(self.normal_mode_widget)
-
-    def wizard_go_next(self):
-        # Сохраняем и помечаем текущий как проверенный
-        self.checked_checkbox.setChecked(True)
-        
-        if self.wizard_current_index < len(self.wizard_terms) - 1:
-            self.wizard_current_index += 1
-            self._show_wizard_step()
-        else:
-            QMessageBox.information(self, "Завершено", "Вы просмотрели все оставшиеся конфликты.")
-            self.end_wizard_mode()
-
-    def wizard_go_prev(self):
-        # Просто переходим назад, ПРЕДВАРИТЕЛЬНО СОХРАНИВ ИЗМЕНЕНИЯ
-        if self.wizard_current_index > 0:
-            self.wizard_current_index -= 1
-            self._show_wizard_step()
-
-    def _show_wizard_step(self):
-        if not self.wizard_mode_active or not self.wizard_terms:
-            return
-
-        self.wizard_progress_label.setText(f"Шаг {self.wizard_current_index + 1} из {len(self.wizard_terms)}")
-        self.wizard_prev_button.setEnabled(self.wizard_current_index > 0)
-        self.wizard_next_button.setText("Далее >" if self.wizard_current_index < len(self.wizard_terms) - 1 else "Завершить")
-
-        term_to_show = self.wizard_terms[self.wizard_current_index]
-        
-        # ИЗМЕНЕНИЕ: Ищем по UserRole
-        for i in range(self.left_list.count()):
-            item = self.left_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == term_to_show:
-                self.left_list.setCurrentItem(item)
-                break
+    @property
+    def wizard_checked_keys(self):
+        return self.checked_terms
 
 
     def toggle_view(self):
@@ -347,42 +437,6 @@ class ComplexOverlapResolverPage(ShellPage):
                 note_item.setText(note_text)
                 self.sub_terms_table.resizeRowToContents(row)
     
-    # --- ИЗМЕНЕНИЕ: Логика сохранения обновлена для чтения из QTableWidgetItem ---
-    def _save_current_changes(self):
-        if not hasattr(self, 'current_term') or not self.current_term: return
-        orig_term = self.current_term
-        if orig_term not in self.deleted_terms and hasattr(self, 'main_term_edit'):
-            new_term = self.main_term_edit.text().strip()
-            new_trans = self.main_trans_edit.text().strip()
-            new_note = self.main_note_edit.text().strip()
-            
-            original_data = self.original_glossary.get(orig_term, {})
-            if (orig_term != new_term or 
-                original_data.get('rus', '') != new_trans or
-                original_data.get('note', '') != new_note):
-                self.pending_changes[orig_term] = (new_term, {"rus": new_trans, "note": new_note})
-            elif orig_term in self.pending_changes:
-                del self.pending_changes[orig_term]
-        
-        if hasattr(self, 'sub_terms_table'):
-            for i in range(self.sub_terms_table.rowCount()):
-                sub_orig_term_item = self.sub_terms_table.item(i, 0)
-                if not sub_orig_term_item: continue
-                sub_orig_term = sub_orig_term_item.data(Qt.ItemDataRole.UserRole)
-                if sub_orig_term in self.deleted_terms: continue
-                
-                sub_new_term = self.sub_terms_table.item(i, 0).text().strip()
-                sub_new_trans = self.sub_terms_table.item(i, 1).text().strip()
-                sub_new_note = self.sub_terms_table.item(i, 2).text().strip()
-
-                sub_original_data = self.original_glossary.get(sub_orig_term, {})
-                if (sub_orig_term != sub_new_term or 
-                    sub_original_data.get('rus', '') != sub_new_trans or
-                    sub_original_data.get('note', '') != sub_new_note):
-                    self.pending_changes[sub_orig_term] = (sub_new_term, {"rus": sub_new_trans, "note": sub_new_note})
-                elif sub_orig_term in self.pending_changes:
-                    del self.pending_changes[sub_orig_term]
-
     def on_group_changed(self, current, previous):
         self.checked_checkbox.blockSignals(True)
         if current:
@@ -535,24 +589,12 @@ class ComplexOverlapResolverPage(ShellPage):
     
     def _on_sub_table_item_changed(self, item: QTableWidgetItem):
         """Автоматически сохраняет изменения из таблицы под-терминов."""
-        row, col = item.row(), item.column()
-        if col not in [0, 1, 2]: return # Интересуют столбцы 0, 1, 2
-        
-        # Идентификатор хранится в столбце 0
-        id_item = self.sub_terms_table.item(row, 0)
-        if not id_item: return
-        original_term_id = id_item.data(Qt.ItemDataRole.UserRole)
-        
-        current_term, current_data = self.pending_changes.get(
-            original_term_id,
-            (original_term_id, self.original_glossary.get(original_term_id, {}).copy())
+        apply_sub_table_edit_to_pending(
+            self.sub_terms_table,
+            item,
+            self.pending_changes,
+            lambda original_term_id: self.original_glossary.get(original_term_id, {})
         )
-
-        if col == 0: current_term = item.text()
-        elif col == 1: current_data['rus'] = item.text()
-        elif col == 2: current_data['note'] = item.text()
-        
-        self.pending_changes[original_term_id] = (current_term, current_data)
     
     def delete_main_term(self):
         if self.current_term:
@@ -613,12 +655,11 @@ class ComplexOverlapResolverPage(ShellPage):
         return patch_list
 
 
-class _ComplexOverlapResolverDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(ComplexOverlapResolverPage, name)
-
-
-class ComplexOverlapResolverDialog(QDialog, metaclass=_ComplexOverlapResolverDialogMeta):
+class ComplexOverlapResolverDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(ComplexOverlapResolverPage),
+):
     """Modal wrapper hosting ComplexOverlapResolverPage for the legacy exec() API."""
 
     def __init__(self, overlap_groups, inverted_groups, original_glossary, pymorphy_available, parent=None):
@@ -639,23 +680,18 @@ class ComplexOverlapResolverDialog(QDialog, metaclass=_ComplexOverlapResolverDia
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
 
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
-
     def closeEvent(self, event):
         self.page.reject()
         event.accept()
 
 
-class ReverseConflictResolverPage(ShellPage):
+class ReverseConflictResolverPage(WizardStepMixin, ShellPage):
     """
     Супер-диалог, который решает и обратные конфликты, и связывает "сирот".
     Версия 2.2 с пошаговым режимом "Визард".
     """
     page_title = "Обратные конфликты"
+    preferred_window_size = (1200, 800)
     result_ready = pyqtSignal(bool)
 
     def __init__(self, reverse_issues, original_glossary, parent=None, morph=None):
@@ -665,18 +701,13 @@ class ReverseConflictResolverPage(ShellPage):
 
         self.entry_map = {}
         self.reverse_issues = self._build_issue_records(reverse_issues)
-        
+
         self.pending_changes = {}
         self.deleted_entries = set()
         self.checked_items = set() # Для отметки проверенных
-        
-        # --- Состояние для пошагового режима ---
-        self.wizard_mode_active = False
-        self.wizard_items = []
-        self.wizard_current_index = -1
 
         self.setWindowTitle("Шаг 2: Обратные конфликты и связывание")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(900, 520)
         self.init_ui()
 
     @staticmethod
@@ -792,51 +823,19 @@ class ReverseConflictResolverPage(ShellPage):
         self.populate_list()
         self.end_wizard_mode()
 
-    def start_wizard_mode(self):
-        self.wizard_items = [self.translations_list.item(i).text() for i in range(self.translations_list.count()) if self.translations_list.item(i).text() not in self.checked_items]
-        
-        if not self.wizard_items:
-            QMessageBox.information(self, "Все готово", "Все конфликты в этом списке уже помечены как проверенные.")
-            return
-            
-        self.wizard_mode_active = True
-        self.wizard_current_index = 0
-        self.translations_list.setEnabled(False)
-        self.top_controls_stack.setCurrentWidget(self.wizard_mode_widget)
-        self._show_wizard_step()
+    # --- Пятёрка методов пошагового режима «Визард» унаследована от
+    # WizardStepMixin (общая с ComplexOverlapResolverPage, см.
+    # dups-gt_ui_dialogs_glossary_dialogs_conflict_reso-06). Элементы
+    # translations_list не хранят UserRole, поэтому _wizard_item_key
+    # использует их текст как ключ — это то же самое, что раньше делал
+    # findItems(term_to_show, Qt.MatchFlag.MatchExactly) в _show_wizard_step.
+    @property
+    def wizard_list_widget(self):
+        return self.translations_list
 
-    def end_wizard_mode(self):
-        self.wizard_mode_active = False
-        self.wizard_items = []
-        self.wizard_current_index = -1
-        self.translations_list.setEnabled(True)
-        self.top_controls_stack.setCurrentWidget(self.normal_mode_widget)
-
-    def wizard_go_next(self):
-        self.checked_checkbox.setChecked(True)
-        
-        if self.wizard_current_index < len(self.wizard_items) - 1:
-            self.wizard_current_index += 1
-            self._show_wizard_step()
-        else:
-            QMessageBox.information(self, "Завершено", "Вы просмотрели все оставшиеся конфликты.")
-            self.end_wizard_mode()
-    
-    def wizard_go_prev(self):
-        # Просто переходим назад, ПРЕДВАРИТЕЛЬНО СОХРАНИВ ИЗМЕНЕНИЯ
-        if self.wizard_current_index > 0:
-            self.wizard_current_index -= 1
-            self._show_wizard_step()
-
-    def _show_wizard_step(self):
-        if not self.wizard_mode_active or not self.wizard_items: return
-        self.wizard_progress_label.setText(f"Шаг {self.wizard_current_index + 1} из {len(self.wizard_items)}")
-        self.wizard_prev_button.setEnabled(self.wizard_current_index > 0)
-        self.wizard_next_button.setText("Далее >" if self.wizard_current_index < len(self.wizard_items) - 1 else "Завершить")
-
-        term_to_show = self.wizard_items[self.wizard_current_index]
-        items = self.translations_list.findItems(term_to_show, Qt.MatchFlag.MatchExactly)
-        if items: self.translations_list.setCurrentItem(items[0])
+    @property
+    def wizard_checked_keys(self):
+        return self.checked_items
 
     def _on_table_item_changed(self, item: QTableWidgetItem):
         """Автоматически сохраняет изменения из таблицы."""
@@ -885,39 +884,8 @@ class ReverseConflictResolverPage(ShellPage):
         """Обновляет состояние галочки при клике на элемент."""
         self.checked_checkbox.setChecked(item.text() in self.checked_items)
 
-    def _save_current_changes(self):
-        if not hasattr(self, 'complete_table') or not self.complete_table: return
-        
-        for i in range(self.complete_table.rowCount()):
-            # ИЗМЕНЕНИЕ: ID теперь в столбце 0
-            original_item = self.complete_table.item(i, 0)
-            if not original_item: continue
-            
-            original_id_tuple = original_item.data(Qt.ItemDataRole.UserRole)
-            if original_id_tuple in self.deleted_entries: continue
-            
-            new_data = {
-                # ИЗМЕНЕНИЕ: Считываем данные из колонок 0, 1, 2
-                "original": self.complete_table.item(i, 0).text(),
-                "rus": self.complete_table.item(i, 1).text(),
-                "note": self.complete_table.item(i, 2).text()
-            }
-            
-            original_entry = self.entry_map[original_id_tuple]
-            last_known_data = self.pending_changes.get(original_id_tuple, original_entry)
-
-            if new_data['original'] != last_known_data.get('original', '') or \
-               new_data['rus'] != last_known_data.get('rus', '') or \
-               new_data['note'] != last_known_data.get('note', ''):
-                updated_entry = last_known_data.copy()
-                updated_entry.update(new_data)
-                self.pending_changes[original_id_tuple] = updated_entry
-            elif original_id_tuple in self.pending_changes:
-                if self.pending_changes[original_id_tuple] == original_entry:
-                    del self.pending_changes[original_id_tuple]
-
     def on_group_changed(self, current, previous):
-        
+
         self.checked_checkbox.blockSignals(True)
         if current:
             self.checked_checkbox.setChecked(current.text() in self.checked_items)
@@ -1092,7 +1060,11 @@ class ReverseConflictResolverPage(ShellPage):
         orphan_note = orphan_entry.get('note', '')
         for i in range(self.complete_table.rowCount()):
              # --- ИЗМЕНЕНИЕ: Обновляем item напрямую ---
-            note_item = self.complete_table.item(i, 3)
+             # ИСПРАВЛЕНИЕ: колонка "Примечание" имеет индекс 2 (0=Оригинал,
+             # 1=Перевод, 2=Примечание, 3=Действия — там QTableWidgetItem
+             # никогда не создаётся, только setCellWidget), поэтому раньше
+             # note_item всегда был None и примечание никуда не копировалось.
+            note_item = self.complete_table.item(i, 2)
             if note_item:
                 note_item.setText(orphan_note)
 
@@ -1158,12 +1130,11 @@ class ReverseConflictResolverPage(ShellPage):
         return patch_list
 
 
-class _ReverseConflictResolverDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(ReverseConflictResolverPage, name)
-
-
-class ReverseConflictResolverDialog(QDialog, metaclass=_ReverseConflictResolverDialogMeta):
+class ReverseConflictResolverDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(ReverseConflictResolverPage),
+):
     """Modal wrapper hosting ReverseConflictResolverPage for the legacy exec() API."""
 
     def __init__(self, reverse_issues, original_glossary, parent=None, morph=None):
@@ -1178,12 +1149,6 @@ class ReverseConflictResolverDialog(QDialog, metaclass=_ReverseConflictResolverD
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
 
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
-
     def closeEvent(self, event):
         self.page.reject()
         event.accept()
@@ -1197,10 +1162,17 @@ class DirectConflictResolverDialog(QDialog):
     """
     def __init__(self, conflicts, parent=None, morph=None):
         super().__init__(parent)
-        self.conflicts = conflicts
+        # ИСПРАВЛЕНИЕ: раньше self.conflicts был тем же словарём, что и
+        # GlossaryManagerPage.direct_conflicts (передаётся по ссылке).
+        # Ручное удаление строки в таблице мутировало его немедленно —
+        # термин пропадал из конфликтов страницы даже при нажатии
+        # «Отмена». Работаем с собственной копией: словарь и списки
+        # вариантов копируются, отдельные словари-варианты — нет (они не
+        # изменяются на месте нигде в этом диалоге).
+        self.conflicts = {term: list(options) for term, options in conflicts.items()}
         self.morph = morph
         self.resolved_glossary = {}
-        
+
         # --- Состояние для пошагового режима ---
         self.wizard_conflicts_list = list(self.conflicts.keys())
         self.wizard_current_index = 0
@@ -1397,21 +1369,98 @@ class DirectConflictResolverDialog(QDialog):
                 gen_note_btn = QPushButton(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogContentsView), "")
                 gen_note_btn.setFixedSize(24, 24)
                 gen_note_btn.setToolTip("Сгенерировать примечание")
-                gen_note_btn.clicked.connect(lambda ch, r=i: self.generate_note_for_table(r))
+                # ИСПРАВЛЕНИЕ: раньше в замыкании захватывался индекс строки
+                # на момент построения таблицы (r=i). После ручного удаления
+                # ДРУГОЙ строки (см. _delete_conflict_row) все строки ниже
+                # неё сдвигаются вверх, и захваченный индекс перестаёт
+                # соответствовать реальной строке кнопки. Теперь строка
+                # определяется динамически по текущему положению контейнера
+                # actions_widget в таблице (_row_of_cell_widget), поэтому
+                # устареть не может.
+                gen_note_btn.clicked.connect(
+                    lambda ch, aw=actions_widget: self.generate_note_for_table(
+                        self._row_of_cell_widget(aw, 5)
+                    )
+                )
                 actions_layout.addWidget(gen_note_btn)
-            
+
             delete_btn = QPushButton(delete_icon, "")
             delete_btn.setToolTip("Удалить этот конфликт из списка")
-            delete_btn.clicked.connect(lambda checked, row=i: self.table.removeRow(row))
+            # ИСПРАВЛЕНИЕ: раньше в замыкании захватывался индекс строки на
+            # момент построения таблицы (row=i). После первого ручного
+            # removeRow() персистентные виджеты нижних строк визуально
+            # сдвигались вверх, но их кнопки продолжали хранить старый
+            # индекс — повторное нажатие удаляло не тот термин. Теперь
+            # кнопка хранит сам термин, а _delete_conflict_row удаляет ровно
+            # одну строку таблицы (без полной перестройки — та сбрасывала бы
+            # выбор пользователя во ВСЕХ остальных строках).
+            delete_btn.clicked.connect(lambda checked, t=term: self._delete_conflict_row(t))
             actions_layout.addWidget(delete_btn)
             self.table.setCellWidget(i, 5, actions_widget)
 
             combo.setProperty("options", trans_options)
-            combo.setProperty("row", i)
             combo.currentIndexChanged.connect(self.on_combo_changed_for_table)
 
         self.table.resizeRowsToContents()
-    
+
+    def _row_of_cell_widget(self, widget, column):
+        """Определяет актуальный номер строки таблицы, в чьей ячейке
+        указанной колонки сейчас расположен widget.
+
+        Нужен потому, что после ручного удаления одной строки (removeRow)
+        Qt сам корректно переносит персистентные виджеты нижних строк
+        вверх вместе с их состоянием, но любой индекс, заранее захваченный
+        в замыкании или сохранённый в свойстве виджета при построении
+        таблицы, при этом устаревает. Поиск по текущему положению виджета
+        всегда актуален и не может рассинхронизироваться.
+        """
+        for row in range(self.table.rowCount()):
+            if self.table.cellWidget(row, column) is widget:
+                return row
+        return -1
+
+    def _update_conflicts_count_label(self):
+        """Обновляет подпись «Найдено N терминов…» над табличным режимом."""
+        if hasattr(self, 'table_widget') and self.table_widget.layout():
+            top_bar_layout = self.table_widget.layout().itemAt(0).layout()
+            if top_bar_layout and top_bar_layout.itemAt(0) and isinstance(top_bar_layout.itemAt(0).widget(), QLabel):
+                top_bar_layout.itemAt(0).widget().setText(
+                    f"<b>Найдено {len(self.conflicts)} терминов с несколькими вариантами перевода.</b>"
+                )
+
+    def _delete_conflict_row(self, term):
+        """Удаляет термин из self.conflicts и убирает ровно его строку из
+        таблицы.
+
+        ИСПРАВЛЕНИЕ: раньше метод полностью перестраивал таблицу через
+        _populate_table(), которая создаёт все виджеты заново — комбобокс
+        сбрасывался на первый вариант, ячейка «Свой вариант» очищалась, а
+        примечание перезаписывалось значением по умолчанию ВО ВСЕХ
+        остальных строках, а не только в удаляемой. Теперь удаляется
+        только сама строка (removeRow корректно переносит состояние
+        нижних строк вверх), а self.conflicts и список визарда
+        синхронизируются отдельно.
+        """
+        row = None
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item is not None and item.text() == term:
+                row = r
+                break
+        if row is not None:
+            self.table.removeRow(row)
+
+        self.conflicts.pop(term, None)
+
+        # Синхронизируем список визарда с self.conflicts (как это уже
+        # делает auto_resolve_by_frequency) — иначе переход в пошаговый
+        # режим падает с KeyError на удалённом термине.
+        self.wizard_conflicts_list = list(self.conflicts.keys())
+        if self.wizard_current_index >= len(self.wizard_conflicts_list):
+            self.wizard_current_index = max(0, len(self.wizard_conflicts_list) - 1)
+
+        self._update_conflicts_count_label()
+
     def auto_resolve_by_frequency(self):
         resolved_count = 0
         reduced_count = 0
@@ -1509,12 +1558,9 @@ class DirectConflictResolverDialog(QDialog):
              self.wizard_progress_label.setText("Готово")
         
         # Обновляем заголовок таблицы (если виджет существует)
-        if hasattr(self, 'table_widget') and self.table_widget.layout():
-            top_bar_layout = self.table_widget.layout().itemAt(0).layout()
-            if top_bar_layout and top_bar_layout.itemAt(0) and isinstance(top_bar_layout.itemAt(0).widget(), QLabel):
-                 top_bar_layout.itemAt(0).widget().setText(f"<b>Найдено {len(self.conflicts)} терминов с несколькими вариантами перевода.</b>")
+        self._update_conflicts_count_label()
 
-        QMessageBox.information(self, "Результат схлопывания", 
+        QMessageBox.information(self, "Результат схлопывания",
                                 f"Автоматически разрешено конфликтов: {resolved_count}\n"
                                 f"Упрощено (удалены слабые варианты): {reduced_count}\n\n"
                                 f"Осталось разобрать вручную: {len(self.conflicts)}")
@@ -1533,7 +1579,12 @@ class DirectConflictResolverDialog(QDialog):
              return
 
         term = self.wizard_conflicts_list[self.wizard_current_index]
-        options = self.conflicts[term]
+        # Защитная страховка: term мог быть удалён из self.conflicts не
+        # через штатную синхронизацию (см. _delete_conflict_row) — тогда
+        # просто не показываем шаг вместо падения с KeyError.
+        options = self.conflicts.get(term)
+        if options is None:
+            return
 
         self.wizard_progress_label.setText(f"<b>Шаг {self.wizard_current_index + 1} из {len(self.wizard_conflicts_list)}</b>")
         self.wizard_term_label.setText(term)
@@ -1680,7 +1731,12 @@ class DirectConflictResolverDialog(QDialog):
 
     def on_combo_changed_for_table(self, index):
         combo = self.sender()
-        row = combo.property("row")
+        # ИСПРАВЛЕНИЕ: раньше номер строки брался из свойства "row",
+        # выставленного один раз при построении таблицы, — после ручного
+        # удаления другой строки (см. _delete_conflict_row) это значение
+        # устаревало. Определяем строку динамически по текущему положению
+        # самого комбобокса.
+        row = self._row_of_cell_widget(combo, 2)
         options = combo.property("options")
         custom_variant_item = self.table.item(row, 3)
         note_item = self.table.item(row, 4)

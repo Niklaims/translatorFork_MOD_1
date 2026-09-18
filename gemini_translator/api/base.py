@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QApplication
 from ..utils.async_helpers import run_sync
 from ..utils.debug_logger import create_operation_trace
 from ..utils.helpers import estimate_gemini_tokens
+from . import token_usage
 from .errors import (
     OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
     ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
@@ -23,6 +24,12 @@ _current_debug_trace = contextvars.ContextVar("current_debug_trace", default=Non
 _DEFAULT_TRANSIENT_DISCONNECT_RETRIES = 1
 _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS = 1.0
 
+# Перегрузка на стороне провайдера: ответ пришёл, но сервер просит подождать.
+# Отдельно от transient-disconnect — там рвётся соединение и запрос не доехал.
+_SERVER_OVERLOAD_STATUSES = frozenset({500, 502, 503})
+_DEFAULT_SERVER_OVERLOAD_RETRIES = 3
+_DEFAULT_SERVER_OVERLOAD_RETRY_DELAY_SECONDS = 15.0
+
 
 def _get_ssl_context_signature():
     ssl_cert_file = os.environ.get("SSL_CERT_FILE") or None
@@ -32,11 +39,33 @@ def _get_ssl_context_signature():
     return ("certifi", certifi.where(), None)
 
 
+# Кэш SSL-контекстов по сигнатуре источника сертификатов. Контекст ни один
+# потребитель не мутирует, поэтому его можно разделять между сессиями:
+# ssl.create_default_context() заново читает и разбирает CA-bundle (~9 мс),
+# и без кэша эта цена платилась на каждую aiohttp-сессию — в том числе на
+# каждую попытку multi-pass/parallel-provider оркестратора (perf:network/1).
+_SSL_CONTEXT_CACHE: dict[tuple, ssl.SSLContext] = {}
+_SSL_CONTEXT_CACHE_LOCK = threading.Lock()
+
+
 def _create_ssl_context():
-    source, cafile, _capath = _get_ssl_context_signature()
+    signature = _get_ssl_context_signature()
+    with _SSL_CONTEXT_CACHE_LOCK:
+        cached = _SSL_CONTEXT_CACHE.get(signature)
+        if cached is not None:
+            return cached
+    source, cafile, _capath = signature
     if source == "env":
-        return ssl.create_default_context()
-    return ssl.create_default_context(cafile=cafile)
+        context = ssl.create_default_context()
+    else:
+        context = ssl.create_default_context(cafile=cafile)
+    with _SSL_CONTEXT_CACHE_LOCK:
+        return _SSL_CONTEXT_CACHE.setdefault(signature, context)
+
+
+def create_ssl_context():
+    """Public alias: every outbound HTTPS call must trust the same bundle."""
+    return _create_ssl_context()
 
 try:
     import requests
@@ -47,8 +76,22 @@ except ImportError:
 
 try:
     import socks
-    from aiohttp_socks import ProxyConnector, ProxyType
-    PROXY_ERRORS = (socks.ProxyError, socks.GeneralProxyError, socks.ProxyConnectionError)
+    from aiohttp_socks import (
+        ProxyConnector,
+        ProxyType,
+        ProxyError as _AiohttpSocksProxyError,
+        ProxyConnectionError as _AiohttpSocksProxyConnectionError,
+        ProxyTimeoutError as _AiohttpSocksProxyTimeoutError,
+    )
+    # aiohttp_socks оборачивает исключения python_socks в СВОИ собственные
+    # классы (aiohttp_socks/_errors.py), которые наследуют напрямую Exception,
+    # а не OSError — в отличие от python_socks.Proxy*Error. Без них отказ
+    # SOCKS-прокси на async-пути (ProxyConnector) не попадал под
+    # классификацию NetworkError ниже и улетал наружу голым `raise e`.
+    PROXY_ERRORS = (
+        socks.ProxyError, socks.GeneralProxyError, socks.ProxyConnectionError,
+        _AiohttpSocksProxyError, _AiohttpSocksProxyConnectionError, _AiohttpSocksProxyTimeoutError,
+    )
 except (ImportError, AttributeError):
     socks = None
     ProxyConnector = None
@@ -87,6 +130,37 @@ class BaseApiHandler:
         self._session_timeout = None
         self._session_ssl_context_signature = None
 
+    @staticmethod
+    def _normalize_content(content):
+        """Разбирает content LLM-ответа (строка/список чанков/None/скаляр) в
+        обычную строку. Общая логика для хендлеров, чьи API отдают content
+        как список чанков ({"text": ...} / {"content": ...} /
+        {"type": "output_text", "text": ...})."""
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if text is None:
+                        text = item.get("content")
+                    if text is None and item.get("type") == "output_text":
+                        text = item.get("text")
+                    if text is not None:
+                        parts.append(str(text))
+                elif item is not None:
+                    parts.append(str(item))
+            return "".join(parts)
+
+        if content is None:
+            return ""
+
+        return str(content)
+
     def _proactive_session_init(self):
         # No-op: the session is created lazily and asynchronously on first
         # `await self._get_or_create_session_internal()` (e.g. in call_api).
@@ -94,41 +168,117 @@ class BaseApiHandler:
         # loop. Kept as a method so existing setup_client callers stay valid.
         return
 
+    @staticmethod
+    def _usage_count(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
+
+    def _remember_token_usage(self, input_tokens, output_tokens, total_tokens=None, cached_tokens=None, thinking_tokens=None):
+        """Keep what the provider billed for the attempt in flight; the latest report wins.
+
+        The numbers go to the attempt's tally, not to the handler: one handler
+        serves several requests of a worker at once.
+        """
+        token_usage.remember(
+            input_tokens,
+            output_tokens,
+            cached_tokens=cached_tokens,
+            thinking_tokens=thinking_tokens,
+            total_tokens=total_tokens,
+        )
+
+    def _remember_openai_usage(self, usage):
+        """Take the usage object of an OpenAI-compatible response or stream chunk.
+
+        Reasoning tokens are already counted in completion_tokens there;
+        completion_tokens_details.reasoning_tokens tells their share.
+        """
+        if not isinstance(usage, dict):
+            return
+        prompt_tokens = self._usage_count(usage.get("prompt_tokens"))
+        completion_tokens = self._usage_count(usage.get("completion_tokens"))
+        if prompt_tokens is None and completion_tokens is None:
+            return
+        details = usage.get("prompt_tokens_details")
+        cached_tokens = self._usage_count(details.get("cached_tokens")) if isinstance(details, dict) else None
+        if cached_tokens is None:
+            # DeepSeek reports its context cache under its own name.
+            cached_tokens = self._usage_count(usage.get("prompt_cache_hit_tokens"))
+        completion_details = usage.get("completion_tokens_details")
+        thinking_tokens = (
+            self._usage_count(completion_details.get("reasoning_tokens"))
+            if isinstance(completion_details, dict)
+            else None
+        )
+        self._remember_token_usage(
+            prompt_tokens or 0,
+            completion_tokens or 0,
+            self._usage_count(usage.get("total_tokens")),
+            cached_tokens,
+            thinking_tokens,
+        )
+
+    def _token_usage_provider(self):
+        for config_name in ("model_config", "provider_config"):
+            config = getattr(self.worker, config_name, None)
+            if isinstance(config, dict) and config.get("provider"):
+                return config["provider"]
+        return None
+
+    def _token_usage_event(self, usage, *, estimated) -> dict:
+        event = dict(
+            usage,
+            estimated=estimated,
+            model_id=getattr(self.worker, "model_id", None),
+            provider=self._token_usage_provider(),
+        )
+        # A worker that is not a translation worker (QA inside a translation
+        # session) names its operation; everything else is counted by the reader.
+        operation = getattr(self.worker, "token_usage_operation", None)
+        if isinstance(operation, str) and operation:
+            event["operation"] = operation
+        return event
+
     def _estimate_token_usage(self, prompt, response_text) -> dict:
-        provider = (getattr(self.worker, "model_config", {}) or {}).get("provider", "")
-        if not provider:
-            if "gemini" in type(self).__name__.lower():
-                provider = "gemini"
-            else:
-                provider = "openrouter"
+        reported = token_usage.reported()
+        if reported:
+            return self._token_usage_event(reported, estimated=False)
+        input_tokens = estimate_gemini_tokens(prompt)
+        output_tokens = estimate_gemini_tokens(response_text)
+        return self._token_usage_event(
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            },
+            estimated=True,
+        )
 
-        if provider.lower() == "gemini":
-            from ..utils.helpers import estimate_gemini_tokens
-            input_tokens = estimate_gemini_tokens(prompt)
-            output_tokens = estimate_gemini_tokens(response_text)
-        else:
-            from ..utils.helpers import estimate_openrouter_tokens
-            input_tokens = estimate_openrouter_tokens(prompt)
-            output_tokens = estimate_openrouter_tokens(response_text)
-
-        return {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "estimated": True,
-            "model_id": getattr(self.worker, "model_id", None),
-            "provider": provider,
-        }
+    def _publish_token_usage(self, usage) -> None:
+        try:
+            # Looked up on the module at call time: the nolib bridge replaces it.
+            token_usage.publish_token_usage(usage, getattr(self.worker, "_post_event", None))
+        except Exception:
+            # Accounting never fails the request it accounts for.
+            pass
 
     def _post_token_usage(self, prompt, response_text) -> None:
         try:
             usage = self._estimate_token_usage(prompt, response_text)
         except Exception:
             return
+        self._publish_token_usage(usage)
 
-        poster = getattr(self.worker, "_post_event", None)
-        if callable(poster):
-            poster("token_usage_updated", usage)
+    def _post_failed_attempt_token_usage(self) -> None:
+        """A failed attempt is billed too: publish what the provider reported for it."""
+        reported = token_usage.reported()
+        if reported:
+            self._publish_token_usage(self._token_usage_event(reported, estimated=False))
 
     def setup_client(self, client_override=None, proxy_settings=None):
         """Базовая настройка."""
@@ -188,7 +338,12 @@ class BaseApiHandler:
         timeout = aiohttp.ClientTimeout(total=api_timeout)
         # No explicit loop=: ClientSession binds to asyncio.get_running_loop(),
         # so the session and its connector always share the loop running this call.
-        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, read_bufsize=1048576 * 10)
+        # trust_env=False (явно): единственный источник прокси — proxy_settings
+        # приложения (см. _build_connector выше и qa/assembly.aiohttp_session_factory),
+        # переменные окружения HTTP_PROXY/HTTPS_PROXY (trust_env читает только их и
+        # ~/.netrc, не системный прокси Windows/macOS) не должны молча подменять маршрут —
+        # тот же принцип, что и в utils/updater.build_updater_session.
+        self._session = aiohttp.ClientSession(timeout=timeout, connector=connector, trust_env=False)
         self._session_proxy_signature = desired_proxy_signature
         self._session_timeout = api_timeout
         self._session_ssl_context_signature = desired_ssl_context_signature
@@ -309,6 +464,53 @@ class BaseApiHandler:
             base_delay = _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS
         return base_delay * max(1, attempt)
 
+    @staticmethod
+    def _is_server_overload_status(status: int) -> bool:
+        """Провайдер жив, но просит подождать: 500/502/503."""
+        return status in _SERVER_OVERLOAD_STATUSES
+
+    def _server_overload_retry_attempts(self) -> int:
+        raw_value = self._config_value(
+            "server_overload_retries",
+            _DEFAULT_SERVER_OVERLOAD_RETRIES,
+        )
+        try:
+            return max(1, int(raw_value))
+        except (TypeError, ValueError):
+            return _DEFAULT_SERVER_OVERLOAD_RETRIES
+
+    def _server_overload_retry_delay(self, attempt: int) -> float:
+        raw_value = self._config_value(
+            "server_overload_retry_delay_seconds",
+            _DEFAULT_SERVER_OVERLOAD_RETRY_DELAY_SECONDS,
+        )
+        try:
+            base_delay = max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            base_delay = _DEFAULT_SERVER_OVERLOAD_RETRY_DELAY_SECONDS
+        return base_delay * max(1, attempt)
+
+    async def _retry_after_server_overload(self, status: int, attempt: int, service_name: str) -> bool:
+        """Ждёт и отвечает, повторять ли запрос после ответа `status`.
+
+        `attempt` — номер только что провалившейся попытки, начиная с 1. Когда
+        попытки исчерпаны, метод возвращает False СРАЗУ: пауза перед отказом
+        никого не дожидается, а раньше каждый из трёх хендлеров успевал так
+        проспать лишние 45 секунд.
+        """
+        if status not in _SERVER_OVERLOAD_STATUSES:
+            return False
+        if attempt >= self._server_overload_retry_attempts():
+            return False
+
+        delay = self._server_overload_retry_delay(attempt)
+        self.worker._post_event('log_message', {
+            'message': f"⏳ Сервер {service_name} перегружен ({status}). Ждём {delay:g} с перед повтором."
+        })
+        if delay:
+            await asyncio.sleep(delay)
+        return True
+
     def _exception_chain(self, error: Exception):
         seen = set()
         stack = [error]
@@ -360,12 +562,8 @@ class BaseApiHandler:
         context = f" при запросе к {service_name}" if service_name else ""
         if isinstance(error, aiohttp.ServerDisconnectedError):
             category = "Сервер разорвал соединение"
-            return f"{category}{context}"
         elif isinstance(error, (aiohttp.ClientSSLError, ssl.SSLError)):
             category = "Ошибка SSL/TLS"
-        elif isinstance(error, aiohttp.ClientPayloadError):
-            category = "Сервер некорректно прервал передачу данных"
-            return f"{category}{context} (ClientPayloadError)"
         else:
             category = "Сетевой сбой"
         return f"{category}{context} ({type(error).__name__}): {error}"
@@ -440,42 +638,49 @@ class BaseApiHandler:
 
         try:
             while True:
+                # Every attempt fills its own tally: neither a retry nor a
+                # neighbouring request on this handler sees these numbers.
+                usage_token = token_usage.begin_attempt()
                 try:
-                    if self.is_async_native:
-                        result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
-                    else:
-                        result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
-                    break
-                except asyncio.CancelledError as exc:
-                    if self._is_shutdown_cancellation():
-                        raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
+                    try:
+                        if self.is_async_native:
+                            result = await self._async_executor(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                        else:
+                            result = await self._sync_executor_wrapper(prompt, log_prefix, allow_incomplete, use_stream, debug, max_output_tokens)
+                    except asyncio.CancelledError as exc:
+                        self._post_failed_attempt_token_usage()
+                        if self._is_shutdown_cancellation():
+                            raise OperationCancelledError("Операция отменена системой (asyncio.CancelledError)") from exc
 
-                    error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
-                    self._force_session_reset()
-                    raise NetworkError(error_msg, delay_seconds=10) from exc
-                except Exception as exc:
-                    if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
-                        self._debug_record_error(
-                            exc,
-                            attempt=attempt,
-                            extra={
-                                "transient_disconnect_retry": True,
-                                "next_attempt": attempt + 1,
-                            },
-                        )
+                        error_msg = "Запрос прерван (CancelledError). Вероятная причина: таймаут DNS или сброс соединения."
                         self._force_session_reset()
-                        delay = self._transient_disconnect_retry_delay(attempt)
-                        if delay:
-                            await asyncio.sleep(delay)
-                        attempt += 1
-                        continue
+                        raise NetworkError(error_msg, delay_seconds=10) from exc
+                    except Exception as exc:
+                        self._post_failed_attempt_token_usage()
+                        if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
+                            self._debug_record_error(
+                                exc,
+                                attempt=attempt,
+                                extra={
+                                    "transient_disconnect_retry": True,
+                                    "next_attempt": attempt + 1,
+                                },
+                            )
+                            self._force_session_reset()
+                            delay = self._transient_disconnect_retry_delay(attempt)
+                            if delay:
+                                await asyncio.sleep(delay)
+                            attempt += 1
+                            continue
 
-                    self._process_exception_and_counters(exc)
-                    raise
+                        self._process_exception_and_counters(exc)
+                        raise
 
-            self._finalize_debug_trace(trace, started_at=started_at, status="success")
-            self._post_token_usage(prompt, result)
-            return result
+                    self._finalize_debug_trace(trace, started_at=started_at, status="success")
+                    self._post_token_usage(prompt, result)
+                    return result
+                finally:
+                    token_usage.end_attempt(usage_token)
         except Exception as exc:
             self._finalize_debug_trace(
                 trace,
@@ -602,7 +807,9 @@ class BaseApiHandler:
         # ЛОГИКА СБРОСА СЕССИИ
         # Если это NetworkError или ошибка aiohttp, сбрасываем сессию,
         # так как коннектор может быть в "битом" состоянии.
-        is_aiohttp_error = isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, OSError))
+        # PROXY_ERRORS (aiohttp_socks) — те же «транспортные» сбои: после них коннектор
+        # тоже может остаться битым, а по тексту их не всегда видно.
+        is_aiohttp_error = isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, OSError) + tuple(PROXY_ERRORS))
         # Проверяем также по тексту ошибки, если она завернута
         error_text = str(e).lower()
         is_disconnect = "disconnected" in error_text or "connection" in error_text or "closed" in error_text

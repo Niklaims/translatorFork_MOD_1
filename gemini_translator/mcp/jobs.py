@@ -5,12 +5,35 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import secrets
+import threading
 
+from ..utils.io_utils import atomic_write_text
+from ._json_io import load_task_json
 from .paths import ensure_state_dirs, job_dir
 
 TEXT_FIELD_HINTS = ("text", "prompt", "chapter", "response", "content")
 SECRET_FIELD_HINTS = ("api_key", "api-key", "token", "secret", "password")
 SECRET_ARG_OPTIONS = {"--api-key", "--token", "--password"}
+
+# perf:cpu-idle-background/3: кэш РАЗОБРАННОГО СЛОВАРЯ job.json по пути файла,
+# чтобы list_jobs() не перечитывал и не парсил JSON давно завершённых задач,
+# которые больше никогда не меняются, на каждый опрос /status. Кэшируется
+# именно dict (то, что вернул json.loads), а не JobRecord: JobRecord —
+# изменяемый объект, который боевой код (_pipeline_allows_start ->
+# mark_finished) правит на месте ДО save_job, и если бы кэш раздавал один и
+# тот же инстанс всем вызовам list_jobs(), такая мутация была бы видна всем
+# потребителям немедленно, а при сбое save_job — навсегда разошлась бы с
+# диском. JobRecord.from_dict() строится заново на каждый вызов list_jobs(),
+# так что вызывающий код всегда получает приватную, свежую запись; кэшу
+# принадлежит только дорогая часть — read_text()+json.loads().
+# Ключ — путь к job.json (str от Path.resolve(), не зависит от того, был ли
+# state_dir относительным); значение — ((mtime_ns, size) на момент чтения,
+# разобранный dict). Файл перечитывается заново, только когда mtime ИЛИ
+# размер реально изменились (пара, а не один mtime_ns — защита от «racily
+# clean» на файловых системах с грубым разрешением времени, где два
+# перезаписанных статуса задачи могут попасть в один и тот же тик часов).
+_LIST_JOBS_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+_LIST_JOBS_CACHE_LOCK = threading.Lock()
 
 
 def utc_now() -> str:
@@ -111,22 +134,14 @@ def job_path(state_dir: Path, job_id: str) -> Path:
 def save_job(state_dir: Path, job: JobRecord) -> None:
     directory = job_dir(state_dir, job.id)
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / "job.json"
     payload = json.dumps(job.to_dict(), ensure_ascii=False, indent=2)
-    temp_path = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
-    try:
-        temp_path.write_text(payload, encoding="utf-8")
-        temp_path.replace(path)
-    finally:
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+    # dups-gt_mcp_ai_bridge-53: общий атомарный хелпер (уникальный temp-файл,
+    # fsync, подчистка) вместо собственной temp+replace копии.
+    atomic_write_text(directory / "job.json", payload)
 
 
 def load_job(state_dir: Path, job_id: str) -> JobRecord:
-    payload = json.loads(job_path(state_dir, job_id).read_text(encoding="utf-8"))
-    return JobRecord.from_dict(payload)
+    return load_task_json(job_path(state_dir, job_id), JobRecord.from_dict)
 
 
 def list_jobs(state_dir: Path) -> list[JobRecord]:
@@ -134,8 +149,32 @@ def list_jobs(state_dir: Path) -> list[JobRecord]:
     if not root.exists():
         return []
     jobs = []
+    seen_keys: set[str] = set()
     for path in sorted(root.glob("*/job.json")):
-        jobs.append(JobRecord.from_dict(json.loads(path.read_text(encoding="utf-8"))))
+        cache_key = str(path.resolve())
+        seen_keys.add(cache_key)
+        stat_result = path.stat()
+        stat_key = (stat_result.st_mtime_ns, stat_result.st_size)
+        with _LIST_JOBS_CACHE_LOCK:
+            cached = _LIST_JOBS_CACHE.get(cache_key)
+        if cached is not None and cached[0] == stat_key:
+            payload = cached[1]
+        else:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            with _LIST_JOBS_CACHE_LOCK:
+                _LIST_JOBS_CACHE[cache_key] = (stat_key, payload)
+        # Каждый вызов строит свою собственную JobRecord из кэшированного
+        # dict: from_dict копирует argv/children/metadata, поэтому мутация
+        # записи, которую делает вызывающий код (например, mark_finished
+        # в _pipeline_allows_start ДО save_job), не отравляет кэш и не видна
+        # другим потокам/вызовам.
+        jobs.append(JobRecord.from_dict(payload))
+    with _LIST_JOBS_CACHE_LOCK:
+        # Задачи, чей job.json больше не существует (директория удалена),
+        # не должны держать память бессрочно, пока живёт демон.
+        stale_keys = [key for key in _LIST_JOBS_CACHE if key not in seen_keys]
+        for key in stale_keys:
+            del _LIST_JOBS_CACHE[key]
     return sorted(jobs, key=lambda item: item.created_at, reverse=True)
 
 

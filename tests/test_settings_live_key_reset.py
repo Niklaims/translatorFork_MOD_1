@@ -31,30 +31,36 @@ class SettingsLiveKeyResetTests(unittest.TestCase):
         self.addCleanup(self.temp_dir.cleanup)
 
     def _create_manager(self, bus):
-        return SettingsManager(
+        manager = SettingsManager(
             event_bus=bus,
             config_file=os.path.join(self.temp_dir.name, "settings.json"),
         )
+        # Менеджер переживает тест (его держит подписка на aboutToQuit), а
+        # таймер обслуживания лимитов тикает раз в 5 с и после удаления
+        # временного каталога: хранилище квот пересоздаёт пустую базу и падает
+        # с «no such table» внутри чужого теста, который крутит цикл событий.
+        self.addCleanup(manager._limit_maintenance_timer.stop)
+        # Хранилище квот держит соединение с базой открытым, а Windows не даёт
+        # удалить временный каталог с открытым файлом.
+        self.addCleanup(manager._key_runtime_store.close)
+        return manager
 
     def test_expired_gemini_key_is_reset_and_announced_without_reload(self):
         bus = _RecordingBus()
         manager = self._create_manager(bus)
 
         expired_at = int(time.time()) - (48 * 60 * 60)
-        with manager.file_lock:
-            manager._cache["api_keys_with_status"] = [
-                {
-                    "key": "GEMINI_TEST_KEY",
-                    "provider": "gemini",
-                    "status_by_model": {
-                        "gemini-test-model": {
-                            "exhausted_at": expired_at,
-                            "exhausted_level": 2,
-                            "requests": [expired_at],
-                        }
-                    },
+        manager.save_key_statuses([{"key": "GEMINI_TEST_KEY", "provider": "gemini"}])
+        # save_key_statuses пишет только конфигурацию; runtime живёт в SQLite.
+        manager._key_runtime_store.merge_statuses({
+            "GEMINI_TEST_KEY": {
+                "gemini-test-model": {
+                    "exhausted_at": expired_at,
+                    "exhausted_level": 2,
+                    "requests": [expired_at],
                 }
-            ]
+            }
+        })
 
         bus.events.clear()
         manager._refresh_expired_key_limits()
@@ -82,31 +88,27 @@ class SettingsLiveKeyResetTests(unittest.TestCase):
         manager = self._create_manager(_RecordingBus())
         now = int(time.time())
         expired_at = now - (48 * 60 * 60)
-        with manager.file_lock:
-            manager._cache["api_keys_with_status"] = [
-                {
-                    "key": "CURRENTLY_LIMITED_KEY",
-                    "provider": "gemini",
-                    "status_by_model": {
-                        "gemini-test-model": {
-                            "exhausted_at": now,
-                            "exhausted_level": 2,
-                            "requests": [now],
-                        }
-                    },
-                },
-                {
-                    "key": "EXPIRED_KEY",
-                    "provider": "gemini",
-                    "status_by_model": {
-                        "gemini-test-model": {
-                            "exhausted_at": expired_at,
-                            "exhausted_level": 2,
-                            "requests": [expired_at],
-                        }
-                    },
-                },
-            ]
+        manager.save_key_statuses([
+            {"key": "CURRENTLY_LIMITED_KEY", "provider": "gemini"},
+            {"key": "EXPIRED_KEY", "provider": "gemini"},
+        ])
+        # save_key_statuses пишет только конфигурацию; runtime живёт в SQLite.
+        manager._key_runtime_store.merge_statuses({
+            "CURRENTLY_LIMITED_KEY": {
+                "gemini-test-model": {
+                    "exhausted_at": now,
+                    "exhausted_level": 2,
+                    "requests": [now],
+                }
+            },
+            "EXPIRED_KEY": {
+                "gemini-test-model": {
+                    "exhausted_at": expired_at,
+                    "exhausted_level": 2,
+                    "requests": [expired_at],
+                }
+            },
+        })
 
         statuses = {
             item["key"]: item for item in manager.load_key_statuses()

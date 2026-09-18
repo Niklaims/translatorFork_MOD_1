@@ -3,11 +3,13 @@
 import atexit
 import os
 import json
+from pathlib import Path
 # --- ИЗМЕНЕНИЕ 1: Импортируем threading целиком ---
 import threading
 import weakref
 
 from . import fast_json
+from .io_utils import atomic_write_bytes, atomic_write_json, atomic_write_text
 
 try:
     import zstandard as _zstd
@@ -55,6 +57,27 @@ except (ImportError, AttributeError):
     print("[ProjectManager WARN] PatientLock не найден. Используется стандартный RLock.")
     from threading import RLock as PatientLock
 
+# Лок на файл карты проекта, а не на экземпляр: несколько живых
+# TranslationProjectManager на одну и ту же project_folder (основное окно
+# перевода + диалог глоссария/анализатора частотности, открытые параллельно)
+# обязаны сериализовать свои read-modify-write через ОДИН и тот же объект,
+# иначе более поздний flush() затирает диск снимком, снятым до записи
+# другого экземпляра, и молча теряет его регистрации. WeakValueDictionary —
+# лок живёт, пока жив хотя бы один менеджер этого файла, и не течёт после.
+_MAP_LOCKS_GUARD = threading.Lock()
+_MAP_LOCKS = weakref.WeakValueDictionary()
+
+
+def _get_shared_map_lock(map_file_path):
+    """Возвращает единый на процесс лок для конкретного файла карты проекта."""
+    key = os.path.abspath(map_file_path)
+    with _MAP_LOCKS_GUARD:
+        lock = _MAP_LOCKS.get(key)
+        if lock is None:
+            lock = PatientLock()
+            _MAP_LOCKS[key] = lock
+        return lock
+
 import zipfile
 import re
 from ..api import config as api_config
@@ -75,7 +98,7 @@ class TranslationProjectManager:
         self.validation_cache_zst_path = self.validation_cache_path + '.zst'
         self.term_frequency_cache_path = os.path.join(project_folder, 'term_frequency_cache.json')
         self.chapter_analysis_cache_path = os.path.join(project_folder, 'chapter_analysis_cache.json')
-        self.lock = PatientLock()
+        self.lock = _get_shared_map_lock(self.map_file_path)
         # Отложенные регистрации: register_translation вызывается на каждую
         # главу, а полная перезапись растущего файла на каждую делает
         # суммарную запись за сессию квадратичной. Регистрации копятся здесь
@@ -89,6 +112,18 @@ class TranslationProjectManager:
 
     FLUSH_DEBOUNCE_SECONDS = 1.5
 
+    def get_translation_qa_journal_path(self) -> Path:
+        """Return the durable QA decision-history journal path for this project."""
+        return Path(self.project_folder) / 'translation_qa.json'
+
+    def get_translation_qa_backup_dir(self) -> Path:
+        """Return the directory reserved for reversible QA history backups."""
+        return Path(self.project_folder) / 'translation_qa_backups'
+
+    def get_translation_qa_embedding_cache_dir(self) -> Path:
+        """Return the dedicated disposable semantic-embedding cache directory."""
+        return Path(self.project_folder) / 'translation_qa_embedding_cache'
+
     def _load(self):
         _flush_pending_for_map(self.map_file_path, exclude=self)
         with self.lock:
@@ -100,16 +135,14 @@ class TranslationProjectManager:
             return {}
 
     def _write_map_file_unsafe(self, data_to_save):
-        """Атомарная запись карты: tmp-файл + os.replace (под блокировкой)."""
-        os.makedirs(os.path.dirname(self.map_file_path), exist_ok=True)
-        tmp_path = self.map_file_path + ".tmp"
-        with open(tmp_path, 'w', encoding='utf-8') as f:
-            json.dump(data_to_save, f, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp_path, self.map_file_path)
-
-    def _save_internal(self, data_to_save):
-        with self.lock:
-            self._save_unsafe(data_to_save)
+        """Атомарная запись карты через общий writer (под блокировкой)."""
+        payload = json.dumps(
+            data_to_save,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        atomic_write_text(self.map_file_path, payload)
 
     def _save_unsafe(self, data_to_save):
         """Внутренний метод, вызывается, когда блокировка уже установлена.
@@ -183,30 +216,77 @@ class TranslationProjectManager:
             self.data[path1][version_suffix] = path2
             self._schedule_flush_unsafe()
 
+    def _version_map_file_path(self):
+        return os.path.join(self.project_folder, 'glossary_versions.json')
+
+    def _load_version_map_unsafe(self):
+        """Вызывается, когда self.lock уже удержан (или не нужен)."""
+        version_file = self._version_map_file_path()
+        if os.path.exists(version_file):
+            try:
+                with open(version_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def _write_version_map_unsafe(self, version_map):
+        """Атомарная запись карты версий через общий writer (под self.lock)."""
+        version_file = self._version_map_file_path()
+        try:
+            payload = json.dumps(version_map, ensure_ascii=False, indent=2)
+            atomic_write_text(version_file, payload)
+        except Exception as e:
+            print(f"[ProjectManager] Ошибка сохранения версий: {e}")
+            raise
+
     def load_version_map(self):
         """
         Загружает карту версий терминов (glossary_versions.json).
         Возвращает dict: { 'Original Term': [ {scope: [], override: {}}, ... ] }
         """
-        version_file = os.path.join(self.project_folder, 'glossary_versions.json')
         with self.lock:
-            if os.path.exists(version_file):
-                try:
-                    with open(version_file, 'r', encoding='utf-8') as f:
-                        return json.load(f)
-                except Exception:
-                    return {}
-            return {}
+            return self._load_version_map_unsafe()
 
     def save_version_map(self, version_map):
-        """Сохраняет карту версий."""
-        version_file = os.path.join(self.project_folder, 'glossary_versions.json')
+        """Сохраняет карту версий целиком.
+
+        Ошибка записи логируется и пробрасывается вызывающему коду —
+        единственный вызывающий (TermVersioningDialog) показывает её
+        пользователю через QMessageBox, поэтому тихое проглатывание
+        здесь сделало бы сбой сохранения версий термина незаметным.
+
+        Перезаписывает ВЕСЬ файл переданным словарём — если между чтением
+        и этим вызовом карту менял кто-то ещё, его правки будут потеряны.
+        Для правки одного термина без этого риска используйте
+        update_term_versions()."""
         with self.lock:
-            try:
-                with open(version_file, 'w', encoding='utf-8') as f:
-                    json.dump(version_map, f, ensure_ascii=False, indent=2)
-            except Exception as e:
-                print(f"[ProjectManager] Ошибка сохранения версий: {e}")
+            self._write_version_map_unsafe(version_map)
+
+    def update_term_versions(self, term, rules):
+        """Атомарно перечитывает карту версий, заменяет записи одного
+        термина и сохраняет — read-modify-write под ОДНИМ удержанием
+        self.lock, а не read (в конструкторе диалога) + write (полным
+        устаревшим снимком) по отдельности.
+
+        Закрывает окно lost update: если конструктор TermVersioningDialog
+        прочитал карту, а до его сохранения кто-то ещё (второй открытый
+        диалог версий, воркер перевода и т.п.) успел изменить карту через
+        этот же project_manager, тот вклад не будет затёрт устаревшим
+        снимком диалога.
+
+        rules == [] или None удаляет термин из карты (как раньше делал
+        TermVersioningDialog._save_all_versions).
+
+        Возвращает получившуюся полную карту версий."""
+        with self.lock:
+            current = self._load_version_map_unsafe()
+            if rules:
+                current[term] = rules
+            else:
+                current.pop(term, None)
+            self._write_version_map_unsafe(current)
+            return current
     
     def remove_translation(self, original_internal_path, version_suffix):
         """Атомарно удаляет одну версию перевода."""
@@ -636,18 +716,17 @@ class TranslationProjectManager:
             os.makedirs(os.path.dirname(self.validation_cache_path), exist_ok=True)
             serialized = fast_json.dumps(payload, indent=2, sort_keys=True)
             if _zstd is not None:
-                tmp_path = self.validation_cache_zst_path + '.tmp'
-                with open(tmp_path, 'wb') as f:
-                    f.write(_zstd.ZstdCompressor(level=3).compress(serialized.encode('utf-8')))
-                os.replace(tmp_path, self.validation_cache_zst_path)
+                compressed = _zstd.ZstdCompressor(level=3).compress(
+                    serialized.encode('utf-8')
+                )
+                atomic_write_bytes(self.validation_cache_zst_path, compressed)
                 # Легаси-файл убираем, чтобы не разъезжался со сжатым.
                 try:
                     os.remove(self.validation_cache_path)
                 except OSError:
                     pass
             else:
-                with open(self.validation_cache_path, 'w', encoding='utf-8') as f:
-                    f.write(serialized)
+                atomic_write_text(self.validation_cache_path, serialized)
 
     def load_term_frequency_cache(self):
         with self.lock:
@@ -662,9 +741,9 @@ class TranslationProjectManager:
 
     def save_term_frequency_cache(self, payload):
         with self.lock:
-            os.makedirs(os.path.dirname(self.term_frequency_cache_path), exist_ok=True)
-            with open(self.term_frequency_cache_path, 'w', encoding='utf-8') as f:
-                fast_json.dump(payload, f, indent=2, sort_keys=True)
+            atomic_write_json(
+                self.term_frequency_cache_path, payload, indent=2, sort_keys=True
+            )
 
     def get_all_originals(self):
         from .epub_tools import extract_number_from_path
@@ -812,9 +891,7 @@ class TranslationProjectManager:
             # Конвертируем set в отсортированный список для стабильного и читаемого вывода
             data_to_save = sorted(list(generated_chapters_set))
             try:
-                os.makedirs(os.path.dirname(self.glossary_map_path), exist_ok=True)
-                with open(self.glossary_map_path, 'w', encoding='utf-8') as f:
-                    json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+                atomic_write_json(self.glossary_map_path, data_to_save, indent=2)
                 print(f"[INFO] Карта сгенерированного глоссария ({len(data_to_save)} глав) сохранена.")
             except IOError as e:
                 print(f"[ERROR] Не удалось сохранить файл карты глоссария: {e}")
@@ -840,12 +917,6 @@ class TranslationProjectManager:
     def load_user_problem_terms(self) -> list:
         with self.lock:
             return self._load_user_problem_terms_unsafe()
-
-    def save_user_problem_terms(self, items: list):
-        with self.lock:
-            os.makedirs(os.path.dirname(self.user_problem_terms_path), exist_ok=True)
-            with open(self.user_problem_terms_path, 'w', encoding='utf-8') as f:
-                json.dump(items, f, ensure_ascii=False, indent=2)
 
     def upsert_user_problem_terms(self, new_items: list):
         with self.lock:
@@ -885,9 +956,7 @@ class TranslationProjectManager:
                     str(item.get('id', '')),
                 )
             )
-            os.makedirs(os.path.dirname(self.user_problem_terms_path), exist_ok=True)
-            with open(self.user_problem_terms_path, 'w', encoding='utf-8') as f:
-                json.dump(data_to_save, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.user_problem_terms_path, data_to_save, indent=2)
 
             return {
                 'added': added,
@@ -914,9 +983,7 @@ class TranslationProjectManager:
             if removed_count == 0:
                 return 0
 
-            os.makedirs(os.path.dirname(self.user_problem_terms_path), exist_ok=True)
-            with open(self.user_problem_terms_path, 'w', encoding='utf-8') as f:
-                json.dump(filtered_items, f, ensure_ascii=False, indent=2)
+            atomic_write_json(self.user_problem_terms_path, filtered_items, indent=2)
 
             return removed_count
     
@@ -951,9 +1018,7 @@ class TranslationProjectManager:
         """Потокобезопасно сохраняет кэш анализа состава глав."""
         with self.lock:
             try:
-                os.makedirs(os.path.dirname(self.chapter_analysis_cache_path), exist_ok=True)
-                with open(self.chapter_analysis_cache_path, 'w', encoding='utf-8') as f:
-                    fast_json.dump(cache_data, f, indent=2)
+                atomic_write_json(self.chapter_analysis_cache_path, cache_data, indent=2)
             except IOError as e:
                 print(f"[ERROR] Не удалось сохранить кэш анализа глав: {e}")
 
@@ -962,8 +1027,6 @@ class TranslationProjectManager:
         with self.lock:
             cache_path = self._get_size_cache_path()
             try:
-                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-                with open(cache_path, 'w', encoding='utf-8') as f:
-                    fast_json.dump(cache_data, f, indent=2)
+                atomic_write_json(cache_path, cache_data, indent=2)
             except IOError as e:
                 print(f"[ERROR] Не удалось сохранить кэш размеров глав: {e}")

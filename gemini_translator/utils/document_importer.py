@@ -3,17 +3,18 @@
 
 from __future__ import annotations
 
+import codecs
 from dataclasses import dataclass
-import html as html_lib
 import os
 from pathlib import Path
 import re
-from typing import Any
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
 
 from .epub_tools import EpubCreator
+from .html_text import extract_visible_text_normalized
+from .text import escape_html
 
 
 SUPPORTED_DOCUMENT_EXTENSIONS = {
@@ -42,6 +43,32 @@ class DocumentImportError(RuntimeError):
     pass
 
 
+def set_all_checked(widget, checked: bool, column: int = 0) -> None:
+    """Установить чекбокс всех строк ``QTableWidget``/``QListWidget``.
+
+    Единая точка для паттерна «Выбрать всё / Снять всё», продублированного
+    независимо в validation.py, benchmark_page.py, glossary_widget.py и
+    здесь же. Функция только выставляет состояние — специфичные для
+    вызывающей стороны пост-обновления (сводка выбора, оценка запуска и
+    т.п.) остаются за её пределами.
+
+    ``column`` учитывается только для ``QTableWidget`` (у ``QListWidget``
+    нет колонок). Отсутствующий в ячейке item пропускается молча — это
+    безопасный вариант, к которому приведены все бывшие копии.
+    """
+    state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+    if hasattr(widget, "rowCount"):
+        count = widget.rowCount()
+        item_at = lambda index: widget.item(index, column)  # noqa: E731
+    else:
+        count = widget.count()
+        item_at = widget.item
+    for index in range(count):
+        item = item_at(index)
+        if item:
+            item.setCheckState(state)
+
+
 @dataclass
 class DocumentChapter:
     title: str
@@ -66,16 +93,7 @@ def is_convertible_document(path: str | os.PathLike) -> bool:
 
 
 def strip_html_to_text(html_text: str) -> str:
-    try:
-        from bs4 import BeautifulSoup
-
-        return BeautifulSoup(str(html_text or ""), "html.parser").get_text(" ", strip=True)
-    except Exception:
-        return re.sub(r"<[^>]+>", " ", str(html_text or "")).strip()
-
-
-def _escape(value: Any) -> str:
-    return html_lib.escape(str(value or ""), quote=True)
+    return extract_visible_text_normalized(html_text)
 
 
 def _safe_title(value: str, fallback: str = "Глава") -> str:
@@ -108,7 +126,7 @@ def _wrap_xhtml(title: str, body_html: str) -> str:
     return f"""<?xml version='1.0' encoding='utf-8'?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head>
-  <title>{_escape(title)}</title>
+  <title>{escape_html(title)}</title>
   <meta http-equiv="Content-Type" content="text/html; charset=utf-8"/>
 </head>
 <body>
@@ -118,10 +136,51 @@ def _wrap_xhtml(title: str, body_html: str) -> str:
 
 
 def _read_text_with_fallbacks(path: Path) -> str:
+    raw_bytes = path.read_bytes()
+
+    # Сначала честно смотрим на BOM: cp1251/utf-8 в переборе ниже почти всегда
+    # "успешно", но неверно декодируют UTF-16-байты кириллического текста
+    # раньше, чем очередь доходит до настоящей кодировки (см.
+    # utils-io/bugs/1-docimp-utf16-misdecode).
+    bom_encodings = (
+        (codecs.BOM_UTF8, "utf-8-sig"),
+        (codecs.BOM_UTF32_BE, "utf-32"),
+        (codecs.BOM_UTF32_LE, "utf-32"),
+        (codecs.BOM_UTF16_BE, "utf-16"),
+        (codecs.BOM_UTF16_LE, "utf-16"),
+    )
+    for bom, encoding in bom_encodings:
+        if raw_bytes.startswith(bom):
+            try:
+                return raw_bytes.decode(encoding)
+            except UnicodeDecodeError:
+                pass
+
+    # Без BOM полагаемся на эвристику bs4 (как уже сделано в epub_json.py), но
+    # доверяем ей только результат из семейства UTF-16/UTF-32: для однобайтовых
+    # кодировок (cp1251 и т.п.) статистическая эвристика регулярно ошибается на
+    # коротких текстах (например, cp1251 путается с cp1125/windows-1250), а
+    # именно ради них ниже есть детерминированный перебор — им и оставляем
+    # решение в остальных случаях.
+    try:
+        from bs4 import UnicodeDammit
+    except ImportError:
+        pass
+    else:
+        is_html = path.suffix.lower() in {".html", ".htm", ".xhtml"}
+        decoded = UnicodeDammit(raw_bytes, is_html=is_html)
+        detected_encoding = str(decoded.original_encoding or "").lower().replace("_", "-")
+        if (
+            decoded.unicode_markup is not None
+            and not decoded.contains_replacement_characters
+            and detected_encoding.startswith(("utf-16", "utf-32"))
+        ):
+            return decoded.unicode_markup
+
     errors = []
     for encoding in ("utf-8-sig", "utf-8", "cp1251", "utf-16"):
         try:
-            return path.read_text(encoding=encoding)
+            return raw_bytes.decode(encoding)
         except UnicodeDecodeError as exc:
             errors.append(f"{encoding}: {exc}")
     raise DocumentImportError(f"Не удалось определить кодировку файла {path.name}: {'; '.join(errors[:2])}")
@@ -150,7 +209,7 @@ def _paragraphs_from_plain_text(text: str) -> str:
 
     def flush():
         if buffer:
-            paragraphs.append(f"<p>{_escape(' '.join(buffer))}</p>")
+            paragraphs.append(f"<p>{escape_html(' '.join(buffer))}</p>")
             buffer.clear()
 
     for raw_line in str(text or "").splitlines():
@@ -179,13 +238,13 @@ def _plain_text_to_chapters(text: str, title: str) -> list[DocumentChapter]:
     for pos, (start_index, heading) in enumerate(headings):
         end_index = headings[pos + 1][0] if pos + 1 < len(headings) else len(lines)
         content = "\n".join(lines[start_index + 1 : end_index])
-        body = f"<h1>{_escape(heading)}</h1>\n{_paragraphs_from_plain_text(content)}"
+        body = f"<h1>{escape_html(heading)}</h1>\n{_paragraphs_from_plain_text(content)}"
         chapters.append(DocumentChapter(title=_safe_title(heading), html=body))
     return [chapter for chapter in chapters if chapter.html.strip()]
 
 
 def _inline_markdown(text: str) -> str:
-    escaped = _escape(text)
+    escaped = escape_html(text)
     escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
@@ -205,7 +264,7 @@ def _markdown_lines_to_html(lines: list[str]) -> str:
 
     def flush_code():
         if code_lines:
-            parts.append("<pre><code>" + _escape("\n".join(code_lines)) + "</code></pre>")
+            parts.append("<pre><code>" + escape_html("\n".join(code_lines)) + "</code></pre>")
             code_lines.clear()
 
     for raw_line in lines:
@@ -301,7 +360,7 @@ def _html_to_chapters(text: str, title: str) -> list[DocumentChapter]:
         if isinstance(child, NavigableString):
             text_value = str(child).strip()
             if text_value:
-                current_parts.append(f"<p>{_escape(text_value)}</p>")
+                current_parts.append(f"<p>{escape_html(text_value)}</p>")
             continue
         if not isinstance(child, Tag):
             continue
@@ -316,7 +375,7 @@ def _html_to_chapters(text: str, title: str) -> list[DocumentChapter]:
     if current_parts:
         chapters.append(DocumentChapter(current_title, "\n".join(current_parts)))
     if not chapters:
-        chapters = [DocumentChapter(_safe_title(title), f"<p>{_escape(strip_html_to_text(text))}</p>")]
+        chapters = [DocumentChapter(_safe_title(title), f"<p>{escape_html(strip_html_to_text(text))}</p>")]
     return chapters
 
 
@@ -333,7 +392,7 @@ def _docx_heading_level(style_name: str) -> int | None:
 
 
 def _docx_run_to_html(run) -> str:
-    text = _escape(getattr(run, "text", "")).replace("\t", "&#8195;").replace("\n", "<br/>")
+    text = escape_html(getattr(run, "text", "")).replace("\t", "&#8195;").replace("\n", "<br/>")
     if not text:
         return ""
     if getattr(run, "bold", False):
@@ -354,7 +413,7 @@ def _docx_paragraph_to_html(paragraph) -> tuple[int | None, str, str] | None:
     tag = f"h{level}" if level else "p"
     run_html = "".join(_docx_run_to_html(run) for run in getattr(paragraph, "runs", [])).strip()
     if not run_html:
-        run_html = _escape(text)
+        run_html = escape_html(text)
     return level, f"<{tag}>{run_html}</{tag}>", text
 
 
@@ -364,7 +423,7 @@ def _docx_table_to_html(table) -> str:
         cells = []
         for cell in row.cells:
             paragraphs = [
-                _escape(paragraph.text.strip())
+                escape_html(paragraph.text.strip())
                 for paragraph in cell.paragraphs
                 if paragraph.text.strip()
             ]
@@ -640,9 +699,7 @@ class DocumentImportDialog(QtWidgets.QDialog):
         self.preview.setHtml(self.chapters[current_row].html)
 
     def _set_all_checked(self, checked: bool):
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for row in range(self.table.rowCount()):
-            self.table.item(row, 0).setCheckState(state)
+        set_all_checked(self.table, checked)
 
     def _delete_selected(self):
         rows = sorted({index.row() for index in self.table.selectedIndexes()}, reverse=True)
@@ -659,7 +716,7 @@ class DocumentImportDialog(QtWidgets.QDialog):
             return
         merged_parts = []
         for chapter in selected:
-            merged_parts.append(f"<h1>{_escape(chapter.title)}</h1>\n{chapter.html}")
+            merged_parts.append(f"<h1>{escape_html(chapter.title)}</h1>\n{chapter.html}")
         merged = DocumentChapter(self.title_edit.text().strip() or self.source_path.stem, "\n".join(merged_parts))
         self.chapters = [merged]
         self._populate_table()

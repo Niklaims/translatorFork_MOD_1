@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import copy
 import glob
 import html
 import json
@@ -15,10 +16,9 @@ import subprocess
 import sys
 import time
 import traceback
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlunparse
 
@@ -32,6 +32,7 @@ from gemini_translator.api.errors import (
 )
 from gemini_translator.api.factory import get_api_handler_class
 
+from . import playwright_launcher
 from .models import (
     DEFAULT_RULATE_TELEGRAM_LINK,
     DEFAULT_RULATE_VK_LINK,
@@ -93,8 +94,12 @@ TOMATO_EXE_PATTERNS = (
 )
 _TOMATO_AUTOSTART_PROCESS: subprocess.Popen | None = None
 _TOMATO_AUTOSTART_CLEANUP_REGISTERED = False
+# Защищает check-then-act над двумя глобалами выше: без блокировки два
+# параллельных воркера (например, AiPrepareWorker и CoverPromptWorker),
+# независимо решающих запустить Tomato Web UI, могли оба увидеть
+# _TOMATO_AUTOSTART_PROCESS is None и оба вызвать subprocess.Popen(...).
+_TOMATO_AUTOSTART_LOCK = Lock()
 
-QIDIAN_DESCRIPTION_HEADER = "作品简介"
 QIDIAN_DESCRIPTION_HEADERS = {
     "作品简介",
     "内容简介",
@@ -263,56 +268,16 @@ def normalize_rulate_tags(value) -> list[str]:
         value,
         allowed=allowed_tags,
         fallback=_fallback_tags_from_allowed(allowed_tags),
+        limit=15,
     )
 
 
-def configure_playwright_runtime() -> None:
-    if sys.platform == "win32" and hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
-        try:
-            current_policy = asyncio.get_event_loop_policy()
-        except Exception:
-            current_policy = None
-        if not isinstance(current_policy, asyncio.WindowsProactorEventLoopPolicy):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-    resolved_paths = {
-        "PLAYWRIGHT_BROWSERS_PATH": api_config.find_playwright_browsers_path(),
-        "PLAYWRIGHT_NODEJS_PATH": api_config.find_node_executable(),
-        "PLAYWRIGHT_PACKAGE_ROOT": api_config.find_playwright_package_root(),
-    }
-    for env_name, resolved_path in resolved_paths.items():
-        if not resolved_path:
-            continue
-        path_obj = Path(resolved_path)
-        if path_obj.exists():
-            os.environ[env_name] = str(path_obj)
-
-
-def _playwright_browser_install_hint() -> str:
-    python_executable = sys.executable or "python"
-    return (
-        "Playwright не нашел совместимый Chromium. "
-        f"Установите браузер командой: \"{python_executable}\" -m playwright install chromium"
-    )
-
-
-def _is_browser_missing_error(error: Exception) -> bool:
-    text = str(error).lower()
-    return (
-        "executable doesn't exist" in text
-        or "playwright install" in text
-        or "browserType.launch" in text and "executable" in text
-        or "chromium distribution" in text and "not found" in text
-    )
-
-
-def _candidate_browser_cache_roots() -> list[Path]:
-    roots: list[Path] = []
-    for env_name in ("PLAYWRIGHT_BROWSERS_PATH",):
-        env_value = os.environ.get(env_name)
-        if env_value:
-            roots.append(Path(env_value))
-
+# Playwright Chromium launcher: каноническая реализация вынесена в
+# qidian_rulate/playwright_launcher.py (cluster-57 dedup). Здесь остаются
+# только тонкие обёртки с site-specific extra_roots (api_config-пути) - их
+# имена сохранены для обратной совместимости с существующими тестами.
+def _qidian_extra_cache_roots() -> list:
+    extra_roots = []
     try:
         executable_dir = api_config.get_executable_dir()
     except Exception:
@@ -321,135 +286,36 @@ def _candidate_browser_cache_roots() -> list[Path]:
         dev_root = api_config.get_dev_project_root()
     except Exception:
         dev_root = None
-
-    module_root = Path(__file__).resolve().parents[1]
-    for base in (module_root, executable_dir, dev_root, Path.cwd()):
+    for base in (executable_dir, dev_root):
         if base:
-            roots.append(Path(base) / "playwright_runtime" / "ms-playwright")
-
-    localappdata = os.environ.get("LOCALAPPDATA")
-    if localappdata:
-        roots.append(Path(localappdata) / "ms-playwright")
-
-    unique = []
-    seen = set()
-    for root in roots:
-        try:
-            resolved = root.resolve()
-        except Exception:
-            resolved = root
-        key = str(resolved).lower()
-        if key not in seen and resolved.exists() and resolved.is_dir():
-            seen.add(key)
-            unique.append(resolved)
-    return unique
+            extra_roots.append(base)
+    return extra_roots
 
 
-def _revision_from_path(path: Path) -> int:
-    match = re.search(r"chromium-(\d+)", str(path))
-    if not match:
-        return -1
-    return int(match.group(1))
-
-
-def _find_cached_chromium_executable() -> Path | None:
-    candidates: list[Path] = []
-    for root in _candidate_browser_cache_roots():
-        candidates.extend(root.glob("chromium-*/chrome-win*/chrome.exe"))
-    existing = [candidate for candidate in candidates if candidate.exists() and candidate.is_file()]
-    if not existing:
-        return None
-    return max(existing, key=_revision_from_path)
+def _is_browser_missing_error(error: Exception) -> bool:
+    return playwright_launcher.is_browser_missing_error(error)
 
 
 def _launch_chromium(playwright, *, headless: bool, log_callback=None):
-    try:
-        return playwright.chromium.launch(
-            headless=headless,
-            args=BROWSER_ARGS,
-        )
-    except Exception as error:
-        if not _is_browser_missing_error(error):
-            raise
-        if log_callback:
-            log_callback("WARNING", "Playwright Chromium не найден, пробую fallback-браузер.")
-
-    cached_executable = _find_cached_chromium_executable()
-    if cached_executable:
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: запускаю Chromium из {cached_executable}.")
-            return playwright.chromium.launch(
-                executable_path=str(cached_executable),
-                headless=headless,
-                args=BROWSER_ARGS,
-            )
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Кэшированный Chromium не запустился: {error}")
-
-    for channel in ("chrome", "msedge"):
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: пробую системный браузер {channel}.")
-            return playwright.chromium.launch(
-                channel=channel,
-                headless=headless,
-                args=BROWSER_ARGS,
-            )
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Системный браузер {channel} не запустился: {error}")
-
-    raise RuntimeError(_playwright_browser_install_hint())
+    return playwright_launcher.launch_chromium(
+        playwright,
+        headless=headless,
+        args=BROWSER_ARGS,
+        extra_roots=_qidian_extra_cache_roots(),
+        log_callback=log_callback,
+    )
 
 
-def _launch_persistent_chromium_context(playwright, *, user_data_dir: str, viewport: dict, log_callback=None):
-    try:
-        return playwright.chromium.launch_persistent_context(
-            user_data_dir=user_data_dir,
-            headless=False,
-            viewport=viewport,
-            args=BROWSER_ARGS,
-        )
-    except Exception as error:
-        if not _is_browser_missing_error(error):
-            raise
-        if log_callback:
-            log_callback("WARNING", "Playwright Chromium не найден, пробую fallback-браузер.")
-
-    cached_executable = _find_cached_chromium_executable()
-    if cached_executable:
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: запускаю Chromium из {cached_executable}.")
-            return playwright.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                executable_path=str(cached_executable),
-                headless=False,
-                viewport=viewport,
-                args=BROWSER_ARGS,
-            )
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Кэшированный Chromium не запустился: {error}")
-
-    for channel in ("chrome", "msedge"):
-        try:
-            if log_callback:
-                log_callback("INFO", f"Playwright: пробую системный браузер {channel}.")
-            return playwright.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                channel=channel,
-                headless=False,
-                viewport=viewport,
-                args=BROWSER_ARGS,
-            )
-        except Exception as error:
-            if log_callback:
-                log_callback("WARNING", f"Системный браузер {channel} не запустился: {error}")
-
-    raise RuntimeError(_playwright_browser_install_hint())
+def _launch_persistent_chromium_context(playwright, *, user_data_dir: str, viewport: dict | None = None, headless: bool = False, log_callback=None):
+    return playwright_launcher.launch_persistent_chromium_context(
+        playwright,
+        user_data_dir=user_data_dir,
+        args=BROWSER_ARGS,
+        viewport=viewport,
+        headless=headless,
+        extra_roots=_qidian_extra_cache_roots(),
+        log_callback=log_callback,
+    )
 
 
 def _clean_text(value: str | None) -> str:
@@ -468,8 +334,8 @@ def _clean_qidian_description(value: str | None, *, title: str = "", author: str
     escaped_title = re.escape(title) if title else r"[^》]+"
 
     seo_prefix_patterns = [
-        rf"^.{0,80}?创作的[^。]{{0,120}}?《{escaped_title}》[^。]{{0,160}}?最新章节[:：][^。]*。",
-        rf"^.{0,80}?创作的[^。]{{0,120}}?《{escaped_title}》，已更新[^。]*。",
+        rf"^.{{0,80}}?创作的[^。]{{0,120}}?《{escaped_title}》[^。]{{0,160}}?最新章节[:：][^。]*。",
+        rf"^.{{0,80}}?创作的[^。]{{0,120}}?《{escaped_title}》，已更新[^。]*。",
     ]
     if author:
         escaped_author = re.escape(author)
@@ -638,12 +504,6 @@ def _image_dimensions(image_data: bytes) -> tuple[int, int]:
     if not image.loadFromData(image_data):
         return 0, 0
     return image.width(), image.height()
-
-
-def _format_image_size(image_data: bytes) -> str:
-    width, height = _image_dimensions(image_data)
-    dimensions = f"{width}x{height}" if width and height else "unknown size"
-    return f"{dimensions}, {len(image_data) / 1024:.1f} KB"
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:
@@ -964,20 +824,7 @@ def parse_catalog_metadata(raw_response: str) -> PreparedRulateMetadata:
     )
 
 
-def parse_prepared_metadata(raw_response: str) -> PreparedRulateMetadata:
-    payload = _parse_json_response(raw_response)
-    catalog = parse_catalog_metadata(json.dumps(payload, ensure_ascii=False))
-    return PreparedRulateMetadata(
-        english_title=_clean_text(payload.get("english_title")),
-        translated_title=_clean_text(payload.get("translated_title")),
-        translated_description=_clean_multiline(payload.get("translated_description")),
-        genres=catalog.genres,
-        tags=catalog.tags,
-        cover_prompt=catalog.cover_prompt,
-    )
-
-
-def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str]) -> list[str]:
+def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str], limit: int = 8) -> list[str]:
     if isinstance(value, str):
         candidates = [part.strip() for part in re.split(r"[,;\n]", value) if part.strip()]
     elif isinstance(value, list):
@@ -1004,7 +851,7 @@ def _normalize_list(value, *, allowed: list[str] | None, fallback: list[str]) ->
             break
         if item not in normalized:
             normalized.append(item)
-    return normalized[:8]
+    return normalized[:limit]
 
 
 def _clean_multiline(value: str | None) -> str:
@@ -1295,7 +1142,8 @@ def _find_tomato_executable() -> Path | None:
 
 
 def _stop_tomato_autostart_process() -> None:
-    process = _TOMATO_AUTOSTART_PROCESS
+    with _TOMATO_AUTOSTART_LOCK:
+        process = _TOMATO_AUTOSTART_PROCESS
     if process and process.poll() is None:
         try:
             process.terminate()
@@ -1323,39 +1171,43 @@ def _start_tomato_web_server(
         log("WARNING", "Tomato: автозапуск доступен только для локального Web UI.")
         return False
 
-    process = _TOMATO_AUTOSTART_PROCESS
-    if process and process.poll() is None:
-        log("INFO", "Tomato: Web UI уже запускается, жду готовности...")
-    else:
-        executable = _find_tomato_executable()
-        if not executable:
-            log(
-                "WARNING",
-                f"Tomato: exe не найден. Укажите путь в {TOMATO_EXE_ENV} или положите TomatoNovelDownloader*.exe рядом с программой.",
-            )
-            return False
+    # Читать/решать/запускать процесс нужно атомарно: без блокировки два
+    # параллельных воркера могут оба увидеть _TOMATO_AUTOSTART_PROCESS is None
+    # и оба запустить свой subprocess.Popen(...) на один и тот же порт.
+    with _TOMATO_AUTOSTART_LOCK:
+        process = _TOMATO_AUTOSTART_PROCESS
+        if process and process.poll() is None:
+            log("INFO", "Tomato: Web UI уже запускается, жду готовности...")
+        else:
+            executable = _find_tomato_executable()
+            if not executable:
+                log(
+                    "WARNING",
+                    f"Tomato: exe не найден. Укажите путь в {TOMATO_EXE_ENV} или положите TomatoNovelDownloader*.exe рядом с программой.",
+                )
+                return False
 
-        env = os.environ.copy()
-        env.setdefault("TOMATO_WEB_ADDR", _tomato_bind_addr_from_base_url(base_url))
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-        try:
-            log("INFO", f"Tomato: запускаю Web UI из {executable}...")
-            _TOMATO_AUTOSTART_PROCESS = subprocess.Popen(
-                [str(executable), "--server"],
-                cwd=str(executable.parent),
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
-        except Exception as error:
-            log("WARNING", f"Tomato: не удалось запустить Web UI: {error}")
-            return False
+            env = os.environ.copy()
+            env.setdefault("TOMATO_WEB_ADDR", _tomato_bind_addr_from_base_url(base_url))
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+            try:
+                log("INFO", f"Tomato: запускаю Web UI из {executable}...")
+                _TOMATO_AUTOSTART_PROCESS = subprocess.Popen(
+                    [str(executable), "--server"],
+                    cwd=str(executable.parent),
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+            except Exception as error:
+                log("WARNING", f"Tomato: не удалось запустить Web UI: {error}")
+                return False
 
-        if not _TOMATO_AUTOSTART_CLEANUP_REGISTERED:
-            atexit.register(_stop_tomato_autostart_process)
-            _TOMATO_AUTOSTART_CLEANUP_REGISTERED = True
+            if not _TOMATO_AUTOSTART_CLEANUP_REGISTERED:
+                atexit.register(_stop_tomato_autostart_process)
+                _TOMATO_AUTOSTART_CLEANUP_REGISTERED = True
 
     deadline = time.monotonic() + TOMATO_STARTUP_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
@@ -1670,15 +1522,23 @@ def _run_ai_request(
     max_output_tokens: int = 4096,
     cancel_event: Event | None = None,
 ) -> str:
-    provider_config = deepcopy(api_config.api_providers().get(provider_id) or {})
+    # api_providers_view()/all_models_view() — общий кэш БЕЗ копирования всего
+    # реестра (см. gemini_translator/api/config.py). Копируем точечно только
+    # извлечённую запись — тем же паттерном, что и в
+    # gemini_translator/core/worker.py:259-261 — вместо deepcopy всего
+    # реестра провайдеров/моделей ради одной записи.
+    provider_config = copy.deepcopy(api_config.api_providers_view().get(provider_id) or {})
     if not provider_config:
         raise ValueError(f"Провайдер '{provider_id}' не найден в конфиге.")
 
     model_name = model_settings.get("model") or api_config.default_model_name()
-    model_config = deepcopy(api_config.all_models().get(model_name) or {})
+    model_config = copy.deepcopy(api_config.all_models_view().get(model_name) or {})
     if not model_config:
+        # provider_config выше уже независимая копия (deepcopy), поэтому
+        # вложенный словарь модели из неё тоже независим — второй deepcopy
+        # здесь не нужен.
         provider_models = provider_config.get("models") or {}
-        model_config = deepcopy(provider_models.get(model_name) or {})
+        model_config = provider_models.get(model_name) or {}
     if not model_config:
         raise ValueError(f"Модель '{model_name}' не найдена в конфиге провайдера.")
 
@@ -1793,7 +1653,7 @@ class QidianFetchWorker(QThread):
                     "или https://www.qimao.com/shuku/195958/"
                 )
 
-            configure_playwright_runtime()
+            api_config.configure_playwright_runtime()
             from playwright.sync_api import sync_playwright
 
             source = _source_name(self.qidian_url)
@@ -1903,13 +1763,47 @@ class QidianFetchWorker(QThread):
             self.finished_signal.emit()
 
 
+def _wait_until_browser_closed_or_interrupted(page, should_stop) -> None:
+    """Ждёт закрытия видимого Chromium пользователем, но также проверяет
+    `should_stop()` на каждой итерации.
+
+    Раньше цикл был `while True` и выходил ТОЛЬКО когда Playwright бросал
+    исключение при обращении к уже закрытой странице — у RulateFillWorker/
+    RulateLoginWorker не было способа остановить их программно, поэтому уход
+    со страницы Qidian Creator, не закрыв браузер руками, оставлял QThread и
+    процесс Chromium висеть в памяти до закрытия всего приложения.
+
+    `should_stop` — обычно `self._cancel_event.is_set` (по образцу
+    `AiPrepareWorker._cancel_event`): сознательно НЕ `QThread.isInterruptionRequested`,
+    потому что Qt делает `requestInterruption()` no-op, пока поток не запущен
+    через `.start()` (`d->running` внутри Qt проверяется до установки флага) —
+    `threading.Event` работает независимо от состояния QThread и тестируется
+    без реального запуска потока.
+    """
+    try:
+        while not should_stop():
+            page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+
 class RulateLoginWorker(QThread):
     log_signal = pyqtSignal(str, str)
     finished_signal = pyqtSignal()
 
+    def __init__(self):
+        super().__init__()
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        """Просит воркер закрыть браузер и выйти из цикла ожидания на
+        следующей проверке (страница-хозяин может звать это при уходе со
+        страницы, не дожидаясь, пока пользователь сам закроет Chromium)."""
+        self._cancel_event.set()
+
     def run(self) -> None:
         try:
-            configure_playwright_runtime()
+            api_config.configure_playwright_runtime()
             from playwright.sync_api import sync_playwright
 
             self.log_signal.emit("INFO", "Rulate: открываю браузер для входа.")
@@ -1929,11 +1823,7 @@ class RulateLoginWorker(QThread):
                     "WARNING",
                     "Войдите в Rulate в открытом браузере и закройте окно браузера. Куки сохранятся.",
                 )
-                try:
-                    while True:
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                _wait_until_browser_closed_or_interrupted(page, self._cancel_event.is_set)
             self.log_signal.emit("SUCCESS", "Rulate: браузер закрыт, куки сохранены.")
         except Exception as error:
             self.log_signal.emit("ERROR", f"Rulate login: {error}")
@@ -1949,7 +1839,7 @@ def _fetch_qidian_cover_context(
     original_description: str = "",
     log_callback=None,
 ) -> tuple[str, str]:
-    configure_playwright_runtime()
+    api_config.configure_playwright_runtime()
     from playwright.sync_api import sync_playwright
 
     def log(level: str, message: str) -> None:
@@ -2049,7 +1939,7 @@ def _fetch_fanqie_cover_context(
         log("SUCCESS", "Fanqie: получено глав для контекста обложки через Tomato.")
         return tomato_chapters, description
 
-    configure_playwright_runtime()
+    api_config.configure_playwright_runtime()
     from playwright.sync_api import sync_playwright
 
     chapters = []
@@ -2126,7 +2016,7 @@ def _fetch_qimao_cover_context(
     original_description: str = "",
     log_callback=None,
 ) -> tuple[str, str]:
-    configure_playwright_runtime()
+    api_config.configure_playwright_runtime()
     from playwright.sync_api import sync_playwright
 
     def log(level: str, message: str) -> None:
@@ -2241,7 +2131,7 @@ def _fetch_ciweimao_cover_context(
     original_description: str = "",
     log_callback=None,
 ) -> tuple[str, str]:
-    configure_playwright_runtime()
+    api_config.configure_playwright_runtime()
     from playwright.sync_api import sync_playwright
 
     def log(level: str, message: str) -> None:
@@ -2870,6 +2760,62 @@ def _find_generated_cover(
     return max(candidates, key=lambda item: item.stat().st_mtime)
 
 
+def _execute_codex_cover_command(
+    command,
+    *,
+    project_root: Path,
+    output_dir: Path,
+    target_path: Path,
+    log,
+    action_label: str,
+) -> Path:
+    """Запускает Codex CLI для генерации/перевода обложки и находит результат.
+
+    Каноническая реализация общего блока CodexCoverGenerateWorker.run и
+    CodexCoverTranslateWorker.run (cluster dups-qidian_rulate_workers-59,
+    finding qidian-tools/design/5-codex-cover-worker-run-duplica): запуск
+    subprocess.run, логирование stdout/stderr, проверка returncode и поиск
+    сгенерированного файла через _find_generated_cover были продублированы
+    почти дословно между обоими воркерами, отличаясь только текстом
+    сообщения об отсутствующем файле - этот текст передаётся через
+    `action_label` ("обложки" / "переведённой обложки").
+    """
+    started_at = time.time()
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    completed = subprocess.run(
+        command,
+        cwd=str(project_root),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=1200,
+        creationflags=creationflags,
+        check=False,
+    )
+
+    if completed.stdout.strip():
+        log("DEBUG", "Codex stdout:\n" + _tail_text(completed.stdout))
+    if completed.stderr.strip():
+        log("DEBUG", "Codex stderr:\n" + _tail_text(completed.stderr))
+    if completed.returncode != 0:
+        details = _tail_text(completed.stderr or completed.stdout)
+        raise RuntimeError(f"Codex завершился с кодом {completed.returncode}. {details}".strip())
+
+    generated_path = _find_generated_cover(
+        output_dir,
+        target_path,
+        started_at,
+        codex_output="\n".join([completed.stdout, completed.stderr]),
+    )
+    if not generated_path:
+        details = _tail_text(completed.stdout or completed.stderr)
+        raise RuntimeError(
+            f"Codex завершился без найденного файла {action_label} в output/codex_covers. " + details
+        )
+    return generated_path
+
+
 def _build_codex_cover_generation_prompt(cover_prompt: str, target_path: Path) -> str:
     return f"""Use the imagegen skill/tool to generate a finished raster book cover.
 
@@ -2987,40 +2933,14 @@ class CodexCoverGenerateWorker(QThread):
             _append_codex_prompt(command, prompt)
 
             self.log("INFO", f"Codex: запускаю генерацию обложки в {target_path}")
-            started_at = time.time()
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-            completed = subprocess.run(
+            generated_path = _execute_codex_cover_command(
                 command,
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1200,
-                creationflags=creationflags,
-                check=False,
+                project_root=project_root,
+                output_dir=self.output_dir,
+                target_path=target_path,
+                log=self.log,
+                action_label="обложки",
             )
-
-            if completed.stdout.strip():
-                self.log("DEBUG", "Codex stdout:\n" + _tail_text(completed.stdout))
-            if completed.stderr.strip():
-                self.log("DEBUG", "Codex stderr:\n" + _tail_text(completed.stderr))
-            if completed.returncode != 0:
-                details = _tail_text(completed.stderr or completed.stdout)
-                raise RuntimeError(f"Codex завершился с кодом {completed.returncode}. {details}".strip())
-
-            generated_path = _find_generated_cover(
-                self.output_dir,
-                target_path,
-                started_at,
-                codex_output="\n".join([completed.stdout, completed.stderr]),
-            )
-            if not generated_path:
-                details = _tail_text(completed.stdout or completed.stderr)
-                raise RuntimeError(
-                    "Codex завершился без найденного файла обложки в output/codex_covers. "
-                    + details
-                )
 
             self.cover_ready.emit(str(generated_path.resolve()))
             self.log("SUCCESS", f"Codex: обложка создана: {generated_path.resolve()}")
@@ -3116,40 +3036,14 @@ class CodexCoverTranslateWorker(QThread):
             _append_codex_prompt(command, prompt)
 
             self.log("INFO", f"Codex: редактирую обложку и сохраняю результат в {target_path}")
-            started_at = time.time()
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
-            completed = subprocess.run(
+            generated_path = _execute_codex_cover_command(
                 command,
-                cwd=str(project_root),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=1200,
-                creationflags=creationflags,
-                check=False,
+                project_root=project_root,
+                output_dir=self.output_dir,
+                target_path=target_path,
+                log=self.log,
+                action_label="переведённой обложки",
             )
-
-            if completed.stdout.strip():
-                self.log("DEBUG", "Codex stdout:\n" + _tail_text(completed.stdout))
-            if completed.stderr.strip():
-                self.log("DEBUG", "Codex stderr:\n" + _tail_text(completed.stderr))
-            if completed.returncode != 0:
-                details = _tail_text(completed.stderr or completed.stdout)
-                raise RuntimeError(f"Codex завершился с кодом {completed.returncode}. {details}".strip())
-
-            generated_path = _find_generated_cover(
-                self.output_dir,
-                target_path,
-                started_at,
-                codex_output="\n".join([completed.stdout, completed.stderr]),
-            )
-            if not generated_path:
-                details = _tail_text(completed.stdout or completed.stderr)
-                raise RuntimeError(
-                    "Codex завершился без найденного файла переведённой обложки в output/codex_covers. "
-                    + details
-                )
 
             self.cover_ready.emit(str(generated_path.resolve()))
             self.log("SUCCESS", f"Codex: переведённая обложка создана: {generated_path.resolve()}")
@@ -3171,13 +3065,20 @@ class RulateFillWorker(QThread):
     def __init__(self, draft: RulateBookDraft):
         super().__init__()
         self.draft = draft
+        self._cancel_event = Event()
+
+    def cancel(self) -> None:
+        """Просит воркер закрыть браузер и выйти из цикла ожидания на
+        следующей проверке (страница-хозяин может звать это при уходе со
+        страницы, не дожидаясь, пока пользователь сам закроет Chromium)."""
+        self._cancel_event.set()
 
     def log(self, level: str, message: str) -> None:
         self.log_signal.emit(level, message)
 
     def run(self) -> None:
         try:
-            configure_playwright_runtime()
+            api_config.configure_playwright_runtime()
             from playwright.sync_api import sync_playwright
 
             self.log("INFO", "Rulate: открываю форму создания книги...")
@@ -3211,11 +3112,7 @@ class RulateFillWorker(QThread):
                     "SUCCESS",
                     "Rulate: форма заполнена. Проверьте вкладки и нажмите сохранение вручную.",
                 )
-                try:
-                    while True:
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
+                _wait_until_browser_closed_or_interrupted(page, self._cancel_event.is_set)
         except Exception as error:
             self.log("ERROR", f"Rulate: {error}")
             self.log("DEBUG", traceback.format_exc())
@@ -3594,10 +3491,14 @@ def _selector_exists(page, selector: str) -> bool:
 
 def _wait_for_selector_attached(page, selector: str, timeout: int = 15000) -> bool:
     try:
-        page.wait_for_selector(selector, state="attached", timeout=timeout, strict=False)
+        page.wait_for_selector(selector, state="attached", timeout=timeout)
         return True
     except Exception:
-        return False
+        try:
+            page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+            return True
+        except Exception:
+            return False
 
 
 def _first_meaningful_select_option(options: list[dict]) -> int | None:
@@ -4670,56 +4571,15 @@ _QIDIAN_EXTRACT_SCRIPT = r"""() => {
         }
         return "";
     };
-    const descriptionFromBody = () => {
-        const body = bodyText();
-        const lines = body.replace(/\r/g, "").split("\n").map((line) => line.replace(/[ \t\u00a0]+/g, " ").trim());
-        const headers = new Set(["作品简介", "内容简介", "书籍简介", "小说简介", "作品介绍", "内容介绍"]);
-        const isHeader = (line) => headers.has(line) || (line.length <= 16 && Array.from(headers).some((header) => line.endsWith(header)));
-        const start = lines.findIndex(isHeader);
-        if (start < 0) return "";
-        const stopLines = new Set(["男生月票榜", "女生月票榜", "月票", "推荐票", "打赏", "本月票数", "本周打赏人数", "包含本书的书单", "目录", "书友互动", "本书荣誉"]);
-        const isStopLine = (line) => (
-            stopLines.has(line) ||
-            line.startsWith("男生月票榜") ||
-            line.startsWith("女生月票榜") ||
-            line.startsWith("包含本书的书单") ||
-            line.startsWith("目录 ")
-        );
-        const isLikelyTag = (line) => (
-            line &&
-            line.length <= 8 &&
-            /[\u4e00-\u9fff]/.test(line) &&
-            !/[。！？!?…，、；;：:《》“”"'（）()]/.test(line)
-        );
-        let stopReached = false;
-        let entries = [];
-        for (const line of lines.slice(start + 1)) {
-            if (!line) {
-                if (entries.length && entries[entries.length - 1] !== null) entries.push(null);
-                continue;
-            }
-            if (isStopLine(line)) {
-                stopReached = true;
-                break;
-            }
-            entries.push(line);
-        }
-        while (entries.length && entries[0] === null) entries.shift();
-        while (entries.length && entries[entries.length - 1] === null) entries.pop();
-        if (
-            stopReached &&
-            entries.length >= 2 &&
-            entries[entries.length - 2] === null &&
-            isLikelyTag(entries[entries.length - 1])
-        ) {
-            entries = entries.slice(0, -2);
-        }
-        return entries
-            .map((entry) => entry === null ? "" : entry)
-            .join("\n")
-            .replace(/\n{3,}/g, "\n\n")
-            .trim();
-    };
+    // Эвристика поиска описания по заголовку/стоп-строкам живёт теперь
+    // только в Python (_extract_qidian_description_from_body,
+    // qidian_rulate/workers.py) - раньше она была продублирована здесь
+    // байт-в-байт (cluster dups-qidian_rulate_workers-59, finding
+    // qidian-tools/design/4-qidian-description-heuristic-d) и рисковала
+    // разойтись с Python-версией при будущей правке только одной из копий.
+    // Этот скрипт отдаёт сырой body_text, а простые DOM-фолбэки ниже
+    // остаются как запасной кандидат на случай, если Python-эвристика не
+    // найдёт заголовок описания в body_text.
     const imageFromSrcset = (srcset) => {
         if (!srcset) return "";
         const first = srcset.split(",")[0] || "";
@@ -4743,7 +4603,6 @@ _QIDIAN_EXTRACT_SCRIPT = r"""() => {
         ], "src") ||
         imageFromSrcset(firstAttr([".book-img img", ".book-cover img", "img"], "srcset"));
     const description =
-        descriptionFromBody() ||
         firstMultilineText([
             ".book-intro p",
             ".book-intro",

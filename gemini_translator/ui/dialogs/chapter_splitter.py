@@ -16,7 +16,6 @@ from pathlib import Path
 from bs4 import BeautifulSoup, NavigableString, Tag
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QFileDialog,
     QFormLayout,
@@ -24,17 +23,14 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )
-from .menu_utils import prompt_return_to_menu, return_to_main_menu
+from ...utils.epub_tools import find_opf_path
 
 
 RULATE_HEADER_RE = re.compile(
@@ -80,10 +76,6 @@ class SplitStats:
 
 def append_part_suffix(title, part_number):
     return f"{title} (Часть {part_number})"
-
-
-def text_length(value):
-    return len(value.strip())
 
 
 def normalize_posix_path(path):
@@ -420,21 +412,6 @@ def _get_package_namespace(root):
     return "http://www.idpf.org/2007/opf"
 
 
-def _find_opf_path(epub_zip):
-    try:
-        container_root = SafeET.fromstring(epub_zip.read("META-INF/container.xml"))
-        for elem in container_root.iter():
-            if elem.tag.endswith("rootfile"):
-                return elem.attrib.get("full-path")
-    except Exception:
-        pass
-
-    for name in epub_zip.namelist():
-        if name.lower().endswith(".opf"):
-            return name
-    raise FileNotFoundError("Не удалось найти content.opf внутри EPUB.")
-
-
 def split_epub_file(input_path, output_path, settings, log_callback=None, progress_callback=None):
     def log(message):
         if log_callback:
@@ -443,7 +420,7 @@ def split_epub_file(input_path, output_path, settings, log_callback=None, progre
     stats = SplitStats()
 
     with zipfile.ZipFile(input_path, "r") as zin:
-        opf_path = _find_opf_path(zin)
+        opf_path = find_opf_path(zin)
         opf_dir = posixpath.dirname(opf_path)
         opf_root = SafeET.fromstring(zin.read(opf_path))
         ns_uri = _get_package_namespace(opf_root)
@@ -489,6 +466,18 @@ def split_epub_file(input_path, output_path, settings, log_callback=None, progre
             internal_path = manifest_info["internal_path"]
             media_type = manifest_info["media_type"]
             if "html" not in media_type and "xhtml" not in media_type:
+                continue
+
+            item_properties = manifest_info.get("properties") or ""
+            if "nav" in item_properties or posixpath.basename(internal_path).lower() == "nav.xhtml":
+                # Документ навигации (EPUB3 nav.xhtml) — это оглавление книги,
+                # а не глава для перевода, и его ссылки отдельно обновляет
+                # цикл ниже (по манифесту). Если разбить его здесь как обычную
+                # главу, тот цикл всё равно перечитает исходный файл из архива
+                # и либо затрёт уже сохранённую часть 1 полным содержимым,
+                # либо (если у nav стоит properties="nav") унаследовавшие это
+                # свойство part-файлы упадут там с KeyError — такого файла в
+                # исходном архиве нет.
                 continue
 
             html_text = zin.read(internal_path).decode("utf-8", errors="ignore")
@@ -721,51 +710,3 @@ class ChapterSplitterThread(QThread):
                 "output_path": self.output_path,
             }
         )
-
-
-class ChapterSplitterWindow(QMainWindow):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Chapter Splitter")
-        self.setMinimumSize(860, 680)
-        self._returning_to_main_menu = False
-
-        from gemini_translator.ui.pages.chapter_splitter_page import ChapterSplitterPage
-
-        self.page = ChapterSplitterPage(self)
-        self.setCentralWidget(self.page)
-
-        toolbar = QToolBar()
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
-        act_menu = QAction("В меню", self)
-        act_menu.triggered.connect(self._return_to_menu)
-        toolbar.addAction(act_menu)
-
-    @property
-    def worker(self):
-        return self.page.worker
-
-    def _return_to_menu(self):
-        if self.page.worker and self.page.worker.isRunning():
-            QMessageBox.warning(self, "Подождите", "Сначала дождитесь завершения обработки.")
-            return
-        self._returning_to_main_menu = True
-        self.close()
-
-    def closeEvent(self, event):
-        if self.page.worker and self.page.worker.isRunning():
-            QMessageBox.warning(self, "Подождите", "Сначала дождитесь завершения обработки.")
-            event.ignore()
-            return
-        if self._returning_to_main_menu:
-            return_to_main_menu()
-            event.accept()
-            return
-        action = prompt_return_to_menu(self)
-        if action == "cancel":
-            event.ignore()
-            return
-        if action == "menu":
-            return_to_main_menu()
-        event.accept()

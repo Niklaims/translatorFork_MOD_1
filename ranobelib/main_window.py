@@ -1,12 +1,10 @@
 import json
 import logging
 import os
-import re
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PyQt6 import sip
 from PyQt6.QtCore import QDateTime, QObject, QSettings, QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
@@ -82,17 +80,10 @@ from qidian_rulate.workers import (
     QidianFetchWorker,
     validate_source_url,
 )
+from gemini_translator.utils import qt_utils
+from gemini_translator.utils.text import split_csv
 
 SCHEDULE_LIMIT_DAYS = 60
-
-
-def _qt_object_is_alive(obj) -> bool:
-    if obj is None:
-        return False
-    try:
-        return not sip.isdeleted(obj)
-    except TypeError:
-        return True
 
 
 def calculate_fit_interval_minutes(
@@ -123,10 +114,6 @@ except Exception:
     KeyManagementWidget = None
     ModelSettingsWidget = None
     SettingsManager = None
-
-
-def _split_csv_text(text: str) -> list[str]:
-    return [part.strip() for part in re.split(r"[,;\n]+", text or "") if part.strip()]
 
 
 class _CoverPreviewWorker(QThread):
@@ -205,6 +192,24 @@ class _RanobeEventBus(QObject):
         return self._data_store.get(key, default)
 
 class RanobeUploaderApp(QMainWindow):
+
+    # Имена атрибутов-воркеров (QThread), за которыми нужно следить при закрытии окна:
+    # closeEvent обязан знать о них всех, иначе окно закрывается (или «Вернуться в
+    # меню» его прячет), а поток с открытым браузером/сетевым запросом продолжает
+    # работать в фоне без какой-либо возможности его остановить из GUI.
+    _TRACKED_WORKER_ATTRS = (
+        "worker",
+        "login_worker",
+        "login_rulate_worker",
+        "_rulate_media_fetch_worker",
+        "_rulate_media_ai_worker",
+        "_rulate_media_worker",
+        "_rulate_worker",
+        "_rulate_dl_worker",
+        "_media_source_cover_fetch_worker",
+        "_media_codex_cover_worker",
+        "_detector",
+    )
 
     def __init__(self):
         super().__init__()
@@ -293,7 +298,6 @@ class RanobeUploaderApp(QMainWindow):
         self.theme_mode_combo.addItem("Авто (как в системе)", "auto")
         self.theme_mode_combo.addItem("Светлая", "light")
         self.theme_mode_combo.addItem("Тёмная", "dark")
-        self.theme_mode_combo.addItem("Своя", "custom")
         self.theme_mode_combo.currentIndexChanged.connect(
             lambda _i: self._on_theme_mode_changed(self.theme_mode_combo.currentData())
         )
@@ -922,7 +926,17 @@ class RanobeUploaderApp(QMainWindow):
         self._save_settings()
         if callable(self._return_to_menu_handler):
             self.hide()
-            self.close()
+            # close() зовёт closeEvent, который теперь может отказать (активный
+            # воркер + пользователь ответил «Нет» — см. _confirm_close_running_workers)
+            # и вернуть False через event.ignore(). Раньше handler вызывался
+            # безусловно — окно оставалось скрытым, а воркер продолжал работать
+            # в фоне без единого видимого признака. QWidget.close() возвращает
+            # именно bool, поэтому сравниваем со строгим False, а не truthy-проверкой:
+            # это не ломает лёгкие тестовые заглушки close(), которые ничего не
+            # возвращают (None).
+            if self.close() is False:
+                self.show()
+                return
             self._return_to_menu_handler()
             return
         self.close()
@@ -1165,7 +1179,7 @@ class RanobeUploaderApp(QMainWindow):
                 is_dark = theme_manager.system_is_dark(QApplication.instance())
             except ImportError:
                 is_dark = False
-        elif mode in ("dark", "custom"):
+        elif mode == "dark":
             is_dark = True
         else:
             is_dark = False
@@ -1341,7 +1355,67 @@ class RanobeUploaderApp(QMainWindow):
         self.settings.setValue("skip_uploaded", self.chk_skip_uploaded.isChecked())
         self._save_rulate_media_state()
 
+    def _running_workers(self) -> list:
+        """Вернуть работающие сейчас QThread-воркеры (см. _TRACKED_WORKER_ATTRS)."""
+        running = []
+        for attr in self._TRACKED_WORKER_ATTRS:
+            worker = getattr(self, attr, None)
+            if worker is not None and worker.isRunning():
+                running.append(worker)
+        return running
+
+    def _confirm_close_running_workers(self) -> bool:
+        """Спросить пользователя перед закрытием, если есть активные воркеры.
+
+        Возвращает True, если закрытие можно продолжать (воркеров не было, либо
+        пользователь подтвердил прерывание — все найденные воркеры уже остановлены
+        вызовом stop()). Возвращает False, если пользователь отказался — тогда
+        closeEvent должен вызвать event.ignore() и не закрывать окно.
+        """
+        running = self._running_workers()
+        if not running:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Идёт фоновый процесс",
+            "Выполняется фоновая задача (загрузка глав, авторизация, парсинг и т.п.). "
+            "Прервать её и закрыть окно?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        for worker in running:
+            try:
+                worker.stop()
+            except AttributeError:
+                # У части воркеров (например, RanobeLibCatalogMatchWorker,
+                # QidianFetchWorker, CodexCoverTranslateWorker — см. ranobelib/workers.py
+                # и qidian_rulate/workers.py) нет метода stop(): просим стандартный
+                # Qt-механизм прерывания как единственный общий путь и явно
+                # предупреждаем — гарантии реальной остановки это не даёт, поток
+                # должен сам проверять isInterruptionRequested().
+                self._append_log(
+                    "WARNING",
+                    f"Воркер {worker.__class__.__name__} не поддерживает stop() — "
+                    "запрошено прерывание Qt, но поток может продолжить работу в фоне.",
+                )
+                try:
+                    worker.requestInterruption()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return True
+
     def closeEvent(self, event):
+        # Не даём закрыть окно (крестиком или через «Вернуться в меню», который в
+        # итоге тоже зовёт self.close()), пока активный воркер — например,
+        # UploadWorker с открытым браузером и отложенной публикацией — не будет
+        # остановлен или пользователь явно не подтвердит прерывание.
+        if not self._confirm_close_running_workers():
+            event.ignore()
+            return
+
         self._closing = True
         self._save_settings()
         for dlg in self._process_dialogs.values():
@@ -1443,22 +1517,22 @@ class RanobeUploaderApp(QMainWindow):
         if not self._append_log(level, message):
             return
         dlg = self._process_dialogs.get(key)
-        if _qt_object_is_alive(dlg):
+        if qt_utils.qt_object_is_alive(dlg):
             dlg.append_log(level, message)
 
     def _process_progress(self, key: str, value: int):
-        if getattr(self, "_closing", False) or not _qt_object_is_alive(self):
+        if getattr(self, "_closing", False) or not qt_utils.qt_object_is_alive(self):
             return
         self.progress_bar.setValue(value)
         dlg = self._process_dialogs.get(key)
-        if _qt_object_is_alive(dlg):
+        if qt_utils.qt_object_is_alive(dlg):
             dlg.set_progress(value)
 
     def _finish_process_dialog(self, key: str):
-        if getattr(self, "_closing", False) or not _qt_object_is_alive(self):
+        if getattr(self, "_closing", False) or not qt_utils.qt_object_is_alive(self):
             return
         dlg = self._process_dialogs.get(key)
-        if _qt_object_is_alive(dlg):
+        if qt_utils.qt_object_is_alive(dlg):
             dlg.mark_finished()
 
     # ── Логирование ──
@@ -1471,11 +1545,11 @@ class RanobeUploaderApp(QMainWindow):
         else:
             logging.info(message)
 
-        if getattr(self, "_closing", False) or not _qt_object_is_alive(self):
+        if getattr(self, "_closing", False) or not qt_utils.qt_object_is_alive(self):
             return False
 
         log_area = getattr(self, "log_area", None)
-        if not _qt_object_is_alive(log_area):
+        if not qt_utils.qt_object_is_alive(log_area):
             return False
 
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1918,15 +1992,15 @@ class RanobeUploaderApp(QMainWindow):
                 "cover_path": self._media_codex_cover_path,
                 "year": self.media_year_edit.text().strip(),
                 "description": self.media_description_edit.toPlainText().strip(),
-                "rulate_genres": _split_csv_text(self.media_rulate_genres_edit.toPlainText()),
-                "rulate_tags": _split_csv_text(self.media_rulate_tags_edit.toPlainText()),
+                "rulate_genres": split_csv(self.media_rulate_genres_edit.toPlainText()),
+                "rulate_tags": split_csv(self.media_rulate_tags_edit.toPlainText()),
                 "type_value": self.media_type_combo.currentData() or "12",
                 "status_value": self.media_status_combo.currentData() or "1",
                 "age_value": self.media_age_combo.currentData() or "3",
                 "translation_status_value": self.media_translation_status_combo.currentData() or "1",
                 "chapter_upload_value": self.media_chapter_upload_combo.currentData() or "2",
-                "genres": _split_csv_text(self.media_genres_edit.toPlainText()),
-                "tags": _split_csv_text(self.media_tags_edit.toPlainText()),
+                "genres": split_csv(self.media_genres_edit.toPlainText()),
+                "tags": split_csv(self.media_tags_edit.toPlainText()),
                 "create_author": self.media_create_author_chk.isChecked(),
             }
         )
@@ -2170,7 +2244,6 @@ class RanobeUploaderApp(QMainWindow):
             ch_num = ch.get("number", 0)
             volume = str(ch.get("volume") or self.default_vol_input.text().strip() or "1")
             can_download = ch.get("downloadable", False)
-            ch_id = ch.get("id", "")
 
             item = QListWidgetItem(title)
             item.setData(Qt.ItemDataRole.UserRole, ch)
@@ -2375,49 +2448,127 @@ class RanobeUploaderApp(QMainWindow):
 
     # ── Feature 2: Авто-возобновление ──
 
+    def _load_resume_done_keys(self) -> set:
+        """Прочитать множество идентификаторов (том+номер) уже отправленных глав.
+
+        Идентификатор — стабильный ключ главы (`chapter_identity`), а не позиционный
+        индекс: см. _save_resume_state ниже про причину.
+        """
+        raw = self.settings.value("resume_done_json", "")
+        if not raw:
+            return set()
+        try:
+            data = json.loads(str(raw))
+        except Exception:
+            return set()
+        return set(data) if isinstance(data, list) else set()
+
     def _check_resume(self, file_path: str, total_chapters: int):
         """Проверить, есть ли незавершённая загрузка для этого файла."""
         resume_file = self.settings.value("resume_file", "")
-        resume_index = self.settings.value("resume_index", -1, type=int)
         resume_url = self.settings.value("resume_url", "")
+        done_keys = self._load_resume_done_keys() if resume_file == file_path else set()
 
-        if resume_file == file_path and resume_index >= 0 and resume_index < total_chapters - 1:
-            answer = QMessageBox.question(
-                self,
-                "Незавершённая загрузка",
-                f"Обнаружена незавершённая загрузка (глава {resume_index + 1} из {total_chapters}).\n"
-                f"Продолжить с главы {resume_index + 2}?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if answer == QMessageBox.StandardButton.Yes:
-                # Снять галочки со всех глав до resume_index включительно
-                for i in range(min(resume_index + 1, self.chapters_list_widget.count())):
-                    self.chapters_list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
-                # Восстановить URL, если он был сохранён
-                if resume_url:
-                    self.url_input.setText(resume_url)
-                self._append_log(
-                    "INFO",
-                    f"Возобновление с главы {resume_index + 2} из {total_chapters}",
-                )
-            else:
+        # Сверяем сохранённые идентификаторы с главами ТЕКУЩЕГО полного списка —
+        # только они реально что-то значат для возобновления.
+        matched_keys = set()
+        for i in range(self.chapters_list_widget.count()):
+            chapter = self.chapters_list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+            key = chapter_identity(chapter.volume, chapter.number)
+            if key in done_keys:
+                matched_keys.add(key)
+
+        if not matched_keys:
+            if done_keys:
+                # Сохранённое состояние относится не к этому файлу/главам — не актуально.
                 self._clear_resume_state()
+            return
 
-    def _save_resume_state(self, chapter_index: int):
-        """Сохранить прогресс загрузки."""
+        if len(matched_keys) >= total_chapters:
+            # Все главы файла уже были отправлены раньше — возобновлять нечего.
+            self._clear_resume_state()
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Незавершённая загрузка",
+            f"Обнаружена незавершённая загрузка (уже отправлено глав: "
+            f"{len(matched_keys)} из {total_chapters}).\n"
+            f"Снять галочки с уже отправленных глав?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            # Снимаем галочки по стабильному идентификатору главы (том+номер), а не по
+            # позиции в списке: chapter_done_signal нумерует главы внутри
+            # ОТФИЛЬТРОВАННОГО списка выбранных глав (self.worker.chapters_list), который
+            # при частичном выборе не совпадает по индексам с полным chapters_list_widget.
+            for i in range(self.chapters_list_widget.count()):
+                item = self.chapters_list_widget.item(i)
+                chapter = item.data(Qt.ItemDataRole.UserRole)
+                key = chapter_identity(chapter.volume, chapter.number)
+                if key in matched_keys:
+                    item.setCheckState(Qt.CheckState.Unchecked)
+            # Восстановить URL, если он был сохранён
+            if resume_url:
+                self.url_input.setText(resume_url)
+            self._append_log(
+                "INFO",
+                f"Возобновление: снято {len(matched_keys)} уже отправленных "
+                f"глав из {total_chapters}",
+            )
+        else:
+            self._clear_resume_state()
+
+    def _save_resume_state(self, chapter):
+        """Сохранить прогресс загрузки.
+
+        Копим МНОЖЕСТВО идентификаторов (том+номер) уже успешно отправленных глав,
+        а не позиционный индекс: chapter_done_signal нумерует главы внутри
+        отфильтрованного списка ВЫБРАННЫХ глав (self.worker.chapters_list), который
+        при частичном выборе глав не совпадает по индексам с полным
+        chapters_list_widget — старое поведение снимало галочки не с тех глав.
+
+        Идентификатор главы (`том:номер`) сам по себе не уникален между КНИГАМИ —
+        "1:1", "1:2"… повторяются в любой книге с нумерацией с первого тома. Поэтому
+        накопленное множество нельзя просто дописывать: если ранее сохранённое
+        состояние относится к другому файлу-источнику ИЛИ другому URL книги на
+        сайте (например, для загрузок с Rulate self._current_file_path всегда
+        "(Rulate)", различает книги только url_input — целевой RanobeLib-URL),
+        начинаем набор заново, а не переносим чужие ключи на новую книгу.
+        """
+        if chapter is None:
+            return
+        stored_file = self.settings.value("resume_file", "")
+        stored_url = self.settings.value("resume_url", "")
+        current_url = self.url_input.text()
+        if stored_file == self._current_file_path and stored_url == current_url:
+            done_keys = self._load_resume_done_keys()
+        else:
+            done_keys = set()
+        done_keys.add(chapter_identity(chapter.volume, chapter.number))
         self.settings.setValue("resume_file", self._current_file_path)
-        self.settings.setValue("resume_index", chapter_index)
-        self.settings.setValue("resume_url", self.url_input.text())
+        self.settings.setValue("resume_done_json", json.dumps(sorted(done_keys)))
+        self.settings.setValue("resume_url", current_url)
 
     def _clear_resume_state(self):
         """Очистить состояние незавершённой загрузки."""
         self.settings.remove("resume_file")
-        self.settings.remove("resume_index")
+        self.settings.remove("resume_index")  # старый ключ формата — на всякий случай
+        self.settings.remove("resume_done_json")
         self.settings.remove("resume_url")
 
     def _on_chapter_done(self, index: int):
-        """Слот для сигнала chapter_done_signal: сохраняем прогресс."""
-        self._save_resume_state(index)
+        """Слот для сигнала chapter_done_signal: сохраняем прогресс.
+
+        index — позиция внутри self.worker.chapters_list (список ВЫБРАННЫХ глав,
+        см. _save_resume_state), а не внутри chapters_list_widget.
+        """
+        worker = getattr(self, "worker", None)
+        chapters_list = getattr(worker, "chapters_list", None)
+        chapter = None
+        if chapters_list is not None and 0 <= index < len(chapters_list):
+            chapter = chapters_list[index]
+        self._save_resume_state(chapter)
 
     def _populate_chapter_list(self):
         search_role = Qt.ItemDataRole.UserRole + 1
@@ -2463,34 +2614,22 @@ class RanobeUploaderApp(QMainWindow):
     # ── Управление списком глав ──
 
     def _select_all(self):
-        self.chapters_list_widget.setUpdatesEnabled(False)
-        try:
-            for i in range(self.chapters_list_widget.count()):
-                self.chapters_list_widget.item(i).setCheckState(Qt.CheckState.Checked)
-        finally:
-            self.chapters_list_widget.setUpdatesEnabled(True)
+        # cluster-61: список поддерживает фильтр по подстроке (search_input →
+        # _filter_chapters, скрывает элементы через isHidden) — only_visible=True
+        # не даёт «Выбрать все» задевать отфильтрованные (скрытые) главы.
+        from gemini_translator.ui.dialogs import chapter_selection_dialog as selection_utils
+
+        selection_utils.set_checked_all(self.chapters_list_widget, True, only_visible=True)
 
     def _deselect_all(self):
-        self.chapters_list_widget.setUpdatesEnabled(False)
-        try:
-            for i in range(self.chapters_list_widget.count()):
-                self.chapters_list_widget.item(i).setCheckState(Qt.CheckState.Unchecked)
-        finally:
-            self.chapters_list_widget.setUpdatesEnabled(True)
+        from gemini_translator.ui.dialogs import chapter_selection_dialog as selection_utils
+
+        selection_utils.set_checked_all(self.chapters_list_widget, False, only_visible=False)
 
     def _invert_selection(self):
-        self.chapters_list_widget.setUpdatesEnabled(False)
-        try:
-            for i in range(self.chapters_list_widget.count()):
-                item = self.chapters_list_widget.item(i)
-                new_state = (
-                    Qt.CheckState.Unchecked
-                    if item.checkState() == Qt.CheckState.Checked
-                    else Qt.CheckState.Checked
-                )
-                item.setCheckState(new_state)
-        finally:
-            self.chapters_list_widget.setUpdatesEnabled(True)
+        from gemini_translator.ui.dialogs import chapter_selection_dialog as selection_utils
+
+        selection_utils.invert_checked(self.chapters_list_widget, only_visible=True)
 
     def _on_item_clicked(self, item):
         row = self.chapters_list_widget.row(item)
@@ -2667,7 +2806,13 @@ class RanobeUploaderApp(QMainWindow):
             lambda val: self._process_progress("upload", val)
         )
         self.worker.stats_signal.connect(self._update_stats)
-        self.worker.eta_signal.connect(lambda s: self.lbl_eta.setText(f"ETA: {s}"))
+        # stop() не мгновенен (см. closeEvent/_confirm_close_running_workers): воркер
+        # может успеть эмитить ETA уже после того, как окно закрыто и lbl_eta удалён.
+        self.worker.eta_signal.connect(
+            lambda s: self.lbl_eta.setText(f"ETA: {s}")
+            if qt_utils.qt_object_is_alive(getattr(self, "lbl_eta", None))
+            else None
+        )
         self.worker.finished_signal.connect(self._on_upload_finished)
         self.worker.chapter_done_signal.connect(self._on_chapter_done)  # Feature 2
 
@@ -2688,6 +2833,16 @@ class RanobeUploaderApp(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_file.setEnabled(True)
         self.lbl_eta.setText("ETA: —")
+
+        # Сбой вне цикла по главам (нет сессии, не поднялся браузер): статистика
+        # (0, 0, 0) — это не «всё загружено», resume-состояние трогать нельзя.
+        fatal_error = str(getattr(getattr(self, "worker", None), "fatal_error", "") or "")
+        if fatal_error:
+            self._append_log("ERROR", f"Загрузка прервана: {fatal_error}")
+            self._show_notification(APP_NAME, f"Загрузка прервана — {fatal_error}")
+            self._finish_process_dialog("upload")
+            return
+
         self._append_log("SUCCESS", "Загрузка завершена.")
 
         # Feature 2: очистить прогресс при полной загрузке (без ошибок и пропусков)

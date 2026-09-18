@@ -17,6 +17,8 @@ from ..errors import (
     TemporaryRateLimitError,
     ValidationFailedError,
 )
+from . import _deepseek_common
+from ._sse_stream import SSEStreamInterrupted, parse_openai_compatible_sse_stream
 
 
 class NvidiaApiHandler(BaseApiHandler):
@@ -60,31 +62,21 @@ class NvidiaApiHandler(BaseApiHandler):
         self.worker.model_id = self._model_id_candidates[self._model_id_index]
         return self.worker.model_id
 
-    def _normalize_content(self, content):
-        if isinstance(content, str):
-            return content
+    def _reset_model_id_to_primary(self):
+        """Сбрасывает активную модель к primary перед каждым новым вызовом call_api.
 
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    text = item.get("text")
-                    if text is None:
-                        text = item.get("content")
-                    if text is None and item.get("type") == "output_text":
-                        text = item.get("text")
-                    if text is not None:
-                        parts.append(str(text))
-                elif item is not None:
-                    parts.append(str(item))
-            return "".join(parts)
-
-        if content is None:
-            return ""
-
-        return str(content)
+        _model_id_candidates строится один раз в setup_client на весь жизненный
+        цикл воркера (много глав/задач), а _switch_to_next_model_id на 404
+        мутирует worker.model_id перманентно. Без сброса alias-фолбэк одной
+        главы залипает на все последующие главы этой сессии воркера и путает
+        RPD-счётчик (settings_manager.increment_request_count пишет уже под
+        другим model_id). Сброс в начале call_api заставляет каждую новую
+        задачу заново пробовать primary_model_id, сохраняя при этом
+        внутрицикловый фолбэк на alias при повторном 404 в рамках этого вызова.
+        """
+        if getattr(self, "_model_id_candidates", None):
+            self._model_id_index = 0
+            self.worker.model_id = self._model_id_candidates[0]
 
     def _clean_response_text(self, text):
         cleaned = self._normalize_content(text)
@@ -107,40 +99,8 @@ class NvidiaApiHandler(BaseApiHandler):
             if key in model_config and model_config[key] is not None:
                 payload[key] = model_config[key]
 
-    def _resolve_deepseek_reasoning_effort(self):
-        model_config = self._model_config()
-        effort = (
-            getattr(self.worker, "thinking_level", None)
-            or model_config.get("default_reasoning_effort")
-            or model_config.get("min_thinking_budget")
-            or "high"
-        )
-        effort = str(effort).strip().lower()
-        return "max" if effort in {"max", "xhigh"} else "high"
-
     def _apply_deepseek_options(self, payload):
-        model_config = self._model_config()
-        configured_mode = str(model_config.get("deepseek_thinking") or "").strip().lower()
-        has_thinking_config = "thinkingLevel" in model_config or "min_thinking_budget" in model_config
-        supports_thinking = (
-            configured_mode in {"enabled", "disabled"}
-            or model_config.get("thinkingLevel") is not None
-            or (has_thinking_config and model_config.get("min_thinking_budget") is not False)
-        )
-        if not supports_thinking:
-            return
-
-        if configured_mode in {"enabled", "disabled"}:
-            thinking_enabled = configured_mode == "enabled"
-        else:
-            thinking_enabled = bool(getattr(self.worker, "thinking_enabled", False))
-
-        payload["thinking"] = {"type": "enabled" if thinking_enabled else "disabled"}
-        if not thinking_enabled:
-            return
-
-        payload["reasoning_effort"] = self._resolve_deepseek_reasoning_effort()
-        payload.pop("temperature", None)
+        _deepseek_common.build_deepseek_thinking_options(payload, self._model_config(), self.worker)
 
     def _apply_qwen_options(self, payload):
         model_config = self._model_config()
@@ -182,6 +142,9 @@ class NvidiaApiHandler(BaseApiHandler):
             self._apply_gemma_options(payload)
 
     def _extract_text_from_result(self, result, allow_incomplete=False):
+        # Both the direct answer and the one fetched by status polling come through here.
+        if isinstance(result, dict):
+            self._remember_openai_usage(result.get("usage"))
         candidates = [result]
         if isinstance(result, dict):
             for key in ("response", "result", "data", "output"):
@@ -376,6 +339,7 @@ class NvidiaApiHandler(BaseApiHandler):
         max_output_tokens=None,
     ):
         session = await self._get_or_create_session_internal()
+        self._reset_model_id_to_primary()
 
         headers = {
             "Authorization": f"Bearer {self.worker.api_key}",
@@ -401,10 +365,20 @@ class NvidiaApiHandler(BaseApiHandler):
         elif allow_incomplete:
             payload["max_tokens"] = int(self.worker.model_config.get("max_output_tokens", 8192) * 0.98)
 
-        max_retries = 3
+        self._debug_record_request(
+            {
+                "method": "POST",
+                "url": self.base_url,
+                "headers": headers,
+                "payload": payload,
+            },
+            extra={"use_stream": use_stream, "allow_incomplete": allow_incomplete},
+        )
+
+        # Повторы при перегрузке: политика общая, см. BaseApiHandler.
         retry_count = 0
 
-        while retry_count < max_retries:
+        while True:
             try:
                 async with session.post(self.base_url, headers=headers, json=payload) as response:
                     if response.status == 202:
@@ -418,21 +392,23 @@ class NvidiaApiHandler(BaseApiHandler):
                     if response.status != 200:
                         error_text = await response.text()
                         txt_low = error_text.lower()
+                        self._debug_record_response(
+                            error_text,
+                            attempt=retry_count + 1,
+                            status=f"http_{response.status}",
+                            extra={"http_status": response.status, "mode": "error"},
+                        )
 
-                        if response.status in [500, 502, 503]:
-                            wait_time = 15.0 * (retry_count + 1)
-                            self.worker._post_event(
-                                "log_message",
-                                {
-                                    "message": (
-                                        f"⏳ Сервер NVIDIA NIM перегружен ({response.status}). "
-                                        f"Ждем {wait_time}с перед повтором."
-                                    )
-                                },
+                        if self._is_server_overload_status(response.status):
+                            if await self._retry_after_server_overload(
+                                response.status, retry_count + 1, "NVIDIA NIM"
+                            ):
+                                retry_count += 1
+                                continue
+                            raise NetworkError(
+                                "Не удалось получить ответ от NVIDIA NIM из-за перегрузки серверов (Retry Limit).",
+                                delay_seconds=30,
                             )
-                            await asyncio.sleep(wait_time)
-                            retry_count += 1
-                            continue
 
                         if response.status in [401, 403]:
                             raise RateLimitExceededError(
@@ -474,42 +450,26 @@ class NvidiaApiHandler(BaseApiHandler):
                         )
 
                     if use_stream:
-                        collected_text = ""
-                        finish_reason = None
-
                         try:
-                            async for line in response.content:
-                                line_str = line.decode("utf-8").strip()
-                                if not line_str or line_str == "data: [DONE]":
-                                    continue
+                            collected_text, finish_reason, raw_stream_lines = await parse_openai_compatible_sse_stream(
+                                response,
+                                capture_raw=(self._has_debug_trace() or debug),
+                                on_usage=self._remember_openai_usage,
+                            )
+                        except SSEStreamInterrupted as interrupted:
+                            raise PartialGenerationError(
+                                f"Обрыв стрима NVIDIA NIM: {interrupted.original_error}",
+                                partial_text=interrupted.partial_text,
+                                reason="NETWORK_ERROR",
+                            ) from interrupted.original_error
 
-                                if not line_str.startswith("data: "):
-                                    continue
-
-                                json_str = line_str[6:]
-                                try:
-                                    chunk = json.loads(json_str)
-                                except json.JSONDecodeError:
-                                    continue
-
-                                if "choices" in chunk and chunk["choices"]:
-                                    delta = chunk["choices"][0].get("delta", {})
-                                    content_part = delta.get("content", "")
-                                    if content_part:
-                                        collected_text += content_part
-
-                                    current_finish_reason = chunk["choices"][0].get("finish_reason")
-                                    if current_finish_reason:
-                                        finish_reason = current_finish_reason
-
-                        except Exception as stream_error:
-                            if collected_text:
-                                raise PartialGenerationError(
-                                    f"Обрыв стрима NVIDIA NIM: {stream_error}",
-                                    partial_text=collected_text,
-                                    reason="NETWORK_ERROR",
-                                )
-                            raise stream_error
+                        if raw_stream_lines is not None:
+                            self._debug_record_response(
+                                "\n".join(raw_stream_lines),
+                                attempt=retry_count + 1,
+                                status=finish_reason or "stream",
+                                extra={"mode": "stream", "http_status": response.status},
+                            )
 
                         if finish_reason == "length" and not allow_incomplete:
                             raise PartialGenerationError(
@@ -521,6 +481,12 @@ class NvidiaApiHandler(BaseApiHandler):
                         return self._clean_response_text(collected_text)
 
                     result = await response.json(content_type=None)
+                    self._debug_record_response(
+                        result,
+                        attempt=retry_count + 1,
+                        status="http_200",
+                        extra={"mode": "full", "http_status": response.status},
+                    )
                     return self._extract_text_from_result(result, allow_incomplete=allow_incomplete)
 
             except asyncio.TimeoutError:
@@ -544,8 +510,3 @@ class NvidiaApiHandler(BaseApiHandler):
             except Exception as error:
                 traceback.print_exc()
                 raise Exception(f"Критическая ошибка NVIDIA NIM: {error}")
-
-        raise NetworkError(
-            "Не удалось получить ответ от NVIDIA NIM из-за перегрузки серверов (Retry Limit).",
-            delay_seconds=30,
-        )

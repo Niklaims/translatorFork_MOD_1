@@ -33,7 +33,10 @@ ADDITIONAL_DATA = [
     ('tools\\tomato', 'tools\\tomato'),
 ]
 
-EXCLUDE_DIRS = {'venv', '.venv', 'env', '.git', '__pycache__', 'dist', 'build'}
+EXCLUDE_DIRS = {
+    'venv', '.venv', 'env', '.git', '__pycache__', 'dist', 'build',
+    'tests', 'tools', '.worktrees', '.claude',
+}
 PROJECT_MODULES = {
     'gemini_translator',
     'gemini_reader_v3',
@@ -51,7 +54,15 @@ PROJECT_MODULES = {
     'utils',
     'workers',
 }
-DEV_MODULES = {'pyinstaller', 'pyinstaller-hooks-contrib'}
+DEV_MODULES = {
+    'pyinstaller', 'pyinstaller-hooks-contrib',
+    'PyInstaller', 'pytest', 'pytest-qt', 'ruff',
+}
+# Опциональные ML-зависимости, используемые только вспомогательными
+# скриптами/офлайн-инструментами (не рантаймом приложения) — не должны
+# попадать в requirements.txt/requirements-translator-only.txt при
+# автогенерации, даже если их импорт где-то обнаружен сканером.
+OPTIONAL_ML_PACKAGES = {'onnxruntime', 'tokenizers', 'navec', 'slovnet', 'comet'}
 DATA_FILE_EXTENSIONS = {'.txt', '.json', '.ico', '.css', '.html', '.js'}
 # RanobeLib загружается из bundled source-файлов, поэтому PyInstaller
 # не видит его import playwright.sync_api во время анализа main.py.
@@ -69,14 +80,16 @@ HIDDEN_IMPORTS_BLOCK = [
     *LAZY_HANDLER_HIDDEN_IMPORTS,
     *LAZY_SERVER_HIDDEN_IMPORTS,
 ]
-MANUAL_COLLECT_DATA_MODULES = {'certifi', 'docx', 'qoder_agent_sdk'}
+MANUAL_COLLECT_DATA_MODULES = {'certifi', 'docx'}
+# Qoder CLI в сборку не кладётся (его докачивает хендлер), а RECORD пакета
+# нужен, чтобы сверить скачанный бинарник с тем, что стоит на машине сборки.
+MANUAL_COPY_METADATA_PACKAGES = {'qoder-agent-sdk'}
 COLLECT_DATA_EXCLUDE_MODULES = {'setuptools'}
 MANUALLY_PACKAGED_PACKAGES = {'playwright'}
 # --- КОНФИГУРАЦИЯ ЗАВИСИМОСТЕЙ ---
 IMPORT_TO_PACKAGE_MAP = {
     'socks': 'PySocks',
     'opencc': 'opencc-python-reimplemented',
-    'Levenshtein': 'python-Levenshtein',
     'jwt': 'pyjwt',
     'bs4': 'beautifulsoup4',
     'docx': 'python-docx',
@@ -84,7 +97,6 @@ IMPORT_TO_PACKAGE_MAP = {
     'edge_tts': 'edge-tts',
     'google': 'google-genai',
     'pyaudio': 'PyAudio',
-    'pymorphy2': 'pymorphy3',
     'qoder_agent_sdk': 'qoder-agent-sdk',
     'recognizers_text': 'recognizers-text',
     'recognizers_number': 'recognizers-text-number',
@@ -97,25 +109,30 @@ ESSENTIAL_PACKAGES = {
     'playwright',
     'python-docx',
     'EbookLib',
-    'nltk',
     'PyAudio',
     'pydub',
     'edge-tts',
     'google-genai',
-    'loguru',
     'websockets',
     'soupsieve',
     'urllib3',
+    'numpy',
+    'pandas',
+    'razdel',
+    'tzdata',
 }
 FORCED_VERSIONS = {
     'cryptography': '>=48.0.1',
     'defusedxml': '>=0.7.1',
     'idna': '>=3.15',
+    'pyasn1': '>=0.6.4',
     'pydantic': '>=2.0.0',
     'qoder-agent-sdk': '>=1.0.8',
-    'setuptools': '<81',
     'soupsieve': '>=2.8.4',
     'urllib3': '>=2.7.0',
+    'numpy': '>=2.0,<3',
+    'pandas': '>=3.0,<4',
+    'razdel': '>=0.5,<1',
 }
 CONFLICTING_PACKAGES_TO_REMOVE = {"os_patch", "pyinstaller_hooks_contrib"}
 
@@ -298,7 +315,7 @@ def apply_package_mapping(dependencies):
 
 def update_requirements_file(dependencies):
     print(f"\n--- Этап 4: Обновление '{OUTPUT_REQUIREMENTS_FILE}' ---")
-    filtered_deps = dependencies - DEV_MODULES - CONFLICTING_PACKAGES_TO_REMOVE
+    filtered_deps = dependencies - DEV_MODULES - CONFLICTING_PACKAGES_TO_REMOVE - OPTIONAL_ML_PACKAGES
     final_dependencies = set()
     for dep in filtered_deps:
         dep_lower = dep.lower()
@@ -348,12 +365,16 @@ def generate_pure_bat_script(dependencies, collect_data_flags):
     collect_data_args = [
         f'--collect-data="{module}"' for module in sorted(collect_data_modules)
     ]
+    copy_metadata_args = [
+        f'--copy-metadata="{package}"' for package in sorted(MANUAL_COPY_METADATA_PACKAGES)
+    ]
 
     def build_runner_command(mode):
         runner_args = [
             f'"%PYTHON_CMD%" build_runner.py --mode {mode}',
             '--name="%AppName%"',
             *collect_data_args,
+            *copy_metadata_args,
         ]
         return " ^\n".join(runner_args)
 

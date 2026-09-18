@@ -3,11 +3,15 @@ import runpy
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 
 _BUILD_CONFIG = runpy.run_path(str(Path(SPECPATH) / "pyinstaller_config.py"))
 LAZY_HANDLER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_HANDLER_HIDDEN_IMPORTS"]
+QA_RUNTIME_HIDDEN_IMPORTS = [
+    "gemini_translator.qa.book_metrics",
+    "razdel",
+]
 
 
 PROJECT_ROOT = Path.cwd().resolve()
@@ -16,14 +20,18 @@ ICON_PATH = PROJECT_ROOT / "gemini_translator" / "GT.ico"
 
 datas = [
     ('config', 'config'),
+    # Versioned QA prompts are read through importlib.resources at runtime and
+    # must therefore be collected, or every QA request fails closed.
+    ('gemini_translator/config/translation_qa_prompts.json', 'gemini_translator/config'),
 ]
 datas += collect_data_files('PyQt6')
 datas += collect_data_files('certifi')
 datas += collect_data_files('docx')
-datas += collect_data_files('emoji')
 datas += collect_data_files('jieba')
 datas += collect_data_files('lxml')
-datas += collect_data_files('qoder_agent_sdk')
+# Qoder CLI (~100 МБ) в сборку не кладётся: хендлер скачивает его при первом
+# запросе к Qoder и сверяет с хешем из RECORD пакета, поэтому нужны его метаданные.
+datas += copy_metadata('qoder-agent-sdk')
 datas += collect_data_files('werkzeug')
 
 
@@ -36,9 +44,8 @@ a = Analysis(
         'PyQt6.sip',
         'docx',
         'pypdf',
-        'google.genai',
-        'google.genai.types',
         *LAZY_HANDLER_HIDDEN_IMPORTS,
+        *QA_RUNTIME_HIDDEN_IMPORTS,
     ],
     hookspath=[],
     hooksconfig={},

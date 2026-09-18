@@ -14,6 +14,7 @@ import math
 from collections import Counter, defaultdict # Убедимся, что Counter импортирован
 
 import importlib
+import threading
 try:
     import jieba
     JIEBA_AVAILABLE = True
@@ -34,10 +35,25 @@ except ImportError:
     OpenCC = None
     OPENCC_AVAILABLE = False
 
+from . import cjk_ranges
+
 STOP_WORDS = {'the', 'a', 'an', 'to', 'in', 'on', 'of', 'for', 'with', 'am', 'i'}
 CJK_STOP_WORDS = {'的', '是', '一', '不', '人', '我', '了', '在', '有', '和', '之'}
-CJK_CHAR_RE = re.compile(r'[一-鿿぀-ヿ가-힯]')
 MORPHOLOGY_SUFFIXES_TO_IGNORE = ["'s", "es", "s"]
+
+
+def normalize_word(word):
+    """Удаляет первый подходящий английский суффикс/окончание из
+    MORPHOLOGY_SUFFIXES_TO_IGNORE («первое совпадение»).
+
+    Единая реализация для SmartGlossaryFilter и GlossaryLogic — раньше у
+    каждого класса был свой одинаковый метод _normalize_word
+    (dups-gt_utils_language_tools-39).
+    """
+    for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
+        if word.endswith(suffix):
+            return word[:-len(suffix)]
+    return word
 # Определяем пороги
 ORDERED_SEARCH_THRESHOLD = 99      # Уровень 2: Порядок важен, но прощаем морфологию
 UNORDERED_WORDS_THRESHOLD = 98     # Уровень 3: Разрешаем перестановку слов
@@ -80,7 +96,8 @@ def _glossary_text(value):
     return "" if value is None else str(value).strip()
 
 
-_HAN_RE = re.compile(r'[\u4e00-\u9fff]+')
+# cluster-32 dedup (раунд 2): было _HAN_RE = re.compile(r'[一-鿿]+') — тот
+# же диапазон + квантификатор, что и cjk_ranges.CHINESE_CHAR_RE.
 _OPENCC_CONVERTERS = {}
 
 
@@ -103,7 +120,7 @@ def get_chinese_script_variants(text):
     variants = [value]
     seen = {value}
 
-    if not value or not _HAN_RE.search(value):
+    if not value or not cjk_ranges.CHINESE_CHAR_RE.search(value):
         return variants
 
     for config_name in ("t2s", "s2t"):
@@ -127,20 +144,19 @@ class LanguageDetector:
     @staticmethod
     def contains_chinese(text):
         """Проверяет, содержит ли текст китайские иероглифы"""
-        chinese_pattern = re.compile(r'[\u4e00-\u9fff]+')
-        return bool(chinese_pattern.search(text))
-    
+        # cluster-32 dedup: диапазон теперь один на весь проект —
+        # gemini_translator.utils.cjk_ranges.CHINESE_CHAR_RE.
+        return bool(cjk_ranges.CHINESE_CHAR_RE.search(text))
+
     @staticmethod
     def contains_japanese(text):
         """Проверяет, содержит ли текст японские символы (хирагана, катакана)"""
-        japanese_pattern = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]+')
-        return bool(japanese_pattern.search(text))
-    
+        return bool(cjk_ranges.JAPANESE_CHAR_RE.search(text))
+
     @staticmethod
     def contains_korean(text):
         """Проверяет, содержит ли текст корейские символы (хангыль)"""
-        korean_pattern = re.compile(r'[\uac00-\ud7af]+')
-        return bool(korean_pattern.search(text))
+        return bool(cjk_ranges.KOREAN_CHAR_RE.search(text))
     
     @staticmethod
     def is_cjk_text(text):
@@ -152,13 +168,38 @@ class LanguageDetector:
 
 class ChineseTextProcessor:
     """Обработчик китайского текста с поддержкой сегментации"""
-    
-    def __init__(self, freq_power=3, freq_base=10, freq_offset=5, 
+
+    # --- Общий на ВЕСЬ процесс стек "обучений" Jieba ---
+    # Защищаемый ресурс — сам модуль jieba (jieba.dt.FREQ), процесс-глобальное
+    # состояние, а не поле одного экземпляра ChineseTextProcessor. Его пишут и
+    # читают РАЗНЫЕ экземпляры этого класса: общий ContextManager.chinese_processor
+    # (основная сессия перевода + параллельный content-filter redirect-движок,
+    # см. setup.py:_maybe_start_parallel_filter_redirect) и отдельный процессор,
+    # который создаёт себе SmartGlossaryFilter/GlossaryReplacer (см. add_custom_words
+    # и reset ниже). Поэтому стек обучений и его лок — атрибуты КЛАССА: reset()
+    # одного экземпляра обязан видеть (и не портить) обучения, сделанные через другой.
+    #
+    # Каждый элемент стека — снимок ОДНОГО вызова add_custom_words():
+    #   {"owner": <вызвавший ChineseTextProcessor>, "words": {слово: freq_до_обучения}}
+    # freq_до_обучения — число (слово уже было в словаре Jieba) либо _ABSENT
+    # (слова не было вовсе — при откате его нужно удалить через jieba.del_word()).
+    _training_stack = []
+    _training_lock = threading.Lock()
+    _ABSENT = object()
+
+    def __init__(self, freq_power=3, freq_base=10, freq_offset=5,
                  mult_factor_base=1.0, mult_factor_len_coeff=0.5):
         """
         Инициализирует процессор с параметрами для умной настройки частот.
         """
         self.jieba_initialized = False
+        # Сколько СОБСТВЕННЫХ (сделанных через add_custom_words именно на ЭТОМ
+        # экземпляре) обучений ещё не сняты парным reset() именно с него.
+        # Нужно, чтобы reset() экземпляра, который сам ничего не обучал
+        # (например, свежий процессор GlossaryReplacer.cleanup() при
+        # has_cjk_terms=False), не трогал обучения ДРУГИХ процессоров в общем
+        # _training_stack и не вызывал внеплановую перезагрузку jieba.
+        self._own_pending_trainings = 0
         if JIEBA_AVAILABLE:
             self.init_jieba()
             # Сохраняем параметры для настройки весов
@@ -225,64 +266,159 @@ class ChineseTextProcessor:
         """
         if not JIEBA_AVAILABLE or not glossary:
             return
-            
+
         if not self.jieba_initialized:
             self.init_jieba()
-            
-        try:
-            cleaner_re = re.compile(r'\W+', re.UNICODE)
-            words_to_train = set()
-            
-            for term in glossary.keys():
-                if not LanguageDetector.contains_chinese(term):
-                    continue
 
-                # --- ШАГ 1: Получаем чистое содержание термина ---
-                # Мы делаем это ОДИН раз в самом начале.
-                clean_content_str = cleaner_re.sub(' ', term).strip()
+        # Всё обучение (включая фактическую запись в jieba.dt.FREQ и снимок
+        # для отката) выполняется под тем же классовым локом, под которым
+        # reset() целиком делает откат и полную importlib.reload(jieba).
+        # Без этого возможна гонка: reset() другой сессии уже решил
+        # перезагрузить jieba и делает reload вне лока, а это обучение
+        # параллельно пишет в jieba.dt.FREQ — свежую запись стирает чужой reload.
+        with self.__class__._training_lock:
+            try:
+                cleaner_re = re.compile(r'\W+', re.UNICODE)
+                words_to_train = set()
 
-                # Если после очистки ничего не осталось, пропускаем
-                if not clean_content_str:
-                    continue
+                for term in glossary.keys():
+                    if not LanguageDetector.contains_chinese(term):
+                        continue
 
-                for script_variant in get_chinese_script_variants(clean_content_str):
-                    # --- ШАГ 2: Добавляем слова из оригинального чистого содержания ---
-                    words_to_train.update(script_variant.split())
+                    # --- ШАГ 1: Получаем чистое содержание термина ---
+                    # Мы делаем это ОДИН раз в самом начале.
+                    clean_content_str = cleaner_re.sub(' ', term).strip()
 
-                    # --- ШАГ 3: Ищем и добавляем нормализованные вариации ---
-                    normalized_content_str = unicodedata.normalize('NFKC', script_variant)
+                    # Если после очистки ничего не осталось, пропускаем
+                    if not clean_content_str:
+                        continue
 
-                    if script_variant != normalized_content_str:
-                        words_to_train.update(normalized_content_str.split())
+                    for script_variant in get_chinese_script_variants(clean_content_str):
+                        # --- ШАГ 2: Добавляем слова из оригинального чистого содержания ---
+                        words_to_train.update(script_variant.split())
 
-            # --- ШАГ 4: Обучение Jieba на финальном, уникальном наборе слов ---
-            for word in words_to_train:
-                if not word or not LanguageDetector.contains_chinese(word): 
-                    continue
+                        # --- ШАГ 3: Ищем и добавляем нормализованные вариации ---
+                        normalized_content_str = unicodedata.normalize('NFKC', script_variant)
 
-                # === ИСПРАВЛЕНИЕ ЗДЕСЬ ===
-                # Заменяем несуществующий get_abs_freqs на прямой доступ к словарю
-                current_freq = jieba.dt.FREQ.get(word, 0)
-                # =========================
-                
-                base_freq = self._get_word_freq_by_length(word)
-                
-                if current_freq > 0:
-                    multiplication_factor = self._get_multiplication_factor(word)
-                    new_freq = int(current_freq * multiplication_factor) + base_freq
-                else:
-                    new_freq = base_freq
-                jieba.add_word(word, freq=new_freq)
+                        if script_variant != normalized_content_str:
+                            words_to_train.update(normalized_content_str.split())
 
-        except Exception as e:
-            print(f"Error adding smart custom words to jieba: {e}")
-    
+                # --- ШАГ 4: Обучение Jieba на финальном, уникальном наборе слов ---
+                # Снимок "какая частота была ДО обучения" — чтобы reset() потом
+                # мог откатить именно ЭТО обучение, не трогая слова, за которые
+                # всё ещё отвечает другое активное обучение (см. reset() ниже).
+                snapshot = {}
+                for word in words_to_train:
+                    if not word or not LanguageDetector.contains_chinese(word):
+                        continue
+
+                    # === ИСПРАВЛЕНИЕ ЗДЕСЬ ===
+                    # Заменяем несуществующий get_abs_freqs на прямой доступ к словарю
+                    raw_freq = jieba.dt.FREQ.get(word, self.__class__._ABSENT)
+                    current_freq = 0 if raw_freq is self.__class__._ABSENT else raw_freq
+                    # =========================
+
+                    base_freq = self._get_word_freq_by_length(word)
+
+                    if current_freq > 0:
+                        multiplication_factor = self._get_multiplication_factor(word)
+                        new_freq = int(current_freq * multiplication_factor) + base_freq
+                    else:
+                        new_freq = base_freq
+
+                    if word not in snapshot:
+                        snapshot[word] = raw_freq
+                    jieba.add_word(word, freq=new_freq)
+
+                if snapshot:
+                    # Регистрируем это обучение в общем стеке — оно должно
+                    # получить парный reset() до того, как состояние Jieba
+                    # будет реально очищено (см. _training_stack в начале класса).
+                    self.__class__._training_stack.append({"owner": self, "words": snapshot})
+                    self._own_pending_trainings += 1
+
+            except Exception as e:
+                print(f"Error adding smart custom words to jieba: {e}")
+
     def reset(self):
         """
-        Полностью сбрасывает состояние Jieba путем перезагрузки модуля.
-        Это единственный надежный способ очистить измененные в памяти частоты слов.
+        Откатывает результат СОБСТВЕННЫХ (сделанных этим экземпляром) обучений
+        и, только если во всём процессе не осталось ни одного незакрытого
+        обучения, полностью перезагружает модуль jieba.
+
+        jieba — общий на процесс ресурс, а не состояние одного экземпляра
+        ChineseTextProcessor (см. _training_stack в начале класса): его
+        параллельно используют несколько TranslationEngine (основная сессия +
+        redirect-движок content-filter) и отдельный процессор, который
+        создаёт себе GlossaryReplacer. Раньше reset() безусловно делал
+        importlib.reload(jieba), стирая обучение ЛЮБОЙ другой активной сессии.
+        Теперь:
+          1. Экземпляр, который сам ничего не обучал (self._own_pending_trainings
+             == 0 — например, только что созданный процессор
+             GlossaryReplacer.cleanup() при has_cjk_terms=False), вообще не
+             трогает общий стек и не запускает перезагрузку — иначе он стирал
+             бы обучение чужой активной сессии, разделяющей тот же jieba.
+          2. Иначе снимается ОДНО собственное обучение из общего стека, и
+             откатываются частоты только тех слов, за которые не отвечает
+             НИ ОДНО из оставшихся в стеке обучений.
+          3. Полный importlib.reload(jieba) происходит, только когда общий
+             стек опустел — т.е. закрыты вообще ВСЕ активные обучения во
+             всём процессе, а не только в этом экземпляре.
+        Так непарный add_custom_words (например, обучение redirect-движка,
+        который гасят через engine.cleanup() в обход stop_session() —
+        см. находку major) оставляет в стеке одну "зависшую" запись, а не
+        выключает очистку jieba навсегда для всех последующих сессий.
         """
-        if JIEBA_AVAILABLE and self.jieba_initialized:
+        if not (JIEBA_AVAILABLE and self.jieba_initialized):
+            return
+
+        with self.__class__._training_lock:
+            if self._own_pending_trainings <= 0:
+                # Этот экземпляр сам ничего не обучал — снимать нечего, и
+                # трогать чужие записи в общем стеке нельзя.
+                return
+
+            stack = self.__class__._training_stack
+
+            # Ищем последнюю (LIFO) ещё не снятую запись, положенную именно
+            # этим экземпляром.
+            own_index = None
+            for i in range(len(stack) - 1, -1, -1):
+                if stack[i]["owner"] is self:
+                    own_index = i
+                    break
+
+            if own_index is None:
+                # В норме не должно происходить (счётчик разошёлся со стеком):
+                # молча не откатываем чужие слова, просто чиним свой счётчик.
+                self._own_pending_trainings = 0
+                return
+
+            entry = stack.pop(own_index)
+            self._own_pending_trainings -= 1
+
+            # Слова, всё ещё нужные хотя бы одному ОСТАВШЕМУСЯ обучению,
+            # откатывать нельзя.
+            still_needed = set()
+            for other in stack:
+                still_needed.update(other["words"].keys())
+
+            for word, prior_freq in entry["words"].items():
+                if word in still_needed:
+                    continue
+                try:
+                    if prior_freq is self.__class__._ABSENT:
+                        jieba.del_word(word)
+                    else:
+                        jieba.add_word(word, freq=prior_freq)
+                except Exception as e:
+                    print(f"[JIEBA ERROR] Не удалось откатить слово '{word}': {e}")
+
+            should_reload = len(stack) == 0
+            if not should_reload:
+                print("[JIEBA] Полная перезагрузка Jieba отложена: в процессе есть другие активные обучения.")
+                return
+
             try:
                 # Перезагружаем модуль jieba, чтобы он заново считал свои словари с диска
                 importlib.reload(jieba)
@@ -417,16 +553,6 @@ class SmartGlossaryFilter:
     def _normalize_text(self, text):
         """Применяет универсальную Unicode-нормализацию NFKC."""
         return unicodedata.normalize('NFKC', text)
-    
-    def _normalize_word(self, word):
-        """
-        Удаляет распространенные английские суффиксы/окончания из слова.
-        Работает по принципу "первое совпадение".
-        """
-        for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
-            if word.endswith(suffix):
-                return word[:-len(suffix)]
-        return word
     
     
     
@@ -779,7 +905,7 @@ class SmartGlossaryFilter:
     @staticmethod
     def _is_masked_single_char(term, residual_text):
         """Односимвольный CJK-термин, не встречающийся вне более длинных терминов."""
-        if len(term) != 1 or not CJK_CHAR_RE.match(term):
+        if len(term) != 1 or not cjk_ranges.CORE_CJK_CHAR_RE.match(term):
             return False
         return term not in residual_text
 
@@ -888,7 +1014,7 @@ class SmartGlossaryFilter:
                 else:
                     # В обычном режиме (для порога 99) мы все смягчаем
                     filtered_words = [w for w in term_words if w not in STOP_WORDS]
-                    processed_words = [self._normalize_word(w) for w in filtered_words]
+                    processed_words = [normalize_word(w) for w in filtered_words]
 
                 final_processed_term = " ".join(" ".join(processed_words).split())
 
@@ -1076,7 +1202,6 @@ class GlossaryLogic:
         # --- Шаг 3: Оценка кандидатов ---
         # Порог для переводов должен учитывать штраф.
         # Если final=90, то (Trans - 5) >= 90 => Trans >= 95.
-        trans_threshold_needed = final_threshold + 5 
 
         for term1_orig, term2_orig in all_candidate_pairs:
             d1 = term_data.get(term1_orig)
@@ -1139,13 +1264,6 @@ class GlossaryLogic:
         return similarity_map
 
     
-    def _normalize_word(self, word):
-        """Удаляет распространенные английские суффиксы/окончания."""
-        for suffix in MORPHOLOGY_SUFFIXES_TO_IGNORE:
-            if word.endswith(suffix):
-                return word[:-len(suffix)]
-        return word
-
     def _get_universal_tokens(self, text):
         """УНИВЕРСАЛЬНЫЙ ТОКЕНИЗАТОР: иероглиф или слово - это токен."""
         if LanguageDetector.is_cjk_text(text):
@@ -1154,7 +1272,7 @@ class GlossaryLogic:
             normalized = unicodedata.normalize('NFKC', text).lower()
             clean_text = re.sub(r'\W+', ' ', normalized, flags=re.UNICODE).strip()
             all_tokens = clean_text.split()
-            return [self._normalize_word(token) for token in all_tokens if token not in STOP_WORDS]
+            return [normalize_word(token) for token in all_tokens if token not in STOP_WORDS]
 
     def _calculate_levenshtein_similarity(self, s1, s2):
         """Вычисляет структурную похожесть строк."""
@@ -1172,45 +1290,6 @@ class GlossaryLogic:
             prev_row = curr_row
         return 1.0 - (prev_row[n] / m)
 
-    
-    def find_lcs_substring_sequence(self, a, b):
-        """
-        ФИНАЛЬНАЯ ВЕРСИЯ. Находит самую длинную общую непрерывную подстроку.
-        АВТОМАТИЧЕСКИ определяет, нужно ли применять CJK стоп-слова,
-        анализируя входные токены.
-        """
-        stop_words_to_use = set()
-        # Эвристика: если хотя бы один из токенов содержит CJK, применяем фильтр.
-        # Проверяем только первые несколько токенов для скорости.
-        combined_sample = a[:5] + b[:5]
-        if any(LanguageDetector.is_cjk_text(token) for token in combined_sample):
-            stop_words_to_use = CJK_STOP_WORDS
-    
-        # Фильтруем входные списки токенов от стоп-слов, если это необходимо
-        filtered_a = [token for token in a if token not in stop_words_to_use]
-        filtered_b = [token for token in b if token not in stop_words_to_use]
-    
-        m, n = len(filtered_a), len(filtered_b)
-        dp = [[0 for _ in range(n + 1)] for _ in range(m + 1)]
-        
-        max_len = 0
-        end_pos_a = 0
-        
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                if filtered_a[i - 1] == filtered_b[j - 1]:
-                    dp[i][j] = dp[i - 1][j - 1] + 1
-                    if dp[i][j] > max_len:
-                        max_len = dp[i][j]
-                        end_pos_a = i
-                else:
-                    dp[i][j] = 0
-        
-        if max_len > 0:
-            return filtered_a[end_pos_a - max_len : end_pos_a]
-        else:
-            return []
-    
     def _calculate_bag_of_chars_similarity(self, s1, s2):
         """Вычисляет композиционную похожесть по мешку символов."""
         if not s1 and not s2: return 1.0

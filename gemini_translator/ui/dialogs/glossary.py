@@ -23,7 +23,7 @@ from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
     QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
     QFileDialog, QMessageBox, QWidget, QHBoxLayout, QComboBox,
-    QSplitter, QStyle, QGroupBox, QAbstractItemView, QGridLayout, QToolButton
+    QSplitter, QStyle, QGroupBox, QAbstractItemView, QGridLayout
 )
 
 # --- Импорты из модулей проекта ---
@@ -52,8 +52,10 @@ from .glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 
 # Утилиты и API
 from ..shell import ShellPage
+from .menu_utils import PageDialogProxyMixin, make_page_delegating_meta, prompt_return_to_menu
 from ...api import config as api_config
 from ...utils.settings import SettingsManager
+from ...utils.io_utils import atomic_write_json
 from ...utils.language_tools import (
     LanguageDetector, ChineseTextProcessor, GlossaryLogic
 )
@@ -717,23 +719,9 @@ class GlossaryManagerPage(ShellPage):
 
         pagination_layout.addStretch() # Распорка слева от пагинации
         
-        self.first_page_button = QPushButton("<< В начало"); self.first_page_button.clicked.connect(self._go_to_first_page)
-        self.prev_page_button = QPushButton("< Назад"); self.prev_page_button.clicked.connect(self._go_to_prev_page)
         self.page_info_label = QLabel("Всего: 0"); self.page_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.next_page_button = QPushButton("Вперед >"); self.next_page_button.clicked.connect(self._go_to_next_page)
-        self.last_page_button = QPushButton("В конец >>"); self.last_page_button.clicked.connect(self._go_to_last_page)
-        self.page_navigation_controls = [
-            self.first_page_button,
-            self.prev_page_button,
-            self.next_page_button,
-            self.last_page_button,
-        ]
-        for button in self.page_navigation_controls:
-            button.setVisible(False)
-        
-        pagination_layout.addWidget(self.first_page_button); pagination_layout.addWidget(self.prev_page_button)
-        pagination_layout.addWidget(self.page_info_label); pagination_layout.addWidget(self.next_page_button); pagination_layout.addWidget(self.last_page_button); 
-        
+        pagination_layout.addWidget(self.page_info_label)
+
         pagination_layout.addStretch() # Распорка справа от пагинации
         
         # --- КНОПКА СОРТИРОВКИ (СПРАВА) ---
@@ -860,8 +848,7 @@ class GlossaryManagerPage(ShellPage):
         project_glossary_path = os.path.join(self.associated_project_path, "project_glossary.json")
 
         try:
-            with open(project_glossary_path, 'w', encoding='utf-8') as f:
-                json.dump(glossary_to_save, f, ensure_ascii=False, indent=2, sort_keys=True)
+            atomic_write_json(project_glossary_path, glossary_to_save, indent=2, sort_keys=True)
 
             self.mark_current_state_as_saved(saved_to_project=True)
             self._sync_saved_project_state_to_parent(glossary_to_save)
@@ -953,13 +940,6 @@ class GlossaryManagerPage(ShellPage):
         if hasattr(self, 'wait_dialog') and self.wait_dialog:
             self.wait_dialog.close(); self.wait_dialog = None
             
-    @pyqtSlot(dict)
-    def _on_create_new_term_requested(self, new_entry_data):
-        """Слот, который принимает сигнал от диалога и создает новый термин."""
-        self._add_new_term(new_entry_data=new_entry_data)
-        QMessageBox.information(self, "Термин создан", 
-            f"Новый термин '{new_entry_data.get('original')}' добавлен в конец списка и готов к редактированию.")
-    
     def _add_new_term(self, new_entry_data=None):
         """
         "DB-driven" добавление. Вставляет термин в БД, затем переходит
@@ -1188,10 +1168,6 @@ class GlossaryManagerPage(ShellPage):
     # --- НОВЫЕ МЕТОДЫ: СИСТЕМА ПАГИНАЦИИ И ЗАГРУЗКИ ДАННЫХ ---
     # ---------------------------------------------------------------------------
     
-    @property
-    def total_pages(self) -> int:
-        return 1
-
     def _get_sort_clause(self) -> str:
         """Возвращает строку для SQL-запроса ORDER BY."""
         column_map = {0: 'original', 1: 'rus', 2: 'note', 3: 'timestamp'}
@@ -1442,31 +1418,8 @@ class GlossaryManagerPage(ShellPage):
 
 
     def _update_pagination_controls(self):
-        """Обновляет состояние кнопок и текста навигации."""
+        """Обновляет текст сводки количества терминов."""
         self.page_info_label.setText(f"Всего: {self.total_items}")
-
-        for button in getattr(self, "page_navigation_controls", ()):
-            button.setEnabled(False)
-
-    def _go_to_first_page(self):
-        self.table.setCurrentItem(None)
-        self.current_page = 0
-        self._load_current_page()
-
-    def _go_to_prev_page(self):
-        self.table.setCurrentItem(None)
-        self.current_page = 0
-        self._load_current_page()
-
-    def _go_to_next_page(self):
-        self.table.setCurrentItem(None)
-        self.current_page = 0
-        self._load_current_page()
-
-    def _go_to_last_page(self):
-        self.table.setCurrentItem(None)
-        self.current_page = 0
-        self._load_current_page()
 
     def _find_page_for_id(self, db_id: str) -> int:
         # Единый вертикальный список — страница всегда одна.
@@ -1499,18 +1452,6 @@ class GlossaryManagerPage(ShellPage):
         else:
             self._highlight_timer = None
             print("Progressive highlighting finished.")
-    
-    def _reset_analysis_state(self):
-        """
-        Полностью сбрасывает все результаты анализа.
-        """
-        self.direct_conflicts.clear()
-        self.reverse_issues.clear()
-        self.overlap_groups.clear()
-        self.inverted_overlaps.clear()
-        self.conflicting_term_keys.clear()
-        self.is_analysis_dirty = True
-        self._update_analysis_ui()
     
     def _invalidate_analysis_for_terms(self, affected_terms: set):
         """
@@ -1721,7 +1662,6 @@ class GlossaryManagerPage(ShellPage):
             self.number = next((g for g in grammemes_set if g in {'sing', 'plur'}), None)
             self.gender = next((g for g in grammemes_set if g in {'masc', 'femn', 'neut'}), None)
             self.POS = next((g for g in grammemes_set if g.isupper()), None)
-            self.animacy = next((g for g in grammemes_set if g in {'anim', 'inan'}), None)
         def __contains__(self, grammeme): return grammeme in self.grammemes
         def __str__(self): return ",".join(sorted(list(self.grammemes)))
 
@@ -1828,41 +1768,7 @@ class GlossaryManagerPage(ShellPage):
         'ADVB': {   'NOUN':-5.0, 'ADJF': 15.0,'VERB': 25.0, 'INFN': 25.0, 'PRTF': 15.0, 'NUMR':-10.0, 'ADVB': 10.0, 'PRCL': 8.0   },
         'PRCL': {   'NOUN':-5.0, 'ADJF':-5.0, 'VERB': 15.0, 'INFN': 15.0, 'PRTF':-5.0,  'NUMR':-10.0, 'ADVB': 8.0,  'PRCL':-5.0   },
     }
-    
-    PUNCTUATION_MATRIX = {
-        # Ключ: знак препинания. Значение: "квадратная" матрица {POS_до: {POS_после: балл}}
-        ',': {
-            'NOUN': {'NOUN': 12.0, 'NPRO': -5.0,  'ADJF': 14.0, 'PRTF': 14.0, 'VERB': -5.0,  'NUMR': -5.0},
-            'NPRO': {'NOUN': -5.0,  'NPRO': 12.0, 'ADJF': 14.0, 'PRTF': 14.0, 'VERB': -5.0,  'NUMR': -5.0},
-            'ADJF': {'NOUN': 13.0, 'NPRO': 13.0, 'ADJF': 12.0, 'PRTF': 11.0, 'VERB': -5.0,  'NUMR': -5.0},
-            'PRTF': {'NOUN': 13.0, 'NPRO': 13.0, 'ADJF': 11.0, 'PRTF': 12.0, 'VERB': -5.0,  'NUMR': -5.0},
-            'VERB': {'NOUN': -5.0,  'NPRO': -5.0,  'ADJF': -5.0,  'PRTF': -5.0,  'VERB': 12.0, 'NUMR': -5.0},
-            'NUMR': {'NOUN': -5.0,  'NPRO': -5.0,  'ADJF': -5.0,  'PRTF': -5.0,  'VERB': -5.0,  'NUMR': 12.0}, # Однородные числительные
-        },
-        
-        ';': {
-            # Точка с запятой обычно разделяет более крупные, независимые блоки.
-            # Поэтому связи здесь слабее, чем у запятой.
-            'NOUN': {'NOUN': 8.0, 'NPRO': -5.0, 'ADJF': 5.0,  'PRTF': 5.0,  'VERB': -5.0, 'NUMR': -5.0},
-            'NPRO': {'NOUN': -5.0, 'NPRO': 8.0, 'ADJF': 5.0,  'PRTF': 5.0,  'VERB': -5.0, 'NUMR': -5.0},
-            'ADJF': {'NOUN': 4.0,  'NPRO': 4.0,  'ADJF': 8.0,  'PRTF': 7.0,  'VERB': -5.0, 'NUMR': -5.0},
-            'PRTF': {'NOUN': 4.0,  'NPRO': 4.0,  'ADJF': 7.0,  'PRTF': 8.0,  'VERB': -5.0, 'NUMR': -5.0},
-            'VERB': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': 8.0,  'NUMR': -5.0},
-            'NUMR': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': 8.0},
-        },
-        
-        ':': {
-            # Двоеточие вводит пояснение. Связь несимметрична.
-            'NOUN': {'NOUN': 10.0, 'NPRO': 10.0, 'ADJF': 10.0, 'PRTF': 10.0, 'VERB': 10.0, 'NUMR': 10.0}, # Пояснение к существительному
-            # остальные строки в основном будут с низкими баллами
-            'NPRO': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': -5.0},
-            'ADJF': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': -5.0},
-            'PRTF': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': -5.0},
-            'VERB': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': -5.0},
-            'NUMR': {'NOUN': -5.0, 'NPRO': -5.0, 'ADJF': -5.0, 'PRTF': -5.0, 'VERB': -5.0, 'NUMR': -5.0},
-        }
-    }
-    
+
     def _get_pos_priority(self, parse):
         tag = parse.tag
         if 'NOUN' in tag: pos_prio = 1.0
@@ -2219,7 +2125,7 @@ class GlossaryManagerPage(ShellPage):
             return "Не удалось проанализировать фразу."
         
         # Находим победителя по энергии
-        best_energy, best_molecule, best_combo, best_resolved_molecule = max(molecules_with_energy, key=lambda item: item[0])
+        best_energy, _best_molecule, best_combo, best_resolved_molecule = max(molecules_with_energy, key=lambda item: item[0])
         
         # --- блок вывода ---
         if debug: 
@@ -2396,26 +2302,26 @@ class GlossaryManagerPage(ShellPage):
         else:
             self._update_analysis_widgets()
 
-    def get_glossary(self) -> list:
-        conn = self._get_db_conn()
-        with conn:
-            # Обязательно выбираем timestamp для сохранения в файл
-            cursor = conn.execute("SELECT original, rus, note, timestamp FROM glossary_editor_state ORDER BY sequence ASC")
-            return [dict(row) for row in cursor.fetchall()]
-
-    def _get_glossary_with_db_ids(self) -> list:
-        """Возвращает строки для внутренних редакторов с устойчивым ID из БД."""
+    def get_glossary(self, include_db_id: bool = False) -> list:
+        """Строки редактора в порядке sequence (timestamp обязателен — он
+        уходит в файл). ``include_db_id`` добавляет устойчивый id из БД как
+        ``_db_id`` для внутренних редакторов — раньше это был второй метод с
+        почти тем же SELECT (dups-gt_ui_dialogs_glossary-04)."""
+        columns = "original, rus, note, timestamp"
+        if include_db_id:
+            columns = "id AS _db_id, " + columns
         conn = self._get_db_conn()
         with conn:
             cursor = conn.execute(
-                """
-                SELECT id AS _db_id, original, rus, note, timestamp
-                FROM glossary_editor_state
-                ORDER BY sequence ASC
-                """
+                f"SELECT {columns} FROM glossary_editor_state ORDER BY sequence ASC"
             )
             return [dict(row) for row in cursor.fetchall()]
-    
+
+    def _get_glossary_with_db_ids(self) -> list:
+        """Тонкий алиас get_glossary(include_db_id=True): имя используют
+        conflict-резолверы и tests/test_glossary_conflict_identity.py."""
+        return self.get_glossary(include_db_id=True)
+
     def _remove_selected_terms(self):
         selected_indexes = self.table.selectionModel().selectedIndexes()
         if not selected_indexes: return
@@ -2952,17 +2858,6 @@ class GlossaryManagerPage(ShellPage):
                 
         self.conflicting_term_keys = set(self.conflict_map.keys())
     
-    def _std_icon(self, pixmap):
-        """Кэш стандартных иконок: style().standardIcon на каждую кнопку
-        каждой строки — ~0.2мс × тысячи вызовов при заполнении таблицы."""
-        cache = getattr(self, '_std_icon_cache', None)
-        if cache is None:
-            cache = self._std_icon_cache = {}
-        icon = cache.get(pixmap)
-        if icon is None:
-            icon = cache[pixmap] = self.style().standardIcon(pixmap)
-        return icon
-
     def _create_row_buttons(self, row, item_dict):
         """Записывает состав кнопок строки в данные item'ов колонок 3/4 —
         рисует их GlossaryActionDelegate, виджеты не создаются."""
@@ -3101,40 +2996,6 @@ class GlossaryManagerPage(ShellPage):
                 delegate.invalidate_cache()
                 self.table.viewport().update()
         super().changeEvent(event)
-
-    def _configure_table_action_button(self, button: QToolButton, extra_style: str = ""):
-        button.setFixedSize(self.TABLE_ACTION_BUTTON_SIZE)
-        button.setIconSize(self.TABLE_ACTION_ICON_SIZE)
-        button.setAutoRaise(True)
-        button.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Fixed,
-            QtWidgets.QSizePolicy.Policy.Fixed,
-        )
-        # Строка стиля одинакова для всех кнопок с одним extra_style —
-        # собираем один раз на страницу, а не на каждую кнопку каждой строки.
-        style_cache = getattr(self, '_action_btn_style_cache', None)
-        if style_cache is None:
-            style_cache = self._action_btn_style_cache = {}
-        stylesheet = style_cache.get(extra_style)
-        if stylesheet is None:
-            stylesheet = style_cache[extra_style] = (
-                "QToolButton {"
-                "background: transparent;"
-                "border: 1px solid transparent;"
-                "border-radius: 6px;"
-                "padding: 0px;"
-                f"min-width: {self.TABLE_ACTION_BUTTON_SIZE.width()}px;"
-                f"max-width: {self.TABLE_ACTION_BUTTON_SIZE.width()}px;"
-                f"min-height: {self.TABLE_ACTION_BUTTON_SIZE.height()}px;"
-                f"max-height: {self.TABLE_ACTION_BUTTON_SIZE.height()}px;"
-                f"{extra_style}"
-                "}"
-                "QToolButton:hover {"
-                f"background-color: {theme_manager.color('accent_hover_soft')};"
-                f"border-color: {theme_manager.color('border_strong')};"
-                "}"
-            )
-        button.setStyleSheet(stylesheet)
 
     def _action_column_width_for_buttons(self, button_count: int) -> int:
         if button_count <= 0:
@@ -3728,8 +3589,7 @@ class GlossaryManagerPage(ShellPage):
         except Exception:
             state['vertical_scroll_value'] = 0
         try:
-            with open(state_path, 'w', encoding='utf-8') as f:
-                json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+            atomic_write_json(state_path, state, indent=2, sort_keys=True)
         except Exception as e:
             print(f"Failed to persist glossary page state: {e}")
 
@@ -3907,12 +3767,11 @@ class GlossaryManagerPage(ShellPage):
 # --- Wrapper and re-export follow below ---
 
 
-class _GlossaryDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(GlossaryManagerPage, name)
-
-
-class MainWindow(QDialog, metaclass=_GlossaryDialogMeta):
+class MainWindow(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(GlossaryManagerPage),
+):
     """Thin modal wrapper hosting GlossaryManagerPage (preserves the old QDialog API + result)."""
 
     @property
@@ -3940,12 +3799,6 @@ class MainWindow(QDialog, metaclass=_GlossaryDialogMeta):
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
 
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
-
     def closeEvent(self, event):
         # MOVED from the page; self.<x> → self.page.<x>
         if self.page.launch_mode != 'standalone' and not self.page._dialog_result_closing:
@@ -3954,22 +3807,12 @@ class MainWindow(QDialog, metaclass=_GlossaryDialogMeta):
             return
 
         if self.page.launch_mode == 'standalone':
-            msg_box = QMessageBox(self)
-            msg_box.setWindowTitle("Завершение работы")
-            msg_box.setText("Вы хотите закрыть приложение или вернуться в главное меню?")
-            msg_box.setIcon(QMessageBox.Icon.Question)
+            action = prompt_return_to_menu(self)
 
-            btn_menu = msg_box.addButton("Вернуться в меню", QMessageBox.ButtonRole.ActionRole)
-            btn_exit = msg_box.addButton("Выйти из программы", QMessageBox.ButtonRole.DestructiveRole)
-            btn_cancel = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
-
-            msg_box.exec()
-            clicked = msg_box.clickedButton()
-
-            if clicked == btn_cancel:
+            if action == "cancel":
                 event.ignore()
                 return
-            elif clicked == btn_menu:
+            elif action == "menu":
                 self.page._ask_delete_backup()
                 # Спецкод для main.py
                 QApplication.exit(2000)

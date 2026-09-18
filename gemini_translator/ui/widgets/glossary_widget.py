@@ -5,7 +5,6 @@ import os
 
 import re
 import traceback
-import zipfile
 import time
 
 from PyQt6 import QtWidgets
@@ -24,6 +23,9 @@ from ..dialogs.glossary import (
 )
 from ..dialogs.glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 from .ancestor_utils import find_ancestor_by_class_name
+from ...utils.document_importer import set_all_checked
+from ...utils.glossary_tools import glossary_entry_key, glossary_entries_as_list
+from ...utils.io_utils import atomic_write_json
 from ...utils.settings import SettingsManager
 from ...api import config as api_config
 from collections import defaultdict
@@ -40,8 +42,8 @@ GLOSSARY_PAGE_SIZE = 500
 def sorted_glossary_entries(entries: list[dict]) -> list[dict]:
     """Стабильно сортирует записи по original, оставляя пустые строки в конце."""
     def sort_key(entry):
-        original = str(entry.get("original", "") or "").strip()
-        return not original, original.casefold()
+        key = glossary_entry_key(entry)
+        return not key, key
 
     return sorted(
         entries,
@@ -53,15 +55,22 @@ def normalize_glossary_field(value) -> str:
     return "" if value is None else str(value)
 
 
+def apply_glossary_field_normalization(entry: dict) -> dict:
+    """Применяет normalize_glossary_field к общим полям записи глоссария
+    (original/rus/note и, если присутствует, translation) на месте.
+
+    Общая часть normalize_imported_glossary_entry и GlossaryWidget.set_glossary.
+    """
+    entry["original"] = normalize_glossary_field(entry.get("original"))
+    entry["rus"] = normalize_glossary_field(entry.get("rus"))
+    entry["note"] = normalize_glossary_field(entry.get("note"))
+    if "translation" in entry:
+        entry["translation"] = normalize_glossary_field(entry.get("translation"))
+    return entry
+
+
 def glossary_snapshot(entries) -> list[dict]:
-    raw_list = []
-    if isinstance(entries, dict):
-        raw_list = [
-            {"original": key, **(value if isinstance(value, dict) else {"rus": value})}
-            for key, value in entries.items()
-        ]
-    elif isinstance(entries, list):
-        raw_list = entries
+    raw_list = glossary_entries_as_list(entries)
 
     snapshot = []
     for entry in raw_list:
@@ -78,12 +87,6 @@ def glossary_snapshot(entries) -> list[dict]:
     return snapshot
 
 
-def glossary_entry_key(entry) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    return str(entry.get("original", "") or "").strip().casefold()
-
-
 def normalize_imported_glossary_entry(entry) -> dict | None:
     if not isinstance(entry, dict):
         return None
@@ -92,11 +95,7 @@ def normalize_imported_glossary_entry(entry) -> dict | None:
     if not clean_entry.get("rus") and clean_entry.get("translation"):
         clean_entry["rus"] = clean_entry.get("translation")
 
-    clean_entry["original"] = normalize_glossary_field(clean_entry.get("original"))
-    clean_entry["rus"] = normalize_glossary_field(clean_entry.get("rus"))
-    clean_entry["note"] = normalize_glossary_field(clean_entry.get("note"))
-    if "translation" in clean_entry:
-        clean_entry["translation"] = normalize_glossary_field(clean_entry.get("translation"))
+    apply_glossary_field_normalization(clean_entry)
     if clean_entry.get("timestamp") is None:
         clean_entry.pop("timestamp", None)
 
@@ -224,11 +223,7 @@ class GeneratedTermsReviewDialog(QDialog):
         layout.addWidget(self.button_box)
 
     def _set_all_checked(self, checked: bool):
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item:
-                item.setCheckState(state)
+        set_all_checked(self.table, checked)
 
     def accept(self):
         current = self.table.currentItem()
@@ -442,8 +437,10 @@ class GlossaryWidget(QWidget):
         self.project_save_btn.setText("💾 Сохранить в проект*" if is_dirty else "💾 Сохранить в проект")
 
     def _write_glossary_json(self, file_path: str, glossary_data) -> None:
-        with open(file_path, "w", encoding="utf-8") as handle:
-            json.dump(glossary_data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        # Атомарная запись: сначала во временный файл рядом с целевым, затем
+        # os.replace(). Так крах/исключение посреди записи не оставляет на
+        # диске усечённый JSON поверх ранее сохранённых данных.
+        atomic_write_json(file_path, glossary_data, indent=2, sort_keys=True)
 
     def _load_glossary_json(self, file_path: str, missing_value=None):
         if not file_path or not os.path.exists(file_path):
@@ -480,9 +477,19 @@ class GlossaryWidget(QWidget):
         autosave_path = self._project_glossary_autosave_path()
 
         if project_path and os.path.exists(project_path):
-            project_data = self._load_glossary_json(project_path, missing_value=[]) or []
+            try:
+                project_data = self._load_glossary_json(project_path, missing_value=[]) or []
+            except Exception:
+                # Битый project_glossary.json не должен прерывать загрузку —
+                # ниже есть шанс восстановиться из автокопии.
+                project_data = []
 
-        autosave_data = self._load_glossary_json(autosave_path, missing_value=None)
+        try:
+            autosave_data = self._load_glossary_json(autosave_path, missing_value=None)
+        except Exception:
+            # Битая автокопия не должна мешать использованию целого
+            # project_glossary.json.
+            autosave_data = None
         glossary_to_display = project_data
 
         if autosave_data is not None and glossary_snapshot(autosave_data) != glossary_snapshot(project_data):
@@ -555,8 +562,7 @@ class GlossaryWidget(QWidget):
         except Exception:
             state["vertical_scroll_value"] = 0
         try:
-            with open(state_path, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            atomic_write_json(state_path, state, indent=2, sort_keys=True)
         except Exception:
             pass
 
@@ -613,36 +619,25 @@ class GlossaryWidget(QWidget):
         entries_to_load = []
         
         # --- Нормализация данных (rus vs translation + timestamp) ---
-        raw_list = []
-        if isinstance(glossary_data, dict):
-            raw_list = [
-                {"original": k, **(v if isinstance(v, dict) else {"rus": v})}
-                for k, v in glossary_data.items()
-            ]
-        elif isinstance(glossary_data, list):
-            raw_list = glossary_data
-            
+        raw_list = glossary_entries_as_list(glossary_data)
+
         current_now = time.time()
 
         for entry in raw_list:
             if not isinstance(entry, dict):
                 continue
             clean_entry = entry.copy()
-            
+
             # Фолбэк: если нет 'rus', но есть 'translation', используем его
             if 'rus' not in clean_entry and 'translation' in clean_entry:
                 clean_entry['rus'] = clean_entry['translation']
-            
+
             # Гарантируем наличие ключей
             if 'rus' not in clean_entry: clean_entry['rus'] = ""
             if 'note' not in clean_entry: clean_entry['note'] = ""
             if 'original' not in clean_entry: clean_entry['original'] = ""
-            clean_entry['original'] = normalize_glossary_field(clean_entry.get('original'))
-            clean_entry['rus'] = normalize_glossary_field(clean_entry.get('rus'))
-            clean_entry['note'] = normalize_glossary_field(clean_entry.get('note'))
-            if 'translation' in clean_entry:
-                clean_entry['translation'] = normalize_glossary_field(clean_entry.get('translation'))
-            
+            apply_glossary_field_normalization(clean_entry)
+
             # ТАЙМСТАМП: Сохраняем старый или создаем новый (для импорта из старых версий)
             if 'timestamp' not in clean_entry:
                 clean_entry['timestamp'] = current_now
@@ -1220,8 +1215,7 @@ class GlossaryWidget(QWidget):
         if project_folder and msg_box.clickedButton() == save_btn:
             try:
                 project_glossary_path = os.path.join(project_folder, "project_glossary.json")
-                with open(project_glossary_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.get_glossary(), f, ensure_ascii=False, indent=2, sort_keys=True)
+                self._write_glossary_json(project_glossary_path, self.get_glossary())
                 if parent_dialog and hasattr(parent_dialog, 'project_manager') and parent_dialog.project_manager:
                     parent_dialog.project_manager.save_glossary_generation_map(updated_generated_chapters_map)
                 # --- ИСПРАВЛЕНИЕ: Сохраняем копию состояния, чтобы разорвать ссылочную связь ---
@@ -1378,21 +1372,6 @@ class GlossaryCleanupDialog(QDialog):
                         if len(parts) > 1:
                             self.candidates_slashes.add(ident_key)
 
-            # 2. Анализ заголовков (если есть EPUB)
-            # if self.epub_path and os.path.exists(self.epub_path):
-                # epub_cache = {}
-                # try:
-                    # self._analyze_epub_structure(epub_cache)
-                    # for entry in self.glossary_data:
-                        # term = entry.get('original', '').strip()
-                        # rus = entry.get('rus', '')
-                        # ident_key = (entry.get('original', ''), rus)
-                        
-                        # if self._should_remove_as_header(term, epub_cache):
-                            # self.candidates_headers.add(ident_key)
-                # except Exception as e:
-                    # print(f"[Analysis Error] {e}")
-
             # 3. Обновление UI
             self._update_checkboxes()
             self.btn_apply.setEnabled(True)
@@ -1489,71 +1468,3 @@ class GlossaryCleanupDialog(QDialog):
             new_list.append(new_entry)
             
         return new_list, stat_formatted + stat_removed
-
-    # --- Методы анализа EPUB ---
-    def _analyze_epub_structure(self, cache_dict):
-        ignore_patterns = ['toc', 'nav', 'cover', 'style', 'css']
-        with zipfile.ZipFile(self.epub_path, 'r') as zf:
-            for filename in zf.namelist():
-                if not filename.endswith(('.html', '.xhtml', '.htm')): continue
-                if any(pat in filename.lower() for pat in ignore_patterns): continue
-                try:
-                    raw_content = zf.read(filename).decode('utf-8', 'ignore')
-                    # H1 / Title
-                    h1s = re.findall(r'<h1.*?>(.*?)</h1>', raw_content, re.IGNORECASE | re.DOTALL)
-                    titles = re.findall(r'<title.*?>(.*?)</title>', raw_content, re.IGNORECASE | re.DOTALL)
-                    clean_h1s = [re.sub(r'<[^>]+>', '', h).strip() for h in h1s]
-                    clean_titles = [re.sub(r'<[^>]+>', '', t).strip() for t in titles]
-                    
-                    # Чистый текст для анализа длины
-                    no_script = re.sub(r'<(script|style).*?>.*?</\1>', '', raw_content, flags=re.DOTALL | re.IGNORECASE)
-                    blocks_replaced = re.sub(r'</?(p|div|br|h\d|li).*?>', '\n', no_script)
-                    text_only = re.sub(r'<[^>]+>', '', blocks_replaced)
-                    lines = [line.strip() for line in text_only.split('\n') if line.strip()]
-
-                    cache_dict[filename] = {
-                        'lines': lines,
-                        'h1s': set(clean_h1s),
-                        'titles': set(clean_titles)
-                    }
-                except Exception: pass
-
-    def _should_remove_as_header(self, term, cache_dict):
-        if not term or len(term) < 2: return False
-        term_lower = term.lower()
-        found_count = 0
-        last_data = None
-        
-        for fname, data in cache_dict.items():
-            found_in_file = False
-            for line in data['lines']:
-                if term_lower in line.lower():
-                    found_in_file = True
-                    break
-            if found_in_file:
-                found_count += 1
-                last_data = data
-            if found_count > 1: return False 
-
-        if found_count == 0: return False
-        
-        # Только в 1 файле. Проверяем контекст.
-        is_header = False
-        for h in last_data['h1s']:
-            if term_lower in h.lower(): is_header = True; break
-        if not is_header:
-            for t in last_data['titles']:
-                if term_lower in t.lower(): is_header = True; break
-        
-        if not is_header: return False 
-
-        # Проверка на нарратив
-        term_len = len(term)
-        for line in last_data['lines']:
-            if term_lower in line.lower():
-                line_len = len(line)
-                diff = abs(line_len - term_len)
-                if diff / term_len > 0.3: # Если строка на 30% длиннее термина
-                    return False 
-        
-        return True

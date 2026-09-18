@@ -21,6 +21,7 @@ from ..utils.project_manager import TranslationProjectManager
 from ..api.managers import ApiKeyManager
 from ..core.chunk_assembler import ChunkAssembler
 from ..utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor
+from .event_bus_mixin import EventBusMixin
 
 def shutdown_executor_with_deadline(executor, deadline_seconds: float) -> int:
     """Останавливает пул, ожидая потоки не дольше deadline_seconds.
@@ -131,7 +132,7 @@ def normalize_browser_profile_settings(settings: dict, log_callback=None):
             f"[BROWSER] Parallel browser profiles enabled: {profile_count} profile(s)."
         )
 
-class TranslationEngine(QObject):
+class TranslationEngine(EventBusMixin, QObject):
     LONG_PAUSE_THRESHOLD_SECONDS = 60
     MAX_REPEATED_WAITS = 5
     # --- АСИНХРОННЫЕ ИНТЕРВАЛЫ ---
@@ -141,6 +142,9 @@ class TranslationEngine(QObject):
     MONITOR_INTERVAL_MS = 5557 
     
     _worker_finished_signal = pyqtSignal(str, object)
+    # Итоговый проход контроля качества выполняется в своём потоке; сигнал
+    # возвращает результат в поток движка.
+    qa_final_pass_finished = pyqtSignal(object, object)
     # Сигналы остаются, они нужны для UI
  
     def __init__(self, context_manager=None, settings_manager=None, task_manager=None, parent=None, event_bus=None):
@@ -174,7 +178,6 @@ class TranslationEngine(QObject):
             'start_session_requested',
             'manual_stop_requested',
             'soft_stop_requested',
-            'soft_stop_requested_v1_legacy',
             'temporary_limit_warning_received',
             'api_connection_healthy',
             'fatal_error',
@@ -219,6 +222,9 @@ class TranslationEngine(QObject):
         # Для дебага утечек памяти
         self.session_id_for_log = None
         self._worker_finished_signal.connect(self._on_worker_finished)
+        self.qa_final_pass_finished.connect(self._on_final_qa_finished)
+        self._final_qa_state = 'idle'
+        self._qa_epub_path = ''
     
     def _post_event(self, name: str, data: dict = None):
         event = {
@@ -231,24 +237,6 @@ class TranslationEngine(QObject):
             self.bus.emit_event(event)
         elif hasattr(self.bus, "event_posted"):
             self.bus.event_posted.emit(event)
-
-    def _connect_to_bus(self):
-        if hasattr(self.bus, "subscribe"):
-            for topic in self._event_topics:
-                self.bus.subscribe(topic, self.on_event)
-            self._uses_topic_subscription = True
-        else:
-            self.bus.event_posted.connect(self.on_event)
-
-    def _disconnect_from_bus(self):
-        try:
-            if self._uses_topic_subscription and hasattr(self.bus, "unsubscribe"):
-                for topic in self._event_topics:
-                    self.bus.unsubscribe(topic, self.on_event)
-            elif hasattr(self.bus, "event_posted"):
-                self.bus.event_posted.disconnect(self.on_event)
-        except (TypeError, RuntimeError, ValueError):
-            pass
 
     def _cleanup_chunk_assembler(self):
         assembler = getattr(self, "chunk_assembler", None)
@@ -389,17 +377,6 @@ class TranslationEngine(QObject):
             self._check_if_session_finished()
             return
 
-        if event_name == 'soft_stop_requested_v1_legacy':
-            if self.task_manager:
-                # ВЫЗЫВАЕМ НОВЫЙ МЕТОД "ЗАМОРОЗКИ"
-                held_count = self.task_manager.hold_all_pending_tasks()
-                if held_count > 0:
-                    self._post_event('log_message', {
-                        'message': f"Плавная остановка: {held_count} задач 'заморожено'. Ожидание завершения активных воркеров..."
-                    })
-                # Отправляем "пульс", чтобы UI обновился и показал "замороженные" задачи
-            return
-    
         # Обработка "красных" и "желтых" карточек
         if event_name == 'temporary_limit_warning_received' and 'worker' in source:
             now = time.time()
@@ -779,17 +756,31 @@ class TranslationEngine(QObject):
         # --- ИЗМЕНЕНИЕ: Логика получения первой задачи адаптирована под SQLite ---
         first_task_payload = self.task_manager.get_first_pending_task_payload()
         first_task_type = first_task_payload[0] if first_task_payload else None
+        session_kind = str(settings.get('session_kind') or '').strip()
+        explicit_glossary_session = session_kind == 'glossary_generation'
+        if explicit_glossary_session and first_task_type != 'glossary_batch_task':
+            self._end_session(
+                "Критическая ошибка: очередь генерации глоссария была заменена "
+                "задачами другого типа. Пересоберите задачи глоссария и повторите запуск."
+            )
+            return
+        self._qa_epub_path = (
+            str(first_task_payload[1])
+            if first_task_payload and len(first_task_payload) > 1
+            else ''
+        )
+        self._final_qa_state = 'idle' 
         
         # 3. Инициализируем нужные компоненты
 
 
         self.project_manager = None
+        output_folder = settings.get('output_folder')
         
-        if first_task_type == 'glossary_batch_task':
+        if explicit_glossary_session or first_task_type == 'glossary_batch_task':
             merge_mode = settings.get('glossary_merge_mode', 'supplement')
             self._post_event('log_message', {'message': f"[MANAGER] Активирован режим генерации. Слияние: {merge_mode}."})
         else:
-            output_folder = settings.get('output_folder')
             if not output_folder and first_task_type != 'raw_text_translation':
                 self._end_session("Критическая ошибка: не указана папка для вывода.")
                 return
@@ -806,12 +797,14 @@ class TranslationEngine(QObject):
             self.chunk_assembler = ChunkAssembler(output_folder, self.project_manager, settings)
         else:
             self.chunk_assembler = None
+        self._attach_translation_qa(settings)
         total_tasks_for_session = len(self.task_manager.get_all_pending_tasks())
         model_id = settings.get('model_id')
         self._register_active_session()
         self._activate_power_inhibitor_for_session()
         self._post_event('session_started', {
             'session_id': self.session_id,
+            'session_kind': session_kind,
             'model_id': model_id,
             'total_tasks': total_tasks_for_session,
             'background_session': bool(settings.get('background_session')),
@@ -836,13 +829,215 @@ class TranslationEngine(QObject):
             self._post_event('log_message', {'message': f"[RAMP-UP] Плавный запуск {num_to_start} воркеров…"})
         
 
+    def _attach_translation_qa(self, settings):
+        """Wire per-chapter quality control to this session.
+
+        Quality control is an addition to translation, never a precondition for
+        it: any problem here is logged and the session starts without QA.
+        """
+
+        try:
+            from ..qa.assembly import (
+                aiohttp_session_factory,
+                attach_chapter_qa_coordinator,
+                detect_source_language,
+                embedding_keys_for_session,
+            )
+            from ..qa.handler_factory import build_qa_handler_factory
+
+            app = QtWidgets.QApplication.instance()
+            if app is None or not self.project_manager or not self.settings_manager:
+                return
+            keys = [
+                key for key in (settings.get('api_keys') or [])
+                if isinstance(key, str) and key.strip()
+            ]
+            if not keys:
+                return
+            provider = str(settings.get('provider') or '')
+            model_name = str(
+                settings.get('model') or settings.get('model_id') or ''
+            )
+
+            def log(message, details_title='', details_text='', details_html=''):
+                payload = {'message': message}
+                if details_text:
+                    payload['details_title'] = details_title or "Детали проверки"
+                    payload['details_text'] = details_text
+                    if details_html:
+                        payload['details_html'] = details_html
+                self._post_event('log_message', payload)
+
+            # QA spends the session's keys from the back of the list, skips the
+            # ones the workers are holding, and drops any the service declares
+            # spent.  Pinned to the first key it died within a minute: that key
+            # is also the first worker's, and the model allows it twenty
+            # requests a day.
+            from ..qa.key_pool import QaKeyPool
+
+            key_manager = getattr(self, 'api_key_manager', None)
+            key_pool = QaKeyPool(
+                keys,
+                model_id=str(settings.get('model_id') or ''),
+                settings_manager=self.settings_manager,
+                busy=lambda key: key in (getattr(key_manager, 'active_keys', None) or ()),
+            )
+            handler_factory = build_qa_handler_factory(
+                settings_manager=self.settings_manager,
+                key_pool=key_pool,
+                session_settings=settings,
+                log=log,
+            )
+            coordinator = attach_chapter_qa_coordinator(
+                app,
+                project_manager=self.project_manager,
+                settings_manager=self.settings_manager,
+                handler_factory=handler_factory,
+                session_id=str(self.session_id),
+                api_keys_by_provider=embedding_keys_for_session(provider, keys),
+                session_factory=aiohttp_session_factory(
+                    settings.get('proxy_settings')
+                    or self.settings_manager.load_proxy_settings()
+                ),
+                translation_provider=provider,
+                translation_model=model_name,
+                epub_path=str(getattr(self, '_qa_epub_path', '') or ''),
+                source_language_resolver=detect_source_language,
+                stop_requested=lambda: key_pool.seconds_until_available() is None,
+                log=log,
+            )
+            if coordinator is not None:
+                log(
+                    "[QA] Проверка качества перевода включена для этой сессии"
+                    f"{self._describe_qa_checks()}; ключей для проверки: {len(key_pool)}."
+                )
+                coordinator.run_background(
+                    coordinator.resume_pending_qa,
+                    lambda result, error: self._report_resumed_qa(result, error),
+                )
+        except Exception as exc:
+            self._post_event('log_message', {
+                'message': f"[QA WARN] Проверка качества не запущена: {exc}"
+            })
+
+    def _describe_qa_checks(self) -> str:
+        """Say which checks the session runs, so a silent night is not a mystery."""
+        try:
+            qa_settings = self.settings_manager.get_qa_settings()
+        except Exception:  # noqa: BLE001 - the line is a courtesy, not a check
+            return ""
+        state = lambda enabled: "вкл" if enabled else "выкл"  # noqa: E731
+        return (
+            f" (язык — {state(qa_settings.check_language_after_chapter)}, "
+            f"полнота — {state(qa_settings.check_completeness_after_chapter)})"
+        )
+
+    def _start_final_qa_pass(self) -> bool:
+        """Run the closing quality pass once, before the session is declared done.
+
+        Returns True while the pass is running, so the session waits for it. A
+        failure never changes a successful translation: it is reported and the
+        session ends anyway.
+        """
+
+        state = getattr(self, '_final_qa_state', 'idle')
+        if state != 'idle':
+            return state == 'running'
+        coordinator = getattr(QtWidgets.QApplication.instance(), 'qa_coordinator', None)
+        if coordinator is None:
+            self._final_qa_state = 'skipped'
+            return False
+        try:
+            qa_settings = self.settings_manager.get_qa_settings()
+        except Exception:
+            self._final_qa_state = 'skipped'
+            return False
+        if not qa_settings.final_book_pass:
+            self._final_qa_state = 'skipped'
+            return False
+
+        self._final_qa_state = 'running'
+        self._post_event('log_message', {
+            'message': "[QA] Итоговый проход по книге перед завершением сессии…"
+        })
+        session_id = str(self.session_id)
+
+        def report_progress(done, total, chapter_id):
+            # The session waits for this pass, so it must not look frozen.
+            self._post_event('log_message', {
+                'message': f"[QA] Итоговый проход: {done}/{total} — {chapter_id}"
+            })
+
+        coordinator.run_background(
+            lambda: coordinator.run_final_book_pass(
+                session_id, on_progress=report_progress
+            ),
+            lambda result, error: self.qa_final_pass_finished.emit(result, error),
+        )
+        return True
+
+    @pyqtSlot(object, object)
+    def _on_final_qa_finished(self, result, error):
+        """Report the closing pass and let the session finish."""
+        self._final_qa_state = 'done'
+        if error is not None:
+            self._post_event('log_message', {
+                'message': f"[QA WARN] Итоговый проход не завершён: {error}"
+            })
+        else:
+            blocking = tuple(getattr(result, 'blocking_chapters', ()) or ())
+            checked = len(getattr(result, 'results', ()) or ())
+            stopped = tuple(getattr(result, 'stopped', ()) or ())
+            message = f"[QA] Итоговый проход завершён, проверено глав: {checked}."
+            if stopped:
+                message += (
+                    " Ключи для проверки больше недоступны, не проверено глав: "
+                    f"{len(stopped)}. Продолжите проверку в окне «Качество перевода», "
+                    "когда ключи восстановятся."
+                )
+            if blocking:
+                message += " Требуют решения: " + ", ".join(blocking[:5])
+            self._post_event('log_message', {'message': message})
+        self._check_if_session_finished()
+
+    def _report_resumed_qa(self, result, error):
+        """Log what a restart recovered, without ever failing the session start."""
+        if error is not None:
+            self._post_event('log_message', {
+                'message': f"[QA WARN] Не удалось продолжить прерванные проверки: {error}"
+            })
+            return
+        task_ids = tuple(getattr(result, 'task_ids', ()) or ())
+        if task_ids:
+            self._post_event('log_message', {
+                'message': f"[QA] Продолжены прерванные проверки: {len(task_ids)}."
+            })
+
+    def _detach_translation_qa(self):
+        """Stop the session's quality control without ever raising."""
+        try:
+            from ..qa.assembly import detach_chapter_qa_coordinator
+
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                detach_chapter_qa_coordinator(app)
+        except Exception:
+            return
+
     def is_managed_mode(self):
-        if self.bus and hasattr(self.bus, '_data_store'):
-            # Ищем любой ключ, начинающийся с 'managed_session_active_'
-            for key in self.bus._data_store.keys():
-                if key.startswith('managed_session_active_') and self.bus.get_data(key) is True:
-                    return True
-        return False
+        """Активна ли управляемая сессия оркестратора.
+
+        Делегирует в канонический EventBus.has_managed_session_active()
+        (main.py) вместо собственного скана bus._data_store по префиксу
+        'managed_session_active_' — хвост дедупа core-a/design/1
+        (dups-gt_core_task_manager-21). Сравнение ``is True`` намеренное:
+        заглушки шины в тестах (MagicMock) отдают не-bool, и это, как и
+        раньше, означает «не управляемый режим».
+        """
+        predicate = getattr(self.bus, 'has_managed_session_active', None)
+        if predicate is None:
+            return False
+        return predicate() is True
     
     
     def cancel_translation(self, reason: str = "Отменено пользователем"):
@@ -855,12 +1050,13 @@ class TranslationEngine(QObject):
         # 2. Принудительная зачистка флагов Оркестратора.
         # Это гарантирует, что при любом выходе (ошибка, стоп, финиш)
         # система выйдет из управляемого режима и воркеры перестанут ждать.
-        if self.bus and hasattr(self.bus, '_data_store'):
-             # Создаем список ключей для удаления (чтобы не менять словарь во время итерации)
-             orchestrator_keys = [k for k in self.bus._data_store.keys() if k.startswith('managed_session_active_')]
-             for k in orchestrator_keys:
-                 self.bus.pop_data(k, None)
-                 
+        # Делегируем в EventBus.clear_managed_session_flags() (main.py) —
+        # парный мутатор к has_managed_session_active; собственный скан
+        # _data_store по префиксу убран (хвост core-a/design/1).
+        clear_flags = getattr(self.bus, 'clear_managed_session_flags', None)
+        if clear_flags is not None:
+            clear_flags()
+
         if not self.session_id or self.is_session_finishing:
             return
         
@@ -877,7 +1073,7 @@ class TranslationEngine(QObject):
         finally:
             self._release_power_inhibitor()
         
-        self._end_session_event(reason, self.session_id)
+        self._end_session_event(reason)
         if not self.summary_shown_for_session:
             self.show_summary_data()
 
@@ -887,13 +1083,15 @@ class TranslationEngine(QObject):
         # 1. Сначала отправляем сигнал о завершении, пока ID еще валиден
         
         
+        self._detach_translation_qa()
         self.session_id = None
         self.is_starting = False # <-- Сбрасываем и этот флаг тоже
         
-    def _end_session_event(self, reason: str, session_id_event=None):
+    def _end_session_event(self, reason: str):
         self._post_event('session_finished', {
             'reason': reason,
             "session_id_log": self.session_id,
+            'session_kind': self.session_settings.get('session_kind'),
             'background_session': bool(self.session_settings.get('background_session')),
             'background_role': self.session_settings.get('background_role'),
             'background_run_id': self.session_settings.get('background_run_id'),
@@ -1162,7 +1360,7 @@ class TranslationEngine(QObject):
                     self._post_event('log_message', {'message': f"[MANAGER] ♻️ Ротация: Запускаю свежую замену для ключа …{key_to_launch[-4:]}, пока старый воркер завершается."})
                     
                     # ХИТРОСТЬ: Удаляем сразу, запускаем сразу. Таймер не нужен.
-                    old_future = self.active_workers_map.pop(self.keys_map.get(key_to_launch))
+                    self.active_workers_map.pop(self.keys_map.get(key_to_launch))
                     self.shutting_down_workers.discard(self.keys_map.get(key_to_launch))
                     self._launch_worker(key_to_launch)
                     return True
@@ -1255,6 +1453,18 @@ class TranslationEngine(QObject):
         # 1. ГЛАВНЫЙ ВОПРОС: Мы закончили?
         # TaskManager сам проверил и базу, и флаги оркестратора.
         if self.task_manager.is_finished():
+            if self._start_final_qa_pass():
+                return
+            # Высокий риск QA остаётся в отчёте, но не задерживает перевод.
+            gate_check = getattr(self.task_manager, 'has_blocking_qa_gate', None)
+            if callable(gate_check) and gate_check():
+                self._post_event('log_message', {'message': (
+                    "[QA] Перевод завершён; есть главы с высоким риском. "
+                    "Проверьте их в окне «Качество перевода»."
+                )})
+                self.show_summary_data()
+                self._end_session("Перевод завершён: есть главы с замечаниями QA")
+                return
             self._post_event('log_message', {'message': "[MANAGER] Работа завершена (Задачи выполнены / Флаг снят)."})
             self.show_summary_data()
             self._end_session("Сессия успешно завершена")

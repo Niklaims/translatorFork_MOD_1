@@ -6,7 +6,7 @@ import html
 import json
 import os
 import re
-import tempfile
+import weakref
 import zipfile
 from array import array
 from collections import Counter, defaultdict
@@ -23,7 +23,6 @@ from PyQt6.QtGui import (
     QFont,
     QKeySequence,
     QShortcut,
-    QSyntaxHighlighter,
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
@@ -52,7 +51,9 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from gemini_translator.ui import theme_manager
+from ...utils.io_utils import atomic_write_json, atomic_write_text
 from ..widgets.overlay_tab_widget import install_tab_fade
+from ..widgets.regex_syntax_highlighter import HTML_PALETTE_LIGHT, HtmlSyntaxHighlighter
 
 
 BLOCK_RE = re.compile(
@@ -305,25 +306,6 @@ def _read_text_file(path: str) -> str:
         return file.read()
 
 
-def _atomic_write_text(path: str, content: str) -> None:
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".chapter_editor_", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as temp_file:
-            temp_file.write(content)
-            temp_file.flush()
-            os.fsync(temp_file.fileno())
-        os.replace(temp_path, path)
-    except Exception:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        raise
-
-
 def _visible_preview(raw_text: str, limit: int = 180) -> str:
     if not raw_text:
         return ""
@@ -550,45 +532,118 @@ def _read_from_epub(epub_path: str | None, internal_path: str | None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
-class HtmlSyntaxHighlighter(QSyntaxHighlighter):
-    def __init__(self, document: QTextDocument):
-        super().__init__(document)
+@dataclass
+class _ChapterAnalysisResult:
+    """Итог фонового анализа: список проблем + построчный дифф.
 
-        self.tag_format = QTextCharFormat()
-        self.tag_format.setForeground(QColor("#0f5c7a"))
-        self.tag_format.setFontWeight(QFont.Weight.Bold)
+    ``current_text``/``saved_text`` — тексты, ПО КОТОРЫМ считался этот
+    результат. Пока воркер работает, ``ChapterEditorDialog.save_changes``
+    или ``_reload_from_disk`` могут успеть сменить ``self._saved_text``
+    (см. ``_set_saved_state``) — тогда прилетевший дифф посчитан против
+    уже неактуального сохранённого текста, и применять его нельзя (см.
+    ``_on_analysis_ready``).
+    """
 
-        self.attr_format = QTextCharFormat()
-        self.attr_format.setForeground(QColor("#7b3fb7"))
+    problem_spots: list[ProblemSpot]
+    changed_lines: set[int]
+    diff_is_limited: bool
+    current_text: str
+    saved_text: str
 
-        self.string_format = QTextCharFormat()
-        self.string_format.setForeground(QColor("#b54708"))
 
-        self.comment_format = QTextCharFormat()
-        self.comment_format.setForeground(QColor("#687076"))
-        self.comment_format.setFontItalic(True)
+class _ChapterAnalysisWorker(QtCore.QThread):
+    """HTML-парсинг проблемных мест и построчный дифф в фоновом потоке.
 
-    def highlightBlock(self, text: str) -> None:
-        for match in re.finditer(r"<!--.*?-->", text):
-            self.setFormat(match.start(), match.end() - match.start(), self.comment_format)
+    Раньше ``ChapterEditorDialog._refresh_analysis`` делала это же самое
+    прямо в слоте ``QTimer.timeout``, то есть на главном потоке — для
+    больших глав с диалогово-плотной прозой (много коротких повторяющихся
+    строк) ``SequenceMatcher`` заметно подвешивал GUI (см. находку
+    ui-dialogs-other/bugs/6-chapter-editor-sync-diff-block). ``run()``
+    работает только с обычными строками/данными, переданными в
+    конструкторе, и не трогает виджеты — поэтому безопасен вне GUI-потока.
+    """
 
-        for match in re.finditer(r"</?[A-Za-z0-9:_-]+(?:\s+[^>]*?)?>", text):
-            self.setFormat(match.start(), match.end() - match.start(), self.tag_format)
+    analysis_ready = QtCore.pyqtSignal(object)
 
-            inner_text = match.group(0)
-            inner_offset = match.start()
-            for attr_match in re.finditer(r"\b[A-Za-z_:][-A-Za-z0-9_:.]*(?=\=)", inner_text):
-                self.setFormat(
-                    inner_offset + attr_match.start(),
-                    attr_match.end() - attr_match.start(),
-                    self.attr_format,
-                )
-            for string_match in re.finditer(r"\"[^\"]*\"|'[^']*'", inner_text):
-                self.setFormat(
-                    inner_offset + string_match.start(),
-                    string_match.end() - string_match.start(),
-                    self.string_format,
-                )
+    def __init__(
+        self,
+        current_text: str,
+        saved_text: str,
+        original_text: str,
+        parsed_original: ParsedChapterText | None,
+        diff_text_limit: int,
+        diff_line_limit: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._current_text = current_text
+        self._saved_text = saved_text
+        self._original_text = original_text
+        self._parsed_original = parsed_original
+        self._diff_text_limit = diff_text_limit
+        self._diff_line_limit = diff_line_limit
+
+    def run(self) -> None:
+        current_text = self._current_text
+        problem_spots = _analyze_chapter_problems(
+            current_text,
+            self._original_text,
+            parsed_original=self._parsed_original,
+        )
+
+        line_count = current_text.count("\n") + 1 if current_text else 0
+        if len(current_text) > self._diff_text_limit or line_count > self._diff_line_limit:
+            changed_lines: set[int] = set()
+            diff_is_limited = True
+        else:
+            matcher = SequenceMatcher(
+                None,
+                self._saved_text.splitlines(),
+                current_text.splitlines(),
+                autojunk=False,
+            )
+            current_lines = current_text.splitlines()
+            changed_lines = set()
+            for opcode, _i1, _i2, j1, j2 in matcher.get_opcodes():
+                if opcode == "equal":
+                    continue
+                if j1 == j2 and current_lines:
+                    changed_lines.add(min(j1, len(current_lines) - 1))
+                else:
+                    changed_lines.update(range(j1, j2))
+            diff_is_limited = False
+
+        self.analysis_ready.emit(
+            _ChapterAnalysisResult(
+                problem_spots, changed_lines, diff_is_limited, current_text, self._saved_text
+            )
+        )
+
+
+# Воркеры, чей QThread ещё не завершился, но диалог, который их запустил,
+# уже мог быть уничтожен (например, Esc закрывает ChapterEditorDialog через
+# reject() -> done(), минуя closeEvent, а OverlayHost._dismiss сразу же
+# делает setParent(None) + deleteLater() по сигналу finished). Единственная
+# Python-ссылка на воркер раньше жила в ChapterEditorDialog._analysis_thread
+# — вместе с диалогом исчезала и она, и Qt ронял процесс при уничтожении
+# ещё работающего QThread ("QThread: Destroyed while thread is still
+# running"). Модульный реестр держит независимую ссылку, пока поток
+# реально не завершится, поэтому судьба диалога больше не может утащить за
+# собой работающий поток.
+_ACTIVE_ANALYSIS_WORKERS: set["_ChapterAnalysisWorker"] = set()
+
+
+def _retire_analysis_worker(worker: "_ChapterAnalysisWorker | None") -> None:
+    """Освобождаем воркер, когда его QThread реально завершился.
+
+    Подключается к ``QThread.finished`` — этот сигнал взводится изнутри
+    самого потока, поэтому функция не должна обращаться к диалогу (он к
+    этому моменту мог быть уже уничтожен) и трогать виджеты.
+    """
+    if worker is None:
+        return
+    _ACTIVE_ANALYSIS_WORKERS.discard(worker)
+    worker.deleteLater()
 
 
 class ChapterEditorDialog(QDialog):
@@ -638,6 +693,8 @@ class ChapterEditorDialog(QDialog):
         self._loading = False
         self._syncing_scroll = False
         self._diff_is_limited = False
+        self._analysis_thread: _ChapterAnalysisWorker | None = None
+        self._analysis_dirty = False
 
         self.search_timer = QtCore.QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -737,8 +794,12 @@ class ChapterEditorDialog(QDialog):
         self.original_editor = self._create_editor(read_only=True)
         self.original_document = self.original_editor.document()
 
-        self._translated_highlighter = HtmlSyntaxHighlighter(self.translated_document)
-        self._original_highlighter = HtmlSyntaxHighlighter(self.original_document)
+        self._translated_highlighter = HtmlSyntaxHighlighter(
+            self.translated_document, palette=HTML_PALETTE_LIGHT
+        )
+        self._original_highlighter = HtmlSyntaxHighlighter(
+            self.original_document, palette=HTML_PALETTE_LIGHT
+        )
 
         self.mode_tabs.addTab(self.translated_editor, "Только перевод")
 
@@ -1058,8 +1119,68 @@ class ChapterEditorDialog(QDialog):
         self._apply_editor_decorations()
 
     def _refresh_analysis(self) -> None:
+        # HTML-парсинг проблемных мест и SequenceMatcher-дифф — тяжёлые
+        # синхронные операции; чтобы не подвешивать GUI-поток на больших
+        # главах, считаем их в фоновом _ChapterAnalysisWorker и применяем
+        # результат в _on_analysis_ready по сигналу.
+        if self._analysis_thread is not None:
+            # Анализ уже идёт — не запускаем второй поток поверх первого,
+            # а просто отметим, что нужно пересчитать ещё раз по
+            # актуальному тексту, когда текущий воркер завершится.
+            self._analysis_dirty = True
+            return
+        self._start_analysis_worker()
+
+    def _start_analysis_worker(self) -> None:
+        self._analysis_dirty = False
         current_text = self.translated_document.toPlainText()
-        self._problem_spots = self._scan_problem_spots(current_text)
+        worker = _ChapterAnalysisWorker(
+            current_text=current_text,
+            saved_text=self._saved_text,
+            original_text=self._original_text,
+            parsed_original=self._parsed_original_text,
+            diff_text_limit=self.DIFF_TEXT_LIMIT,
+            diff_line_limit=self.DIFF_LINE_LIMIT,
+        )
+        worker.analysis_ready.connect(self._on_analysis_ready)
+        # Держим воркер живым независимо от судьбы диалога — см.
+        # _retire_analysis_worker и комментарий у _ACTIVE_ANALYSIS_WORKERS.
+        # Слабая ссылка в замыкании — чтобы сама эта связь (worker.finished
+        # -> лямбда) не образовывала цикл на worker и не тянула его
+        # освобождение до случайного прохода циклического сборщика мусора:
+        # к моменту, когда finished реально взведётся, worker гарантированно
+        # жив (сигнал шлёт он сам), так что слабая ссылка тут безопасна.
+        _ACTIVE_ANALYSIS_WORKERS.add(worker)
+        worker_ref = weakref.ref(worker)
+        worker.finished.connect(lambda: _retire_analysis_worker(worker_ref()))
+        self._analysis_thread = worker
+        worker.start()
+
+    def _on_analysis_ready(self, result: _ChapterAnalysisResult) -> None:
+        # Снимаем "занято" сразу, до любых обращений к виджетам: если
+        # что-то ниже бросит исключение, _refresh_analysis всё равно не
+        # должна навсегда застрять в режиме "просто помечаем dirty и
+        # ничего не запускаем" (см. находку рецензента — раньше сброс
+        # стоял в конце метода). Сам QThread воркера отдельно освобождает
+        # себя по своему сигналу finished (_retire_analysis_worker), нам
+        # тут ждать/удалять его вручную не нужно.
+        self._analysis_thread = None
+
+        stale = (
+            result.saved_text != self._saved_text
+            or result.current_text != self.translated_document.toPlainText()
+        )
+        if stale:
+            # Пока считался анализ, save_changes()/_reload_from_disk() уже
+            # сменили _saved_text (и обнулили _changed_lines через
+            # _set_saved_state) или текст в редакторе снова изменился —
+            # дифф в result посчитан по старому состоянию и перекрасил бы
+            # только что сохранённые строки как изменённые. Отбрасываем
+            # его и пересчитываем заново по актуальному состоянию.
+            self._start_analysis_worker()
+            return
+
+        self._problem_spots = result.problem_spots
         self._current_problem_index = -1
         self.issues_list.clear()
         for index, problem in enumerate(self._problem_spots):
@@ -1077,28 +1198,8 @@ class ChapterEditorDialog(QDialog):
             self.issues_list.addItem(empty_item)
         self.sidebar_tabs.setTabText(0, f"Проблемы ({len(self._problem_spots)})")
 
-        line_count = current_text.count("\n") + 1 if current_text else 0
-        if len(current_text) > self.DIFF_TEXT_LIMIT or line_count > self.DIFF_LINE_LIMIT:
-            self._changed_lines = set()
-            self._diff_is_limited = True
-        else:
-            matcher = SequenceMatcher(
-                None,
-                self._saved_text.splitlines(),
-                current_text.splitlines(),
-                autojunk=False,
-            )
-            changed_lines = set()
-            current_lines = current_text.splitlines()
-            for opcode, _i1, _i2, j1, j2 in matcher.get_opcodes():
-                if opcode == "equal":
-                    continue
-                if j1 == j2 and current_lines:
-                    changed_lines.add(min(j1, len(current_lines) - 1))
-                else:
-                    changed_lines.update(range(j1, j2))
-            self._changed_lines = changed_lines
-            self._diff_is_limited = False
+        self._changed_lines = result.changed_lines
+        self._diff_is_limited = result.diff_is_limited
 
         self._blocks_stale = True
         if self.mode_tabs.currentWidget() is self.block_table:
@@ -1107,12 +1208,10 @@ class ChapterEditorDialog(QDialog):
         self._update_summary()
         self._apply_editor_decorations()
 
-    def _scan_problem_spots(self, text: str) -> list[ProblemSpot]:
-        return _analyze_chapter_problems(
-            text,
-            self._original_text,
-            parsed_original=self._parsed_original_text,
-        )
+        if self._analysis_dirty:
+            # Пока считался прошлый анализ, текст успел измениться ещё раз —
+            # пересчитываем по-новой, а не оставляем устаревший результат.
+            self._start_analysis_worker()
 
     def _refresh_block_table(self) -> None:
         translated_blocks = _extract_blocks(self.translated_document.toPlainText())
@@ -1383,8 +1482,7 @@ class ChapterEditorDialog(QDialog):
             "text": self.translated_document.toPlainText(),
         }
         try:
-            with open(self.draft_path, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
+            atomic_write_json(self.draft_path, payload, indent=2)
             self.meta_label.setText(
                 f"{self.meta_label.text().split(' • ')[0]} • Черновик обновлён {payload['updated_at']}"
             )
@@ -1518,7 +1616,7 @@ class ChapterEditorDialog(QDialog):
             snapshot_path = self._create_snapshot(disk_text)
 
         try:
-            _atomic_write_text(self.translated_path, current_text)
+            atomic_write_text(self.translated_path, current_text)
         except OSError as error:
             QMessageBox.critical(self, "Сохранение", f"Не удалось сохранить файл:\n{error}")
             return False
@@ -1603,6 +1701,13 @@ class ChapterEditorDialog(QDialog):
         self._schedule_analysis_refresh()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        # Фоновый анализ (_ChapterAnalysisWorker) не нужно здесь ни ждать,
+        # ни обрывать: closeEvent — не единственный и не основной путь
+        # закрытия этого диалога (Esc идёт через QDialog.reject(), минуя
+        # closeEvent целиком), поэтому раньше ожидание, повешенное именно
+        # тут, не спасало от аварийного завершения процесса при закрытии
+        # по Esc. Безопасность воркера при уничтожении диалога обеспечена
+        # структурно — см. _ACTIVE_ANALYSIS_WORKERS/_retire_analysis_worker.
         if not self.translated_document.isModified():
             event.accept()
             return

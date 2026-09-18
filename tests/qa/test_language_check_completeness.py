@@ -1,0 +1,319 @@
+"""A chapter nobody could check must never read as a chapter with nothing wrong.
+
+Measured on a live book: one 429 on the diagnosis request left 33 of 40 chapters
+reporting «найдено 0», which is what a clean chapter reports.  Two behaviours
+close that: a busy service is asked again, and what still could not be checked
+says so out loud and comes back.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from copy import deepcopy
+
+import pytest
+
+from gemini_translator.api.errors import NetworkError
+from gemini_translator.qa.language_validation import (
+    LanguageQaRequest,
+    LanguageQaResult,
+    LanguageQualityPipeline,
+    LanguageReviewError,
+)
+from gemini_translator.qa.llm import CancellationToken, QaModelSelection
+from gemini_translator.qa.llm.language_reviewer import (
+    RETRY_MAX_WAIT_SECONDS,
+    is_transient,
+    request_qa_json,
+    retry_delay,
+)
+from gemini_translator.qa.models import RiskLevel
+from gemini_translator.qa.service import DEFERRED_WARNINGS, ChapterQaResult
+from gemini_translator.utils.epub_json import build_html_document_model
+
+
+_CHAPTER_HTML = "<p>Он взял себе решение уйти.</p><p>Она дала ему знать о приезде.</p>"
+
+
+class _Busy(Exception):
+    """What a handler raises when the service is merely busy: it names a delay."""
+
+    def __init__(self, delay_seconds: float = 30) -> None:
+        super().__init__("Временный лимит запросов (429).")
+        self.delay_seconds = delay_seconds
+
+
+class _Refused(Exception):
+    """What a handler raises when asking again cannot help."""
+
+
+class _Client:
+    def __init__(self, *outcomes: object) -> None:
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    async def complete_json(self, prompt, *, model, max_output_tokens, cancellation, purpose=""):
+        self.calls += 1
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return deepcopy(outcome)
+
+
+def _request(**overrides) -> LanguageQaRequest:
+    values: dict[str, object] = {
+        "chapter_id": "chapter-1",
+        "document_model": build_html_document_model(_CHAPTER_HTML, document_id="chapter-1"),
+        "source_language": "en",
+        "target_language": "ru",
+        "model": QaModelSelection("gemini", "qa-model"),
+        "cancellation": CancellationToken(),
+    }
+    values.update(overrides)
+    return LanguageQaRequest(**values)  # type: ignore[arg-type]
+
+
+def _ask(
+    client: _Client,
+    request: LanguageQaRequest | None = None,
+    *,
+    purpose: str = "language_diagnosis",
+) -> tuple[object, list[float]]:
+    """Run one request, recording the pauses instead of living through them."""
+    pauses: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        pauses.append(seconds)
+
+    payload = asyncio.run(
+        request_qa_json(
+            client,
+            "prompt",
+            request or _request(),
+            1024,
+            purpose,
+            sleep=sleep,
+        )
+    )
+    return payload, pauses
+
+
+# --- asking again ------------------------------------------------------------
+
+
+def test_a_busy_service_is_asked_again():
+    """429 — это «спроси позже», а не «в главе всё хорошо»."""
+    client = _Client(_Busy(), _Busy(), {"issues": []})
+
+    payload, pauses = _ask(client, purpose="language_batch_correction")
+
+    assert payload == {"issues": []}
+    assert client.calls == 3
+    assert len(pauses) == 2
+
+
+def test_a_transient_failure_keeps_retrying_past_the_old_attempt_limit():
+    """503 не должен выбрасывать пакет из QA после четырёх попыток."""
+    overloaded = NetworkError("Сервер Gemini перегружен (503).", delay_seconds=20)
+    client = _Client(*([overloaded] * 4), {"replacements": []})
+
+    payload, pauses = _ask(client, purpose="language_batch_correction")
+
+    assert payload == {"replacements": []}
+    assert client.calls == 5
+    assert pauses == [pytest.approx(20)] * 4
+
+
+def test_a_service_that_stays_busy_stops_only_when_the_check_is_cancelled():
+    """Временный сбой не теряет пакет, но пользователь всё ещё может остановить QA."""
+    request = _request()
+
+    class _CancellingClient(_Client):
+        async def complete_json(self, *args, **kwargs):
+            if self.calls == 4:
+                request.cancellation.cancel()
+            return await super().complete_json(*args, **kwargs)
+
+    client = _CancellingClient(_Busy())
+
+    with pytest.raises(asyncio.CancelledError):
+        _ask(client, request)
+
+    assert client.calls == 5
+
+
+def test_a_refusal_that_asking_again_cannot_fix_is_not_repeated():
+    """Исчерпанная квота или запрещённый промпт от повтора не починятся."""
+    client = _Client(_Refused("quota"))
+
+    with pytest.raises(LanguageReviewError):
+        _ask(client)
+
+    assert client.calls == 1
+
+
+def test_a_timeout_is_retried_until_it_succeeds():
+    """Таймаут — временный сбой, поэтому он не теряет текущий пакет."""
+    client = _Client(TimeoutError("slow"), {"issues": []})
+
+    payload, _pauses = _ask(client)
+
+    assert payload == {"issues": []}
+    assert client.calls == 2
+
+
+def test_only_an_error_that_names_a_delay_is_worth_repeating():
+    """Обработчики говорят «попробуй позже» именно так — задержкой в самой ошибке."""
+    assert is_transient(_Busy()) is True
+    assert is_transient(TimeoutError()) is True
+    assert is_transient(_Refused()) is False
+    assert is_transient(_Busy(delay_seconds=0)) is False
+    assert is_transient(_Busy(delay_seconds=True)) is False
+
+
+def test_the_pauses_grow_and_then_stop_growing():
+    """Пауза растёт, но проверка главы не должна превращаться в ожидание."""
+    delays = [retry_delay(attempt) for attempt in range(8)]
+
+    assert delays == sorted(delays)
+    assert delays[0] < delays[1]
+    assert max(delays) <= 20.0
+
+
+def test_retry_delay_stays_capped_for_a_very_long_outage():
+    """Бесконечный возврат пакета не должен переполнить формулу задержки."""
+    assert retry_delay(10_000) == pytest.approx(20.0)
+
+
+def test_a_pause_is_never_shorter_than_what_the_service_asked_for():
+    """503 «перегружен, подождите 20 с» через полторы секунды ответит тем же."""
+    client = _Client(_Busy(delay_seconds=20), {"issues": []})
+
+    _payload, pauses = _ask(client)
+
+    assert pauses == [pytest.approx(20)]
+
+
+def test_a_service_asking_for_an_hour_gets_the_ceiling_instead():
+    """Ожидание ограничено: ключ на паузе — не повод держать главу час."""
+    client = _Client(_Busy(delay_seconds=3600), {"issues": []})
+
+    _payload, pauses = _ask(client)
+
+    assert pauses == [RETRY_MAX_WAIT_SECONDS]
+    assert RETRY_MAX_WAIT_SECONDS <= 120
+
+
+def test_cancelling_during_the_pause_stops_the_check():
+    """Отменённая проверка не имеет права досыпать свои паузы."""
+    cancellation = CancellationToken()
+    client = _Client(_Busy())
+
+    async def sleep(seconds: float) -> None:  # pragma: no cover - never reached
+        raise AssertionError("отменённая проверка не должна спать")
+
+    async def run() -> None:
+        cancellation.cancel()
+        await request_qa_json(
+            client,
+            "prompt",
+            _request(cancellation=cancellation),
+            1024,
+            "language_diagnosis",
+            sleep=sleep,
+        )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run())
+
+
+# --- saying what was never checked -------------------------------------------
+
+
+def _run(client: _Client) -> LanguageQaResult:
+    return asyncio.run(LanguageQualityPipeline(client).check_chapter(_request()))
+
+
+def test_a_chapter_the_model_never_saw_says_so():
+    """Ради этого всё и делалось: «не проверено» отличимо от «дефектов нет»."""
+    result = _run(_Client(_Refused("quota")))
+
+    assert result.issues == ()
+    assert result.blocks_total == 2
+    assert result.unchecked_blocks == 2
+    assert result.fully_checked is False
+    warning = result.warnings[0]
+    assert warning.startswith("language_diagnosis_failed")
+    # The cause is the whole point: an exhausted key, a busy service and a dead
+    # proxy all read as «сбой запроса» and need different answers.
+    assert "quota" in warning
+
+
+def test_a_chapter_that_was_checked_and_is_clean_says_that_instead():
+    """Пустой результат проверенной главы — это ноль непроверенных абзацев."""
+    result = _run(_Client({"issues": []}))
+
+    assert result.issues == ()
+    assert result.blocks_total == 2
+    assert result.unchecked_blocks == 0
+    assert result.fully_checked is True
+
+
+def test_the_log_shows_how_much_of_the_chapter_was_missed():
+    """Число в логе — единственное, что отличает эти два случая для человека."""
+    result = ChapterQaResult(
+        chapter_id="chapter-1",
+        risk_level=RiskLevel.MEDIUM,
+        may_continue_translation=True,
+        coverage_mode="semantic_alignment",
+        language=LanguageQaResult(
+            chapter_id="chapter-1",
+            warnings=("language_diagnosis_failed",),
+            blocks_total=40,
+            unchecked_blocks=12,
+        ),
+    )
+
+    text = result.change_details()
+    html = result.change_details_html()
+
+    # The line names its own stage: someone who enabled only the typo check
+    # must not read this as a paragraph check they never asked for.
+    assert "ЯЗЫКОВАЯ ПРОВЕРКА НЕ ПРОШЛА: не проверено 12 из 40 абзацев" in text
+    # Текущий проход к главе не возвращается — он идёт по списку, собранному
+    # на старте.  Сообщение обязано назвать момент, иначе читатель ждёт
+    # повтора следующим же шагом и видит вместо него новую главу.
+    assert "следующее «Продолжить проверку»" in text
+    assert "ЯЗЫКОВАЯ ПРОВЕРКА НЕ ПРОШЛА: не проверено 12 из 40 абзацев" in html
+    assert "следующее «Продолжить проверку»" in html
+
+
+def test_an_incompletely_checked_chapter_comes_back():
+    """Непроверенная глава должна вернуться в очередь, а не считаться закрытой."""
+    from gemini_translator.qa.service import _chapter_status
+
+    assert "language_check_incomplete" in DEFERRED_WARNINGS
+
+    result = ChapterQaResult(
+        chapter_id="chapter-1",
+        risk_level=RiskLevel.MEDIUM,
+        may_continue_translation=True,
+        coverage_mode="semantic_alignment",
+        warnings=("language_check_incomplete",),
+    )
+
+    assert _chapter_status(result) == "deferred"
+
+
+def test_an_old_result_without_the_new_numbers_still_renders():
+    """Записанный раньше результат не должен ломать окно изменений."""
+    result = ChapterQaResult(
+        chapter_id="chapter-1",
+        risk_level=RiskLevel.LOW,
+        may_continue_translation=True,
+        coverage_mode="semantic_alignment",
+        language=LanguageQaResult(chapter_id="chapter-1"),
+    )
+
+    assert "НЕ ПРОВЕРЕНО" not in result.change_details()
+    assert "НЕ ПРОВЕРЕНО" not in result.change_details_html()

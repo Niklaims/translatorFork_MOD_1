@@ -55,9 +55,9 @@ except ImportError:
     Document = None
 
 try:
-    import nltk
+    from razdel import sentenize as _razdel_sentenize
 except ImportError:
-    nltk = None
+    _razdel_sentenize = None
 
 try:
     import pyaudio
@@ -81,11 +81,6 @@ try:
 except ImportError:
     genai = None
     genai_types = None
-
-try:
-    from loguru import logger as _loguru_logger
-except ImportError:
-    _loguru_logger = None
 
 try:
     from gemini_translator.api import config as reader_api_config
@@ -118,18 +113,10 @@ try:
 except Exception:
     SettingsManager = None
 
-if platform.system() == "Windows":
-    import subprocess
-    # Патч: заставляем все процессы запускаться без окна консоли
-    _orig_popen = subprocess.Popen
-    def _hidden_popen(*args, **kwargs):
-        if 'creationflags' not in kwargs:
-            kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
-        return _orig_popen(*args, **kwargs)
-    subprocess.Popen = _hidden_popen
-
-
-
+try:
+    from gemini_translator.utils import text_sort as _text_sort
+except Exception:
+    _text_sort = None
 
 
 # --- КОНФИГУРАЦИЯ ---
@@ -498,7 +485,7 @@ class LogSignal(QObject):
 log_fifo = LogSignal()
 
 def custom_log_handler(message):
-    """Глобальный обработчик для перехвата сообщений из loguru и отправки в GUI"""
+    """Обработчик логов для отправки отфильтрованных сообщений в GUI."""
     try:
         record = message.record
         msg = record["message"]
@@ -1349,11 +1336,6 @@ def _split_duo_gender_paragraph(paragraph, previous_dialogue_gender=None):
     return [(TTS_SPEAKER_MALE, paragraph)], previous_dialogue_gender
 
 
-def _split_role_paragraph(paragraph):
-    segments, _ = _split_duo_gender_paragraph(paragraph)
-    return segments
-
-
 def _build_live_role_script(raw_text):
     paragraphs = [
         part.strip()
@@ -2092,10 +2074,6 @@ def _load_trimmed_audio_segment(path):
     return _trim_audio_segment_boundaries(segment)
 
 
-def _load_trimmed_mp3_segment(path):
-    return _load_trimmed_audio_segment(path)
-
-
 def _export_trimmed_audio_file(source_path, output_path, output_format=None):
     segment = _load_trimmed_audio_segment(source_path)
     output_format = output_format or _audio_format_from_path(output_path)
@@ -2110,10 +2088,6 @@ def _export_trimmed_audio_file(source_path, output_path, output_format=None):
             except Exception:
                 pass
         raise RuntimeError(f"Не удалось сохранить audio после обрезки пауз: {exc}") from exc
-
-
-def _export_trimmed_mp3_file(source_path, output_path):
-    _export_trimmed_audio_file(source_path, output_path, output_format="mp3")
 
 
 def _normalize_audio_to_mp3(source_path, output_path=None, ffmpeg_path=None):
@@ -2621,25 +2595,50 @@ class ProjectDailyRequestLimiter:
             return self._get_local_count_locked(model_id, api_key)
 
 
+_CYRILLIC_CHAR_RE = re.compile(r"[Ѐ-ӿ]")
+_LATIN_CHAR_RE = re.compile(r"[A-Za-z]")
+
+
+def _is_russian_text(text):
+    # Cheap heuristic, not a real language detector: routes text to razdel
+    # only when it looks predominantly Russian. It counts characters, not
+    # words, so a Russian paragraph dense with Latin names/terms (or a
+    # mixed-script paragraph in general) can fall back to the plain regex
+    # tokenizer instead of razdel. That is an accepted, deliberate trade-off
+    # (see the sentence-tokenizer characterization tests for the
+    # mixed-script boundary case) rather than an oversight.
+    if not text:
+        return False
+    cyrillic_count = len(_CYRILLIC_CHAR_RE.findall(text))
+    if cyrillic_count == 0:
+        return False
+    latin_count = len(_LATIN_CHAR_RE.findall(text))
+    return cyrillic_count > latin_count
+
+
 def _sentence_tokenize(text):
     fallback_sentences = [
         part.strip()
         for part in re.split(r"(?<=[.!?])\s+|\n+", text)
         if part.strip()
     ]
-    if nltk is None:
+    if _razdel_sentenize is None or not _is_russian_text(text):
         return fallback_sentences
 
     try:
-        return nltk.sent_tokenize(text)
-    except LookupError:
-        if os.environ.get("GEMINI_READER_ALLOW_NLTK_DOWNLOAD") == "1":
-            try:
-                nltk.download("punkt", quiet=True)
-                return nltk.sent_tokenize(text)
-            except Exception:
-                return fallback_sentences
-        return fallback_sentences
+        # razdel.sentenize only splits on sentence punctuation, not on line
+        # breaks, so feed it one line at a time to keep the legacy behaviour
+        # of also breaking on "\n+" (headings, list items, unpunctuated
+        # dialogue lines, verse) instead of merging whole paragraphs into a
+        # single oversized "sentence".
+        razdel_sentences = [
+            substring.text.strip()
+            for line in re.split(r"\n+", text)
+            if line.strip()
+            for substring in _razdel_sentenize(line)
+            if substring.text.strip()
+        ]
+        return razdel_sentences or fallback_sentences
     except Exception:
         return fallback_sentences
 
@@ -2709,21 +2708,13 @@ def _split_live_paragraph(paragraph, max_chars=LIVE_PARAGRAPH_MAX_CHARS):
     return chunks or [paragraph]
 
 
-if platform.system() == "Windows" and "_orig_popen" in globals():
-    subprocess.Popen = _orig_popen
-
-if _loguru_logger is not None:
-    logger = _loguru_logger
-    logger.remove()
-    logger.add(custom_log_handler, level="INFO")
-else:
-    logger = logging.getLogger("gemini_reader")
-    if not getattr(logger, "_gemini_reader_configured", False):
-        logger.setLevel(logging.INFO)
-        logger.handlers.clear()
-        logger.addHandler(_GuiLoggingHandler())
-        logger.propagate = False
-        logger._gemini_reader_configured = True
+logger = logging.getLogger("gemini_reader")
+if not getattr(logger, "_gemini_reader_configured", False):
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.addHandler(_GuiLoggingHandler())
+    logger.propagate = False
+    logger._gemini_reader_configured = True
 
 # --- ПОДГОТОВКА ТЕКСТА ---
 def _is_supported_reader_book_path(path):
@@ -2751,10 +2742,6 @@ def _reader_normalize_epub_html(content):
     if normalize_epub_chapter_heading_to_h1 is None:
         return content
     return normalize_epub_chapter_heading_to_h1(content)
-
-
-def _reader_natural_sort_key(value):
-    return [int(token) if token.isdigit() else token.lower() for token in re.split(r"(\d+)", value)]
 
 
 def _reader_paragraphs_to_html(paragraphs):
@@ -2809,6 +2796,8 @@ def _reader_parse_epub_chapters(filepath):
 def _reader_parse_zip_docx_chapters(filepath):
     if Document is None:
         raise RuntimeError("Для импорта ZIP(DOCX) требуется пакет python-docx.")
+    if _text_sort is None:
+        raise RuntimeError("Для импорта ZIP(DOCX) требуется модуль gemini_translator.utils.text_sort.")
 
     chapters = []
     with zipfile.ZipFile(filepath, "r") as archive:
@@ -2818,7 +2807,7 @@ def _reader_parse_zip_docx_chapters(filepath):
                 for name in archive.namelist()
                 if name.lower().endswith(".docx") and not os.path.basename(name).startswith("~")
             ],
-            key=_reader_natural_sort_key,
+            key=_text_sort.natural_sort_key,
         )
         for index, name in enumerate(docx_files, start=1):
             doc = Document(io.BytesIO(archive.read(name)))
@@ -3472,6 +3461,46 @@ class AudioCombinerWorker(QThread):
             logger.exception(f"Непредвиденная ошибка при объединении аудио: {e}")
             self.finished_signal.emit(f"Ошибка: {str(e)}")
 
+
+class ParallelLiveChapterCombineWorker(QThread):
+    """Фоновая склейка сегментов главы, озвученной несколькими live-воркерами.
+
+    Раньше эта склейка (через ffmpeg, см. ``_combine_mp3_sequence``) выполнялась
+    синхронно прямо в обработчике Qt-сигнала ``finished`` воркера — то есть в
+    главном потоке — и замораживала интерфейс на время работы ffmpeg. Здесь она
+    вынесена в отдельный QThread по аналогии с ``AudioCombinerWorker``: работа с
+    файлами идёт в ``run()`` (другой поток), результат (успех/сообщение)
+    передаётся через ``finished_signal``, а обнуление ссылки на воркер и вся
+    работа с виджетами выполняются в обработчике встроенного сигнала
+    ``finished`` (эмитируется гарантированно ПОСЛЕ фактического завершения
+    потока) — см. ``_finalize_parallel_live_chapter``.
+    """
+
+    finished_signal = pyqtSignal(bool, int, str)
+
+    def __init__(self, book_manager, chapter_index, output_paths, total_tasks, worker_count):
+        super().__init__()
+        self.bm = book_manager
+        self.chapter_index = chapter_index
+        self.output_paths = output_paths
+        self.total_tasks = total_tasks
+        self.worker_count = worker_count
+
+    def run(self):
+        chapter_path = self.bm.get_mp3_path(self.chapter_index)
+        try:
+            _combine_mp3_sequence(self.output_paths, chapter_path)
+            self.bm.mark_chapter_done(self.chapter_index)
+            message = (
+                f"Глава {self.chapter_index + 1} озвучена параллельно: "
+                f"{self.total_tasks} блок(ов), {self.worker_count} воркер(ов)."
+            )
+            self.finished_signal.emit(True, self.chapter_index, message)
+        except Exception as exc:
+            message = f"Ошибка сборки главы {self.chapter_index + 1}: {exc}"
+            self.finished_signal.emit(False, self.chapter_index, message)
+
+
 class AudioPlayer(QThread):
     def __init__(self, audio_queue, vol=80):
         super().__init__()
@@ -3514,8 +3543,19 @@ class AudioPlayer(QThread):
             self.stream.stop_stream()
             self.stream.close()
             self.p.terminate()
-        except:
+        except Exception:
             pass
+        # Плеер больше не читает очередь: освобождаем место, чтобы производители,
+        # ждущие put(), не остались заблокированными на переполненной очереди.
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.audio_queue.task_done()
+            except ValueError:
+                pass
 
 
 # --- ВОРКЕР (С ПОДМЕНОЙ EDGE TTS) ---
@@ -3589,6 +3629,10 @@ class GeminiWorker(QThread):
         self._last_live_mp3_autosave_at = 0.0
         self._last_live_mp3_autosave_step = 0
         self._finished_emitted = False
+        # Кэш сегментов текущей главы: без него main_loop дважды за итерацию
+        # перечитывал/переразбирал TTS-сценарий или все абзацы главы (см. bugs/6).
+        self._segments_cache_chapter_idx = None
+        self._segments_cache = None
 
     def _emit_finished(self):
         if self._finished_emitted:
@@ -3672,6 +3716,24 @@ class GeminiWorker(QThread):
             raw_text = (chapter.raw_text or "").strip()
             return [raw_text] if raw_text else []
         return [part.strip() for part in chapter.flat_sentences if (part or "").strip()]
+
+    def _invalidate_chapter_segments_cache(self):
+        self._segments_cache_chapter_idx = None
+        self._segments_cache = None
+
+    def _cached_chapter_segments(self, chapter_index):
+        """Как _chapter_segments, но пересчитывает список только при смене главы.
+
+        main_loop раньше вызывал _chapter_segments дважды за каждую итерацию
+        внешнего цикла (для total_sent и отдельно для нарезки батча); для
+        voice_mode == 'author_gender' это означало повторное чтение TTS-сценария
+        с диска и его повторный разбор, а для segment_mode == 'paragraphs' —
+        повторный регэксп-разбор всех абзацев главы на каждый запрос (см. bugs/6).
+        """
+        if self._segments_cache_chapter_idx != chapter_index or self._segments_cache is None:
+            self._segments_cache = self._chapter_segments(chapter_index)
+            self._segments_cache_chapter_idx = chapter_index
+        return self._segments_cache
 
     def _join_segments_for_request(self, segments):
         return _join_live_request_segments(
@@ -3985,14 +4047,6 @@ class GeminiWorker(QThread):
                 return None
 
             def _decode_silently():
-                import subprocess
-                startupinfo = None
-                # Скрываем всплывающие окна консоли на Windows
-                if platform.system() == "Windows":
-                    startupinfo = subprocess.STARTUPINFO()
-                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                    startupinfo.wShowWindow = 0 # SW_HIDE
-
                 fp = io.BytesIO(data_out)
                 try:
                     # Конвертируем ответ в нужный нам формат
@@ -4120,6 +4174,25 @@ class GeminiWorker(QThread):
         raw_audio = await self._collect_live_request_raw_audio(client, config, text_to_send)
         return _trim_raw_pcm_boundaries(raw_audio)
 
+    def _enqueue_live_audio(self, item):
+        """Кладёт чанк в очередь воспроизведения, не блокируясь навсегда после «Стоп».
+
+        Очередь ограничена (maxsize=100), а после force_stop() AudioPlayer её больше
+        не читает. Блокирующий put() без таймаута вешал поток воркера, QThread не
+        завершался и окно отказывалось закрываться. Ждём место короткими интервалами
+        и перепроверяем флаг остановки; после остановки чанк просто отбрасывается.
+        """
+        audio_queue = self.audio_queue
+        if audio_queue is None:
+            return False
+        while self._is_running:
+            try:
+                audio_queue.put(item, timeout=0.2)
+                return True
+            except queue.Full:
+                continue
+        return False
+
     def _commit_live_audio_bytes(self, audio_bytes):
         if not audio_bytes:
             return False
@@ -4127,7 +4200,7 @@ class GeminiWorker(QThread):
             with self.buffer_lock:
                 self.audio_chunks.append(audio_bytes)
         if self.audio_queue and not self.fast:
-            self.audio_queue.put((audio_bytes, self.c_idx, self.s_idx, False))
+            self._enqueue_live_audio((audio_bytes, self.c_idx, self.s_idx, False))
         return True
 
     async def _collect_live_payload_audio(self, client, payload):
@@ -4169,17 +4242,33 @@ class GeminiWorker(QThread):
         gemini_retry_count = 0 # Счетчик для повторных попыток пробиться к Gemini (одиночные)
         batch_retry_count = 0  # НОВЫЙ СЧЕТЧИК: для повторных попыток целого батча
 
-        while self._is_running:
-            if self.c_idx == -1:
-                try:
-                    self.c_idx = self.manager_chapter_queue.get_nowait()
-                    self.s_idx = 0 
-                    self._reset_live_mp3_autosave()
-                    single_sentence_mode_remaining = 0
-                    fail_count = 0
-                    gemini_retry_count = 0
-                    batch_retry_count = 0
-                    total_sent = len(self._chapter_segments(self.c_idx))
+        try:
+            while self._is_running:
+                if self.c_idx == -1:
+                    try:
+                        self.c_idx = self.manager_chapter_queue.get_nowait()
+                        self.s_idx = 0
+                        self._reset_live_mp3_autosave()
+                        self._invalidate_chapter_segments_cache()
+                        single_sentence_mode_remaining = 0
+                        fail_count = 0
+                        gemini_retry_count = 0
+                        batch_retry_count = 0
+                        total_sent = len(self._cached_chapter_segments(self.c_idx))
+                        if self.voice_mode == "author_gender" and total_sent == 0:
+                            self.error_signal.emit(
+                                self.worker_id,
+                                f"Глава {self.c_idx + 1}: нет корректного AI-сценария Author/Male/Female. Сначала подготовьте AI-сценарий.",
+                            )
+                            self.c_idx = -1
+                            continue
+                        segment_label = "абз." if self.segment_mode == "paragraphs" else "предл."
+                        logger.info(f"Воркер {self.worker_id} взял Главу {self.c_idx + 1} ({total_sent} {segment_label})")
+                    except queue.Empty:
+                        self._emit_finished()
+                        break
+                else:
+                    total_sent = len(self._cached_chapter_segments(self.c_idx))
                     if self.voice_mode == "author_gender" and total_sent == 0:
                         self.error_signal.emit(
                             self.worker_id,
@@ -4187,177 +4276,168 @@ class GeminiWorker(QThread):
                         )
                         self.c_idx = -1
                         continue
-                    segment_label = "абз." if self.segment_mode == "paragraphs" else "предл."
-                    logger.info(f"Воркер {self.worker_id} взял Главу {self.c_idx + 1} ({total_sent} {segment_label})")
-                except queue.Empty:
-                    self._emit_finished()
-                    break
-            else:
-                total_sent = len(self._chapter_segments(self.c_idx))
-                if self.voice_mode == "author_gender" and total_sent == 0:
-                    self.error_signal.emit(
-                        self.worker_id,
-                        f"Глава {self.c_idx + 1}: нет корректного AI-сценария Author/Male/Female. Сначала подготовьте AI-сценарий.",
-                    )
+
+                if self.bm.is_chapter_done(self.c_idx):
+                    self.chapter_done_ui_signal.emit(self.c_idx)
                     self.c_idx = -1
                     continue
 
-            if self.bm.is_chapter_done(self.c_idx):
-                self.chapter_done_ui_signal.emit(self.c_idx)
-                self.c_idx = -1
-                continue
+                if self.s_idx >= total_sent:
+                    logger.info(f"Воркер {self.worker_id} сохраняет и завершает Главу {self.c_idx + 1}")
+                    await self.save_file(final=True)
+                    self.bm.mark_chapter_done(self.c_idx)
+                    self.chapter_done_ui_signal.emit(self.c_idx)
+                    if self.worker_id == 0: 
+                        self.change_chapter_signal.emit(self.c_idx)
+                    self.c_idx = -1
+                    continue
 
-            if self.s_idx >= total_sent:
-                logger.info(f"Воркер {self.worker_id} сохраняет и завершает Главу {self.c_idx + 1}")
-                await self.save_file(final=True)
-                self.bm.mark_chapter_done(self.c_idx)
-                self.chapter_done_ui_signal.emit(self.c_idx)
-                if self.worker_id == 0: 
-                    self.change_chapter_signal.emit(self.c_idx)
-                self.c_idx = -1
-                continue
+                if total_sent > 0:
+                    self._emit_worker_progress(self.c_idx, self.s_idx, total_sent)
 
-            if total_sent > 0:
-                self._emit_worker_progress(self.c_idx, self.s_idx, total_sent)
-
-            current_chunk_size = 1 if single_sentence_mode_remaining > 0 else self.chunk
+                current_chunk_size = 1 if single_sentence_mode_remaining > 0 else self.chunk
             
-            segments = self._chapter_segments(self.c_idx)
-            text_parts = []
-            actual_count = 0
-            end_range = min(self.s_idx + current_chunk_size, total_sent)
+                segments = self._cached_chapter_segments(self.c_idx)
+                text_parts = []
+                actual_count = 0
+                end_range = min(self.s_idx + current_chunk_size, total_sent)
             
-            for i in range(self.s_idx, end_range):
-                text_parts.append(segments[i])
-                actual_count += 1
+                for i in range(self.s_idx, end_range):
+                    text_parts.append(segments[i])
+                    actual_count += 1
             
-            request_payload = self._build_live_request_payload(self._join_segments_for_request(text_parts))
-            payload_preview = ""
-            if request_payload:
-                if request_payload.get("mode") == "author_gender":
-                    payload_preview = " | ".join(
-                        item.get("text", "")[:20] for item in request_payload.get("plan", [])[:2]
-                    )
-                else:
-                    payload_preview = request_payload.get("text", "")[:30]
-            if not request_payload:
-                self.s_idx += 1
-                if single_sentence_mode_remaining > 0:
-                    single_sentence_mode_remaining -= 1
-                continue
-
-            data_received = False
-            request_budget_acquired = False
-            try:
-                if request_payload.get("mode") == "author_gender":
-                    audio_bytes = await self._collect_live_payload_audio(client, request_payload)
-                    data_received = self._commit_live_audio_bytes(audio_bytes)
-                else:
-                    text_to_send = request_payload["text"]
-                    config = request_payload["config"]
-                    request_audio = bytearray()
-
-                    def _on_live_chunk(data):
-                        request_audio.extend(data)
-                        if self.audio_queue and not self.fast:
-                            self.audio_queue.put((data, self.c_idx, self.s_idx, False))
-
-                    raw_audio = await self._collect_live_request_raw_audio(
-                        client,
-                        config,
-                        text_to_send,
-                        on_chunk=_on_live_chunk,
-                    )
-                    data_received = bool(raw_audio)
-                    if self.record and request_audio:
-                        trimmed_audio = _trim_raw_pcm_boundaries(bytes(request_audio))
-                        with self.buffer_lock:
-                            self.audio_chunks.append(trimmed_audio)
-            except Exception as e:
-                if isinstance(e, ReaderWorkerStopped):
-                    break
-                if isinstance(e, ProjectRateLimitReachedError):
-                    self._abort_for_project_quota(str(e), e.model_id or self.model_id)
-                    break
-                if isinstance(e, RateLimitBudgetError):
-                    self._abort_for_quota_key(str(e), e.model_id or self.model_id)
-                    break
-                if _is_invalid_api_key_error(e):
-                    self._abort_for_invalid_key(str(e))
-                    break
-                if _is_rate_limited_error(e):
-                    self._abort_for_quota_key(str(e), self.model_id)
-                    break
-                # Ошибки сети или внезапные разрывы логируем, чтобы не было "тихих" провалов
-                logger.debug(f"[W{self.worker_id}] Внутренняя ошибка сессии Gemini: {e}")
-
-            if not data_received and self._is_running:
-                if current_chunk_size > 1:
-                    # ДАЕМ БАТЧУ 3 ПОПЫТКИ ПЕРЕД ДРОБЛЕНИЕМ НА ОДИНОЧНЫЕ ПРЕДЛОЖЕНИЯ
-                    if batch_retry_count < 3:
-                        batch_retry_count += 1
-                        logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (батч). Попытка {batch_retry_count}/3 для батча: '{payload_preview}...'")
-                        if not await self._sleep_interruptibly(2):
-                            break
-                        continue # Возвращаемся в начало и пробуем этот же батч целиком
+                request_payload = self._build_live_request_payload(self._join_segments_for_request(text_parts))
+                payload_preview = ""
+                if request_payload:
+                    if request_payload.get("mode") == "author_gender":
+                        payload_preview = " | ".join(
+                            item.get("text", "")[:20] for item in request_payload.get("plan", [])[:2]
+                        )
                     else:
-                        logger.warning(f"[W{self.worker_id}] Батч не прошел после 3 попыток! Дробим {actual_count} предл. по одному...")
-                        single_sentence_mode_remaining = actual_count
-                        fail_count = 0 
-                        gemini_retry_count = 0 
-                        batch_retry_count = 0
-                        continue
-                else:
-                    # ДАЕМ ОДИНОЧНОМУ ПРЕДЛОЖЕНИЮ 3 ПОПЫТКИ ПЕРЕД EDGE TTS
-                    if gemini_retry_count < 3:
-                        gemini_retry_count += 1
-                        logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (одиночное). Попытка {gemini_retry_count}/3 для: '{payload_preview}...'")
-                        if not await self._sleep_interruptibly(2):
-                            break
-                        continue
-                    else:
-                        fallback_source_text = request_payload.get("text", "") if request_payload else ""
-                        if request_payload and request_payload.get("mode") == "author_gender":
-                            fallback_source_text = "\n\n".join(
-                                item.get("text", "") for item in request_payload.get("plan", [])
-                            )
-                        logger.warning(f"[W{self.worker_id}] Gemini сдался после 3 попыток. Озвучка Edge TTS: '{payload_preview}...'")
-                        fallback_data = await self.get_edge_tts_fallback(fallback_source_text)
-                        if fallback_data:
-                            data_received = self._commit_live_audio_bytes(fallback_data)
+                        payload_preview = request_payload.get("text", "")[:30]
+                if not request_payload:
+                    self.s_idx += 1
+                    if single_sentence_mode_remaining > 0:
+                        single_sentence_mode_remaining -= 1
+                    continue
 
-            # УСПЕХ ИЛИ ПРОПУСК
-            if data_received:
-                fail_count = 0 
-                gemini_retry_count = 0 
-                batch_retry_count = 0 # Сбрасываем все счетчики ошибок при успехе
-                self.s_idx = min(self.s_idx + actual_count, total_sent)
-                
-                if single_sentence_mode_remaining > 0:
-                    single_sentence_mode_remaining -= actual_count
-                    
-                self._emit_worker_progress(self.c_idx, self.s_idx, total_sent, force=self.s_idx >= total_sent)
-                
-                if self.worker_id == 0:
-                    self.bm.save_progress(self.c_idx, self.s_idx, force=self.s_idx >= total_sent)
-                
-                if self.record:
-                    await self._autosave_live_mp3_if_due(total_sent)
-            else:
-                # Сюда программа дойдет только если даже Edge TTS не смог сгенерировать звук
-                fail_count += 1
-                if fail_count >= 3:
-                    logger.error(f"[W{self.worker_id}] Пропуск предложения после неудач Edge TTS: '{payload_preview}...'")
+                data_received = False
+                request_budget_acquired = False
+                try:
+                    if request_payload.get("mode") == "author_gender":
+                        audio_bytes = await self._collect_live_payload_audio(client, request_payload)
+                        data_received = self._commit_live_audio_bytes(audio_bytes)
+                    else:
+                        text_to_send = request_payload["text"]
+                        config = request_payload["config"]
+                        request_audio = bytearray()
+
+                        def _on_live_chunk(data):
+                            request_audio.extend(data)
+                            if self.audio_queue and not self.fast:
+                                self._enqueue_live_audio((data, self.c_idx, self.s_idx, False))
+
+                        raw_audio = await self._collect_live_request_raw_audio(
+                            client,
+                            config,
+                            text_to_send,
+                            on_chunk=_on_live_chunk,
+                        )
+                        data_received = bool(raw_audio)
+                        if self.record and request_audio:
+                            trimmed_audio = _trim_raw_pcm_boundaries(bytes(request_audio))
+                            with self.buffer_lock:
+                                self.audio_chunks.append(trimmed_audio)
+                except Exception as e:
+                    if isinstance(e, ReaderWorkerStopped):
+                        break
+                    if isinstance(e, ProjectRateLimitReachedError):
+                        self._abort_for_project_quota(str(e), e.model_id or self.model_id)
+                        break
+                    if isinstance(e, RateLimitBudgetError):
+                        self._abort_for_quota_key(str(e), e.model_id or self.model_id)
+                        break
+                    if _is_invalid_api_key_error(e):
+                        self._abort_for_invalid_key(str(e))
+                        break
+                    if _is_rate_limited_error(e):
+                        self._abort_for_quota_key(str(e), self.model_id)
+                        break
+                    # Ошибки сети или внезапные разрывы логируем, чтобы не было "тихих" провалов
+                    logger.debug(f"[W{self.worker_id}] Внутренняя ошибка сессии Gemini: {e}")
+
+                if not data_received and self._is_running:
+                    if current_chunk_size > 1:
+                        # ДАЕМ БАТЧУ 3 ПОПЫТКИ ПЕРЕД ДРОБЛЕНИЕМ НА ОДИНОЧНЫЕ ПРЕДЛОЖЕНИЯ
+                        if batch_retry_count < 3:
+                            batch_retry_count += 1
+                            logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (батч). Попытка {batch_retry_count}/3 для батча: '{payload_preview}...'")
+                            if not await self._sleep_interruptibly(2):
+                                break
+                            continue # Возвращаемся в начало и пробуем этот же батч целиком
+                        else:
+                            logger.warning(f"[W{self.worker_id}] Батч не прошел после 3 попыток! Дробим {actual_count} предл. по одному...")
+                            single_sentence_mode_remaining = actual_count
+                            fail_count = 0 
+                            gemini_retry_count = 0 
+                            batch_retry_count = 0
+                            continue
+                    else:
+                        # ДАЕМ ОДИНОЧНОМУ ПРЕДЛОЖЕНИЮ 3 ПОПЫТКИ ПЕРЕД EDGE TTS
+                        if gemini_retry_count < 3:
+                            gemini_retry_count += 1
+                            logger.warning(f"[W{self.worker_id}] Ошибка API Gemini (одиночное). Попытка {gemini_retry_count}/3 для: '{payload_preview}...'")
+                            if not await self._sleep_interruptibly(2):
+                                break
+                            continue
+                        else:
+                            fallback_source_text = request_payload.get("text", "") if request_payload else ""
+                            if request_payload and request_payload.get("mode") == "author_gender":
+                                fallback_source_text = "\n\n".join(
+                                    item.get("text", "") for item in request_payload.get("plan", [])
+                                )
+                            logger.warning(f"[W{self.worker_id}] Gemini сдался после 3 попыток. Озвучка Edge TTS: '{payload_preview}...'")
+                            fallback_data = await self.get_edge_tts_fallback(fallback_source_text)
+                            if fallback_data:
+                                data_received = self._commit_live_audio_bytes(fallback_data)
+
+                # УСПЕХ ИЛИ ПРОПУСК
+                if data_received:
+                    fail_count = 0 
+                    gemini_retry_count = 0 
+                    batch_retry_count = 0 # Сбрасываем все счетчики ошибок при успехе
                     self.s_idx = min(self.s_idx + actual_count, total_sent)
-                    fail_count = 0
-                    gemini_retry_count = 0
-                    batch_retry_count = 0
+                
                     if single_sentence_mode_remaining > 0:
                         single_sentence_mode_remaining -= actual_count
+                    
+                    self._emit_worker_progress(self.c_idx, self.s_idx, total_sent, force=self.s_idx >= total_sent)
+                
+                    if self.worker_id == 0:
+                        self.bm.save_progress(self.c_idx, self.s_idx, force=self.s_idx >= total_sent)
+                
+                    if self.record:
+                        await self._autosave_live_mp3_if_due(total_sent)
                 else:
-                    logger.error(f"[W{self.worker_id}] Ошибка Edge TTS. Попытка {fail_count}/3. Пауза 5 сек...")
-                    if not await self._sleep_interruptibly(5):
-                        break
+                    # Сюда программа дойдет только если даже Edge TTS не смог сгенерировать звук
+                    fail_count += 1
+                    if fail_count >= 3:
+                        logger.error(f"[W{self.worker_id}] Пропуск предложения после неудач Edge TTS: '{payload_preview}...'")
+                        self.s_idx = min(self.s_idx + actual_count, total_sent)
+                        fail_count = 0
+                        gemini_retry_count = 0
+                        batch_retry_count = 0
+                        if single_sentence_mode_remaining > 0:
+                            single_sentence_mode_remaining -= actual_count
+                    else:
+                        logger.error(f"[W{self.worker_id}] Ошибка Edge TTS. Попытка {fail_count}/3. Пауза 5 сек...")
+                        if not await self._sleep_interruptibly(5):
+                            break
+        finally:
+            # Гарантируем запись последней достигнутой позиции при остановке посреди главы:
+            # без этого двухсекундный throttle save_progress мог не долететь до диска (см. bugs/5).
+            if self.worker_id == 0 and self.c_idx != -1:
+                self.bm.save_progress(self.c_idx, self.s_idx, force=True)
 
 
 
@@ -4506,9 +4586,6 @@ class GeminiParallelChapterWorker(GeminiWorker):
                     return False
                 if isinstance(exc, ProjectRateLimitReachedError):
                     self._abort_for_project_quota(str(exc), exc.model_id or self.model_id)
-                    return False
-                if isinstance(exc, RateLimitBudgetError):
-                    self._abort_for_quota_key(str(exc), exc.model_id or self.model_id)
                     return False
                 if _is_invalid_api_key_error(exc):
                     self._abort_for_invalid_key(str(exc))
@@ -5246,7 +5323,7 @@ class FlashTtsWorker(GeminiWorker):
                 with self.buffer_lock:
                     self.audio_chunks.append(audio_bytes)
             if self.audio_queue and not self.fast:
-                self.audio_queue.put((audio_bytes, chapter_index, chunk_index - 1, False))
+                self._enqueue_live_audio((audio_bytes, chapter_index, chunk_index - 1, False))
             if self.record:
                 await self.save_file()
                 self._save_flash_tts_progress(chapter_index, script_text, script_chunks, chunk_index)
@@ -5811,6 +5888,7 @@ class MainWindow(QMainWindow):
         self._active_flash_run_mode = None
         self._active_manager_queue = None
         self._parallel_live_state = None
+        self._parallel_live_combine_worker = None
         self._run_had_invalid_keys = False
         self._project_quota_message = ""
         self._stop_requested = False
@@ -6295,7 +6373,14 @@ class MainWindow(QMainWindow):
         active_workers = any(getattr(worker, "isRunning", lambda: False)() for worker in self.workers)
         combiner_running = bool(self.combiner and self.combiner.isRunning())
         tester_running = bool(self.tester_worker and self.tester_worker.isRunning())
-        return active_workers or combiner_running or tester_running
+        # Фоновая склейка параллельно озвученной главы (см.
+        # ParallelLiveChapterCombineWorker) идёт уже после того, как self.workers
+        # опустел, — без этой проверки приложение считало себя простаивающим
+        # во время её работы: окно можно было закрыть, а кнопку "СТАРТ" нажать
+        # поверх ещё не завершённой склейки.
+        parallel_combine_worker = getattr(self, "_parallel_live_combine_worker", None)
+        parallel_combine_running = bool(parallel_combine_worker and parallel_combine_worker.isRunning())
+        return active_workers or combiner_running or tester_running or parallel_combine_running
 
     def _refresh_runtime_controls(self):
         running = self._running_tasks_exist()
@@ -6632,7 +6717,9 @@ class MainWindow(QMainWindow):
                 if key in existing_map:
                     merged_statuses.append(existing_map[key])
                 else:
-                    merged_statuses.append({"key": key, "provider": "gemini", "status_by_model": {}})
+                    # Только конфигурация: runtime нового ключа заводит само
+                    # хранилище, save_key_statuses его отсюда не читает.
+                    merged_statuses.append({"key": key, "provider": "gemini"})
             self.settings_manager.save_key_statuses(merged_statuses)
         else:
             legacy_data = _load_legacy_settings()
@@ -8203,22 +8290,43 @@ class MainWindow(QMainWindow):
             allow_edge_fallback=self.chk_edge_fallback.isChecked(),
         )
 
-    def _start_replacement_worker_if_possible(self):
+    def _start_replacement_worker_if_possible(self, excluded_worker_id=None):
+        """Строит и запускает replacement-воркер, если это допустимо.
+
+        ``excluded_worker_id`` нужен вызывающим, у которых воркер, который
+        предстоит заменить, ещё физически числится в ``self.workers`` (как,
+        например, ``_on_quota_worker_key`` — реальное удаление произойдёт
+        позже, когда придёт нативный сигнал ``QThread.finished``). Такой
+        воркер исключается из подсчёта занятых слотов, чтобы лимит
+        ``_active_worker_target_count`` не блокировал замену умирающего
+        воркера самим собой.
+
+        Возвращает использованный API-ключ (непустая строка) при успехе,
+        либо ``""``, если замена не была запущена.
+        """
         if getattr(self, "_stop_requested", False):
-            return False
+            return ""
         if self._active_manager_queue is None or self._active_manager_queue.qsize() <= 0:
-            return False
+            return ""
         if self._project_quota_message:
-            return False
+            return ""
         if self._parallel_live_state is not None and self._parallel_live_state.get("cancelled"):
-            return False
-        if len(self.workers) >= self._active_worker_target_count():
-            return False
+            return ""
+        if excluded_worker_id is None:
+            active_worker_count = len(self.workers)
+        else:
+            active_worker_count = sum(
+                1
+                for worker in self.workers
+                if getattr(worker, "worker_id", None) != excluded_worker_id
+            )
+        if active_worker_count >= self._active_worker_target_count():
+            return ""
 
         required_model_ids = self._active_required_model_ids()
         replacement_keys = self._replacement_api_keys(required_model_ids)
         if not replacement_keys:
-            return False
+            return ""
 
         worker_id = self._next_replacement_worker_id()
         api_key = replacement_keys[0]
@@ -8248,14 +8356,18 @@ class MainWindow(QMainWindow):
             self.worker_widgets.pop(worker_id, None)
             row.setParent(None)
             logger.warning(f"Не удалось запустить replacement-воркер: {exc}")
-            return False
+            return ""
 
+        # Стартовая пауза (stagger) нужна только для изначального пакета
+        # воркеров, чтобы не бомбардировать API одновременно; replacement
+        # запускается посреди сессии и должен начать работу немедленно.
+        worker.start_stagger_index = 0
         self.workers.append(worker)
         worker.start()
         self.statusBar().showMessage(
             f"Ключ {_mask_api_key(api_key)} взят как замена; оставшаяся очередь продолжена."
         )
-        return True
+        return api_key
 
     def _on_worker_finished(self, worker_id):
         self._flush_worker_progress()
@@ -8280,6 +8392,12 @@ class MainWindow(QMainWindow):
                 final_message = "Процесс остановлен."
             elif self._active_job_kind == "tts_parallel_live" and self._parallel_live_state is not None:
                 final_message = self._finalize_parallel_live_chapter()
+                if final_message is None:
+                    # Склейка сегментов главы запущена в фоновом QThread; сообщение
+                    # о завершении сессии придёт из её колбэка позже (см. локальный
+                    # on_thread_finished внутри _finalize_parallel_live_chapter),
+                    # здесь ничего больше делать не нужно.
+                    return
             elif self._project_quota_message:
                 final_message = self._project_quota_message
             elif remaining_chapters > 0:
@@ -8291,15 +8409,18 @@ class MainWindow(QMainWindow):
                 final_message = "AI-сценарии подготовлены." if self._active_job_kind == "prepare" else "Озвучка завершена."
                 if self._run_had_invalid_keys:
                     final_message += " Невалидные ключи были исключены из запуска."
-            self._active_manager_queue = None
-            self._active_reader_engine = None
-            self._active_flash_run_mode = None
-            self._run_had_invalid_keys = False
-            self._project_quota_message = ""
-            self._stop_requested = False
-            self.statusBar().showMessage(final_message)
-            from gemini_translator.ui.notifications import NotificationManager
-            NotificationManager.show("Сессия завершена", final_message)
+            self._complete_reading_session(final_message)
+
+    def _complete_reading_session(self, final_message):
+        self._active_manager_queue = None
+        self._active_reader_engine = None
+        self._active_flash_run_mode = None
+        self._run_had_invalid_keys = False
+        self._project_quota_message = ""
+        self._stop_requested = False
+        self.statusBar().showMessage(final_message)
+        from gemini_translator.ui.notifications import NotificationManager
+        NotificationManager.show("Сессия завершена", final_message)
 
     def _on_invalid_worker_key(self, worker_id, api_key, error_text, chapter_index):
         self.disabled_api_keys.add(api_key)
@@ -8313,91 +8434,6 @@ class MainWindow(QMainWindow):
             f"Отключён невалидный API-ключ {masked_key}; {chapter_label} возвращена в очередь."
         )
 
-    def _next_worker_id(self):
-        used_ids = {
-            int(worker_id)
-            for worker_id in self.worker_widgets.keys()
-            if isinstance(worker_id, int)
-        }
-        for worker in self.workers:
-            try:
-                used_ids.add(int(getattr(worker, "worker_id", -1)))
-            except (TypeError, ValueError):
-                pass
-        worker_id = 0
-        while worker_id in used_ids:
-            worker_id += 1
-        return worker_id
-
-    def _available_replacement_key(self, required_model_ids):
-        active_keys = {
-            getattr(worker, "api_key", "")
-            for worker in self.workers
-            if getattr(worker, "api_key", "")
-        }
-        runtime_key_getter = getattr(self, "_runtime_keys_for_required_models", None)
-        candidate_keys = (
-            runtime_key_getter(required_model_ids)
-            if callable(runtime_key_getter)
-            else self._get_available_api_keys(required_model_ids)
-        )
-        for api_key in candidate_keys:
-            if api_key not in active_keys:
-                return api_key
-        return ""
-
-    def _queue_has_pending_work(self):
-        if self._active_manager_queue is None:
-            return False
-        try:
-            return self._active_manager_queue.qsize() > 0
-        except Exception:
-            return True
-
-    def _start_replacement_worker(self):
-        if not self._queue_has_pending_work():
-            return ""
-
-        worker_id = self._next_worker_id()
-
-        if self._active_job_kind == "tts_parallel_live":
-            if self._parallel_live_state is None:
-                return ""
-            replacement_key = self._available_replacement_key([self._selected_model_id()])
-            if not replacement_key:
-                return ""
-            self._add_dashboard_row(worker_id)
-            worker = self._build_parallel_live_worker(worker_id, replacement_key)
-            self._connect_reader_worker_signals(worker)
-
-        elif self._is_flash_tts_mode() or self._active_job_kind == "prepare":
-            required_model_ids = (
-                [self._selected_preprocess_model_id()]
-                if self._active_job_kind == "prepare"
-                else self._worker_models_for_limit()
-            )
-            replacement_key = self._available_replacement_key(required_model_ids)
-            if not replacement_key:
-                return ""
-            self._add_dashboard_row(worker_id)
-            run_mode = "prepare" if self._active_job_kind == "prepare" else self._selected_pipeline_mode()
-            live_playback = self.player is not None and run_mode != "prepare"
-            worker = self._build_flash_worker(worker_id, replacement_key, run_mode, live_playback)
-            self._connect_reader_worker_signals(worker, chapter_done=True, script_ready=True)
-
-        else:
-            replacement_key = self._available_replacement_key([self._selected_model_id()])
-            if not replacement_key:
-                return ""
-            self._add_dashboard_row(worker_id)
-            worker = self._build_live_worker(worker_id, replacement_key, self.player is not None)
-            self._connect_reader_worker_signals(worker, chapter_done=True)
-
-        worker.start_stagger_index = 0
-        self.workers.append(worker)
-        worker.start()
-        return getattr(worker, "api_key", "")
-
     def _on_quota_worker_key(self, worker_id, api_key, model_id, error_text, chapter_index):
         self.disabled_api_keys.add(api_key)
         self._run_had_invalid_keys = True
@@ -8410,7 +8446,11 @@ class MainWindow(QMainWindow):
         self._update_key_state_ui()
         chapter_label = f"глава {chapter_index + 1}" if chapter_index >= 0 else "текущая глава"
         masked_key = _mask_api_key(api_key)
-        replacement_key = self._start_replacement_worker()
+        # worker_id ещё числится в self.workers — реальное удаление произойдёт
+        # позже, в _on_worker_finished, когда придёт нативный сигнал
+        # QThread.finished. Исключаем его явно, чтобы лимит воркеров не
+        # блокировал замену умирающего воркера самим собой.
+        replacement_key = self._start_replacement_worker_if_possible(excluded_worker_id=worker_id)
         if replacement_key:
             self.statusBar().showMessage(
                 f"Ключ {masked_key} списан по лимиту {model_id}; "
@@ -8524,19 +8564,62 @@ class MainWindow(QMainWindow):
                 f"({len(missing_files)} шт.)."
             )
 
-        chapter_path = self.bm.get_mp3_path(chapter_index)
-        try:
-            _combine_mp3_sequence(output_paths, chapter_path)
-            self.bm.mark_chapter_done(chapter_index)
-            self.on_chapter_done_ui(chapter_index)
-            self._cleanup_parallel_live_state(remove_files=True)
-            return (
-                f"Глава {chapter_index + 1} озвучена параллельно: "
-                f"{total_tasks} блок(ов), {state.get('worker_count', 1)} воркер(ов)."
+        # Сама склейка (ffmpeg-конкатенация + loudnorm) может занимать заметное
+        # время на длинных главах, поэтому выполняется в фоновом QThread, а не
+        # синхронно в этом Qt-слоте — иначе интерфейс замирает до её окончания.
+        worker_count = state.get("worker_count", 1)
+        temp_dir = state.get("temp_dir")
+        # Отвязываем состояние сессии от self ДО старта фонового потока: пока
+        # склейка идёт, GUI отзывчив (в отличие от старой синхронной версии),
+        # и пользователь может успеть запустить новую параллельную озвучку —
+        # она не должна унаследовать или затереть чужой self._parallel_live_state.
+        # Всё нужное отложенному колбэку (chapter_index, temp_dir) захватываем
+        # локальными переменными, а не читаем заново из self._parallel_live_state,
+        # который к моменту завершения склейки может принадлежать уже новой сессии.
+        self._parallel_live_state = None
+
+        combine_worker = ParallelLiveChapterCombineWorker(
+            self.bm, chapter_index, output_paths, total_tasks, worker_count
+        )
+        # Храним ссылку на воркер, пока он работает: без этого Python может
+        # собрать объект как мусор до завершения потока (падение QThread), а
+        # _running_tasks_exist()/_refresh_runtime_controls() по этой ссылке
+        # видят, что фоновая склейка ещё идёт (кнопка "СТАРТ" и закрытие окна
+        # остаются заблокированы).
+        self._parallel_live_combine_worker = combine_worker
+        combine_result = {"success": False, "message": ""}
+
+        def on_combine_message(success, _chapter_index, message):
+            combine_result["success"] = success
+            combine_result["message"] = message
+
+        def on_thread_finished():
+            # Ссылку обнуляем и объект удаляем только здесь — во встроенном
+            # сигнале finished, который эмитится ПОСЛЕ фактического завершения
+            # потока, в отличие от finished_signal, эмитируемого изнутри run()
+            # ещё до возврата из него. Как и для AudioCombinerWorker (см.
+            # _start_audio_combiner), это исключает "QThread destroyed while
+            # still running" из-за преждевременного обнуления ссылки.
+            if self._parallel_live_combine_worker is combine_worker:
+                self._parallel_live_combine_worker = None
+            if combine_result["success"]:
+                self.on_chapter_done_ui(chapter_index)
+                if temp_dir and os.path.isdir(temp_dir):
+                    try:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+            self._refresh_runtime_controls()
+            combine_worker.deleteLater()
+            self._complete_reading_session(
+                combine_result["message"] or f"Ошибка сборки главы {chapter_index + 1}."
             )
-        except Exception as exc:
-            self._cleanup_parallel_live_state(remove_files=False)
-            return f"Ошибка сборки главы {chapter_index + 1}: {exc}"
+
+        combine_worker.finished_signal.connect(on_combine_message)
+        combine_worker.finished.connect(on_thread_finished)
+        self._refresh_runtime_controls()
+        combine_worker.start()
+        return None
 
     def _launch_parallel_live_workers(self, chapter_index, available_api_keys, requested_workers):
         if not self.chk_mp3.isChecked():

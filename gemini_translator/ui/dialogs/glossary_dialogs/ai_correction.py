@@ -5,7 +5,6 @@ import time
 import zipfile
 import json
 import re
-import unicodedata
 from collections import defaultdict
 import uuid # <--- ДОБАВИТЬ ЭТОТ ИМПОРТ
 # --- Импорты из PyQt6 ---
@@ -28,6 +27,7 @@ from gemini_translator.ui.widgets.log_widget import LogWidget
 from gemini_translator.ui.widgets.preset_widget import PresetWidget
 from gemini_translator.ui.widgets.ancestor_utils import find_ancestor_by_class_name
 from gemini_translator.ui.overlay_host import exec_dialog
+from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.widgets.overlay_tab_widget import OverlayTabWidget
 from gemini_translator.ui import theme_manager
@@ -247,9 +247,6 @@ class CorrectionSessionPage(ShellPage):
             self.engine = app.engine
 
     def _locate_glossary_owner(self):
-        parent = self.parent()
-        if parent and parent.__class__.__name__ in ('MainWindow', 'GlossaryManagerPage'):
-            return parent
         return find_ancestor_by_class_name(self, 'MainWindow', 'GlossaryManagerPage')
 
     def _get_glossary_owner(self):
@@ -706,20 +703,6 @@ class CorrectionSessionPage(ShellPage):
             self.data_grid_layout.addWidget(widget, row, col)
             widget.setVisible(True) # Убеждаемся, что он видим
 
-
-    def refresh_data(self):
-        """
-        Публичный метод для принудительного обновления данных из родительского окна.
-        Сбрасывает кэши и перезапускает анализ токенов.
-        """
-        self.log_widget.append_message({'message': "[SYSTEM] Данные обновлены из основного окна. Пересчет..."})
-        self._cached_analysis_results = None
-        self._cached_pattern_results = None
-        self._reset_partial_overlap_button()
-        self._reset_pattern_button()
-        self._repack_data_tab_layout()
-        self._initialize_frequency_filter()
-        self.update_token_estimation()
 
     def _resolve_frequency_sources(self):
         main_window = self._get_glossary_owner()
@@ -1304,56 +1287,6 @@ class CorrectionSessionPage(ShellPage):
 
         # 3. Отправляем на гравитационную сортировку
         return self._sort_groups_by_gravity(final_groups)
-
-    def _analyze_overlaps_with_gravity(self, all_overlaps, all_inv_overlaps, processed_terms):
-        """
-        Сложная логика обработки наложений:
-        1. Расчет веса (Score).
-        2. Жадное вычитание (получение уникальных 'остатков').
-        3. Гравитационная сортировка (сближение связанных групп).
-        """
-        # --- 1. Подготовка кандидатов ---
-        groups_source = all_overlaps if len(all_overlaps) < len(all_inv_overlaps) else all_inv_overlaps
-        if not groups_source:
-            return []
-
-        candidates = []
-        for leader, members in groups_source.items():
-            # Полный кластер (все участники группы)
-            cluster = sorted(list(set([leader] + members)))
-            # Score = Длина лидера * Размер группы (чем больше и длиннее, тем важнее)
-            score = len(leader) * len(cluster)
-            candidates.append({
-                'leader': leader,
-                'full_cluster': set(cluster), # Для расчета связей
-                'score': score
-            })
-
-        # Сортируем по убыванию важности (первичная сортировка)
-        candidates.sort(key=lambda x: x['score'], reverse=True)
-
-        # --- 2. Жадное вычитание (формирование блоков) ---
-        valid_groups = []
-
-        for cand in candidates:
-            # Вычисляем уникальные термины (которые еще не были обработаны)
-            unique_terms = [t for t in sorted(list(cand['full_cluster'])) if t not in processed_terms]
-
-            if not unique_terms:
-                continue
-
-            # Регистрируем группу
-            group_data = {
-                'leader': cand['leader'],
-                'unique_terms': unique_terms,    # То, что будем выводить
-                'full_cluster': cand['full_cluster'], # То, по чему будем искать связи
-                'score': cand['score']
-            }
-            valid_groups.append(group_data)
-            processed_terms.update(unique_terms)
-
-        # --- 3. Гравитационная сортировка ---
-        return self._sort_groups_by_gravity(valid_groups)
 
     # --- Методы для управления СКРЫТЫМИ КОНФЛИКТАМИ ---
     def _reset_partial_overlap_button(self):
@@ -2148,39 +2081,6 @@ class CorrectionSessionPage(ShellPage):
 
 
 
-    def _format_term_group(self, title, term_list, glossary_map, include_notes):
-        """Форматирует группу терминов в стандартный блок (Переводы, Примечания)."""
-        lines = []
-        if not term_list:
-            return lines
-
-        lines.append(f'\n--- {title} ---')
-
-        # Сначала переводы
-        translation_lines = []
-        for term in term_list:
-            entry = glossary_map.get(term)
-            if entry and entry.get("rus"):
-                translation_lines.append(f'"{entry.get("original")}" = "{entry.get("rus")}"')
-
-        if translation_lines:
-            lines.append("--- Translations ---")
-            lines.extend(translation_lines)
-
-        # Затем примечания (если включены)
-        if include_notes:
-            note_lines = []
-            for term in term_list:
-                entry = glossary_map.get(term)
-                if entry and entry.get("note"):
-                    note_lines.append(f'"{entry.get("rus")}" - "{entry.get("note")}"')
-
-            if note_lines:
-                lines.append("--- Notes ---")
-                lines.extend(note_lines)
-
-        return lines
-
     def _format_compact_group(self, term_list, glossary_multimap, include_notes):
         """
         Форматирует группу терминов.
@@ -2522,12 +2422,11 @@ class CorrectionSessionPage(ShellPage):
         return settings
 
 
-class _CorrectionSessionDialogMeta(type(QDialog)):
-    def __getattr__(cls, name):
-        return getattr(CorrectionSessionPage, name)
-
-
-class CorrectionSessionDialog(QDialog, metaclass=_CorrectionSessionDialogMeta):
+class CorrectionSessionDialog(
+    PageDialogProxyMixin,
+    QDialog,
+    metaclass=make_page_delegating_meta(CorrectionSessionPage),
+):
     """Modal wrapper hosting CorrectionSessionPage for the legacy exec() API."""
 
     correction_accepted = pyqtSignal(list)
@@ -2544,12 +2443,6 @@ class CorrectionSessionDialog(QDialog, metaclass=_CorrectionSessionDialogMeta):
 
     def _on_result(self, accepted: bool):
         self.done(QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected)
-
-    def __getattr__(self, name):
-        page = self.__dict__.get("page")
-        if page is not None:
-            return getattr(page, name)
-        raise AttributeError(name)
 
     def closeEvent(self, event):
         if not self.page.can_leave():
@@ -2634,9 +2527,6 @@ class CorrectionPreviewDialog(QDialog):
         order = self._sort_order_counter
         self._sort_order_counter += 1
         return order
-
-    def _normalized_case_key(self, text: str) -> str:
-        return unicodedata.normalize("NFC", str(text or ""))
 
     def _classify_translation_change(self, old_values, new_value: str):
         return classify_translation_review_change(old_values, new_value)
