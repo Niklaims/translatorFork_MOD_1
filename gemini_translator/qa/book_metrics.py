@@ -191,7 +191,7 @@ def eligible_baseline_size(
     """
     try:
         frame = BookMetricsAnalyzer().analyze(metrics)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, ImportError):
         return 0
     if frame.empty:
         return 0
