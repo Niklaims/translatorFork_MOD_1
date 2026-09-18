@@ -189,6 +189,17 @@ _DEFAULT_MANUAL_TRANSLATION_PROMPT_TEXT = (
     "Верни только чистый готовый перевод без HTML-тегов, без пояснений и без комментариев.\n\n"
     "{text}"
 )
+_DEFAULT_EXTRACT_GLOSSARY_INSTRUCTION = (
+    "\n\n### ЭКСТРАКЦИЯ ГЛОССАРИЯ ###\n"
+    "Извлеки все новые важные термины, имена и названия, которых не было в предоставленном глоссарии.\n"
+    "Выведи их СТРОГО в самом конце твоего ответа (после перевода) внутри тегов <new_glossary> и </new_glossary> в формате JSON-словаря:\n"
+    "{\n"
+    "  \"Оригинал1\": {\"rus\": \"Перевод1\", \"note\": \"Примечание1\"},\n"
+    "  \"Оригинал2\": {\"rus\": \"Перевод2\", \"note\": \"\"}\n"
+    "}\n"
+    "Если новых терминов нет, верни пустые теги: <new_glossary>{}</new_glossary>."
+)
+DEFAULT_EXTRACT_GLOSSARY_INSTRUCTION = _DEFAULT_EXTRACT_GLOSSARY_INSTRUCTION
 
 def _parse_csv_env_list(env_name: str) -> set[str]:
     raw_value = str(os.environ.get(env_name, "") or "").strip()
@@ -318,6 +329,7 @@ def _load_internal_prompts():
         "glossary_context_simple": "--- КОНТЕКСТ ---\n",
         "glossary_context_full": "--- КОНТЕКСТ ---\n",
         "batch_instruction": "\n\n### ИНСТРУКЦИЯ\n Keep all `<!-- i -->` including the last one. ###\n```html\n{full_text_for_api}\n```\n",
+        "extract_glossary_instruction": _DEFAULT_EXTRACT_GLOSSARY_INSTRUCTION,
         "glossary_output_examples": {"base": ["  \"Arthur\": { \"rus\": \"Артур\", \"note\": \"Персонаж; Мужчина; Имя склоняется (позвал Артура)\" }"]},
         "glossary_tag_explanation": {
             "_INTRO_TEXT_": "GLOSSARY GUIDE\nThe `i` (info) field contains critical commands. Decode them as follows:",
