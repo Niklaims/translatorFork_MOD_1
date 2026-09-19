@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import functools
 import hashlib
 import json
 import ntpath
@@ -7,12 +8,13 @@ import os
 import posixpath
 import re
 import time
+import unicodedata
 import zipfile
 from collections import Counter, defaultdict, deque
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from .language_tools import GlossaryRegexService, LanguageDetector, normalize_glossary_search_text
+from .language_tools import LanguageDetector, get_chinese_script_variants, normalize_glossary_search_text
 
 try:
     from bs4 import BeautifulSoup, UnicodeDammit
@@ -21,7 +23,10 @@ except ImportError:
     BS4_AVAILABLE = False
 
 
-TERM_FREQUENCY_CACHE_VERSION = 3
+# 4: счёт термина больше не зависит от остальных терминов глоссария. Кэши
+# версии 3 посчитаны старым способом, где длинные термины забирали текст у
+# коротких, — их нужно пересчитать, а не показывать.
+TERM_FREQUENCY_CACHE_VERSION = 4
 VIRTUAL_PATH_PREFIX = "mem://"
 
 
@@ -125,101 +130,6 @@ def is_term_frequency_payload_valid(payload, glossary_source, epub_path):
     return payload.get("fingerprint") == build_term_frequency_fingerprint(glossary_source, epub_path)
 
 
-class _GlossarySubstringIndex:
-    """Ахо-Корасик индекс терминов глоссария для поиска подстрок за один проход.
-
-    Строится один раз на весь глоссарий (O(суммарной длины терминов)), после
-    чего для каждого найденного термина все содержащиеся в нём более короткие
-    термины глоссария находятся за один проход по его символам —
-    O(len(found_term)), а не полным перебором всего глоссария на каждый
-    найденный термин (было до O(T^2) на книгу)."""
-
-    class _Node:
-        __slots__ = ("children", "fail", "terms")
-
-        def __init__(self):
-            self.children = {}
-            self.fail = None
-            self.terms = frozenset()
-
-    def __init__(self, terms):
-        root = self._Node()
-        for term in terms:
-            if not term:
-                continue
-            node = root
-            for char in term:
-                node = node.children.setdefault(char, self._Node())
-            node.terms = node.terms | {term}
-
-        root.fail = root
-        queue = deque()
-        for child in root.children.values():
-            child.fail = root
-            queue.append(child)
-
-        while queue:
-            current = queue.popleft()
-            for char, child in current.children.items():
-                fail_state = current.fail
-                while fail_state is not root and char not in fail_state.children:
-                    fail_state = fail_state.fail
-                candidate = fail_state.children.get(char, root)
-                child.fail = candidate if candidate is not child else root
-                child.terms = child.terms | child.fail.terms
-                queue.append(child)
-
-        self._root = root
-
-    def find_contained_terms(self, text):
-        """Возвращает множество терминов глоссария, встречающихся в text как подстроки."""
-        found = set()
-        root = self._root
-        node = root
-        for char in text:
-            while node is not root and char not in node.children:
-                node = node.fail
-            node = node.children.get(char, root)
-            if node.terms:
-                found.update(node.terms)
-        return found
-
-
-def aggregate_term_frequency_stats(glossary_source, term_occurrences, term_distribution):
-    glossary_terms = collect_glossary_originals(glossary_source)
-
-    result_counts = {
-        term: int(term_occurrences.get(term, 0))
-        for term in glossary_terms
-    }
-    result_files = {
-        term: set(term_distribution.get(term, set()))
-        for term in glossary_terms
-    }
-
-    substring_index = _GlossarySubstringIndex(glossary_terms)
-
-    for found_term, found_count in term_occurrences.items():
-        found_count = int(found_count or 0)
-        if found_count <= 0:
-            continue
-
-        found_files = set(term_distribution.get(found_term, set()))
-        for sub_term in substring_index.find_contained_terms(found_term):
-            if len(sub_term) >= len(found_term):
-                continue
-            result_counts[sub_term] = result_counts.get(sub_term, 0) + found_count
-            result_files.setdefault(sub_term, set()).update(found_files)
-
-    return {
-        term: {
-            "count": int(result_counts.get(term, 0)),
-            "files": sorted(result_files.get(term, set())),
-        }
-        for term in glossary_terms
-    }
-
-
 def build_term_frequency_payload(glossary_source, epub_path, term_stats):
     glossary_terms = collect_glossary_originals(glossary_source)
     prepared_terms = {}
@@ -291,25 +201,6 @@ def _extract_text_from_html(raw_content):
     return re.sub(r"<[^>]+>", " ", raw_content)
 
 
-def _frequency_key(text):
-    normalized = normalize_glossary_search_text(text)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized.casefold()
-
-
-def _surface_pattern(surface):
-    parts = re.split(r"(\s+)", surface.strip())
-    pattern_parts = []
-    for part in parts:
-        if not part:
-            continue
-        if part.isspace():
-            pattern_parts.append(r"\s+")
-        else:
-            pattern_parts.append(re.escape(part))
-    return "".join(pattern_parts)
-
-
 def _last_word_variants(word):
     variants = {word}
     lower_word = word.casefold()
@@ -351,56 +242,148 @@ def _alpha_frequency_surfaces(term):
     return variants
 
 
-class GlossaryFrequencyVariantMatcher:
-    """Counts safe alphabetic surface variants for frequency analysis only."""
+_CJK_NOISE_RE = re.compile(r"\W+", re.UNICODE)
+_WHITESPACE_RE = re.compile(r"\s+")
 
-    def __init__(self, glossary_terms):
-        self.variant_map = defaultdict(set)
-        self.pattern = None
 
-        exact_keys = {
-            _frequency_key(term)
-            for term in glossary_terms or []
-            if _frequency_key(term)
-        }
+def _cjk_search_text(text):
+    """Иероглифы ищутся в тексте без пробелов и знаков препинания, как в
+    GlossaryRegexService: «《林峰》» и «林·峰» находят «林峰»."""
+    return _CJK_NOISE_RE.sub("", normalize_glossary_search_text(text))
 
-        pattern_sources = set()
-        for term in glossary_terms or []:
-            base_key = _frequency_key(term)
-            if not base_key:
+
+def _alpha_search_text(text):
+    return _WHITESPACE_RE.sub(" ", normalize_glossary_search_text(text)).casefold()
+
+
+@functools.lru_cache(maxsize=None)
+def _is_word_char(char):
+    """Буква, цифра или _ алфавитного письма: вплотную к такому символу слово
+    не начинается и не кончается. Иероглифы, кана и хангыль — граница: в
+    китайском тексте латиница и числа стоят вплотную к ним без пробела."""
+    if char == "_" or char.isalnum() or unicodedata.category(char).startswith("M"):
+        return not LanguageDetector.is_cjk_text(char)
+    return False
+
+
+class _TermOccurrenceIndex:
+    """Ахо–Корасик по написаниям терминов: за один проход по тексту находит
+    все вхождения всех терминов, в том числе вложенные и пересекающиеся.
+
+    Каждый термин считается отдельно, поэтому его счёт не зависит от
+    остальных терминов глоссария и не меняется, когда их удаляют."""
+
+    class _Node:
+        __slots__ = ("children", "fail", "outputs")
+
+        def __init__(self):
+            self.children = {}
+            self.fail = None
+            self.outputs = ()
+
+    def __init__(self, surface_terms, *, word_boundaries):
+        root = self._Node()
+        for surface, terms in surface_terms.items():
+            node = root
+            for char in surface:
+                node = node.children.setdefault(char, self._Node())
+            # (длина, термины, проверять ли начало, проверять ли конец):
+            # граница нужна только там, где у написания край — буква или
+            # цифра. «[ARMAMENTARIUM]» и «Dr.» стоят вплотную к чему угодно.
+            node.outputs = ((
+                len(surface),
+                tuple(sorted(terms)),
+                word_boundaries and _is_word_char(surface[0]),
+                word_boundaries and _is_word_char(surface[-1]),
+            ),)
+
+        root.fail = root
+        queue = deque()
+        for child in root.children.values():
+            child.fail = root
+            queue.append(child)
+
+        while queue:
+            current = queue.popleft()
+            for char, child in current.children.items():
+                fail_state = current.fail
+                while fail_state is not root and char not in fail_state.children:
+                    fail_state = fail_state.fail
+                candidate = fail_state.children.get(char, root)
+                child.fail = candidate if candidate is not child else root
+                if child.fail.outputs:
+                    child.outputs = child.outputs + child.fail.outputs
+                queue.append(child)
+
+        self._root = root
+
+    def count_into(self, text, counts):
+        """Прибавляет к counts вхождения терминов в text. Пересекающиеся
+        вхождения одного термина считаются один раз, как в str.count."""
+        root = self._root
+        node = root
+        text_length = len(text)
+        last_end = {}
+        for index, char in enumerate(text):
+            while node is not root and char not in node.children:
+                node = node.fail
+            node = node.children.get(char, root)
+            if not node.outputs:
                 continue
 
-            for surface in _alpha_frequency_surfaces(term):
-                surface_key = _frequency_key(surface)
-                if not surface_key:
+            end = index + 1
+            for length, terms, check_start, check_end in node.outputs:
+                start = end - length
+                if check_start and start > 0 and _is_word_char(text[start - 1]):
                     continue
-                if surface_key != base_key and surface_key in exact_keys:
+                if check_end and end < text_length and _is_word_char(text[end]):
                     continue
+                for term in terms:
+                    if start >= last_end.get(term, 0):
+                        counts[term] += 1
+                        last_end[term] = end
 
-                self.variant_map[surface_key].add(term)
-                pattern_sources.add(_surface_pattern(surface))
 
-        if pattern_sources:
-            sorted_sources = sorted(pattern_sources, key=len, reverse=True)
-            self.pattern = re.compile(
-                r"(?<![A-Za-z0-9_])(?:"
-                + "|".join(sorted_sources)
-                + r")(?![A-Za-z0-9_])",
-                re.IGNORECASE,
-            )
+class GlossaryTermCounter:
+    """Считает вхождения терминов глоссария в тексте главы.
 
-    def count_matches(self, text):
-        found_counts = Counter()
-        if not self.pattern:
-            return found_counts
+    Иероглифические термины ищутся в упрощённом и традиционном написании по
+    тексту без знаков препинания. Остальные — целыми словами без учёта
+    регистра, вместе с английским множественным числом и притяжательной
+    формой последнего слова («Rune masters», «traditionalist's»)."""
 
-        normalized_text = normalize_glossary_search_text(text)
-        for match in self.pattern.finditer(normalized_text):
-            surface_key = _frequency_key(match.group(0))
-            for original in self.variant_map.get(surface_key, ()):
-                found_counts[original] += 1
+    def __init__(self, glossary_terms):
+        cjk_surfaces = defaultdict(set)
+        alpha_surfaces = defaultdict(set)
+        for term in glossary_terms or []:
+            normalized = normalize_glossary_search_text(term).strip()
+            if not normalized:
+                continue
+            if LanguageDetector.is_cjk_text(normalized):
+                for variant in get_chinese_script_variants(normalized):
+                    surface = _CJK_NOISE_RE.sub("", variant)
+                    if surface:
+                        cjk_surfaces[surface].add(term)
+            else:
+                for variant in {normalized} | _alpha_frequency_surfaces(term):
+                    surface = _alpha_search_text(variant).strip()
+                    if surface:
+                        alpha_surfaces[surface].add(term)
 
-        return found_counts
+        self._cjk_index = (
+            _TermOccurrenceIndex(cjk_surfaces, word_boundaries=False) if cjk_surfaces else None
+        )
+        self._alpha_index = (
+            _TermOccurrenceIndex(alpha_surfaces, word_boundaries=True) if alpha_surfaces else None
+        )
+
+    def count(self, text):
+        counts = Counter()
+        if self._cjk_index is not None:
+            self._cjk_index.count_into(_cjk_search_text(text), counts)
+        if self._alpha_index is not None:
+            self._alpha_index.count_into(_alpha_search_text(text), counts)
+        return counts
 
 
 def calculate_term_frequency_payload(
@@ -411,7 +394,6 @@ def calculate_term_frequency_payload(
     should_continue=None,
 ):
     glossary_terms = collect_glossary_originals(glossary_data)
-    glossary_dict = {term: {} for term in glossary_terms}
 
     if not _epub_source_exists(epub_path):
         raise FileNotFoundError(f"Файл не найден: {epub_path}")
@@ -419,8 +401,7 @@ def calculate_term_frequency_payload(
     if not glossary_terms:
         return build_term_frequency_payload(glossary_terms, epub_path, {})
 
-    regex_service = GlossaryRegexService(glossary_dict)
-    variant_matcher = GlossaryFrequencyVariantMatcher(glossary_terms)
+    term_counter = GlossaryTermCounter(glossary_terms)
     term_occurrences = Counter()
     term_distribution = defaultdict(set)
 
@@ -443,30 +424,20 @@ def calculate_term_frequency_payload(
             try:
                 raw_content = archive.read(filename)
                 clean_text = _extract_text_from_html(raw_content)
-                match_counts = regex_service.count_matches(clean_text)
-                variant_counts = variant_matcher.count_matches(clean_text)
-                for term, count in variant_counts.items():
-                    match_counts[term] = max(int(match_counts.get(term, 0) or 0), int(count or 0))
-
-                for term, count in match_counts.items():
-                    count = int(count or 0)
-                    if count <= 0:
-                        continue
+                for term, count in term_counter.count(clean_text).items():
                     term_occurrences[term] += count
                     term_distribution[term].add(filename)
             except Exception as exc:
                 print(f"[FreqAnalyzer] Ошибка чтения {filename}: {exc}")
                 continue
 
-    aggregated = aggregate_term_frequency_stats(
-        glossary_terms,
-        term_occurrences,
-        term_distribution,
-    )
     return build_term_frequency_payload(
         glossary_terms,
         epub_path,
-        aggregated,
+        {
+            term: {"count": count, "files": term_distribution[term]}
+            for term, count in term_occurrences.items()
+        },
     )
 
 

@@ -188,5 +188,109 @@ class TermFrequencyToolsTests(unittest.TestCase):
         self.assertEqual(payload["terms"]["Rune masters"]["count"], 1)
 
 
+def _frequency_counts(glossary_terms, chapters):
+    """Счёт по временной EPUB, где каждая глава — один абзац: {термин: вхождений}."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        epub_path = Path(temp_dir) / "book.epub"
+        _write_epub(
+            epub_path,
+            {
+                f"OEBPS/ch{index}.xhtml": (
+                    '<?xml version="1.0" encoding="utf-8"?>\n'
+                    f"<html><body><p>{text}</p></body></html>"
+                )
+                for index, text in enumerate(chapters, start=1)
+            },
+        )
+        payload = calculate_term_frequency_payload(epub_path, list(glossary_terms))
+    return {term: stats["count"] for term, stats in payload["terms"].items()}
+
+
+class TermCountDoesNotDependOnOtherTermsTests(unittest.TestCase):
+    """Счёт термина — как если бы он был в глоссарии один.
+
+    Раньше длинный термин «забирал» кусок текста, а потом его счёт
+    прибавлялся всем терминам, которые содержатся в нём как строка. Счёт
+    зависел от соседей по глоссарию: удалил редкие — и у оставшихся он
+    поменялся, второй проход находил новых «редких»."""
+
+    def test_second_pass_after_deleting_rare_terms_finds_nothing_new(self):
+        # Сценарий пользователя на строках из «Небесного Владыки Бездны».
+        chapters = [
+            "我之绝学名为毁灭刃，能参悟多少便看你的悟性了。",
+            "吴渊列为江州威胁榜第十四，潜力榜第一。威胁榜仅仅排第十四。",
+        ]
+        glossary = ["毁灭刃", "《毁灭刃》", "潜力榜", "威胁榜", "江州威胁榜"]
+
+        first = _frequency_counts(glossary, chapters)
+        kept = [term for term in glossary if first[term] > 1]
+        second = _frequency_counts(kept, chapters)
+
+        self.assertEqual(kept, ["威胁榜"])
+        self.assertEqual(second, {"威胁榜": 2})
+
+    def test_bracketed_twin_does_not_double_count_cjk_term(self):
+        # 原初无量 встречается в книге один раз; 《原初无量》 после очистки
+        # кавычек — та же строка. Раньше короткая получала 2 и переживала
+        # первую чистку.
+        counts = _frequency_counts(
+            ["原初无量", "《原初无量》"],
+            ["半天，原初无量，这就是太源真圣所创的传承"],
+        )
+
+        self.assertEqual(counts, {"原初无量": 1, "《原初无量》": 1})
+
+    def test_word_is_not_counted_inside_a_longer_word(self):
+        # «Li» отдельным словом не встречается ни разу, только внутри «Lin».
+        counts = _frequency_counts(["Li", "Lin Feng"], ["Lin Feng came. Lin Feng left."])
+
+        self.assertEqual(counts, {"Li": 0, "Lin Feng": 2})
+
+    def test_plural_of_compound_term_counts_its_first_word_once(self):
+        counts = _frequency_counts(["Dragon", "Dragon King"], ["The Dragon Kings came."])
+
+        self.assertEqual(counts, {"Dragon": 1, "Dragon King": 1})
+
+    def test_overlapping_cjk_terms_are_both_counted(self):
+        # Без пробелов нельзя сказать, чьё это вхождение, — считаем оба
+        # термина, иначе реально встречающийся уйдёт в кандидаты на удаление.
+        counts = _frequency_counts(["林峰", "峰主"], ["林峰主来了"])
+
+        self.assertEqual(counts, {"林峰": 1, "峰主": 1})
+
+    def test_square_bracket_twin_does_not_double_count_bare_word(self):
+        counts = _frequency_counts(
+            ["[ARMAMENTARIUM]", "ARMAMENTARIUM"],
+            ["He cast [ARMAMENTARIUM] once."],
+        )
+
+        self.assertEqual(counts, {"[ARMAMENTARIUM]": 1, "ARMAMENTARIUM": 1})
+
+    def test_case_twin_does_not_hide_plural_form(self):
+        counts = _frequency_counts(
+            ["Acromantula", "acromantulas"],
+            ["Acromantulas attacked. An acromantula fled."],
+        )
+
+        self.assertEqual(counts, {"Acromantula": 2, "acromantulas": 1})
+
+    def test_multiword_term_is_found_across_line_break_in_markup(self):
+        counts = _frequency_counts(["Dragon King"], ["The Dragon\n    King came."])
+
+        self.assertEqual(counts, {"Dragon King": 1})
+
+    def test_cjk_term_is_found_in_other_script_and_across_punctuation(self):
+        counts = _frequency_counts(["龙王", "林峰"], ["龍王来了。林·峰笑了"])
+
+        self.assertEqual(counts, {"龙王": 1, "林峰": 1})
+
+    def test_non_cjk_terms_next_to_hanzi_are_counted(self):
+        # В китайском тексте нет пробелов: латиница и числа стоят вплотную
+        # к иероглифам.
+        counts = _frequency_counts(["TED", "1558"], ["他看了TED演讲。1558打出了五杀"])
+
+        self.assertEqual(counts, {"TED": 1, "1558": 1})
+
+
 if __name__ == "__main__":
     unittest.main()
