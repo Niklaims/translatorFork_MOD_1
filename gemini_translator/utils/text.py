@@ -86,13 +86,22 @@ CLEANUP_PATTERN = re.compile(
     # Находим необязательные пробелы ПОСЛЕ троеточия
     fr'\s*'
 )
+END_DASH_TO_ELLIPSIS_PATTERN = re.compile(fr'\s*[{DASH_CHARS}]+\s*</p>')
 TAG_NEWLINE_PATTERN = re.compile(r'(</(p|h1|div)>)')
 COMMA_MERGE_PATTERN = re.compile(fr'([{COMMA_CHARS}])\s*</p>\s*<p[^>]*>')
 END_DASH_CANDIDATE_PATTERN = re.compile(fr'\s*[{DASH_CHARS}]+\s*</p>')
 FORBIDDEN_CHARS_BEFORE_DASH = ALL_LETTER_CHARS + COMMA_CHARS
 
-# Чистит артефакт "… ." (троеточие + точка) в чистое троеточие "…".
-# Остальные знаки (…, …? …!) легальны.
+# Находит ЛЮБОЕ тире (или группу), которое упирается в знак препинания.
+# Включает: точку, запятую (все виды), двоеточие, точку с запятой, вопросы, восклицания и закрывающую кавычку.
+# Игнорирует открывающие кавычки.
+DASH_BEFORE_PUNCTUATION_PATTERN = re.compile(
+    fr'\s*[{DASH_CHARS}]+\s*'       # Захват тире и пробелов вокруг
+    fr'(?=[{COMMA_CHARS}.:;?!»])'   # Lookahead: дальше идет знак препинания
+)
+
+# Чистит артефакт "…." (троеточие + точка), который образуется после замены "—." -> "….".
+# Превращает его в чистое троеточие "…". Остальные знаки (…, …? …!) легальны.
 ELLIPSIS_DOT_CLEANUP_PATTERN = re.compile(fr'{ELLIPSIS_CHAR}\s*\.')
 
 # --- ПАТТЕРН РАЗРЫВА ДИАЛОГОВ ---
@@ -238,6 +247,17 @@ def _restore_masked_segments(text: str, segment_map: dict[str, str]) -> str:
         lambda m: segment_map.get(m.group(0), m.group(0)), text
     )
 
+DASH_TO_ELLIPSIS_PATTERN = re.compile(
+    # ЗАХВАТЫВАЕМ (Группа 1): тире и пробелы вокруг него, которые нужно заменить
+    fr'(\s*[{DASH_CHARS}]+\s*)'
+    
+    # УСЛОВИЕ (Просмотр вперёд): дальше должен быть разрыв абзаца, за которым
+    # следует либо (ещё одно тире) ИЛИ (заглавная буква)
+    fr'(?=\s*</p>\s*<p[^>]*>\s*'
+    fr'(?:[{DASH_CHARS}]|[{UPPERCASE_CHARS}]))'
+)
+
+
 # --- "УМНЫЕ" ПАТТЕРНЫ СЛИЯНИЯ (ФИНАЛЬНАЯ, ОТЛАЖЕННАЯ ВЕРСИЯ) ---
 REMARK_MERGE_PATTERN = re.compile(
     # ЗАХВАТЫВАЕМ только запятую (Группа 1)
@@ -350,9 +370,9 @@ TOKEN_PATTERN = re.compile(
 )
 
 # Находит тире (любого вида) сразу после открывающей кавычки (с пробелами или без)
-# вместе с пробелами после него, чтобы убрать лишнее тире:
-# « — Текст -> «Текст
-# «-Текст -> «Текст
+# вместе с пробелами после него:
+# « — Текст -> «…Текст
+# «-Текст -> «…Текст
 START_QUOTE_DASH_PATTERN = re.compile(fr'([«„])\s*[{DASH_CHARS}]+\s*')
 
 # --- ПАТТЕРНЫ ДЛЯ ЛОГИКИ РАЗДЕЛЕНИЯ И ФИНАЛИЗАЦИИ ---
@@ -372,6 +392,8 @@ CAPITALIZATION_FIX_PATTERN = re.compile(
 
 # 2. FIX END PUNCTUATION (ЧИСТОТА КОНЦОВКИ)
 # Запятая в конце абзаца (перед опциональной кавычкой и </p>)
+END_COMMA_FIX_PATTERN = re.compile(fr',\s*(?=[»“"”]*\s*</p>)')
+
 # Отсутствие знака препинания в конце абзаца (Буква/Цифра -> Кавычка -> </p>)
 # Исключает ситуации, когда знак уже есть.
 MISSING_DOT_PATTERN = re.compile(fr'(?<=[{ALL_LETTER_CHARS}0-9])(?=[»“"”]*\s*</p>)')
@@ -410,6 +432,66 @@ def dialogue_splitter_with_attributes(match: re.Match) -> str:
     colon = match.group(3)
     return f"{opening_tag}{text_before_colon}{colon}</p>{opening_tag}"
 
+def _last_sign_before(match: re.Match) -> str:
+    """Последний видимый непробельный знак перед совпадением (теги пропускаются)."""
+    window = match.string[max(0, match.start() - 300):match.start()]
+    text = TAG_STRIPPER.sub("", window).rstrip()
+    return text[-1] if text else ''
+
+
+def _ends_sentence_before(match: re.Match) -> bool:
+    sign = _last_sign_before(match)
+    return bool(sign) and sign in '.!?…'
+
+
+def ellipsis_replacer(match: re.Match) -> str:
+    """
+    Заменяет найденное тире на троеточие: по Розенталю оборванная реплика
+    оформляется многоточием, тире обрыва — англицизм моделей.
+    После знака конца предложения («Привет. —») тире — галлюцинация модели и
+    просто удаляется: иначе вышло бы «Привет.…», а ELLIPSIS_CHAOS склеило бы
+    это в «Привет…».
+    Добавляет пробел после, только если за тире не следует тег </p>.
+    """
+    if _ends_sentence_before(match):
+        return ''
+
+    # Получаем весь текст ПОСЛЕ найденного тире
+    text_after = match.string[match.end():]
+
+    # Проверяем, начинается ли этот текст с пробелов, за которыми идет </p>
+    # re.match проверяет строку с самого начала
+    if re.match(r'\s*</p>', text_after):
+        # Если да, то пробел не нужен. Возвращаем только троеточие.
+        return ELLIPSIS_CHAR
+    else:
+        # Во всех остальных случаях добавляем пробел.
+        return f'{ELLIPSIS_CHAR} '
+
+
+def end_of_paragraph_dash_replacer(match: re.Match) -> str:
+    """Тире перед </p>: после знака конца предложения удаляется, иначе «…»."""
+    if _ends_sentence_before(match):
+        return '</p>'
+    return f'{ELLIPSIS_CHAR}</p>'
+
+
+def dash_before_punctuation_replacer(match: re.Match) -> str:
+    """
+    Тире перед знаком препинания или «»» — обрыв речи, по Розенталю это «…».
+    Исключение — висячий дефис, прижатый к слову перед запятой («одно-, двух-
+    и трёхочковых»): это часть слова, а не тире.
+    """
+    if (
+        match.group(0) == '-'
+        and match.start() > 0
+        and match.string[match.start() - 1].isalpha()
+        and match.string.startswith(',', match.end())
+    ):
+        return match.group(0)
+    return ELLIPSIS_CHAR
+
+
 def attribution_merge_replacer(match: re.Match) -> str:
     """
     Склеивает реплику с оторванными словами автора: «— Я хотел</p><p>— сказал он».
@@ -417,10 +499,11 @@ def attribution_merge_replacer(match: re.Match) -> str:
     как требует пунктуация прямой речи; после прочих знаков — только пробел.
     Раньше на этом месте появлялось «…».
     """
-    text_before = TAG_STRIPPER.sub("", match.string[max(0, match.start() - 200):match.start()]).rstrip()
-    if text_before and re.match(fr'[{ALL_LETTER_CHARS}0-9{DETECT_CLOSE_QUOTES})]', text_before[-1]):
+    sign = _last_sign_before(match)
+    if sign and re.match(fr'[{ALL_LETTER_CHARS}0-9{DETECT_CLOSE_QUOTES})]', sign):
         return f', {match.group(1)}'
     return f' {match.group(1)}'
+
 
 def smart_end_dash_replacer(match: re.Match) -> str:
     """
@@ -903,9 +986,9 @@ def finalize_cleanup(html_content: str) -> str:
     """
     Финальная зачистка:
     1. Лечит "сросшиеся" диалоги (Контекстный Митоз или BR).
-    2. Убирает тире в конце абзаца после знака препинания; после слова или
-       запятой тире оборванной реплики остаётся (многоточий не сочиняем).
-    3. Расставляет пробелы вокруг троеточий.
+    2. Превращает выжившие тире в конце абзацев в троеточия (оборванная речь
+       по Розенталю); после знака конца предложения тире просто удаляет.
+    3. Расставляет пробелы вокруг троеточий и убирает пробелы внутри кавычек.
     """
     content = html_content
     # --- ЭТАП 0: ЛЕЧЕНИЕ СРОСШИХСЯ ДИАЛОГОВ ---
@@ -952,8 +1035,8 @@ def finalize_cleanup(html_content: str) -> str:
         content
     )
     
-    # 1. Конечное тире: после знака препинания убираем, после слова оставляем
-    content = END_DASH_CANDIDATE_PATTERN.sub(smart_end_dash_replacer, content)
+    # 1. Нагло меняем конечное тире на троеточие (после «.!?…» — удаляем)
+    content = END_DASH_TO_ELLIPSIS_PATTERN.sub(end_of_paragraph_dash_replacer, content)
     
     # 2. ЗАЧИСТКА ХАОСА
 
@@ -991,8 +1074,8 @@ def finalize_cleanup(html_content: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Безопасное удаление тире (перед </p>): склейка тегов могла подвести новое
-    content = END_DASH_CANDIDATE_PATTERN.sub(smart_end_dash_replacer, content)
+    # Безопасное удаление тире (перед </p>)
+    content = END_DASH_TO_ELLIPSIS_PATTERN.sub(end_of_paragraph_dash_replacer, content)
     
     # Список тегов, которые требуют изоляции (блочные)
     # ВАЖНО: Теги вроде <b>, <span>, <a>, <em> СЮДА НЕ ВХОДЯТ, они инлайновые.
@@ -1025,7 +1108,7 @@ def finalize_cleanup(html_content: str) -> str:
     )
 
     # --- ЭТАП 3: ТОЧЕЧНАЯ КОРРЕКЦИЯ (SMART SPLIT) ---
-    # Запятая в конце абзаца остаётся запятой (раньше становилась «…»).
+    content = END_COMMA_FIX_PATTERN.sub(ELLIPSIS_CHAR, content)
     content = MISSING_DOT_PATTERN.sub('.', content)
 
     content, tag_map = _mask_html_tags(content, "TAG_FIN")
@@ -1209,9 +1292,9 @@ def prettify_html(html_content: str) -> str:
     content = MISSING_SPACE_PATTERN.sub(handle_missing_space, content)
     
     content = ELLIPSIS_CHAOS_PATTERN.sub(ELLIPSIS_CHAR, content) # Здесь .. -> … безопасно для путей
+    content = DASH_BEFORE_PUNCTUATION_PATTERN.sub(dash_before_punctuation_replacer, content)
     content = ELLIPSIS_DOT_CLEANUP_PATTERN.sub(ELLIPSIS_CHAR, content)
-    # Тире сразу после открывающей кавычки лишнее; раньше оно становилось «…».
-    content = START_QUOTE_DASH_PATTERN.sub(r'\1', content)
+    content = START_QUOTE_DASH_PATTERN.sub(r'\1…', content)
     
     # ВОЗВРАЩАЕМ ТЕГИ ОБРАТНО
     content = _restore_masked_segments(content, tag_map)
@@ -1230,8 +1313,8 @@ def prettify_html(html_content: str) -> str:
     content = LETTER_MERGE_PATTERN.sub(' ', content)
     content = COMMA_LOWERCASE_MERGE_PATTERN.sub(r'\1 ', content)
     
-    # Обрывы. Тире оборванной реплики остаётся тире: многоточия ставит только
-    # автор, иначе читатель принимает их за его привычку.
+    # Обрывы и троеточия
+    content = DASH_TO_ELLIPSIS_PATTERN.sub(ellipsis_replacer, content)
     content = CLEANUP_PATTERN.sub(cleanup_replacer, content)
     content = FINAL_MERGE_PATTERN.sub(attribution_merge_replacer, content)
     content = SUB_MERGE_PATTERN.sub(r' \1 ', content)
@@ -1687,7 +1770,8 @@ def refine_typography_in_html(html_content: str) -> str:
     content = re.sub(r'<[^>]+>', mask_callback, html_content)
     content = process_markdown_segment(content)
     content = re.sub(r'<[^>]+>', mask_callback, content)
-
+    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*(?=»)', ELLIPSIS_CHAR, content)
+    
     # --- ЭТАП 2: РЕНТГЕН ---
     def get_context_char(text, pos, direction, skip_spaces=False):
         """
@@ -1728,29 +1812,6 @@ def refine_typography_in_html(html_content: str) -> str:
             return char
         return '\n'
 
-    # Тире перед закрывающей «»»: после слова это обрыв реплики («Она
-    # поранилась-»), тире остаётся как написано и прячется от разбора ниже,
-    # иначе он разнесёт его пробелами; после знака препинания («Нет! —»)
-    # тире лишнее. Раньше здесь всегда ставилось «…».
-    def dash_before_closing_quote(m):
-        prev_sign = get_context_char(content, m.start(), -1, skip_spaces=True)
-        if not re.match(fr'[{ALL_LETTER_CHARS}0-9]', prev_sign):
-            return ''
-        key = f"\0TAG_{len(tag_map)}\0"
-        tag_map[key] = m.group(0).rstrip()
-        return key
-
-    content = re.sub(fr'\s*[{DASH_CHARS}]+\s*(?=»)', dash_before_closing_quote, content)
-    # Тире с пробелом перед знаком препинания («Баллы —?», «<em>РРРР </em>–!»)
-    # висит в воздухе: убираем вместе с пробелами, маски строчных тегов между
-    # ними сохраняем. Прижатое к слову («одно-,») остаётся, см. «Г».
-    content = re.sub(
-        fr'[ \t ]+(?:\0TAG_\d+\0)*[ \t ]*[{DASH_CHARS}]+[ \t ]*'
-        fr'(?=(?:\0TAG_\d+\0)*[,.:;?!])',
-        lambda m: ''.join(re.findall(r'\0TAG_\d+\0', m.group(0))),
-        content,
-    )
-
     # --- ЭТАП 3: ОБРАБОТКА ---
     # Глобальный признак: ИИ использует оператор после запятой хоть раз в документе.
 
@@ -1789,8 +1850,8 @@ def refine_typography_in_html(html_content: str) -> str:
             # А. АКТИВАЦИЯ ДИАЛОГА
             if prev_sign in '\n.!?…:':
                 # Слова автора внутри кавычек: «Стой! – крикнул он». Раньше
-                # после тире вставлялось «…», и следующее тире видело его
-                # только на втором проходе.
+                # после тире вставлялось «…» («– …крикнул»), хотя речь тут
+                # не оборвана; это давало чуть не половину лишних многоточий.
                 if quote_depth > 0:
                     return '– '
 
@@ -1821,14 +1882,10 @@ def refine_typography_in_html(html_content: str) -> str:
                 if prev_c.isdigit() and next_c.isdigit(): return '–'
                 return '-'
 
-            # Г. ОБРЫВ СЛОВА: тире прижато к слову, дальше знак препинания,
-            # закрывающая кавычка или конец абзаца («одно-, двух-», «Ты че-»,
-            # «„Я поранилась-“»). Оставляем как написано: раньше такие тире
-            # успевали стать «…», а разрядка дала бы «одно – ,».
-            if re.match(fr'[{ALL_LETTER_CHARS}0-9]', prev_c) and (
-                next_c in ',.:;?!\n' or next_c in DETECT_CLOSE_QUOTES
-            ):
-                return dash_seq
+            # Висячий дефис перед запятой («одно-, двух- и трёхочковых») —
+            # часть слова: не разносим его пробелами.
+            if dash_seq == '-' and next_c == ',' and re.match(fr'[{ALL_LETTER_CHARS}]', prev_c):
+                return '-'
 
             return ' – '
 
@@ -2446,9 +2503,10 @@ def prettify_html_for_ai(html_content: str) -> str:
     BLOCK_TAGS_CHECK = re.compile(fr'^</?(?:{structural_tags_str})\b', re.IGNORECASE)
 
     # --- ЭТАП 3: МИТОЗ (Разделение) ---
-    # Разрезанные части не помечаются многоточиями: модель переводила эти «…»,
-    # и читатель видел их там, где у автора был просто перенос строки
-    # (у иероглифов isalpha() истинно, так что метка вставала почти везде).
+    # Разрезанные части не помечаются многоточиями: у иероглифов isalpha()
+    # истинно, и метка «…» вставала почти на каждой строке оригинала, а модель
+    # её переводила. Продолжение фразы (строчная буква в начале следующей
+    # части) после перевода склеивает prettify_html.
     def mitosis_callback(m):
         opening = m.group(1)
         tag = m.group(2)
