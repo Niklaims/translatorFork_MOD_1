@@ -252,11 +252,24 @@ class QaGateQueueTests(unittest.TestCase):
 
         self.assertTrue(self.manager.is_finished())
 
-    def test_a_session_waiting_for_qa_is_not_finished(self):
-        """The session must stay alive while a chapter is still being checked."""
+    def test_a_chapter_waiting_for_its_check_does_not_hold_the_session(self):
+        """Translation done means the session is done; the check is continued later.
+
+        A stopped check leaves its chapter in qa_pending, and nobody finishes
+        it during that session: waiting for it kept the session open for good.
+        """
         first = self._add_task(1)
         self.manager.update_task(first, new_status="in_progress")
         self.manager.mark_task_qa_pending(first, ["chapter-1"])
+
+        self.assertTrue(self.manager.is_finished())
+        self.assertEqual(self._status(first), "qa_pending")
+
+    def test_a_chapter_still_translating_keeps_the_session_open(self):
+        self._add_task(1)
+        held = self._add_task(2)
+        self.manager.update_task(held, new_status="in_progress")
+        self.manager.mark_task_qa_pending(held, ["chapter-2"])
 
         self.assertFalse(self.manager.is_finished())
 

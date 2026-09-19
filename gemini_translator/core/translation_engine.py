@@ -970,6 +970,27 @@ class TranslationEngine(EventBusMixin, QObject):
         )
         return True
 
+    def _report_unchecked_chapters(self):
+        """Name what the check did not reach before the translation ended.
+
+        The session does not wait for the check: an end with no word about it
+        read as a hang, and the user stopped the session by hand.
+        """
+        coordinator = getattr(QtWidgets.QApplication.instance(), 'qa_coordinator', None)
+        try:
+            unchecked = (
+                coordinator.unchecked_chapter_count() if coordinator is not None else 0
+            )
+        except Exception:
+            return
+        if not isinstance(unchecked, int) or unchecked <= 0:
+            return
+        self._post_event('log_message', {'message': (
+            f"[QA] Проверка не успела за переводом, не проверено глав: {unchecked}. "
+            "Продолжите её в окне «Качество перевода» кнопкой «Продолжить проверку»: "
+            "она начнёт с того места, где проверка остановилась."
+        )})
+
     @pyqtSlot(object, object)
     def _on_final_qa_finished(self, result, error):
         """Report the closing pass and let the session finish."""
@@ -1444,6 +1465,7 @@ class TranslationEngine(EventBusMixin, QObject):
         if self.task_manager.is_finished():
             if self._start_final_qa_pass():
                 return
+            self._report_unchecked_chapters()
             # Высокий риск QA остаётся в отчёте, но не задерживает перевод.
             gate_check = getattr(self.task_manager, 'has_blocking_qa_gate', None)
             if callable(gate_check) and gate_check():

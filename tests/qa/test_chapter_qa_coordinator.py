@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
 import pytest
 
@@ -272,6 +273,50 @@ def test_cancellation_leaves_the_task_resumable():
 
     assert outcome.outcome.kind == "cancelled"
     assert service.calls == []
+
+
+def test_chapters_handed_over_count_as_unchecked_until_their_check_ends():
+    """A session that ends first must be able to say how much QA did not reach."""
+    queue = _QueueStub()
+    release = threading.Event()
+
+    class _BusyService:
+        async def check_chapter(self, request, options, cancellation):
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return _result(request)
+
+    coordinator = _coordinator(_BusyService(), queue)
+    coordinator.submit("task-1", (_event("chapter-1"), _event("chapter-2")))
+    coordinator.submit("task-2", (_event("chapter-3", "task-2"),))
+
+    assert coordinator.unchecked_chapter_count() == 3
+
+    release.set()
+    coordinator.drain(timeout=5)
+    coordinator.shutdown(timeout=5)
+
+    assert coordinator.unchecked_chapter_count() == 0
+
+
+def test_a_stopped_check_still_counts_its_chapters_as_unchecked():
+    """A cancelled check is owed, not done: the count must not hide it."""
+    queue = _QueueStub()
+
+    class _WaitingService:
+        async def check_chapter(self, request, options, cancellation):
+            while not cancellation.is_cancelled:
+                await asyncio.sleep(0.01)
+            return _result(request)
+
+    coordinator = _coordinator(_WaitingService(), queue)
+    coordinator.submit("task-1", (_event("chapter-1"), _event("chapter-2")))
+    coordinator.cancel()
+    coordinator.drain(timeout=5)
+    coordinator.shutdown(timeout=5)
+
+    assert queue.status["task-1"] == "qa_pending"
+    assert coordinator.unchecked_chapter_count() == 2
 
 
 def test_an_unbuildable_request_defers_the_chapter():
