@@ -482,10 +482,7 @@ def attach_chapter_qa_coordinator(
         qa_settings = settings_manager.get_qa_settings()
     except Exception:  # noqa: BLE001 - unreadable settings mean default QA
         qa_settings = QaSettings()
-    if not (
-        qa_settings.check_completeness_after_chapter
-        or qa_settings.check_language_after_chapter
-    ):
+    if not qa_settings.checks_enabled:
         safe_call(on_unavailable, "Проверка выключена целиком в настройках проверки.")
         return None
 

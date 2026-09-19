@@ -19,13 +19,15 @@ def settings_manager(tmp_path: Path, monkeypatch):
     return SettingsManager(config_file=str(tmp_path / "settings.json"))
 
 
-def test_missing_section_migrates_to_safe_enabled_defaults(settings_manager):
-    """A project from before QA existed must get working defaults, not nothing."""
+def test_missing_section_leaves_quality_control_switched_off(settings_manager):
+    """A fresh or updated install checks nothing until the user switches QA on."""
     qa = settings_manager.get_qa_settings()
 
-    assert qa.check_completeness_after_chapter is True
+    assert qa.check_completeness_after_chapter is False
+    assert qa.check_language_after_chapter is False
+    assert qa.checks_enabled is False
+    # Switching a check on brings back the whole familiar behaviour.
     assert qa.auto_repair_confirmed_omissions is True
-    assert qa.check_language_after_chapter is True
     assert qa.auto_repair_objective_language_issues is True
     assert qa.final_book_pass is True
     assert qa.capabilities == QaCapabilitySettings()
@@ -33,6 +35,64 @@ def test_missing_section_migrates_to_safe_enabled_defaults(settings_manager):
     assert qa.capabilities.language_tool_enabled is False
     assert qa.capabilities.slovnet_enabled is False
     assert qa.capabilities.cometkiwi_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("language", "completeness", "expected"),
+    [(False, False, False), (True, False, True), (False, True, True), (True, True, True)],
+)
+def test_one_switched_on_check_is_enough_for_quality_control(
+    language, completeness, expected
+):
+    qa = QaSettings(
+        check_language_after_chapter=language,
+        check_completeness_after_chapter=completeness,
+    )
+
+    assert qa.checks_enabled is expected
+
+
+def test_switched_on_checks_survive_a_restart(settings_manager, tmp_path: Path):
+    """The user's choice outlives the program: it is read back, not defaulted."""
+    settings_manager.save_qa_settings(QaSettings(check_language_after_chapter=True))
+    settings_manager.flush()
+
+    from gemini_translator.utils.settings import SettingsManager
+
+    reloaded = SettingsManager(
+        config_file=str(tmp_path / "settings.json")
+    ).get_qa_settings()
+
+    assert reloaded.check_language_after_chapter is True
+    assert reloaded.check_completeness_after_chapter is False
+
+
+def test_checks_saved_by_an_older_version_stay_on(tmp_path: Path, monkeypatch):
+    """An update must not undo checks the user already kept switched on."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    config = tmp_path / "settings.json"
+    config.write_text(
+        json.dumps(
+            {
+                SETTINGS_KEY: {
+                    "check_completeness_after_chapter": True,
+                    "auto_repair_confirmed_omissions": True,
+                    "check_language_after_chapter": True,
+                    "auto_repair_objective_language_issues": True,
+                    "final_book_pass": False,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from gemini_translator.utils.settings import SettingsManager
+
+    qa = SettingsManager(config_file=str(config)).get_qa_settings()
+
+    assert qa.check_completeness_after_chapter is True
+    assert qa.check_language_after_chapter is True
+    assert qa.final_book_pass is False
 
 
 def test_settings_round_trip_through_disk(settings_manager, tmp_path: Path):
