@@ -510,6 +510,26 @@ class MessageBoxOverlayTests(unittest.TestCase):
         result = QtWidgets.QMessageBox.information(None, "Т", "Т")
         self.assertEqual(result, QtWidgets.QMessageBox.StandardButton.Ok)
 
+    def test_dismiss_survives_torn_down_card(self):
+        # _card_stack объявлен Optional и обнуляется вместе с карточкой в
+        # _finish_close. _dismiss это уже учитывает при removeWidget, но
+        # следующую карточку поднимал без проверки — отложенный AttributeError.
+        shell = self._shell()
+        page = shell.navigation.current_page()
+        host = shell.overlay_host
+        first = SimpleDialog(page)
+        second = SimpleDialog(page)
+        present_dialog(page, first)
+        present_dialog(page, second)
+        _drain(self.app)
+        self.assertEqual(len(host._entries), 2)
+
+        host._card = None
+        host._card_stack = None
+
+        host._dismiss(host._entries[-1], QDialog.DialogCode.Rejected)
+        self.assertEqual(len(host._entries), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
