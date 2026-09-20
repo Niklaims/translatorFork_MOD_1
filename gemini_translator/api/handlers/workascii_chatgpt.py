@@ -15,6 +15,7 @@ from ..errors import (
     TemporaryRateLimitError,
     ValidationFailedError,
 )
+from ...utils.async_helpers import drain_cancelled_tasks
 from ...utils.text_sanitize import sanitize_path_segment
 
 
@@ -469,9 +470,11 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
                 future = self._pending_commands.pop(command_id, None) if command_id else None
                 if future and not future.done():
                     future.set_result(payload)
-        except asyncio.CancelledError:
-            return
         finally:
+            # Отмену не гасим: её запрашивает только _terminate_bridge_locked,
+            # и задача обязана завершиться именно отменённой, иначе сворачивание
+            # моста не отличит её от штатного конца потока. Блок ниже при этом
+            # отрабатывает в любом случае — висящие вызовы должны получить ошибку.
             if protocol_error:
                 error_message = "Browser bridge returned invalid JSON."
             else:
@@ -490,16 +493,14 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
         if not self._bridge_process or not self._bridge_process.stderr:
             return
 
-        try:
-            while True:
-                line = await self._bridge_process.stderr.readline()
-                if not line:
-                    break
-                text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    self._stderr_tail.append(text)
-        except asyncio.CancelledError:
-            return
+        # Отмена пробрасывается наружу по той же причине, что и в _drain_stdout.
+        while True:
+            line = await self._bridge_process.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                self._stderr_tail.append(text)
 
     def _format_stderr_tail(self) -> str:
         if not self._stderr_tail:
@@ -570,19 +571,11 @@ class WorkAsciiChatGptApiHandler(BaseApiHandler):
                 process.kill()
                 await process.wait()
 
-        if stdout_task:
-            stdout_task.cancel()
-            try:
-                await stdout_task
-            except asyncio.CancelledError:
-                pass
-
-        if stderr_task:
-            stderr_task.cancel()
-            try:
-                await stderr_task
-            except asyncio.CancelledError:
-                pass
+        # Обе задачи дренажа гасим здесь и только здесь. drain_cancelled_tasks
+        # доводит сворачивание до конца и пробрасывает лишь отмену, пришедшую
+        # извне в это же окно (остановка сессии, asyncio.wait_for в base.py):
+        # проглоти её — и execute_api_call примет остановку за обычный ответ.
+        await drain_cancelled_tasks(stdout_task, stderr_task)
 
     async def _close_thread_session_internal(self):
         await self._terminate_bridge()
