@@ -377,7 +377,7 @@ function filterExistingChapters(chapters, { branchId, teamId, volume }) {
 }
 
 function stripChapterHeading(rawText, chapterNumber) {
-  const lines = rawText.replace(/\r\n/g, "\n").split("\n");
+  const lines = rawText.replaceAll("\r\n", "\n").split("\n");
   while (lines.length && !lines[0].trim()) {
     lines.shift();
   }

@@ -153,7 +153,7 @@ class NumeralsExtractionWorker(QtCore.QThread):
                     "rus": rus_text,
                     "note": "числительное"
                 })
-            except:
+            except Exception:
                 continue
         
         final_glossary.sort(key=lambda x: len(x['original']), reverse=True)

@@ -13,6 +13,8 @@ import re
 from ..utils.io_utils import atomic_write_bytes
 from ._common import validate_nonempty_string as _validate_nonempty_string
 
+_REPAIRS_FILENAME = "repairs.json"
+
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _METADATA_VERSION = "translation_qa_repair_store.v1"
 
@@ -171,7 +173,7 @@ class RepairStore:
             return ()
         chapters: list[str] = []
         for directory in sorted(self.root.iterdir()):
-            metadata = _read_json(directory / "repairs.json")
+            metadata = _read_json(directory / _REPAIRS_FILENAME)
             if not isinstance(metadata, dict):
                 continue
             applied = metadata.get("applied") or []
@@ -275,12 +277,12 @@ class RepairStore:
         """
         chapter_id = _identity(chapter_id, "chapter_id")
         primary = self.root / _safe_name(chapter_id)
-        primary_metadata = _read_json(primary / "repairs.json")
+        primary_metadata = _read_json(primary / _REPAIRS_FILENAME)
         if not isinstance(primary_metadata, dict) or primary_metadata.get("chapter_id") == chapter_id:
             return primary
         suffix = hashlib.sha256(chapter_id.encode("utf-8")).hexdigest()[:8]
         fallback = self.root / f"{_safe_name(chapter_id)[:111]}-{suffix}"
-        fallback_metadata = _read_json(fallback / "repairs.json")
+        fallback_metadata = _read_json(fallback / _REPAIRS_FILENAME)
         if isinstance(fallback_metadata, dict) and fallback_metadata.get("chapter_id") != chapter_id:
             # Последний рубеж: даже каталог с хеш-суффиксом занят метаданными
             # ТРЕТЬЕЙ главы (двойная коллизия — практически невероятна для
@@ -294,7 +296,7 @@ class RepairStore:
         return fallback
 
     def _metadata_path(self, chapter_id: str) -> Path:
-        return self._chapter_dir(chapter_id) / "repairs.json"
+        return self._chapter_dir(chapter_id) / _REPAIRS_FILENAME
 
     def _load_metadata(self, chapter_id: str) -> dict | None:
         chapter_id = _identity(chapter_id, "chapter_id")

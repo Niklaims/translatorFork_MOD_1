@@ -2086,7 +2086,7 @@ class CorrectionSessionPage(ShellPage):
                 connected_partners = []
                 for key_pair, strength in connections.items():
                     if leader_to_move in key_pair:
-                        other_leader = list(key_pair - {leader_to_move})[0]
+                        other_leader = next(iter(key_pair - {leader_to_move}))
                         if other_leader in rank_map_placed:
                             partner_rank = rank_map_placed[other_leader]
                             connected_partners.append({'rank': partner_rank, 'weight': strength, 'leader': other_leader})
@@ -2096,7 +2096,7 @@ class CorrectionSessionPage(ShellPage):
                     temp_partners = []
                     for key_pair, strength in connections.items():
                         if leader_to_move in key_pair:
-                            other = list(key_pair - {leader_to_move})[0]
+                            other = next(iter(key_pair - {leader_to_move}))
                             if other in rank_map_before:
                                 temp_partners.append({'rank': rank_map_before[other], 'weight': strength})
                     if temp_partners:

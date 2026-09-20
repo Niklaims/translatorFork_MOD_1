@@ -2554,7 +2554,7 @@ class InitialSetupPage(ShellPage):
                 full_path = os.path.join(self.output_folder, rel_path)
                 if os.path.exists(full_path):
                     try: os.remove(full_path); files_deleted_count += 1
-                    except: pass
+                    except Exception: pass
 
             # Сносим ветку из JSON
             with self.project_manager.lock:
@@ -2572,7 +2572,7 @@ class InitialSetupPage(ShellPage):
                     full_path = os.path.join(self.output_folder, rel_path)
                     if os.path.exists(full_path):
                         try: os.remove(full_path); files_deleted_count += 1
-                        except: pass
+                        except Exception: pass
                 with self.project_manager.lock:
                     data = self.project_manager._load_unsafe()
                     if old_path in data: del data[old_path]

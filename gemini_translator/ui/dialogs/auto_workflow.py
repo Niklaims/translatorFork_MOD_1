@@ -140,7 +140,7 @@ class AutoConsistencyWorker(QtCore.QThread):
                 default=CONSISTENCY_CONFIDENCE_LEVELS,
                 allow_empty=True,
             )
-            problems_by_confidence = {level: 0 for level in CONSISTENCY_CONFIDENCE_LEVELS}
+            problems_by_confidence = dict.fromkeys(CONSISTENCY_CONFIDENCE_LEVELS, 0)
             for problem in engine.all_problems:
                 level = normalize_consistency_confidence(problem.get("confidence"))
                 problems_by_confidence[level] = problems_by_confidence.get(level, 0) + 1

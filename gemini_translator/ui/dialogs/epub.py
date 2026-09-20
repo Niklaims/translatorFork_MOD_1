@@ -1728,7 +1728,7 @@ class TranslatedChaptersManagerDialog(QDialog):
              if not os.path.exists(dest_path) or not os.path.samefile(file_path, dest_path):
                  try:
                      shutil.copy2(file_path, dest_path)
-                 except:
+                 except Exception:
                      pass # Если не вышло скопировать, используем как есть
 
         # Обновляем номера строк
@@ -2560,7 +2560,7 @@ class TranslatedChaptersManagerDialog(QDialog):
                         cover_item = None
                         try:
                              opf_content = zf.read('OEBPS/content.opf')
-                        except:
+                        except Exception:
                              opf_path = [f for f in zf.namelist() if f.endswith('.opf')][0]
                              opf_content = zf.read(opf_path)
                         
@@ -2643,7 +2643,7 @@ class TranslatedChaptersManagerDialog(QDialog):
             # Чистим временную обложку
             if cover_file_path and "temp_extracted_cover" in cover_file_path and os.path.exists(cover_file_path):
                 try: os.remove(cover_file_path)
-                except: pass
+                except Exception: pass
                 
             QtWidgets.QMessageBox.information(self, "Успех", f"EPUB успешно создан: {output_path}")
         except Exception as e:

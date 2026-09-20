@@ -55,7 +55,7 @@ class PerplexityUploader:
                 f"📝 Staged text payload ({len(text)} chars) to {tf.name}")
             return self.upload_file(tf.name, filename)
         except Exception as e:
-            logger.error(f"Text staging failed: {e}")
+            logger.exception(f"Text staging failed: {e}")
             raise
         finally:
             self._secure_delete(tf.name)

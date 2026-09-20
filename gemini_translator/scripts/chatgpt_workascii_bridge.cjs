@@ -818,8 +818,8 @@ function normalizeResponseText(value) {
 
 function normalizeCandidateText(value) {
   return String(value || "")
-    .replace(/\r/g, "")
-    .replace(/\u00a0/g, " ")
+    .replaceAll("\r", "")
+    .replaceAll("\u00a0", " ")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -1866,8 +1866,8 @@ async function extractAssistantOnlyResponse(page, promptEchoGuard = null, respon
 
     function normalize(text) {
       return String(text || "")
-        .replace(/\r/g, "")
-        .replace(/\u00a0/g, " ")
+        .replaceAll("\r", "")
+        .replaceAll("\u00a0", " ")
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();
@@ -2103,8 +2103,8 @@ async function extractBestResponse(page, promptEchoGuard = null, responseGuard =
 
     function normalize(text) {
       return String(text || "")
-        .replace(/\r/g, "")
-        .replace(/\u00a0/g, " ")
+        .replaceAll("\r", "")
+        .replaceAll("\u00a0", " ")
         .replace(/[ \t]+\n/g, "\n")
         .replace(/\n{3,}/g, "\n\n")
         .trim();

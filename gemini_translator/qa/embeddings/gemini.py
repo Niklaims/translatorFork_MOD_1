@@ -37,6 +37,7 @@ from ..key_pool import QaKeyPool
 
 
 _GEMINI_MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_MODEL_PREFIX = "models/"
 _GEMINI_TASK = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 _GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta"
 MAX_KEY_ROTATIONS = 12
@@ -48,11 +49,10 @@ def _model_resource(value: object) -> str:
     if not isinstance(value, str):
         raise EmbeddingContractError("Gemini model must be a valid resource name")
     model = value.strip()
-    if model.startswith("models/"):
-        model = model[len("models/") :]
+    model = model.removeprefix(_MODEL_PREFIX)
     if not _GEMINI_MODEL.fullmatch(model):
         raise EmbeddingContractError("Gemini model must be a valid resource name")
-    return f"models/{model}"
+    return f"{_MODEL_PREFIX}{model}"
 
 
 def _task_type(value: object) -> str:
@@ -165,7 +165,7 @@ class GeminiEmbeddingProvider:
             response_payload = await self._post_json(url, payload)
             publish_embedding_usage(
                 provider=self.name,
-                model=model.removeprefix("models/"),
+                model=model.removeprefix(_MODEL_PREFIX),
                 texts=chunk,
                 reported_input_tokens=_prompt_token_count(response_payload),
             )

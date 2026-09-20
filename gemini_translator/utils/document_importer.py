@@ -17,14 +17,16 @@ from .html_text import extract_visible_text_normalized
 from .text import escape_html
 
 
+# Один источник правды: раньше эта тройка лежала ещё в двух местах, и
+# добавление расширения в одном из них расходилось с остальными.
+HTML_DOCUMENT_EXTENSIONS = {".html", ".htm", ".xhtml"}
+
 SUPPORTED_DOCUMENT_EXTENSIONS = {
     ".docx",
     ".txt",
     ".md",
     ".markdown",
-    ".html",
-    ".htm",
-    ".xhtml",
+    *HTML_DOCUMENT_EXTENSIONS,
     ".pdf",
 }
 
@@ -167,7 +169,7 @@ def _read_text_with_fallbacks(path: Path) -> str:
     except ImportError:
         pass
     else:
-        is_html = path.suffix.lower() in {".html", ".htm", ".xhtml"}
+        is_html = path.suffix.lower() in HTML_DOCUMENT_EXTENSIONS
         decoded = UnicodeDammit(raw_bytes, is_html=is_html)
         detected_encoding = str(decoded.original_encoding or "").lower().replace("_", "-")
         if (
@@ -523,7 +525,7 @@ def extract_document_chapters(path: str | os.PathLike) -> DocumentImportResult:
         text = _read_text_with_fallbacks(source_path)
         return DocumentImportResult(title=title, source_format="markdown", chapters=_markdown_to_chapters(text, title), warnings=[])
 
-    if suffix in {".html", ".htm", ".xhtml"}:
+    if suffix in HTML_DOCUMENT_EXTENSIONS:
         text = _read_text_with_fallbacks(source_path)
         return DocumentImportResult(title=title, source_format="html", chapters=_html_to_chapters(text, title), warnings=[])
 

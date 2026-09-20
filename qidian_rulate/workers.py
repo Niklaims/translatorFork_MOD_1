@@ -50,6 +50,14 @@ except Exception:
         "--disable-infobars",
     ]
 
+# Один User-Agent на все запросы: раньше та же строка лежала в семи
+# местах, и обновление версии Chrome требовало семи правок.
+DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/125.0.0.0 Safari/537.36"
+)
+
 QIDIAN_RULATE_APP_DATA_DIR = Path.home() / ".qidian_rulate_creator"
 RULATE_PROFILE_DIR = Path(
     os.environ.get(
@@ -584,11 +592,7 @@ def _download_cover_image_once(cover_url: str, *, referer: str) -> CoverImageDow
         cover_url,
         timeout=20,
         headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": DESKTOP_USER_AGENT,
             "Referer": referer,
         },
     )
@@ -1001,11 +1005,7 @@ def _fetch_qimao_chapter_links(
         headers={
             "Accept": "application/json, text/plain, */*",
             "Referer": source_url,
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": DESKTOP_USER_AGENT,
         },
     )
     response.raise_for_status()
@@ -1666,11 +1666,7 @@ class QidianFetchWorker(QThread):
                 )
                 page = browser.new_page(
                     viewport={"width": 1280, "height": 900},
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/125.0.0.0 Safari/537.36"
-                    ),
+                    user_agent=DESKTOP_USER_AGENT,
                 )
                 try:
                     page.goto(self.qidian_url, wait_until="domcontentloaded", timeout=60000)
@@ -1857,11 +1853,7 @@ def _fetch_qidian_cover_context(
         )
         page = browser.new_page(
             viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            user_agent=DESKTOP_USER_AGENT,
         )
         try:
             page.goto(qidian_url, wait_until="domcontentloaded", timeout=60000)
@@ -1951,11 +1943,7 @@ def _fetch_fanqie_cover_context(
         )
         page = browser.new_page(
             viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            user_agent=DESKTOP_USER_AGENT,
         )
         try:
             page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
@@ -2034,11 +2022,7 @@ def _fetch_qimao_cover_context(
         )
         page = browser.new_page(
             viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            user_agent=DESKTOP_USER_AGENT,
         )
         try:
             page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
@@ -2150,11 +2134,7 @@ def _fetch_ciweimao_cover_context(
         )
         page = browser.new_page(
             viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+            user_agent=DESKTOP_USER_AGENT,
         )
         try:
             page.goto(source_url, wait_until="domcontentloaded", timeout=60000)
