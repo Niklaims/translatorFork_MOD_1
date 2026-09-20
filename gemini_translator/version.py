@@ -1,4 +1,4 @@
 """Application version metadata shared by UI, CLI, and release checks."""
 
-__version__ = "10.5.25"
+__version__ = "10.5.26"
 APP_VERSION = f"V {__version__}"
