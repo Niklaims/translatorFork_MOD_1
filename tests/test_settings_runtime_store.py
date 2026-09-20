@@ -344,7 +344,10 @@ def test_two_managers_increment_without_lost_updates(tmp_path):
         try:
             barrier.wait()
             for _ in range(30):
-                assert manager.increment_request_count("KEY", "model") is True
+                # Не assert: except ниже ловит BaseException, чтобы донести сбой
+                # из потока наружу, и AssertionError в нём потерял бы смысл.
+                if manager.increment_request_count("KEY", "model") is not True:
+                    raise RuntimeError("increment_request_count вернул не True")
         except BaseException as error:
             errors.append(error)
 
