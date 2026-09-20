@@ -1126,6 +1126,11 @@ class McpDaemon:
                 body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
+                # Ответ целиком проходит через json.dumps, так что исполняемой
+                # разметки в нём быть не может. Запрет на угадывание типа
+                # закрывает единственную лазейку — браузер, решивший прочитать
+                # этот JSON как HTML.
+                self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

@@ -112,6 +112,19 @@ def test_install_claude_config_creates_backup_and_preserves_existing(tmp_path):
     assert "translatorFork" in payload["mcpServers"]
 
 
+@pytest.mark.parametrize("name", [".zshrc", "settings", "config.yaml"])
+def test_install_claude_config_refuses_to_write_outside_json(tmp_path, name):
+    # mode=write отдан клиенту MCP вместе с путём. Существующий не-JSON файл
+    # спасает только случайность — разбор падает раньше записи; по пути,
+    # которого ещё нет, инструмент создаёт что угодно и где угодно.
+    path = tmp_path / name
+
+    with pytest.raises(ValueError, match=r"\.json"):
+        install_claude_config(path, server_name="translatorFork", mode="write")
+
+    assert not path.exists()
+
+
 def test_install_tool_print_mode_does_not_write(tmp_path):
     path = tmp_path / "claude.json"
     result = handle_install_tool(
