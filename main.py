@@ -17,6 +17,7 @@ import sqlite3
 import atexit
 import base64
 import threading
+import time
 import importlib
 import subprocess
 from collections import deque
@@ -1070,13 +1071,11 @@ class EventBus(QtCore.QObject):
 
     def emit_event(self, event: dict):
         """Совместимый способ отправки: topics + старый event_posted сигнал."""
-        if (
-            isinstance(event, dict)
-            and event.get('event') == 'log_message'
-            and QtCore.QThread.currentThread() is not self.thread()
-        ):
-            self._queue_log_event(event)
-            return
+        if isinstance(event, dict) and event.get('event') == 'log_message':
+            self._stamp_log_event(event)
+            if QtCore.QThread.currentThread() is not self.thread():
+                self._queue_log_event(event)
+                return
         if isinstance(event, dict) and event.get('event') in self.STOP_EVENTS:
             self._cancel_inflight_mcp_requests()
         self.event_posted.emit(event)
@@ -1094,6 +1093,18 @@ class EventBus(QtCore.QObject):
             inflight.cancel_all()
         except Exception as exc:
             print(f"[EventBus WARN] Не удалось снять висящие MCP-запросы: {exc}")
+
+    @staticmethod
+    def _stamp_log_event(event: dict):
+        """Отметить лог временем события, а не временем его отрисовки.
+
+        Строки из воркеров ждут своей очереди и в шине, и в самом виджете
+        (скрытая вкладка вообще ничего не рисует). Без метки, поставленной
+        здесь, пользователь увидит время возвращения на экран лога.
+        """
+        data = event.get('data')
+        if isinstance(data, dict):
+            data.setdefault('timestamp', time.time())
 
     def _queue_log_event(self, event: dict):
         """Queue a worker log without adding one Qt event per log line."""
@@ -1133,7 +1144,8 @@ class EventBus(QtCore.QObject):
                     'message': (
                         f'[WARN] Пропущено {dropped_count} сообщений лога: '
                         'интерфейс не успевал обрабатывать поток событий.'
-                    )
+                    ),
+                    'timestamp': time.time(),
                 },
             })
 

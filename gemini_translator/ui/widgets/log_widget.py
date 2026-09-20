@@ -176,14 +176,20 @@ class LogWidget(QWidget):
         self._schedule_log_flush(0 if priority == 'final' else LOG_FLUSH_INTERVAL_MS)
 
     def _queue_log_message(self, data: dict):
-        self._pending_log_data.append(dict(data))
+        entry = dict(data)
+        # Метку времени ставим в момент прихода сообщения, а не при отрисовке:
+        # отрисовка может случиться сильно позже (вкладка была скрыта), и её
+        # время к самому событию отношения не имеет.
+        entry.setdefault('timestamp', time.time())
+        self._pending_log_data.append(entry)
         if len(self._pending_log_data) <= MAX_PENDING_LOG_MESSAGES:
             return
 
         dropped_count = len(self._pending_log_data) - MAX_PENDING_LOG_MESSAGES + 1
         del self._pending_log_data[:dropped_count]
         notice = {
-            'message': f"[WARN] Пропущено {dropped_count} сообщений лога: интерфейс не успевал их отрисовать."
+            'message': f"[WARN] Пропущено {dropped_count} сообщений лога: интерфейс не успевал их отрисовать.",
+            'timestamp': time.time(),
         }
         self._pending_log_data.insert(0, notice)
 
@@ -269,13 +275,21 @@ class LogWidget(QWidget):
                 CATCHUP_FLUSH_INTERVAL_MS if catching_up else LOG_FLUSH_INTERVAL_MS
             )
 
+    @staticmethod
+    def _format_event_time(timestamp) -> str:
+        """Время, когда событие произошло; без метки — время прямо сейчас."""
+        try:
+            return time.strftime("%H:%M:%S", time.localtime(float(timestamp)))
+        except (TypeError, ValueError, OSError, OverflowError):
+            return time.strftime("%H:%M:%S", time.localtime())
+
     def _build_log_html(self, data: dict) -> str:
         message = data.get('message', '')
         if message == "---SEPARATOR---":
             return "<br><hr style='border: 1px dashed #4d5666;'><br>"
 
-        current_time = time.strftime("%H:%M:%S", time.localtime())
-        formatted_line = f"[{current_time}] {message}"
+        event_time = self._format_event_time(data.get('timestamp'))
+        formatted_line = f"[{event_time}] {message}"
 
         color = None
         bold = False
