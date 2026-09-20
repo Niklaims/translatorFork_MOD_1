@@ -1875,8 +1875,12 @@ class ChapterQueueManager(QObject):
         # 2. Проверка базы данных (только если флага нет)
         # Игнорируем 'held', так как в обычном режиме это остатки Dry Run,
         # а в управляемом мы бы вышли выше по флагу.
+        # 'qa_pending' сессию тоже не держит: перевод главы уже сохранён, а
+        # остановленную проверку в этой сессии никто не допроверит — ожидание
+        # её оставляло сессию открытой навсегда. Проверку продолжают потом
+        # кнопкой «Продолжить проверку» или следующая сессия.
         rows = self._execute_light_read(
-            "SELECT 1 FROM tasks WHERE status IN ('pending', 'in_progress', 'qa_pending') LIMIT 1"
+            "SELECT 1 FROM tasks WHERE status IN ('pending', 'in_progress') LIMIT 1"
         )
         if not rows:
             return True

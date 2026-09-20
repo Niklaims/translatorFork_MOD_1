@@ -21,7 +21,7 @@ consistency checker), поэтому rapidfuzz-реализация воспро
 import re
 
 # fuzzywuzzy.utils.asciidammit: удаляются ровно коды 128..255.
-_LATIN1_STRIP_TABLE = {code: None for code in range(128, 256)}
+_LATIN1_STRIP_TABLE = dict.fromkeys(range(128, 256))
 _NON_WORD_RE = re.compile(r"(?u)\W")
 
 
@@ -64,17 +64,15 @@ except ImportError:
     FUZZY_BACKEND = None
     FUZZ_AVAILABLE = False
 
+    # Подсказку про установку правим в одном месте: три заглушки ниже
+    # повторяли её дословно и расходились бы при первой же правке.
+    _NO_BACKEND = "Нет fuzzy-бэкенда: установите rapidfuzz (pip install rapidfuzz)."
+
     def ratio(s1, s2) -> int:
-        raise RuntimeError(
-            "Нет fuzzy-бэкенда: установите rapidfuzz (pip install rapidfuzz)."
-        )
+        raise RuntimeError(_NO_BACKEND)
 
     def token_set_ratio(s1, s2) -> int:
-        raise RuntimeError(
-            "Нет fuzzy-бэкенда: установите rapidfuzz (pip install rapidfuzz)."
-        )
+        raise RuntimeError(_NO_BACKEND)
 
     def token_set_ratio_preclean(s1, s2) -> int:
-        raise RuntimeError(
-            "Нет fuzzy-бэкенда: установите rapidfuzz (pip install rapidfuzz)."
-        )
+        raise RuntimeError(_NO_BACKEND)

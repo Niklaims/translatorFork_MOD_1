@@ -739,7 +739,7 @@ class UntranslatedFixerPage(ShellPage):
 
             try:
                 clean_text = BeautifulSoup(raw_context, 'html.parser').get_text()
-            except:
+            except Exception:
                 clean_text = raw_context
 
             total_len = len(clean_text)
@@ -923,7 +923,7 @@ class UntranslatedFixerPage(ShellPage):
         (ui-dialogs-validation/runtime/10)."""
         term_keys = {str(t or '').strip().lower() for t in terms}
         term_keys.discard('')
-        counts = {key: 0 for key in term_keys}
+        counts = dict.fromkeys(term_keys, 0)
         if not term_keys:
             return counts
 
@@ -2191,7 +2191,7 @@ class UntranslatedFixerPage(ShellPage):
                             # self.selected_indices.discard(idx) 
                             
                             updated_count += 1
-                        except:
+                        except Exception:
                             pass
                 except Exception as e:
                     print(f"Error parsing result: {e}")

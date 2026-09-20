@@ -16,7 +16,7 @@ import html
 import logging
 import hashlib
 import zipfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -2421,7 +2421,7 @@ def _policy_timezone(policy):
 def _current_policy_bucket(policy):
     policy = policy or _gemini_reset_policy()
     tz = _policy_timezone(policy)
-    now_dt = datetime.now(tz) if tz is not None else datetime.utcnow()
+    now_dt = datetime.now(tz) if tz is not None else datetime.now(timezone.utc)
 
     if policy.get("type") == "daily":
         boundary = now_dt.replace(
@@ -2440,7 +2440,7 @@ def _current_policy_bucket(policy):
 def _next_policy_reset_text(policy):
     policy = policy or _gemini_reset_policy()
     tz = _policy_timezone(policy)
-    now_dt = datetime.now(tz) if tz is not None else datetime.utcnow()
+    now_dt = datetime.now(tz) if tz is not None else datetime.now(timezone.utc)
 
     if policy.get("type") == "daily":
         next_reset = now_dt.replace(
@@ -2983,12 +2983,12 @@ class BookManager:
         try:
             shutil.copy(filepath, os.path.join(self.book_dir, filename))
         except Exception as e:
-            logger.error(f"Ошибка при копировании файла: {e}")
+            logger.exception(f"Ошибка при копировании файла: {e}")
 
         try:
             self.chapters = _reader_load_supported_chapters(filepath)
         except Exception as e:
-            logger.error(f"Book import error: {e}")
+            logger.exception(f"Book import error: {e}")
             raise
 
     def get_paths(self):
@@ -3027,7 +3027,7 @@ class BookManager:
                 with open(self.get_paths(), 'r') as f:
                     d = json.load(f)
                     return d.get("chapter", 0), d.get("sentence", 0)
-            except:
+            except Exception:
                 return 0, 0
 
     def is_chapter_done(self, c_idx):
@@ -3353,7 +3353,7 @@ class AudioCombinerWorker(QThread):
                                     raise RuntimeError(duration_result.stderr.strip() or "ffprobe не смог прочитать MP3")
                                 duration_sec = float(duration_result.stdout.strip())
                             except Exception as exc:
-                                logger.error(f"Не удалось прочитать главу {file_name}: {exc}")
+                                logger.exception(f"Не удалось прочитать главу {file_name}: {exc}")
                                 raise RuntimeError(
                                     f"Глава {file_name} содержит битый или неполный MP3. "
                                     f"Нужно переозвучить главу перед склейкой. Детали: {exc}"
@@ -3689,8 +3689,11 @@ class GeminiWorker(QThread):
                 and prev_chapter_index == chapter_index
                 and prev_total_steps == total_steps
             ):
-                prev_pct = int((min(prev_step_index, total_steps) / total_steps) * 100) if total_steps > 0 else 0
-                current_pct = int((min(step_index, total_steps) / total_steps) * 100) if total_steps > 0 else 0
+                # Сюда попадаем только при force=False, а total_steps <= 0
+                # выставляет force выше — значит здесь total_steps строго
+                # положителен и деление безопасно.
+                prev_pct = int((min(prev_step_index, total_steps) / total_steps) * 100)
+                current_pct = int((min(step_index, total_steps) / total_steps) * 100)
                 if current_pct == prev_pct and (now - self._last_progress_emit_at) < READER_PROGRESS_EMIT_INTERVAL_SEC:
                     return
         self._last_progress_emit_payload = payload
@@ -4054,7 +4057,7 @@ class GeminiWorker(QThread):
                     segment = segment.set_frame_rate(AUDIO_RATE).set_channels(AUDIO_CHANNELS).set_sample_width(2)
                     return segment.raw_data
                 except Exception as e:
-                    logger.error(f"[W{self.worker_id}] Ошибка pydub при декодировании Edge TTS: {e}")
+                    logger.exception(f"[W{self.worker_id}] Ошибка pydub при декодировании Edge TTS: {e}")
                     return None
 
             return await _to_thread_with_timeout(
@@ -4065,7 +4068,7 @@ class GeminiWorker(QThread):
             )
 
         except Exception as e:
-            logger.error(f"[W{self.worker_id}] Критическая ошибка Edge TTS: {e}")
+            logger.exception(f"[W{self.worker_id}] Критическая ошибка Edge TTS: {e}")
             return None
 
     def _build_live_connect_config(self):
@@ -4663,7 +4666,7 @@ class GeminiParallelChapterWorker(GeminiWorker):
                 if not completed and not self._is_running:
                     break
             except Exception as exc:
-                logger.error(
+                logger.exception(
                     f"[W{self.worker_id}] Ошибка блока {task['task_index'] + 1}/{task['total_tasks']} главы "
                     f"{task['chapter_index'] + 1}: {exc}"
                 )
@@ -5397,7 +5400,7 @@ class FlashTtsWorker(GeminiWorker):
                 self._abort_for_quota_key(str(exc), exc.model_id or self.model_id)
                 break
             except Exception as exc:
-                logger.error(f"[W{self.worker_id}] Ошибка обработки главы {chapter_index + 1}: {exc}")
+                logger.exception(f"[W{self.worker_id}] Ошибка обработки главы {chapter_index + 1}: {exc}")
                 self.error_signal.emit(self.worker_id, f"Глава {chapter_index + 1}: {exc}")
             finally:
                 self.c_idx = -1
@@ -7918,7 +7921,7 @@ class MainWindow(QMainWindow):
                     os.remove(mp3_p)
                     deleted_count += 1
                 except Exception as e:
-                    logger.error(f"Не удалось удалить {mp3_p}: {e}")
+                    logger.exception(f"Не удалось удалить {mp3_p}: {e}")
                     
         QMessageBox.information(self, "Очистка", f"Очистка завершена.\nУдалено незаконченных файлов: {deleted_count}")
         self.refresh_chapters_list()

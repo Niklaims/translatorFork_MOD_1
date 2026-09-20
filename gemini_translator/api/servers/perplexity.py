@@ -140,7 +140,7 @@ def save_endpoint_info(port: int) -> None:
             json.dump(data, f, indent=2, ensure_ascii=False)
         logger.info("Endpoint saved: %s:%s", safe_host, port)
     except Exception as e:
-        logger.error("Failed to save endpoint: %s", e)
+        logger.exception("Failed to save endpoint: %s", e)
 
 # -------------------- Backend helpers --------------------
 
@@ -313,7 +313,7 @@ def _extract_final_answer_and_model_from_sse(lines: Iterable[bytes]) -> Tuple[st
                      data = json.loads(json_part)
                      detected_model = False
                      break # Немедленно выходим из цикла
-        except:
+        except Exception:
             pass # Игнорируем ошибки декодирования/парсинга здесь, основной парсер справится
         
         if raw == b"":
@@ -420,7 +420,7 @@ class PerplexityBackend:
                 text, filename=s3_filename)
             return result.get("url")
         except Exception as e:
-            logger.error("File upload failed: %s", e)
+            logger.exception("File upload failed: %s", e)
             raise
 
     def _ask_once(self, *, text: str, model: str, token: str, search_focus: str) -> Dict[str, Any]:

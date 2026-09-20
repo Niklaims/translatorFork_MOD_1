@@ -113,7 +113,9 @@ def test_a_running_pass_swaps_resume_for_stop_and_locks_the_rest(qt_app):
 
 def test_the_header_names_the_book_the_checks_and_the_last_pass(qt_app):
     dialog = _dialog(
-        settings=QaSettings(check_completeness_after_chapter=False),
+        settings=QaSettings(
+            check_language_after_chapter=True, check_completeness_after_chapter=False
+        ),
         book_title="Star Rail",
     )
 
@@ -142,7 +144,11 @@ def test_open_suggestions_switches_the_tab(qt_app):
 
 
 def test_an_edit_in_the_settings_tab_is_published_by_the_window(qt_app):
-    dialog = TranslationQualityDialog(settings=QaSettings())
+    dialog = TranslationQualityDialog(
+        settings=QaSettings(
+            check_language_after_chapter=True, check_completeness_after_chapter=True
+        )
+    )
     published: list[QaSettings] = []
     dialog.settings_changed.connect(published.append)
 
@@ -154,7 +160,7 @@ def test_an_edit_in_the_settings_tab_is_published_by_the_window(qt_app):
 
 
 def test_turning_scoring_on_shows_the_score_card(qt_app):
-    dialog = _dialog()
+    dialog = _dialog(settings=QaSettings(check_completeness_after_chapter=True))
     assert dialog.report_view.score_card.isHidden()
 
     dialog.settings_view.cometkiwi_enabled_check.setChecked(True)

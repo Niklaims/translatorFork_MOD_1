@@ -150,7 +150,7 @@ def smart_replace_number_in_title(title, new_number_int):
                 # Пытаемся найти
                 found = recognize_number(title, cult)
                 results.extend(found)
-            except: pass
+            except Exception: pass
         
         if results:
             # Находим самое левое вхождение
@@ -339,7 +339,7 @@ class TxtChapterAnalyzer:
                         if explicit_suffix_count >= 3:
                             score += 100
                     final_results.append(((display, pat, 'direct_regex'), info['count'], score))
-            except: continue
+            except Exception: continue
 
         final_results.sort(key=lambda x: (x[2] if len(x)>2 else 0, x[1]), reverse=True)
         return [item[0:2] for item in final_results]

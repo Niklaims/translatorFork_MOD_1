@@ -24,14 +24,18 @@ jobs:
           cache-dependency-path: |
             requirements.txt
             requirements-dev.txt
+            constraints.txt
 
       - name: Install dependencies
         # setup-python brings setuptools 65.5.0 and no requirement upgrades it,
         # while the audit step below checks the whole interpreter.
         run: |
           python -m pip install --upgrade pip setuptools
-          python -m pip install -r requirements.txt
-          python -m pip install -r requirements-dev.txt
+          # -c constraints.txt даёт тот же набор версий, что и релизная
+          # сборка: иначе проверки идут на одном дереве, а пользователь
+          # получает другое.
+          python -m pip install -r requirements.txt -c constraints.txt
+          python -m pip install -r requirements-dev.txt -c constraints.txt
 
       - name: Run checks
         shell: pwsh

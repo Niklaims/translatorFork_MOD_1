@@ -96,7 +96,7 @@ class HuggingFaceApiHandler(BaseApiHandler):
                         error_json = {}
                         try:
                             error_json = json.loads(error_text)
-                        except: pass
+                        except Exception: pass
                         
                         # Ловим Cold Boot (503 + estimated_time)
                         if response.status == 503 and "estimated_time" in error_json:

@@ -26,13 +26,16 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
+            constraints.txt
             requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install -r requirements-dev.txt
+          # Тот же локфайл, что и у сборки: релизный гейт обязан проверять
+          # ровно то дерево, которое уедет пользователю.
+          python -m pip install -r requirements.txt -c constraints.txt
+          python -m pip install -r requirements-dev.txt -c constraints.txt
 
       - name: Release tag gate
         shell: bash
@@ -65,6 +68,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements.txt
+            constraints.txt
 
       - name: Install System Dependencies (macOS)
         if: matrix.os == 'macos-latest'
@@ -73,8 +77,14 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install pyinstaller
+          # -c constraints.txt: точные версии всего дерева. Без него сборка
+          # брала то, что оказалось свежим в день выпуска, и так в релиз
+          # уехал numpy 2.4, роняющий старт на старых процессорах.
+          python -m pip install -r requirements.txt -c constraints.txt
+          # Закреплено на версии, которую незакреплённая установка даёт
+          # сегодня: сборка не меняется, но мажорный скачок PyInstaller
+          # больше не прилетит в релиз сам собой.
+          python -m pip install pyinstaller==6.22.3
 
       - name: Generate build identity
         shell: bash
@@ -100,7 +110,11 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: |
           codesign --force --deep --sign - "dist/GeminiTranslator.app"
-          npm install -g create-dmg
+          # Без --ignore-scripts сознательно: create-dmg тянет appdmg →
+          # fs-xattr, а это нативный аддон с install: node-gyp rebuild.
+          # Запрет скриптов сломал бы сборку DMG, и || true ниже молча
+          # подсунул бы пользователям macOS архив вместо образа.
+          npm install -g create-dmg@8.1.0
           create-dmg dist/GeminiTranslator.app || true
           mv *.dmg GeminiTranslator-macOS.dmg || true
           # Fallback to ZIP if create-dmg fails (which can happen on some CI environments)
@@ -176,7 +190,10 @@ jobs:
             --output release_assets/update-manifest.json
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        # Единственное третьестороннее действие в репозитории, и у него токен
+        # с правом писать релизы. Тег v2 подвижен: закрепляем по SHA, чтобы
+        # содержимое действия нельзя было подменить задним числом.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: release_assets/*

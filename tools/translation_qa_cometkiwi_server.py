@@ -263,6 +263,9 @@ def build_handler(service: ScoringService):
             encoded = json.dumps(body, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            # The body is json.dumps output, never markup; nosniff stops a
+            # browser from reading it as HTML anyway.
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             # Headers are irreversibly on the wire past this point: a later

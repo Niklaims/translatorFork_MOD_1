@@ -172,6 +172,41 @@ def test_final_pass_checks_only_the_unsettled_chapters():
     assert [item.chapter_id for item in result.results] == ["chapter-2"]
 
 
+def test_a_resumed_pass_starts_where_the_last_check_stopped():
+    """In book order «Продолжить» went back to chapter one and looked like a restart.
+
+    The last check is the latest in time, not the furthest in the book, and
+    the chapters before it are not dropped: they come after the end.
+    """
+    chapters = tuple(f"chapter-{index}" for index in range(1, 7))
+    coordinator = _coordinator(
+        _ServiceStub(),
+        journal=_journal(
+            (
+                _state("chapter-5", updated_at="2026-09-18T09:00:00+00:00"),
+                _state(
+                    "chapter-2",
+                    status="deferred",
+                    updated_at="2026-09-18T10:00:00+00:00",
+                ),
+                _state("chapter-3", updated_at="2026-09-18T12:00:00+00:00"),
+            )
+        ),
+        events=chapters,
+    )
+
+    selected = coordinator.select_unsettled_chapters(
+        tuple(_event(chapter) for chapter in chapters)
+    )
+
+    assert [item.event.chapter_id for item in selected] == [
+        "chapter-4",
+        "chapter-6",
+        "chapter-1",
+        "chapter-2",
+    ]
+
+
 def test_final_pass_does_nothing_when_the_book_is_settled():
     """A finished book must not pay for a pass that has nothing to do."""
     service = _ServiceStub()
@@ -230,6 +265,25 @@ def test_restart_finishes_the_checks_the_previous_run_owed():
     assert result.task_ids == ("task-7",)
     assert service.checked == ["chapter-2"]
     assert queue.outcomes == [("task-7", "completed")]
+    assert coordinator.unchecked_chapter_count() == 0
+
+
+def test_a_restart_stopped_halfway_still_owes_its_chapters():
+    """The end of a session must count what the resumed check did not reach."""
+    queue = _QueueStub()
+    coordinator = _coordinator(
+        _ServiceStub(),
+        journal=_journal(),
+        events=("chapter-1", "chapter-2"),
+        pending=[("task-7", ["chapter-1", "chapter-2"])],
+        queue=queue,
+    )
+    coordinator.cancel()
+
+    asyncio.run(coordinator.resume_pending_qa())
+
+    assert queue.outcomes == [("task-7", "cancelled")]
+    assert coordinator.unchecked_chapter_count() == 2
 
 
 def test_restart_defers_a_task_whose_translation_disappeared():

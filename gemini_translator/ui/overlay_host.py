@@ -404,10 +404,14 @@ class OverlayHost(QtWidgets.QWidget):
         dialog.setParent(None)
         dialog.deleteLater()
         if self._entries:
-            top = self._entries[-1]
-            self._card_stack.setCurrentWidget(top.dialog)
-            self._animate_card_to(self._card_rect_for(top.dialog))
-            self._reveal_after_morph(top.dialog)
+            # Карточку могли уже разобрать (_finish_close гасит _card вместе
+            # с _card_stack) — поднимать тогда нечего, а _animate_card_to
+            # разыменовал бы тот же обнулённый _card.
+            if self._card_stack is not None:
+                top = self._entries[-1]
+                self._card_stack.setCurrentWidget(top.dialog)
+                self._animate_card_to(self._card_rect_for(top.dialog))
+                self._reveal_after_morph(top.dialog)
         else:
             self._begin_close(entry.previous_focus)
         if entry.callback is not None:

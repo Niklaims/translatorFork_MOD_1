@@ -173,6 +173,9 @@ class ChapterQaCoordinator:
         self._thread: threading.Thread | None = None
         self._pending: set[asyncio.Future] = set()
         self._pending_lock = threading.Lock()
+        # Tasks handed over for a check that has not ended, with how many
+        # chapters each carries; guarded by _pending_lock.
+        self._unchecked: dict[str, int] = {}
         # Chapters a check is reading or writing right now, with how many checks
         # hold each: a fix the user applies must not land in one of them.
         self._checking: dict[str, int] = {}
@@ -207,6 +210,7 @@ class ChapterQaCoordinator:
         if not events:
             return
         self._mark_pending(task_id, events)
+        self._owe_check(task_id, len(events))
         self.start()
         loop = self._loop
         if loop is None:  # pragma: no cover - start() guarantees a loop
@@ -245,6 +249,25 @@ class ChapterQaCoordinator:
                 on_done(None, error)
 
         future.add_done_callback(finished)
+
+    def unchecked_chapter_count(self) -> int:
+        """Chapters handed over for a check that has not ended yet.
+
+        A check stopped halfway still counts: its task waits in qa_pending for
+        the next session or for «Продолжить проверку».
+        """
+        with self._pending_lock:
+            return sum(self._unchecked.values())
+
+    def _owe_check(self, task_id, chapters: int) -> None:
+        with self._pending_lock:
+            self._unchecked[str(task_id)] = chapters
+
+    def _settle_check(self, task_id, outcome: QaQueueOutcome) -> None:
+        if outcome.kind == "cancelled":
+            return
+        with self._pending_lock:
+            self._unchecked.pop(str(task_id), None)
 
     def checking_chapters(self) -> frozenset[str]:
         """The chapters a check holds at this moment."""
@@ -335,10 +358,15 @@ class ChapterQaCoordinator:
         A chapter checked under the current rules, carrying no unresolved risk
         and with its text unchanged, is left alone.  This is what lets a pass
         that was closed halfway be continued instead of paid for twice.
+
+        The pass begins after the chapter checked last and comes back to the
+        earlier ones at the end.  In book order it went back to chapter one
+        whenever an early chapter was never checked or was deferred, and a
+        continued pass looked like one started over.
         """
         journal = self._journal()
         states = dict(getattr(journal, "chapter_states", {}) or {})
-        return select_final_pass_chapters(
+        selected = select_final_pass_chapters(
             events,
             states,
             analysis_identity=self._analysis_identity(),
@@ -347,6 +375,7 @@ class ChapterQaCoordinator:
             ),
             fingerprint_for=lambda item: chapter_fingerprint(item.translated_path),
         )
+        return _after_last_check(selected, events, states)
 
     async def run_final_book_pass(
         self, session_id: str, on_progress=None
@@ -382,6 +411,8 @@ class ChapterQaCoordinator:
             return ResumeResult("failed", detail=str(error)[:200])
         if not pending:
             return ResumeResult()
+        for task_id, chapter_ids in pending:
+            self._owe_check(task_id, len(tuple(chapter_ids)))
 
         by_chapter = {event.chapter_id: event for event in self._book_events()}
         task_ids: list[str] = []
@@ -837,6 +868,7 @@ class ChapterQaCoordinator:
             self._report(f"[QA] Не удалось перевести задачу в проверку: {error}")
 
     def _resolve(self, task_id: str, outcome: QaQueueOutcome) -> None:
+        self._settle_check(task_id, outcome)
         if self._task_manager is None:
             return
         try:
@@ -967,6 +999,27 @@ def _outcome_for(
             chapter_ids, reason=", ".join(sorted(set(deferred)))
         )
     return QaQueueOutcome.completed(chapter_ids)
+
+
+def _after_last_check(
+    selected: tuple[SelectedChapter, ...],
+    events: Sequence[TranslationReadyEvent],
+    states: Mapping[str, QaChapterState],
+) -> tuple[SelectedChapter, ...]:
+    """Put the chapters after the one checked last first, and the rest after them."""
+    position = {event.chapter_id: index for index, event in enumerate(events)}
+    checked = [
+        (state.updated_at, position[chapter_id])
+        for chapter_id, state in states.items()
+        if state.updated_at and chapter_id in position
+    ]
+    if not checked:
+        return selected
+    last = max(checked)[1]
+    later = tuple(item for item in selected if position[item.event.chapter_id] > last)
+    return later + tuple(
+        item for item in selected if position[item.event.chapter_id] <= last
+    )
 
 
 class _EmptyJournal:

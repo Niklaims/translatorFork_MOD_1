@@ -9,6 +9,7 @@ from threading import Event, Lock
 from typing import Awaitable, Callable, Mapping, Protocol
 from uuid import uuid4
 
+from ...utils.async_helpers import drain_cancelled_tasks
 from .json_response import QaResponseSchemaError, parse_single_json_object
 
 
@@ -156,34 +157,23 @@ class ExistingHandlerCompletionClient:
         self.requests_made = 0
 
     @staticmethod
-    async def _drain_cancelled_task(task: asyncio.Future) -> None:
-        if not task.done():
-            task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            return
-
-    @classmethod
     async def _discard_unscheduled_awaitable(
-        cls,
         awaitable: Awaitable[object],
     ) -> None:
         cancelled_task = asyncio.ensure_future(awaitable)
         cancelled_task.cancel()
-        await cls._drain_cancelled_task(cancelled_task)
+        await drain_cancelled_tasks(cancelled_task)
 
         if isinstance(awaitable, asyncio.Future) or inspect.iscoroutine(awaitable):
             return
+        # CancelledError отсюда не гасим: await'ов ниже нет, значит это не наша
+        # отмена, а жалоба чужого awaitable в close() — и единственный вызывающий
+        # (_await_with_cancellation) в этот момент и так раскручивает отмену.
         try:
             iterator = awaitable.__await__()
             close = getattr(iterator, "close", None)
             if callable(close):
                 close()
-        except asyncio.CancelledError:
-            return
         except Exception:
             return
 
@@ -209,16 +199,16 @@ class ExistingHandlerCompletionClient:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancellation_task in done or cancellation.is_cancelled:
-                await self._drain_cancelled_task(handler_task)
+                await drain_cancelled_tasks(handler_task)
                 raise asyncio.CancelledError
 
-            await self._drain_cancelled_task(cancellation_task)
+            await drain_cancelled_tasks(cancellation_task)
             result = await handler_task
             cancellation.raise_if_cancelled()
             return result
         except asyncio.CancelledError:
-            await self._drain_cancelled_task(handler_task)
-            await self._drain_cancelled_task(cancellation_task)
+            # Обе задачи одним вызовом: выход на первой оставил бы вторую висеть.
+            await drain_cancelled_tasks(handler_task, cancellation_task)
             raise
 
     @staticmethod

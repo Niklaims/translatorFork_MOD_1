@@ -74,3 +74,43 @@ def run_sync(func, *args, forget: bool = False, timeout: float = None, executor=
     else:
         # Для режима ожидания возвращаем корутину, которую можно будет `await`.
         return main_wrapper()
+
+
+async def drain_cancelled_tasks(*tasks) -> None:
+    """Свернуть задачи, которыми владеет вызывающий, не проглотив чужую отмену.
+
+    Отменить собственную задачу и погасить её `CancelledError` — штатная уборка.
+    Опасность ровно одна: в то же окно может прийти отмена извне (остановка
+    сессии, глобальный `asyncio.wait_for` в api/base.py). Голый
+    `except asyncio.CancelledError: pass` съедает и её — охватывающая корутина
+    продолжает работу вместо раскрутки, и вызывающий код принимает остановку за
+    обычное завершение.
+
+    Разделитель — счётчик `Task.cancelling()` (Python 3.11): он растёт на каждый
+    запрошенный извне `cancel()`. Сравнивается прирост, а не сам факт ненулевого
+    счётчика: уборку часто запускают прямо из блока
+    `except asyncio.CancelledError`, где счётчик уже равен единице, и прерываться
+    там нельзя — иначе ресурсы останутся висеть.
+
+    Все задачи сворачиваются до конца в любом случае, проброс — только после:
+    выход на первой же задаче оставил бы остальные без отмены. По той же причине
+    обычные исключения гасятся — задачу всё равно выбрасывают, а её ошибка не
+    должна обрывать уборку соседних.
+    """
+    current = asyncio.current_task()
+    cancels_before = current.cancelling() if current is not None else 0
+
+    for task in tasks:
+        if task is None:
+            continue
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    if current is not None and current.cancelling() > cancels_before:
+        raise asyncio.CancelledError

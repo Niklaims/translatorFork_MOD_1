@@ -21,46 +21,46 @@ PROPER_SEGMENT_GRAMMEMES = frozenset({"Name", "Surn", "Patr", "Geox", "Orgn", "T
 NOMINAL_POS = frozenset({"NOUN", "NPRO", "ADJF", "PRTF", "NUMR"})
 VERBAL_POS = frozenset({"VERB", "INFN", "GRND", "PRTS"})
 FORCED_FUNCTION_POS = {
-    **{
-        word: "PREP"
-        for word in (
+    **dict.fromkeys(
+        (
             "без", "в", "во", "до", "за", "из", "к", "ко", "на", "над",
             "о", "об", "от", "по", "под", "при", "про", "с", "со", "у",
-        )
-    },
-    **{word: "CONJ" for word in ("а", "да", "и", "или", "как", "но", "словно")},
-    **{word: "PRCL" for word in ("бы", "же", "ли", "не", "ни", "лишь", "ведь", "даже")},
-    **{
-        word: "NPRO"
-        for word in (
+        ),
+        "PREP",
+    ),
+    **dict.fromkeys(("а", "да", "и", "или", "как", "но", "словно"), "CONJ"),
+    **dict.fromkeys(("бы", "же", "ли", "не", "ни", "лишь", "ведь", "даже"), "PRCL"),
+    **dict.fromkeys(
+        (
             "я", "ты", "вы", "мы", "он", "она", "оно", "они", "его", "ее", "ему",
             "им", "их", "кто", "что", "мне", "нас", "вас", "нам", "вам",
             "ним", "них", "это",
-        )
-    },
-    **{
-        word: "ADJF"
-        for word in (
+        ),
+        "NPRO",
+    ),
+    **dict.fromkeys(
+        (
             "все", "всё", "тот", "та", "те", "той", "том", "тем", "тех",
             "один", "одна", "одно", "одни", "одного", "одной", "одному",
             "одним", "одних", "какой", "какая", "какое", "какие",
-        )
-    },
-    **{
-        word: "ADVB"
-        for word in (
+        ),
+        "ADJF",
+    ),
+    **dict.fromkeys(
+        (
             "так", "там", "тут", "где", "уже", "еще", "затем", "обратно",
             "совершенно", "просто", "прямо",
-        )
-    },
+        ),
+        "ADVB",
+    ),
     "больше": "COMP",
-    **{
-        word: "VERB"
-        for word in (
+    **dict.fromkeys(
+        (
             "был", "была", "было", "были", "буду", "будешь", "будет",
             "будем", "будете", "будут",
-        )
-    },
+        ),
+        "VERB",
+    ),
 }
 BOUNDARY_ANCHOR_WORDS = frozenset(FORCED_FUNCTION_POS)
 COMMON_PAIR_BONUSES = {

@@ -1040,10 +1040,19 @@ def _install_qt_message_handler():
         
         if is_threading_error:
             try:
-                if "_patched_qmessagebox_critical" in traceback.print_stack():
+                # Сверяем ИМЕНА кадров, а не текст стека: было
+                # `... in traceback.print_stack()`, но print_stack() печатает
+                # стек в stderr и возвращает None, так что проверка падала
+                # TypeError и подавление не срабатывало ни разу. Поиск
+                # подстроки в format_stack() тоже не годится — туда попадает
+                # исходная строка этой самой проверки, и она совпадает с собой.
+                if any(
+                    frame.name == "_patched_qmessagebox_critical"
+                    for frame in traceback.extract_stack()
+                ):
                     print("\n" + "!"*80)
                     return
-            except:
+            except Exception:
                 pass
             print("\n" + "!"*80)
             print("[SHERLOCK] ПОЙМАНА ОПАСНАЯ ОПЕРАЦИЯ С QT ИЗ ЧУЖОГО ПОТОКА!")
@@ -1055,8 +1064,8 @@ def _install_qt_message_handler():
             # которая дернула метод Qt, вызвавший ошибку.
             try:
                 traceback.print_stack()
-            except:
-                print("traceback.print_stack() не обнаружен") 
+            except Exception:
+                print("traceback.print_stack() не обнаружен")
             print("!"*80 + "\n")
 
     # Устанавливаем наш обработчик
@@ -1348,7 +1357,7 @@ def _patched_qmessagebox_critical(parent, title, text):
         # 1. Подготовка сообщения
         parts = text.split('\n\n', 1)
         header = parts[0]
-        details = text if len(parts) < 2 else text
+        details = text
 
         # Ошибки бывают на десятки/сотни строк: видимая часть окна
         # ограничивается, полный текст остаётся в раскрывающейся

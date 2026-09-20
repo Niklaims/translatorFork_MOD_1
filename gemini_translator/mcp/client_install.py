@@ -123,6 +123,13 @@ def install_claude_config(
     if mode != "write":
         raise ValueError(f"Unsupported install mode for Claude config: {mode}")
 
+    # Путь приходит от клиента MCP вместе с mode=write, а пишем мы сюда JSON.
+    # Без этой проверки любой файл, который клиент назовёт (хоть ~/.zshrc),
+    # создаётся или затирается конфигом. Существующий не-JSON спасал только
+    # побочный эффект: разбор ниже падал раньше записи.
+    if config_path.suffix.lower() != ".json":
+        raise ValueError(f"Claude config path must end with .json: {config_path}")
+
     payload: dict[str, Any] = {}
     if config_path.exists():
         payload = json.loads(config_path.read_text(encoding="utf-8"))

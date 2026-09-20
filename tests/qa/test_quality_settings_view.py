@@ -86,9 +86,9 @@ def test_an_edit_is_published(qt_app):
     view = QualitySettingsView(QaSettings())
     published = _published(view)
 
-    view.language_check.setChecked(False)
+    view.language_check.setChecked(True)
 
-    assert published and published[-1].check_language_after_chapter is False
+    assert published and published[-1].check_language_after_chapter is True
 
 
 def test_loading_settings_publishes_nothing(qt_app):
@@ -241,7 +241,7 @@ def test_a_key_once_picked_for_gemini_is_replaced_on_the_first_edit(qt_app):
     )
     published = _published(view)
 
-    view.language_check.setChecked(False)
+    view.language_check.setChecked(True)
 
     assert published[-1].embedding_api_key == ""
     assert published[-1].embedding_key_provider == "gemini"

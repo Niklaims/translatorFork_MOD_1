@@ -28,15 +28,19 @@ EMBEDDING_PROVIDERS = frozenset({"auto", "gemini", "openai_compatible", "local_o
 class QaSettings:
     """Everything the user can decide about translation QA, with safe defaults.
 
-    Defaults keep the four chapter-level behaviours on and every heavyweight or
-    outbound analyzer off. A capability flag alone never installs a model, runs
-    Java, or sends text anywhere: each one also needs its own explicit setup,
-    checked by :meth:`unsatisfied_requirements`.
+    Quality control is something a user switches on: both chapter checks start
+    off, and with neither on there is no QA at all.  A choice the user saved,
+    including one saved by an older version with these checks on, is read back
+    as it was.  The repairs and the final pass stay on, so switching a check on
+    brings the whole familiar behaviour.  Every heavyweight or outbound
+    analyzer is off as well. A capability flag alone never installs a model,
+    runs Java, or sends text anywhere: each one also needs its own explicit
+    setup, checked by :meth:`unsatisfied_requirements`.
     """
 
-    check_completeness_after_chapter: bool = True
+    check_completeness_after_chapter: bool = False
     auto_repair_confirmed_omissions: bool = True
-    check_language_after_chapter: bool = True
+    check_language_after_chapter: bool = False
     auto_repair_objective_language_issues: bool = True
     auto_fix_language_categories: tuple[str, ...] = DEFAULT_AUTO_FIX_CATEGORIES
     embedding_provider: str = "auto"
@@ -243,6 +247,11 @@ class QaSettings:
             if not self.embedding_base_url:
                 return "Для OpenAI-совместимых эмбеддингов не указан адрес сервиса."
         return ""
+
+    @property
+    def checks_enabled(self) -> bool:
+        """Report whether any chapter check is on; with none, QA does not run."""
+        return self.check_completeness_after_chapter or self.check_language_after_chapter
 
     @property
     def cometkiwi_is_remote(self) -> bool:

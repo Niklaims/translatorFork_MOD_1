@@ -2234,7 +2234,7 @@ class TranslationValidatorPage(ShellPage):
         
         # Спец-сигнал для чекбокса "Включить готовые"
         try: self.check_revalidate_ok.clicked.disconnect() 
-        except: pass
+        except Exception: pass
         self.check_revalidate_ok.clicked.connect(self._on_revalidate_ok_toggled)
 
         # --- ЛЕНИВАЯ ЗАГРУЗКА ---

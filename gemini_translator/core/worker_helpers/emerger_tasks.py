@@ -119,7 +119,7 @@ class EmergencyTask:
                 best_split_pos = pos + len(marker)
         
         partial_text = untrimmed_partial_text[:best_split_pos].rstrip() if best_split_pos != -1 else untrimmed_partial_text
-        if partial_text != untrimmed_partial_text and list(task_payload)[0] == 'epub':
+        if partial_text != untrimmed_partial_text and next(iter(task_payload), None) == 'epub':
             self.worker._post_event('log_message', {'message': "[INFO] Ответ AI оборван. 'Хвост' обрезан до последнего разделителя для чистого доперевода."})
 
         # --- ЗАЩИТА ОТ ВЫРОЖДЕННОГО ХВОСТА ---

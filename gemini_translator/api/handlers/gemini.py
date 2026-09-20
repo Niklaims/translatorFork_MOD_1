@@ -326,7 +326,7 @@ class GeminiApiHandler(BaseApiHandler):
         try:
             error_text_raw = await response.text()
             error_dict = json.loads(error_text_raw)
-        except:
+        except Exception:
             error_dict = {'error': {'message': f"Status {response.status}: {error_text_raw[:200]}"}}
         
         # Обработка случая, если API вернул список ошибок (бывает у Google)

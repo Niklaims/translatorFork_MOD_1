@@ -441,6 +441,9 @@ class _ConsistencyMockWorker:
 
     @is_cancelled.setter
     def is_cancelled(self, value):
+        # Намеренно пусто: флаг только читается, а источник истины — сигнал
+        # отмены. Сеттер существует, чтобы чужая запись не падала с
+        # AttributeError и при этом не могла подменить настоящее состояние.
         pass
 
     def check_cancellation(self):
@@ -1634,7 +1637,7 @@ class ConsistencyEngine(QObject):
             with open(prompts_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
         except Exception as e:
-            logger.error(f"Failed to load consistency prompts: {e}")
+            logger.exception(f"Failed to load consistency prompts: {e}")
             return {}
 
         return data if isinstance(data, dict) else {}
@@ -2050,7 +2053,7 @@ class ConsistencyEngine(QObject):
                         prompt_template = "\n".join(
                             prompts_data.get("batch_chapter_fix", []))
                 except Exception as e:
-                    logger.error(f"Failed to load batch fix prompt: {e}")
+                    logger.exception(f"Failed to load batch fix prompt: {e}")
             
             if not prompt_template:
                 prompt_template = "Fix the following errors in the chapter:\n{errors_list}\n\nChapter:\n{chapter_content}"
@@ -2083,7 +2086,7 @@ class ConsistencyEngine(QObject):
                         prompt_template = "\n".join(
                             prompts_data.get("consistency_correction", []))
                 except Exception as e:
-                    logger.error(f"Failed to load correction prompt: {e}")
+                    logger.exception(f"Failed to load correction prompt: {e}")
             
             if not prompt_template:
                 prompt_template = "Fix this error: {error_description}\n\nChapter:\n{chapter_content}"
@@ -2182,7 +2185,7 @@ class ConsistencyEngine(QObject):
                     results[chapter['path']] = fixed_content
                     self.fix_completed.emit(chapter['path'], fixed_content)
                 except Exception as e:
-                    logger.error(f"Error fixing chapter {chapter_name}: {e}")
+                    logger.exception(f"Error fixing chapter {chapter_name}: {e}")
                     self.error_occurred.emit(f"Ошибка при исправлении {chapter_name}: {e}")
                     with self._active_keys_lock:
                         no_active_keys = not active_keys
@@ -2263,7 +2266,7 @@ class ConsistencyEngine(QObject):
                 self.fix_completed.emit(chapter['path'], fixed_content)
                 
             except Exception as e:
-                logger.error(f"Error fixing chapter {chapter_name}: {e}")
+                logger.exception(f"Error fixing chapter {chapter_name}: {e}")
                 self.error_occurred.emit(f"Ошибка при исправлении {chapter_name}: {e}")
                 if self.is_cancelled or not active_keys:
                     self.is_cancelled = True
@@ -2586,7 +2589,7 @@ class ConsistencyEngine(QObject):
                     raise ValueError("AI returned JSON in an unexpected schema after repair.")
                 return validated
             except Exception as e:
-                logger.error(f"Failed to parse AI response: {e}\nOriginal text: {text[:500]}...")
+                logger.exception(f"Failed to parse AI response: {e}\nOriginal text: {text[:500]}...")
                 raise ValueError(f"Не удалось разобрать JSON-ответ AI-consistency: {e}") from e
 
     def _validate_response(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:

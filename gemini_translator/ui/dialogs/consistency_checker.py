@@ -733,7 +733,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
             try:
                 with open(prompts_file, 'r', encoding='utf-8') as f:
                     prompts_data = json.load(f)
-            except: pass
+            except Exception: pass
             
         scroll = QSplitter(Qt.Orientation.Vertical)
         
@@ -814,7 +814,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
                 prompts_data = json.load(f)
                 for key, editor in self.prompts_editors.items():
                     editor.setPlainText("\n".join(prompts_data.get(key, [])))
-        except: pass
+        except Exception: pass
 
     def _toggle_all_problems(self, state):
         """Включает/выключает чекбоксы для всех строк."""
@@ -1042,7 +1042,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
             with open(project_glossary_path, 'r', encoding='utf-8') as f:
                 return self._normalize_shared_project_glossary_entries(json.load(f))
         except Exception as e:
-            logger.error("Failed to load shared project glossary: %s", e, exc_info=True)
+            logger.exception("Failed to load shared project glossary: %s", e, exc_info=True)
             self._log(f"⚠️ Не удалось загрузить project_glossary.json: {e}")
             return []
 
@@ -2728,7 +2728,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
                     tmp_file.unlink()
             except Exception:
                 pass
-            logger.error(f"Failed to save session: {e}", exc_info=True)
+            logger.exception(f"Failed to save session: {e}", exc_info=True)
 
     def _restore_session(self, data):
         """Восстанавливает состояние из словаря данных."""

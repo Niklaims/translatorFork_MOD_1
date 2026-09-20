@@ -66,7 +66,7 @@ class NotificationManager:
                 try:
                     subprocess.Popen(['osascript', '-e', script])
                 except Exception as e:
-                    logger.error(f"Failed to send macOS notification: {e}")
+                    logger.exception(f"Failed to send macOS notification: {e}")
 
         elif sys.platform == 'win32':
             safe_msg = str(message).replace("'", "''").replace('<', '&lt;').replace('>', '&gt;')
@@ -84,4 +84,4 @@ $notifier.Show($toast)
             try:
                 subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script], creationflags=0x08000000)
             except Exception as e:
-                logger.error(f"Failed to send Windows notification: {e}")
+                logger.exception(f"Failed to send Windows notification: {e}")
