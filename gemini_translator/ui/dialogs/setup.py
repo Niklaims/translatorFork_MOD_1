@@ -109,6 +109,29 @@ TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
 # --- КОНЕЦ НОВЫХ КОНСТАНТ ---
 
 
+def load_bool_setting(settings_manager, key: str, default: bool) -> bool:
+    """Читает один булев флаг из снапшота настроек сессии.
+
+    Пробует ``load_full_session_settings``, затем ``load_settings`` — так
+    исторически хранятся переключатели интерфейса в разных диалогах.
+    Отсутствие менеджера настроек, отсутствие загрузчика, исключение при
+    загрузке, не-dict снапшот или отсутствие ключа — всё падает на ``default``.
+    """
+    if settings_manager is None:
+        return bool(default)
+    for loader_name in ("load_full_session_settings", "load_settings"):
+        loader = getattr(settings_manager, loader_name, None)
+        if not callable(loader):
+            continue
+        try:
+            settings = loader()
+        except Exception:
+            continue
+        if isinstance(settings, dict) and key in settings:
+            return bool(settings.get(key))
+    return bool(default)
+
+
 def _prepare_project_location(folder_path, file_path, choice, move_original):
     """Create/move project files without touching Qt widgets.
 
