@@ -5,7 +5,7 @@ import time
 import zipfile
 import json
 import re
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 import uuid # <--- ДОБАВИТЬ ЭТОТ ИМПОРТ
 # --- Импорты из PyQt6 ---
 from PyQt6 import QtWidgets, QtCore, QtGui
@@ -28,6 +28,7 @@ from gemini_translator.ui.widgets.preset_widget import PresetWidget
 from gemini_translator.ui.widgets.ancestor_utils import find_ancestor_by_class_name
 from gemini_translator.ui.overlay_host import exec_dialog
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
+from ..validation_dialogs.quality_widgets import plural
 from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.widgets.overlay_tab_widget import OverlayTabWidget
 from gemini_translator.ui import theme_manager
@@ -56,6 +57,104 @@ if TYPE_CHECKING:
     from ..glossary import MainWindow
 
 
+
+# --- Нарезка полезной нагрузки на пакеты ---
+
+PayloadUnit = namedtuple("PayloadUnit", ("section", "lines"))
+
+# Готовый пакет: его единицы и та цена, по которой упаковщик его набирал.
+PayloadBatch = namedtuple("PayloadBatch", ("units", "tokens"))
+
+# Что собрал этап подготовки: текст запроса, его цена и те же данные единицами
+# нарезки — из них собирается либо один запрос, либо пакеты.
+PayloadBundle = namedtuple("PayloadBundle", (
+    "text", "tokens", "blocks", "context_added",
+    "hidden_count", "neighbors_count", "pattern_count", "units",
+))
+
+# Заголовки секций в точности повторяют прежнюю сборку одним куском.
+PAYLOAD_SECTION_HEADERS = {
+    "context": "\n--- GLOSSARY CONTEXT ---\n",
+    "direct": "\n--- DIRECT CONFLICTS ---\n",
+    "reverse": "\n--- REVERSE CONFLICTS ---\n",
+    "overlaps": "\n--- OVERLAPS ---\n",
+    "patterns": "\n--- PATTERNS ---\n",
+    "hidden": "\n--- HIDDEN CONFLICTS ---\n",
+    "untranslated": "\n--- UNTRANSLATED ---\n",
+}
+
+
+# Причины, по которым движок сообщает о неудачном конце сессии.
+SESSION_INTERRUPTION_MARKERS = ("Отменено", "Ошибка", "исчерпаны")
+
+
+def session_was_interrupted(reason):
+    """Сессия оборвалась, а не дошла до конца очереди."""
+    text = reason or ""
+    return any(marker in text for marker in SESSION_INTERRUPTION_MARKERS)
+
+
+def partial_results_notice(term_count):
+    """Что сказать, когда часть пакетов доехала, а сессия оборвалась."""
+    word = plural(term_count, 'термин', 'термина', 'терминов')
+    arrived = plural(term_count, 'успел', 'успели', 'успели')
+    return (
+        f"Проверка прервана, но {term_count} {word} {arrived} вернуться "
+        "из уже отправленных пакетов. Остальные остались непроверенными — "
+        "запустите коррекцию ещё раз, когда причина устранится."
+    )
+
+
+def render_payload_units(units):
+    """Собирает текст запроса, ставя заголовок перед первой единицей секции."""
+    lines = []
+    current_section = None
+    for unit in units:
+        if unit.section != current_section:
+            lines.append(PAYLOAD_SECTION_HEADERS[unit.section])
+            current_section = unit.section
+        lines.extend(unit.lines)
+
+    text = "\n".join(lines)
+    text = re.sub(r'\n---\s*\n\s*---\n', r'\n---\n', text)
+    text = re.sub(r'\n{3,}', r'\n\n', text)
+    return text
+
+
+def split_units_into_batches(units, budget, estimate_tokens):
+    """Жадно набивает единицы в пакеты, не превышая бюджет в токенах.
+
+    Единица неделима: половина группы конфликта в отдельном запросе модели
+    бесполезна. Единица, которая сама не влезает в бюджет, уезжает отдельным
+    пакетом — предупредить об этом обязана вызывающая сторона. Заголовок
+    секции стоит один раз на пакет, поэтому и в бюджете считается один раз.
+    """
+    batches = []
+    current = []
+    current_cost = 0
+    current_sections = set()
+
+    for unit in units:
+        unit_cost = estimate_tokens("\n".join(unit.lines))
+        header_cost = (
+            0 if unit.section in current_sections
+            else estimate_tokens(PAYLOAD_SECTION_HEADERS[unit.section])
+        )
+
+        if current and current_cost + header_cost + unit_cost > budget:
+            batches.append(PayloadBatch(units=current, tokens=current_cost))
+            current = []
+            current_cost = 0
+            current_sections = set()
+            header_cost = estimate_tokens(PAYLOAD_SECTION_HEADERS[unit.section])
+
+        current.append(unit)
+        current_cost += header_cost + unit_cost
+        current_sections.add(unit.section)
+
+    if current:
+        batches.append(PayloadBatch(units=current, tokens=current_cost))
+    return batches
 
 class NoteWipeResolutionDialog(QDialog):
     """
@@ -390,6 +489,14 @@ class CorrectionSessionPage(ShellPage):
         self.cb_overlaps.setToolTip("Проблемы вхождения одного термина в другой.")
         self.cb_overlaps.setChecked(False)
 
+        self.cb_untranslated = QCheckBox("Непереведённые остатки")
+        self.cb_untranslated.setToolTip(
+            "Термины, перевод которых остался на языке оригинала (латиница или иероглифы).\n"
+            "Те же, что находит кнопка «Непереведенные остатки» в менеджере глоссария,\n"
+            "но уходят на перевод все разом."
+        )
+        self.cb_untranslated.setChecked(False)
+
         layout_general.addLayout(self.data_grid_layout)
 
         self.frequency_group = QGroupBox("Частотный диапазон")
@@ -423,6 +530,30 @@ class CorrectionSessionPage(ShellPage):
         frequency_layout.addWidget(self.frequency_status_label)
 
         layout_general.addWidget(self.frequency_group)
+
+        self.batching_group = QGroupBox("Пакеты")
+        batching_layout = QHBoxLayout(self.batching_group)
+        self.cb_batching = QCheckBox("Разбивать запрос на пакеты")
+        self.cb_batching.setToolTip(
+            "Большой глоссарий уезжает не одним запросом, а несколькими: каждый пакет\n"
+            "идёт отдельной задачей, а правки всех пакетов приходят одним списком.\n"
+            "Группы терминов не разрываются, но конфликт между терминами из разных\n"
+            "пакетов модель не увидит."
+        )
+        self.cb_batching.setChecked(False)
+
+        self.batch_size_spinbox = NoScrollSpinBox(self)
+        self.batch_size_spinbox.setRange(1, 2000)
+        self.batch_size_spinbox.setSuffix(" тыс.")
+        self.batch_size_spinbox.setToolTip("Предел одного пакета в тысячах токенов.")
+        self.batch_size_spinbox.setEnabled(False)
+
+        batching_layout.addWidget(self.cb_batching)
+        batching_layout.addStretch()
+        batching_layout.addWidget(QLabel("не больше"))
+        batching_layout.addWidget(self.batch_size_spinbox)
+
+        layout_general.addWidget(self.batching_group)
         layout_general.addStretch(1) # Пружина снизу
         opt_tabs.addTab(tab_general, "Данные")
 
@@ -499,6 +630,9 @@ class CorrectionSessionPage(ShellPage):
         self.cb_direct.stateChanged.connect(self.update_token_estimation)
         self.cb_reverse.stateChanged.connect(self.update_token_estimation)
         self.cb_overlaps.stateChanged.connect(self.update_token_estimation)
+        self.cb_untranslated.stateChanged.connect(self.update_token_estimation)
+        self.cb_batching.stateChanged.connect(self._on_batching_toggled)
+        self.batch_size_spinbox.valueChanged.connect(self.update_token_estimation)
         self.cb_hierarchical_patterns.stateChanged.connect(self.update_token_estimation)
         self.cb_frequency_filter.stateChanged.connect(self._on_frequency_filter_toggled)
         self.freq_min_spinbox.valueChanged.connect(self._on_frequency_range_changed)
@@ -535,6 +669,8 @@ class CorrectionSessionPage(ShellPage):
         app = QtWidgets.QApplication.instance()
         if app and hasattr(app, 'event_bus'):
             app.event_bus.event_posted.connect(self._on_global_event)
+
+        self.batch_size_spinbox.setValue(self._default_batch_thousands())
 
         self._ui_is_fully_loaded = True
         self.update_token_estimation()
@@ -583,8 +719,8 @@ class CorrectionSessionPage(ShellPage):
         settings = self.get_settings()
 
         # --- Шаг 1: Подготовка данных ---
-        data_for_ai, estimated_tokens, found_blocks, context_was_added, _, _, _ = self._get_data_and_estimate_tokens()
-        if data_for_ai is None:
+        payload = self._get_data_and_estimate_tokens()
+        if payload.text is None:
             return None
 
         if self.cb_frequency_filter.isChecked() and self._term_frequency_map:
@@ -599,30 +735,42 @@ class CorrectionSessionPage(ShellPage):
 
         # --- Логика проверки контента ---
         is_full_context = self.cb_context.isChecked()
-        if not is_full_context and not found_blocks:
+        if not is_full_context and not payload.blocks:
             QMessageBox.information(self, "Нет проблем",
                                     "Вы отключили отправку всего глоссария, но не выбрали ни одной категории проблем (или проблем нет).\n"
                                     "Данных для отправки нет.")
             return None
 
-        if not context_was_added and not found_blocks:
+        if not payload.context_added and not payload.blocks:
             QMessageBox.warning(self, "Пусто", "Нет данных для отправки. Проверьте настройки или содержимое глоссария.")
             return None
 
-        # --- Проверка токенов ---
+        # --- Нарезка на пакеты и проверка токенов ---
         model_config = settings.get('model_config', {})
         SAFE_PROMPT_TOKEN_LIMIT = int(model_config.get("context_length", 128000) * 0.9)
-        if estimated_tokens > SAFE_PROMPT_TOKEN_LIMIT:
+        batches = self._payload_batches(payload)
+        if batches:
+            batch_texts = [render_payload_units(batch.units) for batch in batches]
+            batch_costs = [batch.tokens for batch in batches]
+        else:
+            # Разбиение выключено (None) или резать нечего: один запрос целиком.
+            batch_texts = [payload.text]
+            batch_costs = [payload.tokens]
+
+        oversized = [cost for cost in batch_costs if cost > SAFE_PROMPT_TOKEN_LIMIT]
+        if oversized:
+            headline, details = self._oversize_warning(
+                limit=SAFE_PROMPT_TOKEN_LIMIT,
+                batch_count=len(batch_texts),
+                oversized_count=len(oversized),
+                payload_tokens=payload.tokens,
+            )
+
             msg_box = QMessageBox(self)
             msg_box.setIcon(QMessageBox.Icon.Warning)
             msg_box.setWindowTitle("Запрос слишком велик")
-            msg_box.setText(
-                f"Расчетное количество токенов ({estimated_tokens:,}) превышает безопасный лимит ({SAFE_PROMPT_TOKEN_LIMIT:,})."
-            )
-            msg_box.setInformativeText(
-                "Отправка такого большого запроса может привести к ошибке API или неполному результату.\n"
-                "Вы уверены, что хотите продолжить?"
-            )
+            msg_box.setText(headline)
+            msg_box.setInformativeText(details)
             continue_button = msg_box.addButton("Все равно продолжить", QMessageBox.ButtonRole.DestructiveRole)
             cancel_button = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
             msg_box.setDefaultButton(cancel_button)
@@ -632,7 +780,7 @@ class CorrectionSessionPage(ShellPage):
                 return None
 
         # --- Сборка промпта и задачи ---
-        final_prompt_template = self._build_final_prompt(found_blocks, context_was_added)
+        final_prompt_template = self._build_final_prompt(payload.blocks, payload.context_added)
         settings['glossary_generation_prompt'] = final_prompt_template
 
         if not self.engine.task_manager:
@@ -640,20 +788,139 @@ class CorrectionSessionPage(ShellPage):
             return None
 
         VIRTUAL_CHAPTER_PATH = "correction_data.txt"
+        tasks = []
         try:
-            virtual_epub_path = self._create_virtual_epub(data_for_ai, VIRTUAL_CHAPTER_PATH)
+            for batch_text in batch_texts:
+                virtual_epub_path = self._create_virtual_epub(batch_text, VIRTUAL_CHAPTER_PATH)
+                tasks.append(('glossary_batch_task', virtual_epub_path, (VIRTUAL_CHAPTER_PATH,)))
         except Exception as e:
             QMessageBox.critical(self, "Ошибка создания данных", f"Не удалось подготовить виртуальный файл:\n{e}")
             return None
 
-        task = ('glossary_batch_task', virtual_epub_path, (VIRTUAL_CHAPTER_PATH,))
-
-        # Очищаем очередь и добавляем задачу
+        # Очищаем очередь и добавляем задачи. Движок с num_instances=1 берёт их
+        # по одной, а результаты всех пакетов копятся в glossary_results и
+        # приходят одним патчем на session_finished.
         self.engine.task_manager.clear_all_queues()
         self.engine.task_manager.clear_glossary_results()
-        self.engine.task_manager.add_pending_tasks([task])
+        self.engine.task_manager.add_pending_tasks(tasks)
 
         return settings
+
+    def _default_batch_thousands(self):
+        """Начальное значение поля: безопасный лимит текущей модели.
+
+        Дальше поле принадлежит пользователю — сменой модели оно не
+        переписывается, иначе набранное вручную число молча пропадало бы.
+        """
+        model_config = self.get_settings().get('model_config', {}) or {}
+        safe_limit = int(model_config.get("context_length", 128000) * 0.9)
+        return max(1, safe_limit // 1000)
+
+    def _on_batching_toggled(self):
+        self.batch_size_spinbox.setEnabled(self.cb_batching.isChecked())
+        self.update_token_estimation()
+
+    def _batch_budget_tokens(self):
+        """Бюджет пакета в токенах, либо None — если разбиение выключено."""
+        checkbox = getattr(self, 'cb_batching', None)
+        spinbox = getattr(self, 'batch_size_spinbox', None)
+        if checkbox is None or spinbox is None or not checkbox.isChecked():
+            return None
+        return max(1, int(spinbox.value()) * 1000)
+
+    def _token_label_text(self, payload, limit):
+        """Текст метки под панелью и признак «не влезает в лимит модели»."""
+        budget = self._batch_budget_tokens()
+        if budget is None:
+            return (
+                f"Запрос: <b>{payload.tokens:,}</b> / {limit:,} токенов",
+                payload.tokens > limit,
+            )
+
+        batches = self._payload_batches(payload)
+        count = len(batches) or 1
+        biggest = max((batch.tokens for batch in batches), default=payload.tokens)
+        return (
+            f"Запрос: <b>{payload.tokens:,}</b> токенов · "
+            f"{count} {plural(count, 'пакет', 'пакета', 'пакетов')} по ≤{budget:,}",
+            biggest > limit,
+        )
+
+    def _oversize_warning(self, limit, batch_count, oversized_count, payload_tokens):
+        """Заголовок и пояснение для запроса, не влезающего в лимит модели.
+
+        Совет обязан отвечать настоящей причине: предлагать включить пакеты
+        тому, у кого они уже включены, бессмысленно.
+        """
+        budget = self._batch_budget_tokens()
+        if budget is None:
+            return (
+                f"Расчетное количество токенов ({payload_tokens:,}) превышает "
+                f"безопасный лимит ({limit:,}).",
+                "Отправка такого большого запроса может привести к ошибке API или неполному результату.\n"
+                "Включите «Разбивать запрос на пакеты», чтобы отправить его частями.\n"
+                "Вы уверены, что хотите продолжить?",
+            )
+
+        headline = (
+            f"Пакетов: {batch_count}, из них {oversized_count} не влезает "
+            f"в безопасный лимит модели ({limit:,} токенов)."
+        )
+        if budget > limit:
+            details = (
+                f"Предел пакета ({budget:,}) больше лимита модели. "
+                f"Поставьте не больше {limit // 1000} тыс.\n"
+                "Вы уверены, что хотите продолжить?"
+            )
+        else:
+            details = (
+                "Пакет не влез целиком, потому что это одна неделимая группа терминов: "
+                "разрывать её между запросами нельзя.\n"
+                "Уменьшите объём данных — снимите «Весь глоссарий» или сузьте частотный "
+                "диапазон — либо возьмите модель с большим контекстом.\n"
+                "Вы уверены, что хотите продолжить?"
+            )
+        return headline, details
+
+    def _payload_batches(self, payload):
+        """Пакеты единицами, либо None — если разбиение выключено.
+
+        Цену пакета считает сам упаковщик, поэтому метке не нужно собирать и
+        заново мерить тексты: на глоссарии в 17 тысяч терминов это экономит
+        полтораста миллисекунд на каждый пересчёт.
+        """
+        budget = self._batch_budget_tokens()
+        if budget is None:
+            return None
+        return split_units_into_batches(payload.units, budget, TokenCounter().estimate_tokens)
+
+    def _data_checkboxes_to_show(self):
+        """Категории, у которых есть данные. Пустая категория в сетку не идёт
+        и снимается, чтобы не влиять на расчёт токенов."""
+        main_window = self._get_glossary_owner()
+        if not main_window or main_window.__class__.__name__ not in ('MainWindow', 'GlossaryManagerPage'):
+            return []
+
+        # Контекст и примечания доступны всегда — ими управляют вручную.
+        widgets_to_show = [self.cb_context, self.cb_notes]
+
+        has_overlaps = (len(main_window.overlap_groups) > 0) or (len(main_window.inverted_overlaps) > 0)
+        has_residue = bool(getattr(main_window, 'untranslated_residue', None))
+
+        for checkbox, has_data in (
+            (self.cb_direct, bool(main_window.direct_conflicts)),
+            (self.cb_reverse, bool(main_window.reverse_issues)),
+            (self.cb_overlaps, has_overlaps),
+            (getattr(self, 'cb_untranslated', None), has_residue),
+        ):
+            if checkbox is None:
+                continue
+            if has_data:
+                widgets_to_show.append(checkbox)
+            else:
+                checkbox.setChecked(False)
+
+        return widgets_to_show
 
     def _repack_data_tab_layout(self):
         """
@@ -665,28 +932,7 @@ class CorrectionSessionPage(ShellPage):
             return
 
         # 1. Определяем, какие виджеты должны быть показаны
-        widgets_to_show = []
-
-        # Context и Notes всегда доступны, если глоссарий не пуст (но покажем всегда для простоты управления)
-        widgets_to_show.append(self.cb_context)
-        widgets_to_show.append(self.cb_notes)
-
-        # Проверяем наличие данных для остальных
-        if main_window.direct_conflicts:
-            widgets_to_show.append(self.cb_direct)
-        else:
-            self.cb_direct.setChecked(False) # Сбрасываем, чтобы не влияло на расчет
-
-        if main_window.reverse_issues:
-            widgets_to_show.append(self.cb_reverse)
-        else:
-            self.cb_reverse.setChecked(False)
-
-        has_overlaps = (len(main_window.overlap_groups) > 0) or (len(main_window.inverted_overlaps) > 0)
-        if has_overlaps:
-            widgets_to_show.append(self.cb_overlaps)
-        else:
-            self.cb_overlaps.setChecked(False)
+        widgets_to_show = self._data_checkboxes_to_show()
 
         # 2. Очищаем текущую сетку (удаляем элементы из Layout, но не удаляем сами объекты виджетов)
         # Обратный цикл нужен, чтобы корректно удалять по индексу
@@ -914,7 +1160,7 @@ class CorrectionSessionPage(ShellPage):
     def _get_data_and_estimate_tokens(self):
         main_window = self._get_glossary_owner()
         if not main_window or main_window.__class__.__name__ not in ('MainWindow', 'GlossaryManagerPage'):
-            return None, 0, None, False, 0, 0, 0
+            return PayloadBundle(None, 0, None, False, 0, 0, 0, [])
 
         # Сброс реестра усыновленных терминов
         self.adopted_terms_registry = set()
@@ -1081,6 +1327,27 @@ class CorrectionSessionPage(ShellPage):
             actual_hidden_count = len(final_hidden_conflicts)
             processed_terms.update(final_hidden_conflicts)
 
+        # 2.7 Непереведённые остатки (латиница/CJK в поле перевода)
+        if getattr(self, 'cb_untranslated', None) is not None and self.cb_untranslated.isChecked():
+            residue_map = getattr(main_window, 'untranslated_residue', None) or {}
+            residue_terms = set()
+            for residue_data in residue_map.values():
+                for hit in residue_data.get('entries_with_residue', []):
+                    # Остаток в примечании термином не является: перевод такой
+                    # записи в порядке, переводить нечего.
+                    if hit.get('location') != 'rus':
+                        continue
+                    term = (hit.get('entry') or {}).get('original')
+                    if term:
+                        residue_terms.add(term)
+
+            residue_terms -= processed_terms
+            if allowed_terms is not None:
+                residue_terms &= allowed_terms
+            if residue_terms:
+                found_blocks['untranslated'] = sorted(residue_terms)
+                processed_terms.update(residue_terms)
+
         final_neighbors_set = raw_context_neighbors - processed_terms
         actual_neighbors_count = len(final_neighbors_set)
 
@@ -1104,26 +1371,31 @@ class CorrectionSessionPage(ShellPage):
                 glossary_multimap[e['original']].append(e)
 
         include_notes = self.cb_notes.isChecked()
-        output_lines = []
+
+        # Вывод собирается единицами нарезки: одна единица — одна смысловая
+        # группа, которую нельзя разорвать между запросами. Без разбиения на
+        # пакеты render_payload_units() склеивает их обратно в прежний текст.
+        payload_units = []
         context_was_added = False
 
+        def add_unit(section, lines):
+            if lines:
+                payload_units.append(PayloadUnit(section=section, lines=list(lines)))
+
         if glossary_to_format:
-            output_lines.append("\n--- GLOSSARY CONTEXT ---\n")
-            output_lines.extend(self._format_compact_group(
-                [e['original'] for e in glossary_to_format], glossary_multimap, include_notes
-            ))
             context_was_added = True
+            for term in sorted(set(e['original'] for e in glossary_to_format)):
+                add_unit('context', self._format_compact_group(
+                    [term], glossary_multimap, include_notes
+                ))
 
         if found_blocks.get('direct'):
-            output_lines.append("\n--- DIRECT CONFLICTS ---\n")
             for term in found_blocks['direct']:
                 lines = self._format_compact_group([term], glossary_multimap, include_notes)
                 if lines:
-                    output_lines.extend(lines)
-                    output_lines.append("")
+                    add_unit('direct', lines + [""])
 
         if found_blocks.get('reverse'):
-            output_lines.append("\n--- REVERSE CONFLICTS ---\n")
             rev_map_by_trans = defaultdict(list)
             for term in found_blocks['reverse']:
                 entries = glossary_multimap.get(term, [])
@@ -1133,55 +1405,56 @@ class CorrectionSessionPage(ShellPage):
             for rus_key in sorted(rev_map_by_trans.keys()):
                 lines = self._format_compact_group(sorted(list(set(rev_map_by_trans[rus_key]))), glossary_multimap, include_notes)
                 if lines:
-                    output_lines.extend(lines)
-                    output_lines.append("")
+                    add_unit('reverse', lines + [""])
 
         if found_blocks.get('overlaps'):
-            output_lines.append("\n--- OVERLAPS ---\n")
-
-            overlap_list = found_blocks['overlaps']
-            for i, group in enumerate(overlap_list):
-                if i > 0: output_lines.append("")
-                output_lines.append(f'--- "{group["leader"]}" ---')
+            for i, group in enumerate(found_blocks['overlaps']):
+                # Пустая строка-разделитель принадлежит группе, а не секции:
+                # так она не потеряется, в какой бы пакет группа ни попала.
+                lines = [""] if i > 0 else []
+                lines.append(f'--- "{group["leader"]}" ---')
 
                 matches = group.get('matches', {})
                 for term in group['unique_terms']:
-                    lines = self._format_compact_group([term], glossary_multimap, include_notes)
-                    output_lines.extend(lines)
+                    lines.extend(self._format_compact_group([term], glossary_multimap, include_notes))
 
                     if term in matches:
                         children = sorted(matches[term])
                         children_lines = self._format_compact_group(children, glossary_multimap, include_notes)
                         for child_line in children_lines:
-                            output_lines.append(f"> {child_line}")
+                            lines.append(f"> {child_line}")
+                add_unit('overlaps', lines)
 
         if found_blocks.get('patterns'):
-            output_lines.append("\n--- PATTERNS ---\n")
             # found_blocks['patterns'] теперь OrderedDict отсортированный по гравитации
             if hasattr(self, 'cb_hierarchical_patterns') and self.cb_hierarchical_patterns.isChecked():
                 for p, m in found_blocks['patterns'].items():
-                    output_lines.extend(self._format_hierarchical_pattern_block(p, m, glossary_multimap, include_notes))
+                    add_unit('patterns', self._format_hierarchical_pattern_block(p, m, glossary_multimap, include_notes))
             else:
                 for p, m in found_blocks['patterns'].items():
                     realized_p = self._determine_realized_pattern(p, m)
-                    output_lines.append(f'\n--- Pattern: "{realized_p}" ---')
-                    output_lines.extend(self._format_compact_group(self._sort_members_with_leader(m, p), glossary_multimap, include_notes))
+                    add_unit('patterns', [f'\n--- Pattern: "{realized_p}" ---']
+                             + self._format_compact_group(self._sort_members_with_leader(m, p), glossary_multimap, include_notes))
 
         if found_blocks.get('hidden'):
-            output_lines.append("\n--- HIDDEN CONFLICTS ---\n")
             for i, comp in enumerate(found_blocks['hidden']):
-                output_lines.append(f'--- Group {i+1} ---')
-                output_lines.extend(self._format_compact_group(comp, glossary_multimap, include_notes))
+                add_unit('hidden', [f'--- Group {i+1} ---']
+                         + self._format_compact_group(comp, glossary_multimap, include_notes))
 
-        data_as_free_text = "\n".join(output_lines)
-        data_as_free_text = re.sub(r'\n---\s*\n\s*---\n', r'\n---\n', data_as_free_text)
-        data_as_free_text = re.sub(r'\n{3,}', r'\n\n', data_as_free_text)
-        # if found_blocks.get('patterns'):
-            # print(data_as_free_text)
+        if found_blocks.get('untranslated'):
+            for term in found_blocks['untranslated']:
+                add_unit('untranslated', self._format_compact_group(
+                    [term], glossary_multimap, include_notes
+                ))
+
+        data_as_free_text = render_payload_units(payload_units)
         estimated_tokens = TokenCounter().estimate_tokens(data_as_free_text)
 
-        return (data_as_free_text, estimated_tokens, found_blocks, context_was_added,
-                actual_hidden_count, actual_neighbors_count, actual_pattern_count)
+        return PayloadBundle(
+            data_as_free_text, estimated_tokens, found_blocks, context_was_added,
+            actual_hidden_count, actual_neighbors_count, actual_pattern_count,
+            payload_units,
+        )
 
 
 
@@ -1417,9 +1690,11 @@ class CorrectionSessionPage(ShellPage):
     def _update_token_estimation_now(self):
         if not self._ui_is_fully_loaded:
             return
-        # Распаковываем все 7 значений
-        data, tokens, _, _, hidden_count, neighbors_count, pattern_count = self._get_data_and_estimate_tokens()
-        if data is None: return
+        payload = self._get_data_and_estimate_tokens()
+        if payload.text is None: return
+        hidden_count = payload.hidden_count
+        neighbors_count = payload.neighbors_count
+        pattern_count = payload.pattern_count
 
         # --- НАЧАЛО ИСПРАВЛЕНИЯ ---
         # Определяем стиль для активной кнопки ОДИН РАЗ, чтобы не повторяться
@@ -1453,8 +1728,12 @@ class CorrectionSessionPage(ShellPage):
         model_config = api_config.all_models().get(model_name, {})
         limit = int(model_config.get("context_length", 128000) * 0.9)
 
-        self.token_info_label.setText(f"Запрос: <b>{tokens:,}</b> / {limit:,} токенов")
-        self.token_info_label.setStyleSheet(f"color: {theme_manager.color('danger')};" if tokens > limit else f"color: {theme_manager.color('success')};")
+        label_text, over_limit = self._token_label_text(payload, limit)
+        self.token_info_label.setText(label_text)
+        self.token_info_label.setStyleSheet(
+            f"color: {theme_manager.color('danger')};" if over_limit
+            else f"color: {theme_manager.color('success')};"
+        )
         self._update_start_button_state()
 
     def _on_start_stop_clicked(self):
@@ -2165,10 +2444,22 @@ class CorrectionSessionPage(ShellPage):
             description_parts.append(f'{block_counter}. {desc}')
             block_counter += 1
 
-        keys_to_check = ['conflicts', 'overlaps', 'patterns', 'hidden']
-        for key in keys_to_check:
-            if key in found_blocks and found_blocks[key]:
-                desc = block_descs.get(key, f"{key} block.")
+        # Ключ блока данных и ключ его описания совпадают не всегда: прямые и
+        # обратные конфликты описаны одним абзацем, поэтому пара ('direct',
+        # 'conflicts') и ('reverse', 'conflicts') даёт одно описание, а не два.
+        BLOCK_DESCRIPTION_KEYS = (
+            ('direct', 'conflicts'),
+            ('reverse', 'conflicts'),
+            ('overlaps', 'overlaps'),
+            ('patterns', 'patterns'),
+            ('hidden', 'hidden'),
+            ('untranslated', 'untranslated'),
+        )
+        described = []
+        for block_key, description_key in BLOCK_DESCRIPTION_KEYS:
+            if found_blocks.get(block_key) and description_key not in described:
+                described.append(description_key)
+                desc = block_descs.get(description_key, f"{description_key} block.")
                 description_parts.append(f'{block_counter}. {desc}')
                 block_counter += 1
 
@@ -2251,17 +2542,21 @@ class CorrectionSessionPage(ShellPage):
                 print(f"[ERROR] Syncing keys in AI-corrector: {e}")
 
             # 3. Проверяем, как завершилась сессия
-            reason = event_data.get('data', {}).get('reason', '')
-            if "Отменено" in reason or "Ошибка" in reason or "исчерпаны" in reason:
-                return
+            # 4. Обработка результата. Обрыв не повод выбрасывать правки,
+            # которые уже приехали из отправленных пакетов.
+            interrupted = session_was_interrupted(event_data.get('data', {}).get('reason', ''))
+            QtCore.QTimer.singleShot(
+                0, lambda: self._process_results_from_db(interrupted=interrupted)
+            )
 
-            # 4. Обработка результата
-            QtCore.QTimer.singleShot(0, self._process_results_from_db)
-
-    def _process_results_from_db(self):
+    def _process_results_from_db(self, interrupted=False):
         """
         Извлекает все строки-термины из БД, собирает из них единый патч,
         запускает диалог предпросмотра и очищает очередь.
+
+        ``interrupted`` — сессия оборвалась. Тогда молчим, если не приехало
+        ничего (о причине уже сказано в журнале), и предупреждаем, что список
+        неполон, если часть пакетов всё же вернулась.
         """
         app = QtWidgets.QApplication.instance()
         if not (app.engine and app.engine.task_manager):
@@ -2283,7 +2578,8 @@ class CorrectionSessionPage(ShellPage):
             self._post_event('log_message', {'message': "[CORRECTOR] Очередь задач очищена после получения результата."})
 
             if not all_term_rows:
-                QMessageBox.information(self, "Результат", "AI-корректор не вернул данных для исправления.")
+                if not interrupted:
+                    QMessageBox.information(self, "Результат", "AI-корректор не вернул данных для исправления.")
                 return
 
             # 4. Собираем единый словарь-патч из отдельных строк
@@ -2305,6 +2601,9 @@ class CorrectionSessionPage(ShellPage):
                 app.engine.task_manager.clear_all_queues()
             QMessageBox.critical(self, "Ошибка обработки результата", f"Не удалось извлечь или обработать результат из базы данных:\n{e}")
             return
+
+        if interrupted:
+            QMessageBox.warning(self, "Проверка не завершена", partial_results_notice(len(patch_dict)))
 
         # 5. Передаем собранный патч на обработку
         self._handle_correction_patch(patch_dict)
