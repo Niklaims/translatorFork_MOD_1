@@ -51,6 +51,7 @@ from ...utils.text import (
 from ...utils.glued_words import repair_glued_russian_words_in_html
 from ...utils.io_utils import atomic_write_text
 from ...utils.qt_utils import deferred_column_autosize
+from ...utils.repeat_scan import find_most_repeated_pattern
 from ...utils.translation_versions import (
     VALIDATED_SUFFIX,
     select_target_translation_version,
@@ -1714,42 +1715,10 @@ class ValidationThread(QThread):
             result_data['combined_deviation'] = dev_val
             result_data['deviation_type'] = dev_type # <-- Сохраняем тип (Абзац/Цифра/Пункт)
 
-            # --- 5. Повторы (Исправленная логика) ---
-            min_reps_scan = 5 
-            max_pattern_len = 20
-            
-            best_repeat_candidate = None 
-            max_reps_found = 0
-
-            # Проходим по всем длинам, чтобы найти ТОТ, у которого больше всего повторений.
-            # (Раньше мы останавливались на первом длинном, и это скрывало частые короткие повторы)
-            for pattern_len in range(max_pattern_len, 0, -1):
-                required_extra = max(1, min_reps_scan - 1)
-                try:
-                    regex = re.compile(r'(.{' + str(pattern_len) + r'})\1{' + str(required_extra) + r',}', re.DOTALL)
-                    match = regex.search(translated_content)
-                    if match:
-                        full_sequence = match.group(0)
-                        repeated_pattern = match.group(1)
-                        
-                        # Игнорируем обычные пробельные отступы, если их не экстремально много
-                        if repeated_pattern.strip() == "" and len(full_sequence) // len(repeated_pattern) < 50:
-                            continue
-                        
-                        actual_count = len(full_sequence) // len(repeated_pattern)
-                        
-                        # ГЛАВНОЕ ИСПРАВЛЕНИЕ:
-                        # Мы сохраняем результат, только если количество повторений БОЛЬШЕ, 
-                        # чем у того, что мы нашли ранее.
-                        # Так мы найдем точку, повторенную 100 раз, даже если перед ней нашли тег, повторенный 6 раз.
-                        if actual_count > max_reps_found:
-                            max_reps_found = actual_count
-                            best_repeat_candidate = (repeated_pattern, actual_count, pattern_len == 1)
-                        
-                        # Мы НЕ делаем break, чтобы проверить все варианты длин
-                except re.error: 
-                    continue
-            
+            # --- 5. Повторы ---
+            # Все длины от 20 до 1, чтобы найти самый частый повтор, а не первый
+            # длинный (см. utils/repeat_scan.py — там же, почему это быстро).
+            best_repeat_candidate = find_most_repeated_pattern(translated_content)
             if best_repeat_candidate:
                 result_data['repeat_data'] = best_repeat_candidate # <-- СЫРОЕ ДАННОЕ: ('a', 15, True)
 
@@ -1962,13 +1931,14 @@ class ValidationThread(QThread):
                                 with open(v_path, 'r', encoding='utf-8') as f:
                                     validated_content = f.read()
 
+                        content_hash = build_text_hash(translated_content)
                         result_data = {
                             'path': version_path, 'internal_html_path': internal_html_path,
                             'original_html': original_content, 'translated_html': translated_content,
                             'status': 'neutral',
                             'has_cached_analysis': True,
-                            'current_content_hash': build_text_hash(translated_content),
-                            'analyzed_content_hash': build_text_hash(translated_content),
+                            'current_content_hash': content_hash,
+                            'analyzed_content_hash': content_hash,
                         }
                         if validated_content: result_data['validated_content'] = validated_content
                         
