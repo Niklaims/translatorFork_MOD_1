@@ -1,10 +1,10 @@
 """Global Google Translate helper for selected text in Qt editors.
 
-The controller is installed once on QApplication and therefore also covers
-dialogs and tool windows created later.  Translation is opt-in: selecting
-foreign text only shows a small action button; the network request starts
-after the user clicks it, uses the context-menu action, or presses the
-keyboard shortcut.
+The controller is installed once per application and covers dialogs and tool
+windows created later: every editor it may act on gets its event filter when
+the editor receives focus.  Translation is opt-in: selecting foreign text only
+shows a small action button; the network request starts after the user clicks
+it, uses the context-menu action, or presses the keyboard shortcut.
 """
 
 from __future__ import annotations
@@ -283,8 +283,38 @@ class SelectionTranslationController(QtCore.QObject):
         self._offer_button.hide()
         self._offer_button.clicked.connect(self._translate_offered_selection)
 
-        app.installEventFilter(self)
+        # Фильтр на всём приложении — вызов Python на каждое событие Qt, а
+        # пока другой поток держит GIL, каждый такой вызов ждёт интерпретатор:
+        # окна открывались с паузами в секунды. Поэтому фильтр ставится на
+        # поле, получившее фокус (Qt отдаёт фокус до того, как доставить
+        # нажатие мыши), а на всё приложение — только пока видна кнопка.
+        self._watching_application = False
+        app.focusChanged.connect(self._on_focus_changed)
+        self._on_focus_changed(None, app.focusWidget())
         app.aboutToQuit.connect(self.shutdown)
+
+    def _on_focus_changed(self, _old, new) -> None:
+        try:
+            source = self._resolve_text_source(new)
+            if source is None:
+                return
+            # Повторная установка того же фильтра Qt не удваивает.
+            source.installEventFilter(self)
+            viewport = getattr(source, "viewport", None)
+            if callable(viewport):
+                viewport().installEventFilter(self)
+        except RuntimeError:
+            return
+
+    def _watch_application(self, enabled: bool) -> None:
+        """Ловить нажатия и уход из приложения везде, пока видна кнопка."""
+        if enabled == self._watching_application:
+            return
+        self._watching_application = enabled
+        if enabled:
+            self._app.installEventFilter(self)
+        else:
+            self._app.removeEventFilter(self)
 
     def eventFilter(self, obj, event):  # noqa: N802 - Qt API name
         event_type = event.type()
@@ -344,6 +374,10 @@ class SelectionTranslationController(QtCore.QObject):
         return False
 
     def shutdown(self) -> None:
+        try:
+            self._app.focusChanged.disconnect(self._on_focus_changed)
+        except TypeError:
+            pass
         self._app.removeEventFilter(self)
         self._hide_offer()
         for job_id in list(self._jobs):
@@ -512,6 +546,7 @@ class SelectionTranslationController(QtCore.QObject):
         self._position_offer_button(global_pos)
         self._offer_button.show()
         self._offer_button.raise_()
+        self._watch_application(True)
 
     def _translate_offered_selection(self) -> None:
         snapshot = self._offered_snapshot
@@ -679,6 +714,7 @@ class SelectionTranslationController(QtCore.QObject):
     def _hide_offer(self) -> None:
         self._offer_button.hide()
         self._offered_snapshot = None
+        self._watch_application(False)
 
     def _event_targets_offer(self, obj, event) -> bool:
         current = obj if isinstance(obj, QtWidgets.QWidget) else None

@@ -11,6 +11,7 @@ from gemini_translator.ui.widgets.log_widget import (
     CATCHUP_FLUSH_BATCH_SIZE,
     CATCHUP_FLUSH_INTERVAL_MS,
     LOG_FLUSH_INTERVAL_MS,
+    MAX_LOG_BLOCKS,
     MAX_LOG_FLUSH_BATCH_SIZE,
     LogWidget,
 )
@@ -57,6 +58,45 @@ class LogWidgetBatchingTests(unittest.TestCase):
             html,
         )
         self.assertNotIn("color: #F39C12;", html)
+
+    def test_log_keeps_only_the_newest_lines(self):
+        # Строки через <br> ложились в один абзац документа: предел блоков не
+        # срабатывал, лог рос без конца, и каждая вставка перекладывала его
+        # целиком — через час перевода сотни миллисекунд на каждый сброс.
+        widget = LogWidget(event_bus=None)
+        try:
+            total = MAX_LOG_BLOCKS + 300
+            for start in range(0, total, MAX_LOG_FLUSH_BATCH_SIZE):
+                widget._insert_html_batch("".join(
+                    widget._build_log_html({"message": f"[INFO] line {index}"})
+                    for index in range(start, min(start + MAX_LOG_FLUSH_BATCH_SIZE, total))
+                ))
+
+            document = widget.log_view.document()
+            text = widget.log_view.toPlainText()
+            self.assertEqual(document.blockCount(), MAX_LOG_BLOCKS)
+            self.assertNotIn("line 0\n", text)
+            self.assertIn(f"line {total - 1}", text)
+            self.assertEqual(text.count("\n"), MAX_LOG_BLOCKS - 1)
+            self.assertTrue(all(line.count("[INFO]") == 1 for line in text.split("\n")))
+        finally:
+            widget.close()
+
+    def test_separator_stays_a_rule_between_lines(self):
+        widget = LogWidget(event_bus=None)
+        try:
+            widget._insert_html_batch(
+                widget._build_log_html({"message": "[INFO] before"})
+                + widget._build_log_html({"message": "---SEPARATOR---"})
+                + widget._build_log_html({"message": "[INFO] after"})
+            )
+
+            lines = widget.log_view.toPlainText().split("\n")
+            self.assertTrue(lines[0].endswith("[INFO] before"))
+            self.assertTrue(lines[-1].endswith("[INFO] after"))
+            self.assertIn("<hr", widget.log_view.toHtml())
+        finally:
+            widget.close()
 
     def test_append_message_queues_until_flush(self):
         widget = LogWidget(event_bus=None)

@@ -7,6 +7,9 @@ import types
 from pathlib import Path
 
 
+from unittest.mock import patch
+
+from gemini_translator.utils import term_frequency_tools
 from gemini_translator.utils.language_tools import GlossaryRegexService
 from gemini_translator.utils.term_frequency_tools import (
     GlossaryFrequencyWorker,
@@ -290,6 +293,45 @@ class TermCountDoesNotDependOnOtherTermsTests(unittest.TestCase):
         counts = _frequency_counts(["TED", "1558"], ["他看了TED演讲。1558打出了五杀"])
 
         self.assertEqual(counts, {"TED": 1, "1558": 1})
+
+
+class ChapterScanTests(unittest.TestCase):
+    def test_chapter_title_in_head_is_not_counted(self):
+        # <title> повторяет заголовок главы из <h1>: засчитанный, он добавлял
+        # по лишнему вхождению каждому термину заголовка в каждой главе.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            _write_epub(
+                epub_path,
+                {
+                    "OEBPS/ch1.xhtml": (
+                        "<html><head><title>第1章 吴渊</title></head>"
+                        "<body><h1>第1章 吴渊</h1><p>吴渊笑了。</p></body></html>"
+                    ),
+                },
+            )
+            payload = calculate_term_frequency_payload(epub_path, [{"original": "吴渊"}])
+
+        self.assertEqual(payload["terms"]["吴渊"]["count"], 2)
+
+    def test_progress_is_thinned_but_reports_first_and_last_chapter(self):
+        # Сигнал на каждую главу забивал очередь главного потока: книга в
+        # тысячу глав — тысяча перерисовок метки, пока анализ держит GIL.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            epub_path = Path(temp_dir) / "book.epub"
+            _write_epub(
+                epub_path,
+                {f"OEBPS/ch{index}.xhtml": "<html><body>High</body></html>" for index in range(1, 51)},
+            )
+            reported = []
+            with patch.object(term_frequency_tools, "PROGRESS_INTERVAL_S", 3600):
+                calculate_term_frequency_payload(
+                    epub_path,
+                    [{"original": "High"}],
+                    progress_callback=lambda current, total, _name: reported.append((current, total)),
+                )
+
+        self.assertEqual(reported, [(1, 50), (50, 50)])
 
 
 if __name__ == "__main__":
