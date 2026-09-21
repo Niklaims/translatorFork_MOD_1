@@ -8,12 +8,11 @@
 """
 import os
 import tempfile
-import types
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6 import QtWidgets
+from PyQt6 import QtWidgets, sip
 
 # Сначала виджет глоссария — так циклический импорт glossary ↔ widgets
 # разрешается так же, как в приложении и остальных тестах.
@@ -39,31 +38,34 @@ class _ProjectManagerStub:
 
 
 class _FrequencyHarness:
-    """Настоящие методы частотного фильтра страницы на лёгких виджетах."""
+    """Настоящие методы частотного фильтра страницы на лёгких виджетах.
 
-    _METHODS = (
-        "_initialize_frequency_filter",
-        "_on_frequency_filter_toggled",
-        "_apply_term_frequency_payload",
-        "_update_frequency_status_label",
-        "_get_frequency_allowed_terms",
-    )
+    Методы — атрибуты класса, а виджеты живут под общим родителем, которого
+    тест удаляет сам: связанные методы в самом объекте замкнули бы цикл, и
+    виджеты удалил бы сборщик мусора — в любой момент, в том числе посреди
+    чужой перестилизации приложения (см. test_theme_restyle_gc_safety).
+    """
+
+    _initialize_frequency_filter = CorrectionSessionPage._initialize_frequency_filter
+    _on_frequency_filter_toggled = CorrectionSessionPage._on_frequency_filter_toggled
+    _apply_term_frequency_payload = CorrectionSessionPage._apply_term_frequency_payload
+    _update_frequency_status_label = CorrectionSessionPage._update_frequency_status_label
+    _get_frequency_allowed_terms = CorrectionSessionPage._get_frequency_allowed_terms
 
     def __init__(self, epub_path, cached_payload):
         self.owner = _Owner()
         self.project_manager = _ProjectManagerStub(cached_payload)
         self.epub_path = epub_path
-        self.cb_frequency_filter = QtWidgets.QCheckBox()
-        self.freq_min_spinbox = QtWidgets.QSpinBox()
-        self.freq_max_spinbox = QtWidgets.QSpinBox()
-        self.frequency_group = QtWidgets.QGroupBox()
-        self.frequency_status_label = QtWidgets.QLabel()
+        self.root = QtWidgets.QWidget()
+        self.cb_frequency_filter = QtWidgets.QCheckBox(self.root)
+        self.freq_min_spinbox = QtWidgets.QSpinBox(self.root)
+        self.freq_max_spinbox = QtWidgets.QSpinBox(self.root)
+        self.frequency_group = QtWidgets.QGroupBox(self.root)
+        self.frequency_status_label = QtWidgets.QLabel(self.root)
         self._frequency_worker = None
         self._term_frequency_payload = {}
         self._term_frequency_map = {}
         self.analysis_starts = 0
-        for name in self._METHODS:
-            setattr(self, name, types.MethodType(getattr(CorrectionSessionPage, name), self))
         self.cb_frequency_filter.stateChanged.connect(self._on_frequency_filter_toggled)
 
     def _get_glossary_owner(self):
@@ -91,6 +93,11 @@ class AiCorrectionFrequencyOnDemandTests(unittest.TestCase):
         with open(self.epub_path, "wb") as epub:
             epub.write(b"stub")
 
+    def _harness(self, cached_payload):
+        page = _FrequencyHarness(self.epub_path, cached_payload)
+        self.addCleanup(sip.delete, page.root)
+        return page
+
     def _fresh_cache(self):
         return build_term_frequency_payload(
             _GLOSSARY,
@@ -99,7 +106,7 @@ class AiCorrectionFrequencyOnDemandTests(unittest.TestCase):
         )
 
     def test_opening_without_fresh_counts_does_not_scan_the_book(self):
-        page = _FrequencyHarness(self.epub_path, cached_payload={})
+        page = self._harness(cached_payload={})
 
         page._initialize_frequency_filter()
 
@@ -108,7 +115,7 @@ class AiCorrectionFrequencyOnDemandTests(unittest.TestCase):
         self.assertFalse(page.cb_frequency_filter.isChecked())
 
     def test_enabling_the_filter_starts_the_scan_when_counts_are_missing(self):
-        page = _FrequencyHarness(self.epub_path, cached_payload={})
+        page = self._harness(cached_payload={})
         page._initialize_frequency_filter()
 
         page.cb_frequency_filter.setChecked(True)
@@ -116,7 +123,7 @@ class AiCorrectionFrequencyOnDemandTests(unittest.TestCase):
         self.assertEqual(page.analysis_starts, 1)
 
     def test_fresh_cache_is_applied_without_scanning(self):
-        page = _FrequencyHarness(self.epub_path, cached_payload=self._fresh_cache())
+        page = self._harness(cached_payload=self._fresh_cache())
 
         page._initialize_frequency_filter()
         page.cb_frequency_filter.setChecked(True)

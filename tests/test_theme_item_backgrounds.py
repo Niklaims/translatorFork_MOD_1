@@ -83,7 +83,7 @@ def themed(qt_app, monkeypatch):
             theme_manager.apply(qt_app, mode=scheme)
 
     yield apply
-    qt_app.setStyleSheet("")
+    theme_manager.set_app_stylesheet(qt_app, "")
     for name in _THEME_ATTRIBUTES:
         if hasattr(qt_app, name):
             delattr(qt_app, name)

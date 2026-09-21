@@ -34,7 +34,7 @@ def themed(qt_app):
         theme_manager.apply(qt_app, mode=mode, manual_colors={"accent": "#d87a3a"})
 
     yield apply
-    qt_app.setStyleSheet("")
+    theme_manager.set_app_stylesheet(qt_app, "")
     for name in _THEME_ATTRIBUTES:
         if hasattr(qt_app, name):
             delattr(qt_app, name)

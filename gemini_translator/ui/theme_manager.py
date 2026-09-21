@@ -6,6 +6,7 @@ Qt-touching parts are thin wrappers at the bottom of the module.
 """
 from __future__ import annotations
 
+import gc
 import re
 from typing import Any
 
@@ -114,12 +115,30 @@ def apply(
     # строке, а окна зовут apply при каждой загрузке настроек: окно перевода
     # теряло на этом полсекунды при каждом открытии.
     if app.styleSheet() != stylesheet:
-        app.setStyleSheet(stylesheet)
+        set_app_stylesheet(app, stylesheet)
     setattr(app, "_active_theme_mode", normalize_mode(mode))
     setattr(app, "_theme_palette", build_theme_palette(base))
     setattr(app, "_glass_active", use_glass)
     _apply_vibrancy_to_top_levels(app, use_glass)
     return scheme
+
+
+def set_app_stylesheet(app, stylesheet: str) -> None:
+    """Таблица стилей всего приложения — только через эту функцию.
+
+    Qt перебирает сырые указатели на все виджеты и на каждом зовёт Python —
+    фильтры событий, обработчики StyleChange. Сборщик мусора, сработавший в
+    таком вызове, может удалить виджет из циклической ссылки, до которого
+    перебор ещё не дошёл, и процесс падает (так падал полный набор тестов).
+    Поэтому на время перестилизации автоматическая сборка выключена.
+    """
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        app.setStyleSheet(stylesheet)
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def migrate_theme_mode(settings: dict | None) -> str:
