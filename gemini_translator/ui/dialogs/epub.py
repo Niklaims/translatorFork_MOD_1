@@ -43,6 +43,7 @@ except ImportError:
 
 # --- Импорты из нашего проекта ---
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from gemini_translator.ui.wait_dialogs import show_when_slow
 from ...utils.epub_tools import (
     get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed,
@@ -494,6 +495,7 @@ class EpubHtmlSelectorDialog(QDialog):
     
         # --- СПИСОК ГЛАВ ---
         self.list_widget = QListWidget()
+        self.list_widget.setItemDelegate(ItemBackgroundDelegate(self.list_widget))
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         content_layout.addWidget(self.list_widget, 1)

@@ -26,6 +26,7 @@ from ...widgets import (
     KeyManagementWidget, ModelSettingsWidget, LogWidget, PresetWidget
 )
 from ...widgets.common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from ...item_background import ItemBackgroundDelegate
 from ...widgets.ancestor_utils import find_ancestor_by_predicate
 from ...shell import ShellPage
 from gemini_translator.ui import theme_manager
@@ -1176,6 +1177,7 @@ class UntranslatedFixerPage(ShellPage):
         
         # --- ТАБЛИЦА ---
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(5)
         # Меняем заголовок последней колонки

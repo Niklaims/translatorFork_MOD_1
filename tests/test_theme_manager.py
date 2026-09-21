@@ -148,3 +148,18 @@ def test_install_reapplies_on_real_color_scheme_signal(qapp):
     finally:
         tm.apply = orig_apply
         setattr(qapp, "_active_theme_mode", "auto")
+
+
+def test_qcolor_reads_hex_and_soft_rgba_tokens():
+    # Мягкие заливки палитры записаны как rgba(...), которую QColor не разбирает.
+    app = type("App", (), {"_theme_palette": {
+        "warning": "#b5730a",
+        "warning_soft_bg": "rgba(181, 115, 10, 0.14)",
+    }})()
+
+    solid = tm.qcolor("warning", app)
+    soft = tm.qcolor("warning_soft_bg", app)
+
+    assert (solid.name(), solid.alpha()) == ("#b5730a", 255)
+    assert (soft.red(), soft.green(), soft.blue()) == (181, 115, 10)
+    assert abs(soft.alphaF() - 0.14) < 0.01

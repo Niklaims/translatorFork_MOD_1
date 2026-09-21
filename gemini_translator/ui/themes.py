@@ -1012,6 +1012,15 @@ QMessageBox QLabel {
 """
 
 
+# The plate every table and list item sits on (the ``::item`` rules below).
+# Those rules make QStyleSheetStyle paint items itself and drop the brush a
+# model gives them, so ui/item_background.py fills that brush on a plate of the
+# same shape.
+ITEM_MARGIN_X = 4
+ITEM_MARGIN_Y = 2
+ITEM_RADIUS = 6
+
+
 def build_dark_stylesheet(theme_colors: Any = None) -> str:
     palette = build_theme_palette(theme_colors)
     stylesheet = STYLESHEET_TEMPLATE
@@ -1030,8 +1039,8 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
         }
         QTableWidget::item, QListWidget::item {
             border: 1px solid transparent;
-            border-radius: 6px;
-            margin: 2px 4px;
+            border-radius: __ITEM_RADIUS__px;
+            margin: __ITEM_MARGIN_Y__px __ITEM_MARGIN_X__px;
             padding: 2px 8px;
             min-height: 28px;
         }
@@ -1073,8 +1082,8 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
             outline: 0;
         }
         QTableWidget::item, QListWidget::item {
-            border-radius: 6px;
-            margin: 2px 4px;
+            border-radius: __ITEM_RADIUS__px;
+            margin: __ITEM_MARGIN_Y__px __ITEM_MARGIN_X__px;
             padding: 2px 8px;
             min-height: 28px;
         }
@@ -1106,6 +1115,9 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
 
     for key, value in palette.items():
         stylesheet = stylesheet.replace(f"__{key.upper()}__", value)
+    stylesheet = stylesheet.replace("__ITEM_RADIUS__", str(ITEM_RADIUS))
+    stylesheet = stylesheet.replace("__ITEM_MARGIN_X__", str(ITEM_MARGIN_X))
+    stylesheet = stylesheet.replace("__ITEM_MARGIN_Y__", str(ITEM_MARGIN_Y))
     stylesheet = stylesheet.replace("__CHEVRON_DOWN_ICON__", _CHEVRON_DOWN_ICON)
     stylesheet = stylesheet.replace("__CHEVRON_UP_ICON__", _CHEVRON_UP_ICON)
     return stylesheet

@@ -27,6 +27,7 @@ from gemini_translator.ui.widgets.log_widget import LogWidget
 from gemini_translator.ui.widgets.preset_widget import PresetWidget
 from gemini_translator.ui.widgets.ancestor_utils import find_ancestor_by_class_name
 from gemini_translator.ui.overlay_host import exec_dialog
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 from ..validation_dialogs.quality_widgets import plural
 from gemini_translator.ui.shell import ShellPage
@@ -3049,6 +3050,7 @@ class CorrectionPreviewDialog(QDialog):
         self.preview_splitter.setChildrenCollapsible(False)
 
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Применить?", "Оригинал", "Было (Перевод)", "Стало (Перевод)", "Было (Примечание)", "Стало (Примечание)"])

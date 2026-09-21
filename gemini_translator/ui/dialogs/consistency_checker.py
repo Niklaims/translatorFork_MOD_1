@@ -19,9 +19,10 @@ import json
 import shutil
 from pathlib import Path
 from datetime import datetime
-from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QRectF, QEvent, QEventLoop, QTimer
-from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QBrush, QTextOption, QPainter
+from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QEvent, QEventLoop, QTimer
+from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QTextCursor, QBrush, QTextOption
 from ...utils.glossary_tools import normalize_glossary_entries
+from ..item_background import ItemBackgroundDelegate, paint_item_background
 
 class CenteredCheckboxDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -32,18 +33,8 @@ class CenteredCheckboxDelegate(QStyledItemDelegate):
         opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
         from PyQt6.QtCore import Qt
         opt.checkState = Qt.CheckState.Unchecked
-        
-        bg_color = index.data(Qt.ItemDataRole.BackgroundRole)
-        if bg_color:
-            painter.save()
-            # Без сглаживания дуги подложек дают пиксельные «лесенки»
-            # на экранах с DPR=1 (Windows/Linux).
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bg_color)
-            rect = QRectF(option.rect).adjusted(4.0, 2.0, -4.0, -2.0)
-            painter.drawRoundedRect(rect, 6.0, 6.0)
-            painter.restore()
+
+        paint_item_background(painter, opt)
 
         style = option.widget.style() if option.widget else QApplication.style()
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, option.widget)
@@ -75,22 +66,6 @@ class CenteredCheckboxDelegate(QStyledItemDelegate):
                     model.setData(index, new_state, Qt.ItemDataRole.CheckStateRole)
                     return True
         return super().editorEvent(event, model, option, index)
-
-class ThemedTableDelegate(QStyledItemDelegate):
-    def paint(self, painter, option, index):
-        from PyQt6.QtCore import Qt
-        bg_color = index.data(Qt.ItemDataRole.BackgroundRole)
-        if bg_color:
-            painter.save()
-            # Без сглаживания дуги подложек дают пиксельные «лесенки»
-            # на экранах с DPR=1 (Windows/Linux).
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(bg_color)
-            rect = QRectF(option.rect).adjusted(4.0, 2.0, -4.0, -2.0)
-            painter.drawRoundedRect(rect, 6.0, 6.0)
-            painter.restore()
-        super().paint(painter, option, index)
 
 
 from ...core.consistency_engine import (
@@ -503,7 +478,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
         self.problems_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.problems_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.problems_table.setAlternatingRowColors(True)
-        self.problems_table.setItemDelegate(ThemedTableDelegate(self.problems_table))
+        self.problems_table.setItemDelegate(ItemBackgroundDelegate(self.problems_table))
         self.problems_table.setItemDelegateForColumn(0, CenteredCheckboxDelegate(self.problems_table))
         problems_layout.addWidget(self.problems_table)
         

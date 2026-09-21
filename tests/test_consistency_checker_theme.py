@@ -10,7 +10,7 @@ app = QApplication.instance()
 if not app:
     app = QApplication(sys.argv)
 
-from gemini_translator.ui.dialogs.consistency_checker import ConsistencyValidatorPage, ThemedTableDelegate
+from gemini_translator.ui.dialogs.consistency_checker import ConsistencyValidatorPage
 from gemini_translator.ui import theme_manager
 
 class TestConsistencyCheckerTheme(unittest.TestCase):

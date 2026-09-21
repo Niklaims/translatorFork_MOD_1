@@ -6,6 +6,7 @@ Qt-touching parts are thin wrappers at the bottom of the module.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 THEME_MODE_KEY = "ui_theme_mode"
@@ -224,6 +225,23 @@ def palette(app=None) -> dict:
 def color(name: str, app=None) -> str:
     """A single token's current hex; safe fallback for unknown names."""
     return palette(app).get(name, "#888888")
+
+
+_RGBA_TOKEN = re.compile(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)")
+
+
+def qcolor(name: str, app=None):
+    """A token as a QColor, including the ``rgba(...)`` soft fills QColor cannot parse."""
+    from PyQt6.QtGui import QColor
+
+    value = color(name, app)
+    match = _RGBA_TOKEN.fullmatch(value)
+    if match is None:
+        return QColor(value)
+    red, green, blue, alpha = match.groups()
+    result = QColor(int(red), int(green), int(blue))
+    result.setAlphaF(float(alpha))
+    return result
 
 
 GLASS_KEY = "ui_glass_enabled"
