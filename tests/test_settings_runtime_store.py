@@ -531,8 +531,11 @@ def test_runtime_mutation_failure_is_reported_without_success_event(
     bus = RecordingBus()
     manager = SettingsManager(event_bus=bus, config_file=str(path))
     now = int(time.time())
+    # Обслуживание лимитов идёт в хранилище только с парами, где есть работа:
+    # старый запрос даёт ему что удалить.
+    stamp = now - 48 * 60 * 60 if method == "_refresh_expired_key_limits" else now
     _seed_key_runtime(manager, "KEY", {
-        "model": {"exhausted_at": now, "exhausted_level": 2, "requests": [now]},
+        "model": {"exhausted_at": now, "exhausted_level": 2, "requests": [stamp]},
     })
     before = path.read_bytes()
     bus.events.clear()
