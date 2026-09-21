@@ -286,7 +286,7 @@ class LogWidget(QWidget):
     def _build_log_html(self, data: dict) -> str:
         message = data.get('message', '')
         if message == "---SEPARATOR---":
-            return "<br><hr style='border: 1px dashed #4d5666;'><br>"
+            return "<div>&nbsp;</div><hr style='border: 1px dashed #4d5666;'><div>&nbsp;</div>"
 
         event_time = self._format_event_time(data.get('timestamp'))
         formatted_line = f"[{event_time}] {message}"
@@ -337,8 +337,10 @@ class LogWidget(QWidget):
 
         if links_html:
             html_line += " " + " ".join(links_html)
-        html_line += "<br>"
-        return html_line
+        # Каждая строка — свой абзац документа. Через <br> лог ложился в один
+        # абзац: предел MAX_LOG_BLOCKS не срабатывал, лог рос без конца, и
+        # каждая вставка перекладывала его целиком (6000 строк — 280 мс).
+        return f"<div>{html_line}</div>"
 
     def _insert_html_batch(self, html_batch: str):
         if not html_batch:
@@ -349,6 +351,9 @@ class LogWidget(QWidget):
             cursor = self.log_view.textCursor()
             cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
             cursor.beginEditBlock()
+            if not self.log_view.document().isEmpty():
+                # Иначе первая строка пачки вольётся в последнюю строку лога.
+                cursor.insertBlock()
             cursor.insertHtml(html_batch)
             cursor.endEditBlock()
         finally:
