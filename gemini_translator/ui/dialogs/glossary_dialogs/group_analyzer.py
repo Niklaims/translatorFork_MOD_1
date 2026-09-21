@@ -333,14 +333,13 @@ class GroupAnalysisPage(ShellPage):
             # Если в modified_subset были дубликаты, они добавятся как есть.
             new_parent_glossary.extend(modified_subset)
             
-            # 4. Применяем изменения в менеджере (с записью в Undo/Redo)
-            self.parent_manager.add_history('wholesale', {
-                'action_name': "Групповая правка", 
-                'description': f"Обработана группа ({len(original_indices)} -> {len(modified_subset)} записей)", 
-                'old_state': parent_glossary
-            })
-            
-            self.parent_manager.set_glossary(new_parent_glossary, run_analysis=True)
+            # 4. Применяем изменения в менеджере одним шагом истории
+            self.parent_manager._replace_glossary_and_log_history(
+                new_parent_glossary,
+                "Групповая правка",
+                f"Обработана группа ({len(original_indices)} -> {len(modified_subset)} записей)",
+                parent_glossary,
+            )
             
             # 5. Обновляем данные в текущем диалоге, чтобы можно было продолжить работу
             self.full_glossary = new_parent_glossary
