@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 
-import aiohttp
 import asyncio
 import json
 import traceback
 
 from .. import config as api_config
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError,
     LocationBlockedError,
@@ -321,7 +320,7 @@ class OpenModelApiHandler(BaseApiHandler):
 
             except asyncio.TimeoutError:
                 raise NetworkError("OpenModel connection timeout", delay_seconds=10)
-            except (aiohttp.ClientError, OSError) as error:
+            except TRANSPORT_ERRORS as error:
                 raise NetworkError(
                     f"Network/SSL error ({type(error).__name__}) during OpenModel request: {error}",
                     delay_seconds=20,

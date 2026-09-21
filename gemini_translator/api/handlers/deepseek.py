@@ -1,7 +1,6 @@
-import aiohttp
 import asyncio
 import time
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError,
     RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
@@ -181,7 +180,7 @@ class DeepseekApiHandler(BaseApiHandler):
 
             except asyncio.TimeoutError:
                 raise NetworkError("Таймаут соединения с DeepSeek", delay_seconds=10)
-            except (aiohttp.ClientError, OSError) as e:
+            except TRANSPORT_ERRORS as e:
                 error_msg = self._format_transport_error(e, "DeepSeek")
                 raise NetworkError(error_msg, delay_seconds=20) from e
             except (RateLimitExceededError, ContentFilterError, NetworkError, 

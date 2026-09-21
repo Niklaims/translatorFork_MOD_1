@@ -1,9 +1,8 @@
-import aiohttp
 import asyncio
 import json
 import time
 import traceback
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError,
     RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
@@ -186,7 +185,7 @@ class HuggingFaceApiHandler(BaseApiHandler):
 
             except asyncio.TimeoutError:
                 raise NetworkError("Таймаут соединения с Hugging Face")
-            except (aiohttp.ClientError, OSError) as e:
+            except TRANSPORT_ERRORS as e:
                 # Это подавит трейсбек в консоли и отправит ошибку в штатный обработчик ретраев
                 error_msg = self._format_transport_error(e, "Hugging Face")
                 raise NetworkError(error_msg, delay_seconds=self.NETWORK_RETRY_DELAY) from e
