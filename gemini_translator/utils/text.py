@@ -12,7 +12,7 @@ import json
 import html
 import zlib
 from lxml import etree
-from bs4 import BeautifulSoup, NavigableString, Comment, Declaration, ProcessingInstruction
+from bs4 import BeautifulSoup, NavigableString, Comment, Declaration, ProcessingInstruction, Tag
 from itertools import groupby
 from difflib import SequenceMatcher
 from collections import Counter
@@ -2092,6 +2092,10 @@ def _remove_duplicated_angle_tag_prefixes(html_content: str) -> str:
     return ORPHAN_CLOSING_PREFIX_BEFORE_DASH_RE.sub(' ', repaired)
 
 
+_ANGLE_BRACKET_RE = re.compile(r'[<>]')
+_DOCTYPE_TOKEN_RE = re.compile(r'<!DOCTYPE\b[^>]*>', re.IGNORECASE)
+
+
 def _consume_valid_angle_token(text: str, start: int) -> int | None:
     if text.startswith('<!--', start):
         end = text.find('-->', start + 4)
@@ -2105,9 +2109,11 @@ def _consume_valid_angle_token(text: str, start: int) -> int | None:
         end = text.find('?>', start + 2)
         return end + 2 if end != -1 else None
 
-    doctype_match = re.match(r'<!DOCTYPE\b[^>]*>', text[start:], flags=re.IGNORECASE)
+    # match с позиции, а не по срезу text[start:]: срез копировал весь хвост
+    # главы на каждый `<` — сотни копий на главу.
+    doctype_match = _DOCTYPE_TOKEN_RE.match(text, start)
     if doctype_match:
-        return start + doctype_match.end()
+        return doctype_match.end()
 
     tag_match = HTML_TAG_TOKEN_RE.match(text, start)
     if tag_match:
@@ -2134,37 +2140,31 @@ def _scan_stray_angle_brackets(html_content: str, collect_limit: int = 0) -> tup
     if not isinstance(html_content, str) or not html_content:
         return html_content, []
 
+    # От скобки к скобке, а текст между ними — срезом: посимвольный цикл по
+    # всей главе стоил окну проверки ~4 мс на главу.
     result = []
     snippets = []
-    i = 0
-    length = len(html_content)
-
-    while i < length:
-        char = html_content[i]
-
+    copied_until = 0
+    position = 0
+    while True:
+        match = _ANGLE_BRACKET_RE.search(html_content, position)
+        if match is None:
+            break
+        index = match.start()
+        char = html_content[index]
         if char == '<':
-            token_end = _consume_valid_angle_token(html_content, i)
+            token_end = _consume_valid_angle_token(html_content, index)
             if token_end is not None:
-                result.append(html_content[i:token_end])
-                i = token_end
+                position = token_end
                 continue
 
-            result.append('&lt;')
-            if collect_limit <= 0 or len(snippets) < collect_limit:
-                snippets.append(f"<: {_angle_artifact_preview(html_content, i)}")
-            i += 1
-            continue
+        result.append(html_content[copied_until:index])
+        result.append('&lt;' if char == '<' else '&gt;')
+        if collect_limit <= 0 or len(snippets) < collect_limit:
+            snippets.append(f"{char}: {_angle_artifact_preview(html_content, index)}")
+        copied_until = position = index + 1
 
-        if char == '>':
-            result.append('&gt;')
-            if collect_limit <= 0 or len(snippets) < collect_limit:
-                snippets.append(f">: {_angle_artifact_preview(html_content, i)}")
-            i += 1
-            continue
-
-        result.append(char)
-        i += 1
-
+    result.append(html_content[copied_until:])
     return "".join(result), snippets
 
 
@@ -3335,17 +3335,30 @@ def repair_missing_paragraph_tags(original_html: str, translated_html: str, soup
     return repaired_html
 
 
+_FINGERPRINT_HEADINGS = frozenset({'h1', 'h2', 'h3', 'h4', 'h5', 'h6'})
+
+
 def _create_structural_fingerprint(soup):
-        """Создает 'отпечаток' HTML-структуры для быстрого сравнения."""
-        fp = {
-            'headings': {}, 
-            'images': len(soup.find_all('img')), 
-            'links': len(soup.find_all('a')), 
-            'lists': len(soup.find_all(['ol', 'ul']))
-        }
-        for h_tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-            fp['headings'][h_tag.name] = fp['headings'].get(h_tag.name, 0) + 1
-        return fp
+        """Создает 'отпечаток' HTML-структуры для быстрого сравнения.
+
+        Один проход по дереву вместо четырёх find_all: окно проверки строит
+        отпечаток дважды на главу, и обходы были восьмой частью анализа.
+        """
+        images = links = lists = 0
+        headings = {}
+        for element in soup.descendants:
+            if not isinstance(element, Tag):
+                continue
+            name = element.name
+            if name == 'img':
+                images += 1
+            elif name == 'a':
+                links += 1
+            elif name == 'ol' or name == 'ul':
+                lists += 1
+            elif name in _FINGERPRINT_HEADINGS:
+                headings[name] = headings.get(name, 0) + 1
+        return {'headings': headings, 'images': images, 'links': links, 'lists': lists}
 
 EXPECTED_BODY_START_BLOCKS = {'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'div'}
 INLINE_BODY_START_TAGS = {
