@@ -163,3 +163,68 @@ def test_qcolor_reads_hex_and_soft_rgba_tokens():
     assert (solid.name(), solid.alpha()) == ("#b5730a", 255)
     assert (soft.red(), soft.green(), soft.blue()) == (181, 115, 10)
     assert abs(soft.alphaF() - 0.14) < 0.01
+
+
+class _RecordingApp:
+    """Приложение, которое помнит, сколько раз ему меняли таблицу стилей."""
+
+    def __init__(self, qapp):
+        self._qapp = qapp
+        self.sheet = ""
+        self.restyles = 0
+
+    def styleHints(self):  # noqa: N802 - Qt API name
+        return self._qapp.styleHints()
+
+    def palette(self):
+        return self._qapp.palette()
+
+    def styleSheet(self):  # noqa: N802 - Qt API name
+        return self.sheet
+
+    def setStyleSheet(self, sheet):  # noqa: N802 - Qt API name
+        self.restyles += 1
+        self.sheet = sheet
+
+    def topLevelWidgets(self):  # noqa: N802 - Qt API name
+        return []
+
+
+def test_apply_skips_restyling_when_the_stylesheet_is_unchanged(qapp):
+    # setStyleSheet перестилизует все виджеты приложения, даже если строка
+    # та же: окно перевода при каждом открытии теряло на этом ~0,5 с.
+    app = _RecordingApp(qapp)
+
+    tm.apply(app, mode="dark", manual_colors={})
+    tm.apply(app, mode="dark", manual_colors={})
+    assert app.restyles == 1
+
+    tm.apply(app, mode="light", manual_colors={})
+    assert app.restyles == 2
+
+
+def test_glass_check_does_not_load_appkit_while_vibrancy_is_off(monkeypatch):
+    from gemini_translator.ui.platform import macos_vibrancy
+
+    probe = MagicMock(return_value=True)
+    monkeypatch.setattr(macos_vibrancy, "VIBRANCY_READY", False)
+    monkeypatch.setattr(macos_vibrancy, "is_available", probe)
+
+    assert tm.glass_available() is False
+    probe.assert_not_called()
+
+
+def test_windows_are_not_touched_while_vibrancy_is_off(monkeypatch):
+    from gemini_translator.ui.platform import macos_vibrancy
+
+    remove = MagicMock()
+    monkeypatch.setattr(macos_vibrancy, "VIBRANCY_READY", False)
+    monkeypatch.setattr(macos_vibrancy, "remove_vibrancy", remove)
+    window = MagicMock()
+    window.isVisible.return_value = True
+    app = MagicMock()
+    app.topLevelWidgets.return_value = [window]
+
+    tm._apply_vibrancy_to_top_levels(app, use_glass=False)
+
+    remove.assert_not_called()

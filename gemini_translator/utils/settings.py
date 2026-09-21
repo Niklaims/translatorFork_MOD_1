@@ -21,7 +21,20 @@ DEFAULT_SETTINGS_DIRNAME = ".epub_translator"
 PROFILE_SETTINGS_DIRNAME = "profiles"
 _DEFAULT_PROFILE_ALIASES = {"", "default", "global", "main"}
 
+# Лимиты ключей меняются редко: Gemini сбрасывает квоту раз в сутки (00:01 по
+# Лос-Анджелесу), у скользящих политик блокировка и запросы выходят из окна
+# через сутки. Таймер обслуживания будится к ближайшему такому моменту, но не
+# реже MAX: на macOS таймер не идёт, пока компьютер спит, и сброс в полночь
+# иначе заметили бы через много часов после пробуждения. И не чаще MIN, чтобы
+# не просыпаться на каждый выпавший из окна запрос активного ключа.
+LIMIT_MAINTENANCE_MIN_DELAY_S = 60
+LIMIT_MAINTENANCE_MAX_DELAY_S = 15 * 60
+
 logger = logging.getLogger(__name__)
+
+
+def _earlier(current, candidate):
+    return candidate if current is None or candidate < current else current
 
 # Сколько ждать, пока другое окно приложения допишет настройки. Обычная запись
 # занимает десятки миллисекунд; дольше замок держит только зависший процесс, и
@@ -302,9 +315,12 @@ class SettingsManager(QObject):
 
         # Пока приложение открыто, своевременно снимаем истекшие ограничения
         # и очищаем счетчики запросов, не дожидаясь перезапуска или ручного
-        # сохранения настроек.
+        # сохранения настроек. Срок следующей проверки — см.
+        # LIMIT_MAINTENANCE_MIN_DELAY_S и _schedule_limit_maintenance.
+        self._next_limit_change_at = None
         self._limit_maintenance_timer = QtCore.QTimer(self)
-        self._limit_maintenance_timer.setInterval(5000)
+        self._limit_maintenance_timer.setSingleShot(True)
+        self._limit_maintenance_timer.setInterval(LIMIT_MAINTENANCE_MIN_DELAY_S * 1000)
         self._limit_maintenance_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
         self._limit_maintenance_timer.timeout.connect(
             self._refresh_expired_key_limits)
@@ -476,11 +492,25 @@ class SettingsManager(QObject):
     @pyqtSlot()
     def _refresh_expired_key_limits(self):
         """Снимает истекшие ограничения ключей и сразу уведомляет интерфейс."""
-        if self._check_and_reset_limits_in_cache():
-            self._post_event(
-                'key_statuses_updated',
-                {'reason': 'automatic_limit_reset'},
-            )
+        try:
+            if self._check_and_reset_limits_in_cache():
+                self._post_event(
+                    'key_statuses_updated',
+                    {'reason': 'automatic_limit_reset'},
+                )
+        finally:
+            self._schedule_limit_maintenance()
+
+    def _schedule_limit_maintenance(self):
+        """Будит таймер к ближайшему моменту, когда лимит может смениться."""
+        if QtCore.QCoreApplication.instance() is None:
+            return
+        delay = LIMIT_MAINTENANCE_MAX_DELAY_S
+        if self._next_limit_change_at is not None:
+            delay = min(delay, max(
+                LIMIT_MAINTENANCE_MIN_DELAY_S, self._next_limit_change_at - time.time(),
+            ))
+        self._limit_maintenance_timer.start(int(delay * 1000))
 
     @pyqtSlot()
     def flush(self):
@@ -718,6 +748,15 @@ class SettingsManager(QObject):
         provider = key_info.get("provider", "default")
         return api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
 
+    def _limit_expiry(self, policy, stamp, now):
+        """Когда запрос или исчерпание с меткой ``stamp`` перестанет действовать."""
+        if policy.get('type') == 'daily':
+            next_reset = self._request_window_cutoff(policy, int(now)) + 24 * 3600
+            if next_reset > now:
+                return next_reset
+        hours = policy.get('duration_hours', 24) if policy.get('type') == 'rolling' else 24
+        return stamp + int(hours) * 3600
+
     def _request_window_cutoff(self, policy, now_ts):
         if policy['type'] == 'rolling':
             return now_ts - (int(policy.get('duration_hours', 24)) * 3600)
@@ -880,19 +919,33 @@ class SettingsManager(QObject):
     def _check_and_reset_limits_in_cache(self):
         """Обслуживает SQLite без блокировки конфигурационного кэша.
 
-        Все пары ключ×модель уходят одной транзакцией. Таймер вызывает это раз
-        в 5 с, и транзакция на пару при 144 ключах означала 1308 коммитов за тик.
+        Пары ключ×модель уходят одной транзакцией, и только те, где есть что
+        удалить или снять: каждый запрос к SQLite отпускает GIL, и 1368 пустых
+        DELETE за тик при 144 ключах подвешивали интерфейс, пока другой поток
+        держит интерпретатор. Заодно запоминает в _next_limit_change_at
+        ближайший момент, когда лимит истечёт или запрос выйдет из окна.
         """
         now = time.time()
         now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
         pairs = []
+        next_change = None
         for key_info in self._materialize_key_statuses_unsafe():
-            cutoff = self._request_window_cutoff(self._get_request_policy(key_info), int(now))
+            policy = self._get_request_policy(key_info)
+            cutoff = self._request_window_cutoff(policy, int(now))
             for model_id, status in key_info.get("status_by_model", {}).items():
                 clear_at = None
+                exhausted_at = status.get("exhausted_at")
                 if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
-                    clear_at = status.get("exhausted_at")
-                pairs.append((key_info["key"], model_id, cutoff, clear_at))
+                    clear_at = exhausted_at
+                elif exhausted_at:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, exhausted_at, now))
+                requests = status.get("requests") or ()
+                live = [stamp for stamp in requests if stamp > cutoff]
+                if live:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, min(live), now))
+                if clear_at is not None or len(live) < len(requests):
+                    pairs.append((key_info["key"], model_id, cutoff, clear_at))
+        self._next_limit_change_at = next_change
         if not pairs:
             return False
         return self._run_runtime_store_operation(

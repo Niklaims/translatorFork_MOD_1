@@ -8,6 +8,7 @@ os.environ.setdefault("GT_DISABLE_LOCAL_MODEL_DISCOVERY", "1")
 from PyQt6 import QtCore, QtWidgets
 
 from main import EventBus
+from gemini_translator.ui import theme_manager
 from gemini_translator.ui.themes import LIGHT_DEFAULT_THEME_COLORS, build_stylesheet
 from gemini_translator.ui.widgets.glossary_widget import GlossaryWidget  # noqa: F401
 from gemini_translator.ui.dialogs.glossary import GlossaryManagerPage
@@ -20,7 +21,7 @@ class GlossaryManagerTableLayoutTests(unittest.TestCase):
         cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
     def setUp(self):
-        self.app.setStyleSheet(build_stylesheet(LIGHT_DEFAULT_THEME_COLORS))
+        theme_manager.set_app_stylesheet(self.app, build_stylesheet(LIGHT_DEFAULT_THEME_COLORS))
         self.app.event_bus = EventBus()
         self.settings_file = tempfile.NamedTemporaryFile(
             suffix=".json",
@@ -37,7 +38,7 @@ class GlossaryManagerTableLayoutTests(unittest.TestCase):
 
     def tearDown(self):
         self.settings.flush()
-        self.app.setStyleSheet("")
+        theme_manager.set_app_stylesheet(self.app, "")
         try:
             os.unlink(self.settings_file.name)
         except FileNotFoundError:

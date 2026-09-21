@@ -8,6 +8,7 @@ from PyQt6 import QtCore, QtGui, QtWidgets
 
 from PyQt6.QtTest import QTest
 
+from gemini_translator.ui import theme_manager
 from gemini_translator.ui.themes import LIGHT_DEFAULT_THEME_COLORS, build_stylesheet
 from gemini_translator.ui.widgets.chapter_list_widget import (
     REORDER_BUTTON_SIZE,
@@ -180,8 +181,8 @@ class DiffGateTests(unittest.TestCase):
         """Делегат должен рендерить стрелки со стилем QPushButton#reorderButton."""
         app = QtWidgets.QApplication.instance()
         previous_stylesheet = app.styleSheet()
-        app.setStyleSheet(build_stylesheet(LIGHT_DEFAULT_THEME_COLORS))
-        self.addCleanup(lambda: app.setStyleSheet(previous_stylesheet))
+        theme_manager.set_app_stylesheet(app, build_stylesheet(LIGHT_DEFAULT_THEME_COLORS))
+        self.addCleanup(theme_manager.set_app_stylesheet, app, previous_stylesheet)
 
         previous_engine = getattr(app, "engine", "__missing__")
         app.engine = None

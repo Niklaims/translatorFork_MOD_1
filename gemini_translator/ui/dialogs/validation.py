@@ -50,6 +50,7 @@ from ...utils.text import (
 )
 from ...utils.glued_words import repair_glued_russian_words_in_html
 from ...utils.io_utils import atomic_write_text
+from ...utils.qt_utils import deferred_column_autosize
 from ...utils.translation_versions import (
     VALIDATED_SUFFIX,
     select_target_translation_version,
@@ -2833,42 +2834,45 @@ class TranslationValidatorPage(ShellPage):
         self.table_results.setSortingEnabled(False)
         self.table_results.setUpdatesEnabled(False)
         
-        for internal_path in ordered_originals:
-            # Даем интерфейсу "дышать" каждые 50 файлов
-            if row_pos % 50 == 0:
-                QApplication.processEvents()
-                if self._is_destroyed():
-                    return
+        # Столбцы с ResizeToContents Qt меряет заново после каждого setItem —
+        # по всем строкам; 514 глав так заполнялись 5,9 с вместо 0,6.
+        with deferred_column_autosize(self.table_results):
+            for internal_path in ordered_originals:
+                # Даем интерфейсу "дышать" каждые 50 файлов
+                if row_pos % 50 == 0:
+                    QApplication.processEvents()
+                    if self._is_destroyed():
+                        return
 
-            versions = self.project_manager.get_versions_for_original(internal_path)
-            if not versions:
-                continue
+                versions = self.project_manager.get_versions_for_original(internal_path)
+                if not versions:
+                    continue
 
-            target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
+                target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
             
-            if not target_rel_path:
-                continue
+                if not target_rel_path:
+                    continue
             
-            full_path = os.path.join(self.translated_folder, target_rel_path)
+                full_path = os.path.join(self.translated_folder, target_rel_path)
 
-            # Данные
-            data_placeholder, needs_analysis = self._build_row_data_for_file(
-                internal_path,
-                full_path,
-                is_validated_present,
-            )
+                # Данные
+                data_placeholder, needs_analysis = self._build_row_data_for_file(
+                    internal_path,
+                    full_path,
+                    is_validated_present,
+                )
 
-            self._append_result_row(
-                row_pos,
-                internal_path,
-                target_rel_path,
-                is_validated_present,
-                data_placeholder,
-                needs_analysis,
-                placeholder_text="Ожидание...",
-            )
+                self._append_result_row(
+                    row_pos,
+                    internal_path,
+                    target_rel_path,
+                    is_validated_present,
+                    data_placeholder,
+                    needs_analysis,
+                    placeholder_text="Ожидание...",
+                )
 
-            row_pos += 1
+                row_pos += 1
 
         if self._is_destroyed():
             return
@@ -4782,37 +4786,39 @@ class TranslationValidatorPage(ShellPage):
         ordered_originals, _ = get_epub_chapter_order(self.original_epub_path, return_method=True)
         row_pos = 0
         
-        for internal_path in ordered_originals:
-            versions = self.project_manager.get_versions_for_original(internal_path)
-            if not versions:
-                continue
+        # См. _populate_initial_table: столбцы меряем один раз в конце.
+        with deferred_column_autosize(self.table_results):
+            for internal_path in ordered_originals:
+                versions = self.project_manager.get_versions_for_original(internal_path)
+                if not versions:
+                    continue
 
-            target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
-            if not target_rel_path:
-                continue
+                target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
+                if not target_rel_path:
+                    continue
 
-            full_path = os.path.join(self.translated_folder, target_rel_path)
-            data, needs_analysis = self._build_row_data_for_file(
-                internal_path,
-                full_path,
-                is_validated_present,
-                preserved_data=preserved_data.get(internal_path),
-            )
-            if internal_path in old_dirty_set:
-                needs_analysis = True
-                self._invalidate_analysis_for_data(data)
+                full_path = os.path.join(self.translated_folder, target_rel_path)
+                data, needs_analysis = self._build_row_data_for_file(
+                    internal_path,
+                    full_path,
+                    is_validated_present,
+                    preserved_data=preserved_data.get(internal_path),
+                )
+                if internal_path in old_dirty_set:
+                    needs_analysis = True
+                    self._invalidate_analysis_for_data(data)
 
-            self._append_result_row(
-                row_pos,
-                internal_path,
-                target_rel_path,
-                is_validated_present,
-                data,
-                needs_analysis,
-                placeholder_text="...",
-            )
+                self._append_result_row(
+                    row_pos,
+                    internal_path,
+                    target_rel_path,
+                    is_validated_present,
+                    data,
+                    needs_analysis,
+                    placeholder_text="...",
+                )
 
-            row_pos += 1
+                row_pos += 1
         
         self._refresh_previous_problem_paths()
         self.reapply_filters()

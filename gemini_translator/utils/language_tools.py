@@ -36,6 +36,7 @@ except ImportError:
     OPENCC_AVAILABLE = False
 
 from . import cjk_ranges
+from .substring_index import contained_terms
 
 STOP_WORDS = {'the', 'a', 'an', 'to', 'in', 'on', 'of', 'for', 'with', 'am', 'i'}
 CJK_STOP_WORDS = {'的', '是', '一', '不', '人', '我', '了', '在', '有', '和', '之'}
@@ -1400,11 +1401,17 @@ class GlossaryLogic:
         terms_set = {_glossary_text(e.get('original')) for e in glossary_list if _glossary_text(e.get('original'))}
         groups, inverted = defaultdict(list), defaultdict(list)
         terms = sorted(list(terms_set), key=len)
-        for i in range(len(terms)):
-            for j in range(i + 1, len(terms)):
-                if terms[i] in terms[j]:
-                    groups[terms[i]].append(terms[j])
-                    inverted[terms[j]].append(terms[i])
+        # Ахо–Корасик вместо перебора всех пар (0,34 с на 4000 терминов при
+        # каждом открытии менеджера). Порядок прежний: внешний цикл — по
+        # короткому термину, внутренний — по содержащим его в порядке terms.
+        containers = [[] for _ in terms]
+        for outer, inner_indices in enumerate(contained_terms(terms)):
+            for inner in inner_indices:
+                containers[inner].append(outer)
+        for inner, outer_indices in enumerate(containers):
+            for outer in outer_indices:
+                groups[terms[inner]].append(terms[outer])
+                inverted[terms[outer]].append(terms[inner])
         return groups, inverted
 
     
