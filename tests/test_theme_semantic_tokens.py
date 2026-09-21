@@ -139,3 +139,18 @@ def test_the_danger_button_and_the_status_chip_are_built_from_tokens():
     success = sheet.split('QLabel#statusChip[tone="success"] {', 1)[1].split("}", 1)[0]
     assert palette["success_text"] in success
     assert "__SUCCESS_TEXT__" not in sheet and "__DANGER_HOVER_BG__" not in sheet
+
+
+ROW_STATUS_TONES = ("success", "warning", "danger", "info", "pending")
+
+
+@pytest.mark.parametrize("scheme", sorted(_SCHEMES))
+@pytest.mark.parametrize("tone", ROW_STATUS_TONES)
+@pytest.mark.parametrize("surface", ["list_bg", "list_alt_bg"])
+def test_row_text_reads_on_every_row_status_fill(scheme, tone, surface):
+    """Строка таблицы со статусом: обычный текст на её заливке не ниже 4.5:1."""
+    palette = themes.build_theme_palette(_SCHEMES[scheme])
+
+    background = _over(palette[f"{tone}_row_bg"], palette[surface])
+
+    assert _ratio(_rgb(palette["text_primary"]), background) >= 4.5

@@ -2,6 +2,8 @@ import weakref  # <<< ИЗМЕНЕНИЕ 1: Добавлен импорт
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import Qt, pyqtSignal
 
+from ...item_background import ItemBackgroundDelegate
+
 
 EXPANDING_TEXT_EDITOR_MIN_HEIGHT = 36
 
@@ -45,10 +47,11 @@ class ExpandingTextEdit(QtWidgets.QTextEdit):
         # И сообщаем об этом, чтобы таблица тоже обновилась
         self.geometryChangeRequested.emit()
 
-class ExpandingTextEditDelegate(QtWidgets.QStyledItemDelegate):
+class ExpandingTextEditDelegate(ItemBackgroundDelegate):
     """
     Финальная версия делегата v4.0 ("Синхронизатор").
     Использует сигналы от редактора для идеальной синхронизации высоты строки.
+    Фон ячеек (подсветка конфликтов и правок) рисует ItemBackgroundDelegate.
     """
     def createEditor(self, parent, option, index):
         editor = ExpandingTextEdit(parent)

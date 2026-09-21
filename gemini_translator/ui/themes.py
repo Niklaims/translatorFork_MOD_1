@@ -132,6 +132,11 @@ def _contrast_ratio(color_a: str, color_b: str) -> float:
 # How opaque the soft status fills are at rest and under the pointer.
 STATUS_SOFT_ALPHA = 0.14
 STATUS_HOVER_ALPHA = 0.22
+# Status fills of table and list rows. At a chip's 0.14 the closest two of the
+# five validator statuses are 0.022 apart in OKLab, barely past the smallest
+# visible step of about 0.02; 0.22 keeps every pair 0.035 or more apart in both
+# schemes.
+STATUS_ROW_ALPHA = 0.22
 # A little above WCAG AA's 4.5:1, so rounding in the final blend never drops a
 # pair under the line.
 READABLE_STATUS_CONTRAST = 4.6
@@ -188,6 +193,9 @@ def build_theme_palette(theme_colors: Any = None) -> dict[str, str]:
     warning = _status("#b5730a", "#e6a23c", window_bg)
     danger = _status("#c0392b", "#ef6b62", window_bg)
     info = _status("#2563c9", "#6aa6ff", window_bg)
+    # Waiting for another pass (the validator's retry). Info's OKLCH lightness
+    # and chroma turned to hue 320: as far from info's blue as from danger's red.
+    pending = _status("#923fa4", "#cd86dd", window_bg)
     status_surfaces = (panel_bg, list_bg, list_alt_bg)
     success_text = _readable_status_text(
         success, status_surfaces, title_text, (STATUS_SOFT_ALPHA,)
@@ -239,6 +247,12 @@ def build_theme_palette(theme_colors: Any = None) -> dict[str, str]:
         "danger_hover_bg": _rgba(danger, STATUS_HOVER_ALPHA),
         "danger_text": danger_text,
         "info": info,
+        "pending": pending,
+        "success_row_bg": _rgba(success, STATUS_ROW_ALPHA),
+        "warning_row_bg": _rgba(warning, STATUS_ROW_ALPHA),
+        "danger_row_bg": _rgba(danger, STATUS_ROW_ALPHA),
+        "info_row_bg": _rgba(info, STATUS_ROW_ALPHA),
+        "pending_row_bg": _rgba(pending, STATUS_ROW_ALPHA),
     }
 
 
@@ -1012,6 +1026,15 @@ QMessageBox QLabel {
 """
 
 
+# The plate every table and list item sits on (the ``::item`` rules below).
+# Those rules make QStyleSheetStyle paint items itself and drop the brush a
+# model gives them, so ui/item_background.py fills that brush on a plate of the
+# same shape.
+ITEM_MARGIN_X = 4
+ITEM_MARGIN_Y = 2
+ITEM_RADIUS = 6
+
+
 def build_dark_stylesheet(theme_colors: Any = None) -> str:
     palette = build_theme_palette(theme_colors)
     stylesheet = STYLESHEET_TEMPLATE
@@ -1030,8 +1053,8 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
         }
         QTableWidget::item, QListWidget::item {
             border: 1px solid transparent;
-            border-radius: 6px;
-            margin: 2px 4px;
+            border-radius: __ITEM_RADIUS__px;
+            margin: __ITEM_MARGIN_Y__px __ITEM_MARGIN_X__px;
             padding: 2px 8px;
             min-height: 28px;
         }
@@ -1073,8 +1096,8 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
             outline: 0;
         }
         QTableWidget::item, QListWidget::item {
-            border-radius: 6px;
-            margin: 2px 4px;
+            border-radius: __ITEM_RADIUS__px;
+            margin: __ITEM_MARGIN_Y__px __ITEM_MARGIN_X__px;
             padding: 2px 8px;
             min-height: 28px;
         }
@@ -1106,6 +1129,9 @@ def build_dark_stylesheet(theme_colors: Any = None) -> str:
 
     for key, value in palette.items():
         stylesheet = stylesheet.replace(f"__{key.upper()}__", value)
+    stylesheet = stylesheet.replace("__ITEM_RADIUS__", str(ITEM_RADIUS))
+    stylesheet = stylesheet.replace("__ITEM_MARGIN_X__", str(ITEM_MARGIN_X))
+    stylesheet = stylesheet.replace("__ITEM_MARGIN_Y__", str(ITEM_MARGIN_Y))
     stylesheet = stylesheet.replace("__CHEVRON_DOWN_ICON__", _CHEVRON_DOWN_ICON)
     stylesheet = stylesheet.replace("__CHEVRON_UP_ICON__", _CHEVRON_UP_ICON)
     return stylesheet

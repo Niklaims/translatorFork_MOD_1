@@ -17,6 +17,7 @@ from ...utils.document_importer import set_all_checked
 from ...utils.html_text import extract_visible_text_normalized
 from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path
 from ...utils.language_tools import LanguageDetector
+from ..item_background import ItemBackgroundDelegate, paint_item_background
 from ..widgets.table_utils import NumericSortItem
 from ..widgets.ancestor_utils import find_ancestor_by_predicate
 from ..widgets.regex_syntax_highlighter import (
@@ -372,28 +373,37 @@ class ChapterStatusDelegate(QtWidgets.QStyledItemDelegate):
         init_option = QtWidgets.QStyleOptionViewItem(option)
         self.initStyleOption(init_option, index)
         init_option.text = ""
+        paint_item_background(painter, init_option)
         style = init_option.widget.style() if init_option.widget else QApplication.style()
         style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, init_option, painter, init_option.widget)
-        text_rect = QtCore.QRect(option.rect)
-        
+        # Текст — в той же рамке, что у соседних колонок: поля и отступы
+        # плашки темы плюс поле текста стиля. Иначе он прилипает к краю плашки.
+        text_rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, init_option, init_option.widget
+        )
+        text_margin = style.pixelMetric(
+            QtWidgets.QStyle.PixelMetric.PM_FocusFrameHMargin, None, init_option.widget
+        ) + 1
+        text_rect.adjust(text_margin, 0, -text_margin, 0)
+
         if has_validated:
             painter.save()
             indicator_rect = QtCore.QRect(option.rect)
             indicator_rect.setLeft(indicator_rect.right() - 24)
             indicator_rect.adjust(0, 2, 0, -2)
-            
+
             painter.setFont(QFont("Segoe UI Symbol", 10))
             painter.setPen(QColor("#2ECC71"))
             painter.drawText(indicator_rect, Qt.AlignmentFlag.AlignCenter, "✅")
             painter.restore()
-            text_rect.setRight(text_rect.right() - 26)
+            text_rect.setRight(min(text_rect.right(), option.rect.right() - 26))
 
         painter.save()
         text_color = QColor("#2ECC71") if has_validated else option.palette.color(QtGui.QPalette.ColorRole.Text)
         painter.setPen(text_color)
-        
+
         flags = Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
-        painter.drawText(text_rect.adjusted(5, 0, 0, 0), int(flags), text)
+        painter.drawText(text_rect, int(flags), text)
         painter.restore()
 
     def sizeHint(self, option, index):
@@ -867,6 +877,7 @@ class AIRepairReviewPage(ShellPage):
         self.splitter = QSplitter(Qt.Orientation.Vertical)
 
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Применить", "Тип", "Файл", "Строка/блок", "Было", "Стало"])
@@ -2027,6 +2038,18 @@ class _LazyOriginalEpubZip:
     def close(self):
         if self._zip is not None:
             self._zip.close()
+
+
+# Заливка строки по статусу — токены темы (themes.py). Прежние тёмные тона
+# в светлой теме сливались в один серый, а «К переотправке» и «Проблема»
+# не различались ни в одной из тем.
+STATUS_ROW_FILLS = {
+    "delete": "danger_row_bg",
+    "ok": "success_row_bg",
+    "retry": "pending_row_bg",
+    "problem": "warning_row_bg",
+    "edited": "info_row_bg",
+}
 
 
 # --- Главное окно диалога ---
@@ -3519,6 +3542,7 @@ class TranslationValidatorPage(ShellPage):
         self.table_results = QTableWidget()
         self.table_results.setAlternatingRowColors(True)
         self.table_results.setMinimumHeight(180)
+        self.table_results.setItemDelegate(ItemBackgroundDelegate(self.table_results))
         self.table_results.setItemDelegateForColumn(0, ChapterStatusDelegate(self.table_results))
         self.table_results.setColumnCount(4); self.table_results.setHorizontalHeaderLabels(["Исходный файл в EPUB", "Проблемы", "Длина (Ориг|Перевод)", "Статус"])
         
@@ -5614,17 +5638,9 @@ class TranslationValidatorPage(ShellPage):
                 self.update_row_color(row, internal_status)
 
     def update_row_color(self, row, status):
-        alpha = 85 
-        color = QColor("transparent") # Нейтральный цвет по умолчанию
-
-        if status == 'delete': color = QColor(90, 58, 58, alpha)
-        elif status == 'ok': color = QColor(46, 75, 62, alpha)
-        elif status == 'retry': color = QColor(88, 68, 46, alpha)
-        elif status == 'problem': color = QColor(93, 72, 53, alpha)
-        elif status == 'edited': color = QColor(58, 75, 95, alpha)
-        # Для 'neutral' мы просто оставляем прозрачный цвет по умолчанию
-
-        brush = QBrush(color)
+        token = STATUS_ROW_FILLS.get(status)
+        # У 'neutral' заливки нет.
+        brush = QBrush(theme_manager.qcolor(token)) if token else QBrush()
         for col in range(self.table_results.columnCount()):
             item = self.table_results.item(row, col)
             if item:

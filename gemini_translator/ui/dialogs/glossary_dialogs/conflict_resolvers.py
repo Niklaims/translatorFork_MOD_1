@@ -14,6 +14,7 @@ from PyQt6.QtGui import QColor
 # --- Импорты из вашего проекта ---
 from gemini_translator.ui.widgets.common_widgets import NoScrollComboBox
 from gemini_translator.ui.shell import ShellPage
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from .custom_widgets import ExpandingTextEditDelegate, SmartTextEdit
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 
@@ -219,6 +220,7 @@ class ComplexOverlapResolverPage(WizardStepMixin, ShellPage):
         self.left_label = QLabel()
         left_layout.addWidget(self.left_label)
         self.left_list = QListWidget()
+        self.left_list.setItemDelegate(ItemBackgroundDelegate(self.left_list))
         self.left_list.setAlternatingRowColors(True)
         self.left_list.currentItemChanged.connect(self.on_group_changed)
         left_layout.addWidget(self.left_list)
@@ -760,6 +762,7 @@ class ReverseConflictResolverPage(WizardStepMixin, ShellPage):
         left_layout = QVBoxLayout(left_panel)
         left_layout.addWidget(QLabel("<b>Проблемные переводы:</b>"))
         self.translations_list = QListWidget()
+        self.translations_list.setItemDelegate(ItemBackgroundDelegate(self.translations_list))
         self.translations_list.setAlternatingRowColors(True)
         self.translations_list.currentItemChanged.connect(self.on_group_changed)
         self.translations_list.itemClicked.connect(self.on_item_clicked)

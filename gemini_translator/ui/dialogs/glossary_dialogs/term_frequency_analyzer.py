@@ -22,6 +22,7 @@ from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.widgets.common_widgets import NoScrollSpinBox
 from .custom_widgets import ExpandingTextEditDelegate
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from ...widgets.overlay_tab_widget import install_tab_fade
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 
@@ -171,6 +172,7 @@ class TermFrequencyAnalyzerPage(ShellPage):
 
     def _create_table(self, editable=False):
         table = QTableWidget()
+        table.setItemDelegate(ItemBackgroundDelegate(table))
         table.setAlternatingRowColors(True)
         table.setColumnCount(4)
         table.setHorizontalHeaderLabels(["Оригинал", "Перевод", "Примечание", "Частота"])
