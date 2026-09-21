@@ -47,6 +47,7 @@ from .glossary_dialogs.import_master import (
     ImporterWizardDialog,
     MultiImportManagerDialog
 )
+from .glossary_dialogs.paste_terms import run_glossary_paste
 # Кастомные виджеты
 from .glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 
@@ -575,6 +576,14 @@ class GlossaryManagerPage(ShellPage):
         
         add_term_button = QPushButton("➕ Добавить термин"); add_term_button.clicked.connect(self._add_new_term)
         top_controls.addWidget(add_term_button)
+
+        self.paste_terms_button = QPushButton("📋 Вставить термины…")
+        self.paste_terms_button.setToolTip(
+            "Вставить список терминов: новые добавятся, а для уже известных "
+            "покажется, что заменится"
+        )
+        self.paste_terms_button.clicked.connect(self._paste_terms)
+        top_controls.addWidget(self.paste_terms_button)
         
         main_layout.addLayout(top_controls)
         
@@ -998,7 +1007,24 @@ class GlossaryManagerPage(ShellPage):
                 self.table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
                 self.table.editItem(item)
                 break
-    
+
+    def _paste_terms(self):
+        """Массовая вставка терминов; расхождения с глоссарием пользователь
+        подтверждает в карточке (см. glossary_dialogs/paste_terms.py)."""
+        self.table.setCurrentItem(None)
+        run_glossary_paste(self, self.get_glossary(include_db_id=True), self._apply_pasted_terms)
+
+    def _apply_pasted_terms(self, plan, accepted_conflicts):
+        # Одна запись истории на всю вставку: «Отменить» откатывает её целиком.
+        patch_list = [
+            {'before': conflict.current, 'after': conflict.replacement}
+            for conflict in accepted_conflicts
+        ]
+        patch_list += [{'before': None, 'after': entry} for entry in plan.additions]
+        self._apply_patch_and_log_history(patch_list, "Вставка терминов", self.get_glossary())
+        if self.launch_mode != 'child':
+            self.save_button.setEnabled(True)
+
     def open_frequency_analyzer(self):
         """Открывает страницу частотного анализа и применяет полученный патч."""
         if self._is_glossary_empty():

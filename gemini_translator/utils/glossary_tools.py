@@ -11,6 +11,7 @@ import time
 import zipfile
 import threading
 import random
+from dataclasses import dataclass
 from ..utils.language_tools import SmartGlossaryFilter, GlossaryRegexService, get_chinese_script_variants
 from ..utils.epub_tools import (
     TASK_SIZE_UNIT_CHARS,
@@ -158,6 +159,98 @@ def normalize_glossary_entries(glossary_data, *, note_fallbacks=("note",), stamp
         })
 
     return normalized
+
+
+@dataclass(frozen=True)
+class GlossaryPasteConflict:
+    """Термин вставки, который уже есть в глоссарии с другим переводом или
+    примечанием. ``index`` и ``current`` — первая запись глоссария с тем же
+    термином (как её передали, со служебными полями вроде ``_db_id``),
+    ``replacement`` — её ``{original, rus, note}`` после замены."""
+    index: int
+    current: dict
+    replacement: dict
+
+
+@dataclass(frozen=True)
+class GlossaryPastePlan:
+    additions: list    # новые термины {original, rus, note} в порядке вставки
+    conflicts: list    # GlossaryPasteConflict
+    unchanged: int     # термины, которые уже есть в глоссарии без расхождений
+    skipped: int       # строки вставки без оригинала
+
+
+def _glossary_text(value) -> str:
+    return "" if value is None else str(value)
+
+
+def plan_glossary_paste(existing_entries, pasted_entries) -> GlossaryPastePlan:
+    """Сравнивает вставленный вручную список терминов с глоссарием.
+
+    Термины сопоставляются по glossary_entry_key: регистр и пробелы по краям
+    не важны. Пустое поле вставки ничего не меняет — строка без примечания
+    не стирает примечание глоссария. Повтор термина внутри вставки перекрывает
+    предыдущую строку. Если в глоссарии термин записан дважды, сравнение идёт
+    с первой записью.
+    """
+    first_index_by_key = {}
+    for index, entry in enumerate(existing_entries):
+        key = glossary_entry_key(entry)
+        if key:
+            first_index_by_key.setdefault(key, index)
+
+    pasted_by_key = {}
+    skipped = 0
+    for entry in pasted_entries:
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        incoming = {
+            'original': _glossary_text(entry.get('original')).strip(),
+            'rus': _glossary_text(entry.get('rus') or entry.get('translation')).strip(),
+            'note': _glossary_text(entry.get('note')).strip(),
+        }
+        key = glossary_entry_key(incoming)
+        if not key:
+            skipped += 1
+            continue
+        pasted_by_key[key] = incoming
+
+    additions, conflicts, unchanged = [], [], 0
+    for key, incoming in pasted_by_key.items():
+        index = first_index_by_key.get(key)
+        if index is None:
+            additions.append(incoming)
+            continue
+
+        current = existing_entries[index]
+        replacement = {
+            field: _glossary_text(current.get(field))
+            for field in ('original', 'rus', 'note')
+        }
+        changed = False
+        for field in ('rus', 'note'):
+            if incoming[field] and incoming[field] != replacement[field].strip():
+                replacement[field] = incoming[field]
+                changed = True
+
+        if changed:
+            conflicts.append(GlossaryPasteConflict(index, current, replacement))
+        else:
+            unchanged += 1
+
+    return GlossaryPastePlan(additions, conflicts, unchanged, skipped)
+
+
+def apply_glossary_paste(existing_entries, plan, accepted_conflicts) -> list:
+    """Глоссарий после вставки: принятые замены на местах своих записей
+    (прочие поля записи, например timestamp, сохраняются), новые термины —
+    в конце. Исходный список не меняется."""
+    merged = [dict(entry) for entry in existing_entries]
+    for conflict in accepted_conflicts:
+        merged[conflict.index].update(conflict.replacement)
+    merged.extend(dict(entry) for entry in plan.additions)
+    return merged
 
 
 # --- НОВАЯ ФУНКЦИЯ ПЕРЕД КЛАССОМ ContextManager ---
