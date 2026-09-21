@@ -109,9 +109,12 @@ def apply(
     scheme = resolve_scheme(normalize_mode(mode), system_is_dark(app))
     base = resolve_base_colors(scheme, manual_colors, system_accent(app))
     use_glass = bool(glass) and glass_available()
-    app.setStyleSheet(
-        build_glass_stylesheet(base, glass_opacities) if use_glass else build_stylesheet(base)
-    )
+    stylesheet = build_glass_stylesheet(base, glass_opacities) if use_glass else build_stylesheet(base)
+    # setStyleSheet перестилизует все виджеты приложения даже при той же
+    # строке, а окна зовут apply при каждой загрузке настроек: окно перевода
+    # теряло на этом полсекунды при каждом открытии.
+    if app.styleSheet() != stylesheet:
+        app.setStyleSheet(stylesheet)
     setattr(app, "_active_theme_mode", normalize_mode(mode))
     setattr(app, "_theme_palette", build_theme_palette(base))
     setattr(app, "_glass_active", use_glass)
@@ -255,7 +258,9 @@ def glass_available() -> bool:
     """
     try:
         from .platform import macos_vibrancy
-        return macos_vibrancy.is_available() and macos_vibrancy.VIBRANCY_READY
+        # Флаг первым: is_available() импортирует AppKit (~0,2 с), а пока
+        # стекло выключено флагом, этот импорт не нужен.
+        return macos_vibrancy.VIBRANCY_READY and macos_vibrancy.is_available()
     except Exception:
         return False
 
@@ -283,6 +288,9 @@ def save_glass(settings_manager, on: bool) -> None:
 def _apply_vibrancy_to_top_levels(app, use_glass: bool) -> None:
     try:
         from .platform import macos_vibrancy
+        if not macos_vibrancy.VIBRANCY_READY:
+            # Пока стекло выключено флагом, его никто не ставил — и снимать нечего.
+            return
         for widget in app.topLevelWidgets():
             try:
                 if widget.isVisible():
