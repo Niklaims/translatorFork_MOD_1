@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import time
@@ -123,11 +124,16 @@ def _show(qt_app, root) -> None:
 def _pixel(view, x: int, y: int) -> str:
     image = view.viewport().grab().toImage()
     ratio = image.devicePixelRatio()
-    return image.pixelColor(QtCore.QPoint(round(x * ratio), round(y * ratio))).name()
+    point = QtCore.QPoint(round(x * ratio), round(y * ratio))
+    # За краем картинки pixelColor молча отдаёт чёрный.
+    assert image.rect().contains(point), f"точка {x}, {y} вне области вида"
+    return image.pixelColor(point).name()
 
 
 def _cell_background(view, index) -> str:
     """Цвет ячейки у правого края: там нет ни текста, ни скруглённых углов."""
+    view.scrollTo(index)
+    QtWidgets.QApplication.processEvents()
     rect = view.visualRect(index)
     return _pixel(view, rect.right() - 12, rect.center().y())
 
@@ -542,3 +548,188 @@ def test_view_shows_item_background_under_theme(
     finally:
         root.close()
         root.deleteLater()
+
+
+# --- Заливки статусов ---------------------------------------------------------
+# Порог заметности разницы цветов в OKLab — около 0,02. Заливка статуса должна
+# отличаться от обычной строки с запасом, а статусы — друг от друга.
+VISIBLE_DIFFERENCE = 0.05
+DISTINCT_DIFFERENCE = 0.03
+# И читаться своим оттенком, а не серым: насыщенность OKLCH прежних тёмных
+# тонов в светлой теме была 0,010–0,018.
+STATUS_CHROMA = 0.025
+
+
+def _oklab(name: str) -> tuple[float, float, float]:
+    """Цвет в OKLab: евклидово расстояние в нём близко к видимой разнице."""
+
+    def linear(channel: int) -> float:
+        value = channel / 255
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    color = QtGui.QColor(name)
+    red, green, blue = (linear(c) for c in (color.red(), color.green(), color.blue()))
+    long = (0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue) ** (1 / 3)
+    medium = (0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue) ** (1 / 3)
+    short = (0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue) ** (1 / 3)
+    return (
+        0.2104542553 * long + 0.7936177850 * medium - 0.0040720468 * short,
+        1.9779984951 * long - 2.4285922050 * medium + 0.4505937099 * short,
+        0.0259040371 * long + 0.7827717662 * medium - 0.8086757660 * short,
+    )
+
+
+def _difference(first: str, second: str) -> float:
+    return math.dist(_oklab(first), _oklab(second))
+
+
+def _chroma(name: str) -> float:
+    _lightness, green_red, blue_yellow = _oklab(name)
+    return math.hypot(green_red, blue_yellow)
+
+
+def _assert_status_fills(fills: dict[str, str], plain: str) -> None:
+    """Каждая заливка видна на фоне строки, отличается от прочих, не серая и читается."""
+    faint = {name: round(_difference(fill, plain), 3) for name, fill in fills.items()}
+    assert min(faint.values()) >= VISIBLE_DIFFERENCE, faint
+    grey = {name: round(_chroma(fill), 3) for name, fill in fills.items()}
+    assert min(grey.values()) >= STATUS_CHROMA, grey
+    alike = {
+        f"{first}~{second}": round(_difference(fills[first], fills[second]), 3)
+        for index, first in enumerate(fills)
+        for second in list(fills)[index + 1:]
+    }
+    assert min(alike.values()) >= DISTINCT_DIFFERENCE, alike
+    unreadable = {name: round(_text_contrast(fill), 2) for name, fill in fills.items()}
+    assert min(unreadable.values()) >= 4.5, unreadable
+
+
+VALIDATOR_STATUSES = ("delete", "ok", "retry", "problem", "edited")
+
+
+def _validator_fills(qt_app, tmp_path, monkeypatch, statuses):
+    """Проверка перевода со статусами в чётных строках и их заливки.
+
+    Только чётные строки: у таблицы чередуются фоны строк.
+    """
+    page, table, _cells = _validator_results(tmp_path, monkeypatch)
+    table.setRowCount(2 * len(statuses))
+    for index, status in enumerate(statuses):
+        for column in range(table.columnCount()):
+            table.setItem(2 * index, column, QtWidgets.QTableWidgetItem(""))
+        page.update_row_color(2 * index, status)
+    _show(qt_app, page)
+    _deselect(qt_app, table)
+    model = table.model()
+    fills = {
+        status: _cell_background(table, model.index(2 * index, 2))
+        for index, status in enumerate(statuses)
+    }
+    return page, fills
+
+
+@pytest.mark.parametrize(("variant", "scheme"), THEMES)
+def test_validator_status_fills_are_distinct_and_readable(
+    qt_app, themed, app_settings, tmp_path, monkeypatch, variant, scheme
+):
+    themed(scheme, variant)
+    page, fills = _validator_fills(
+        qt_app, tmp_path, monkeypatch, (*VALIDATOR_STATUSES, "neutral")
+    )
+    try:
+        plain = fills.pop("neutral")
+        _assert_status_fills(fills, plain)
+
+        # Выделение ложится поверх заливки полупрозрачным цветом акцента.
+        table = page.table_results
+        model = table.model()
+        selected = {}
+        for index, status in enumerate(VALIDATOR_STATUSES):
+            table.selectRow(2 * index)
+            qt_app.processEvents()
+            selected[status] = round(
+                _text_contrast(_cell_background(table, model.index(2 * index, 2))), 2
+            )
+        assert min(selected.values()) >= 4.5, selected
+    finally:
+        page.close()
+        page.deleteLater()
+
+
+@pytest.mark.parametrize(("variant", "scheme"), THEMES)
+def test_epub_chapter_status_fills_are_distinct_and_readable(
+    qt_app, themed, app_settings, tmp_path, monkeypatch, variant, scheme
+):
+    themed(scheme, variant)
+    validator, reference = _validator_fills(qt_app, tmp_path, monkeypatch, ("ok",))
+    dialog, view, _cells = _epub_chapters(tmp_path, monkeypatch)
+    try:
+        chapters = [f"OEBPS/Text/chapter_{number}.xhtml" for number in range(1, 6)]
+        # Проверенная, непроверенная и обычная главы — в чётных строках.
+        dialog.validated_chapters = {chapters[0]}
+        dialog.unvalidated_chapters = {chapters[2]}
+        dialog._populate_list_widget(chapters)
+        _show(qt_app, dialog)
+        _deselect(qt_app, view)
+        model = view.model()
+
+        fills = {
+            "validated": _cell_background(view, model.index(0, 0)),
+            "unvalidated": _cell_background(view, model.index(2, 0)),
+        }
+        _assert_status_fills(fills, _cell_background(view, model.index(4, 0)))
+        # Проверенная глава — тот же статус, что «Готов» в проверке перевода.
+        assert fills["validated"] == reference["ok"]
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+        validator.close()
+        validator.deleteLater()
+
+
+@pytest.mark.parametrize(("variant", "scheme"), THEMES)
+def test_fixer_context_fills_match_validator_statuses(
+    qt_app, themed, app_settings, tmp_path, monkeypatch, variant, scheme
+):
+    themed(scheme, variant)
+    validator, reference = _validator_fills(
+        qt_app, tmp_path, monkeypatch, ("edited", "delete")
+    )
+
+    class _Host(QtWidgets.QWidget):
+        settings_manager = object()
+
+    def entry(term, **changes):
+        return {"term": term, "context": f"<p>{term} here</p>", "location_info": "ch1", **changes}
+
+    # Правленный, очищенный и нетронутый контексты — в чётных строках.
+    page = UntranslatedFixerPage(
+        [
+            entry("Level", new_context="<p>Уровень here</p>"),
+            entry("Mana"),
+            entry("Qi"),
+            entry("Dao"),
+            entry("Sect"),
+        ],
+        _Host(),
+    )
+    page.setParent(None)
+    try:
+        _show(qt_app, page)
+        assert page._clear_context_rows([2]) == 1
+        _deselect(qt_app, page.table)
+        model = page.table.model()
+
+        fills = {
+            "edited": _cell_background(page.table, model.index(0, 2)),
+            "cleared": _cell_background(page.table, model.index(2, 2)),
+        }
+        _assert_status_fills(fills, _cell_background(page.table, model.index(4, 2)))
+        # Правка и очистка — те же статусы, что «Редакт.» и «На удаление»
+        # в проверке перевода, и выглядят так же.
+        assert fills == {"edited": reference["edited"], "cleared": reference["delete"]}
+    finally:
+        page.close()
+        page.deleteLater()
+        validator.close()
+        validator.deleteLater()

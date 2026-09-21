@@ -1247,7 +1247,7 @@ class ChapterEditorDialog(QDialog):
                 changed_item.setForeground(QtGui.QBrush(QColor("#b35c00")))
                 # Непрозрачный светло-жёлтый #fff4d6 под светлым текстом
                 # тёмной темы читался на 1,08:1.
-                translated_item.setBackground(theme_manager.qcolor("warning_soft_bg"))
+                translated_item.setBackground(theme_manager.qcolor("warning_row_bg"))
 
             self.block_table.setItem(row, 0, number_item)
             self.block_table.setItem(row, 1, tag_item)

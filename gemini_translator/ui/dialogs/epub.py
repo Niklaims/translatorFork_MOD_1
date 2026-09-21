@@ -732,6 +732,11 @@ class EpubHtmlSelectorDialog(QDialog):
 
     def _populate_list_widget(self, chapters_to_show):
         self.list_widget.clear()
+        # Заливки статусов — токены темы: проверенная глава как «Готов» в
+        # проверке перевода, переведённая без проверки — info. Прежние тёмные
+        # тона в светлой теме были почти одним серым.
+        validated_fill = theme_manager.qcolor("success_row_bg")
+        unvalidated_fill = theme_manager.qcolor("info_row_bg")
         for i, file_path in enumerate(chapters_to_show):
             size_chars = self._size_cache.get(file_path, 0)
             
@@ -741,9 +746,9 @@ class EpubHtmlSelectorDialog(QDialog):
             self._apply_chapter_item_tooltip(item, file_path)
             
             if file_path in self.validated_chapters:
-                item.setBackground(QtGui.QColor(46, 75, 62, 80))
+                item.setBackground(validated_fill)
             elif file_path in self.unvalidated_chapters:
-                item.setBackground(QtGui.QColor(58, 75, 95, 80))
+                item.setBackground(unvalidated_fill)
             
             self.list_widget.addItem(item)
 

@@ -2040,6 +2040,18 @@ class _LazyOriginalEpubZip:
             self._zip.close()
 
 
+# Заливка строки по статусу — токены темы (themes.py). Прежние тёмные тона
+# в светлой теме сливались в один серый, а «К переотправке» и «Проблема»
+# не различались ни в одной из тем.
+STATUS_ROW_FILLS = {
+    "delete": "danger_row_bg",
+    "ok": "success_row_bg",
+    "retry": "pending_row_bg",
+    "problem": "warning_row_bg",
+    "edited": "info_row_bg",
+}
+
+
 # --- Главное окно диалога ---
 class TranslationValidatorPage(ShellPage):
 
@@ -5626,17 +5638,9 @@ class TranslationValidatorPage(ShellPage):
                 self.update_row_color(row, internal_status)
 
     def update_row_color(self, row, status):
-        alpha = 85 
-        color = QColor("transparent") # Нейтральный цвет по умолчанию
-
-        if status == 'delete': color = QColor(90, 58, 58, alpha)
-        elif status == 'ok': color = QColor(46, 75, 62, alpha)
-        elif status == 'retry': color = QColor(88, 68, 46, alpha)
-        elif status == 'problem': color = QColor(93, 72, 53, alpha)
-        elif status == 'edited': color = QColor(58, 75, 95, alpha)
-        # Для 'neutral' мы просто оставляем прозрачный цвет по умолчанию
-
-        brush = QBrush(color)
+        token = STATUS_ROW_FILLS.get(status)
+        # У 'neutral' заливки нет.
+        brush = QBrush(theme_manager.qcolor(token)) if token else QBrush()
         for col in range(self.table_results.columnCount()):
             item = self.table_results.item(row, col)
             if item:

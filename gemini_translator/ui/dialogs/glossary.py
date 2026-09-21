@@ -1143,10 +1143,10 @@ class GlossaryManagerPage(ShellPage):
         color = QColor("transparent")
         if conflict_types:
             # Можно задать разные цвета для разных типов, но пока используем один.
-            # Мягкая заливка предупреждений темы: прежний светло-жёлтый
+            # Заливка строки-предупреждения из темы: прежний светло-жёлтый
             # (255, 243, 205, 120) терялся на светлой теме, а на тёмной
             # светлел до 3,5:1 со светлым текстом.
-            color = theme_manager.qcolor('warning_soft_bg')
+            color = theme_manager.qcolor('warning_row_bg')
     
         for col in range(3): # Подсвечиваем только ячейки с данными
             cell_item = self.table.item(row, col)
