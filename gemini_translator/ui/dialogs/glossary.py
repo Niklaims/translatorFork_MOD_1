@@ -910,8 +910,8 @@ class GlossaryManagerPage(ShellPage):
                     conn.execute("UPDATE glossary_editor_state SET original=?, rus=?, note=? WHERE id=?",
                                  (old_entry['original'], old_entry['rus'], old_entry['note'], old_entry['id']))
                 elif change_type == 'delete':
-                    conn.executemany("INSERT OR REPLACE INTO glossary_editor_state (id, sequence, original, rus, note) VALUES (?, ?, ?, ?, ?)",
-                                     [(e['id'], e['sequence'], e['original'], e['rus'], e['note']) for e in data['entries']])
+                    conn.executemany("INSERT OR REPLACE INTO glossary_editor_state (id, sequence, original, rus, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                                     [(e['id'], e['sequence'], e['original'], e['rus'], e['note'], e['timestamp']) for e in data['entries']])
                 elif change_type == 'add':
                     conn.execute("DELETE FROM glossary_editor_state WHERE id=?", (data['added_id'],))
             
@@ -920,8 +920,8 @@ class GlossaryManagerPage(ShellPage):
                 old_state = data['old_state']
                 if old_state:
                     # При восстановлении wholesale-состояния, генерируем новые ID, чтобы избежать коллизий
-                    conn.executemany("INSERT INTO glossary_editor_state (id, sequence, original, rus, note) VALUES (?, ?, ?, ?, ?)",
-                                     [(str(uuid.uuid4()), i, e['original'], e['rus'], e['note']) for i, e in enumerate(old_state)])
+                    conn.executemany("INSERT INTO glossary_editor_state (id, sequence, original, rus, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                                     [(str(uuid.uuid4()), i, e['original'], e['rus'], e['note'], e['timestamp']) for i, e in enumerate(old_state)])
 
         # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Вместо всех sync/update вызываем одну функцию ---
         self._load_current_page()
