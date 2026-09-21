@@ -6085,10 +6085,13 @@ class TranslationValidatorPage(ShellPage):
             if row_index not in soup_cache:
                 soup_cache[row_index] = BeautifulSoup(html_content, 'html.parser')
             soup = soup_cache[row_index]
+            # Текстовые узлы главы — одним обходом дерева: find_all(string=...)
+            # обходил его заново на каждое слово (треть открытия помощника).
+            chapter_strings = [node for node in soup.descendants if isinstance(node, NavigableString)]
 
             for term in result_data['untranslated_words']:
                 term_pattern = re.compile(re.escape(term), re.IGNORECASE)
-                text_nodes = soup.find_all(string=term_pattern)
+                text_nodes = [node for node in chapter_strings if term_pattern.search(node)]
 
                 for node in text_nodes:
                     if not node.parent:
