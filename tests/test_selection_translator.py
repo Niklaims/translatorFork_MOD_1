@@ -172,3 +172,84 @@ def test_offer_survives_application_deactivation_during_its_click(monkeypatch):
     assert controller._offered_snapshot is snapshot
     controller.shutdown()
     app.removeEventFilter(controller)
+
+
+class _CountingController(SelectionTranslationController):
+    """Контроллер, который записывает, какие события прошли через его фильтр."""
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt API name
+        getattr(self, "filtered", []).append(event.type())
+        return super().eventFilter(obj, event)
+
+
+def _counting_controller(app):
+    controller = _CountingController(app)
+    controller.filtered = []
+    return controller
+
+
+def _mouse_event(event_type, buttons):
+    point = QtCore.QPointF(1, 1)
+    return QtGui.QMouseEvent(
+        event_type,
+        point,
+        point,
+        point,
+        QtCore.Qt.MouseButton.LeftButton,
+        buttons,
+        QtCore.Qt.KeyboardModifier.NoModifier,
+    )
+
+
+def test_controller_does_not_filter_every_application_event():
+    # Фильтр на всём приложении — вызов Python на каждое событие Qt. Пока
+    # другой поток держит GIL, каждый такой вызов ждёт интерпретатор, и окна
+    # открывались с паузами в секунды.
+    app = _app()
+    controller = _counting_controller(app)
+    bystander = QtWidgets.QWidget()
+
+    QtWidgets.QApplication.sendEvent(bystander, QtCore.QEvent(QtCore.QEvent.Type.User))
+
+    assert controller.filtered == []
+    controller.shutdown()
+
+
+def test_focused_text_editor_still_offers_translation_after_selection():
+    app = _app()
+    controller = _counting_controller(app)
+    editor = QtWidgets.QPlainTextEdit()
+    offered = []
+    controller._offer_after_selection = lambda ref, _pos: offered.append(ref())
+    release = _mouse_event(
+        QtCore.QEvent.Type.MouseButtonRelease, QtCore.Qt.MouseButton.NoButton
+    )
+
+    controller._on_focus_changed(None, editor)
+    QtWidgets.QApplication.sendEvent(editor.viewport(), release)
+    app.processEvents()
+
+    assert offered == [editor]
+    controller.shutdown()
+
+
+def test_offer_watches_the_whole_application_only_while_visible():
+    app = _app()
+    controller = _counting_controller(app)
+    editor = QtWidgets.QLineEdit("Hello world")
+    editor.setSelection(0, 5)
+    bystander = QtWidgets.QWidget()
+
+    controller._offer_after_selection(weakref.ref(editor), QtCore.QPoint(300, 300))
+    assert controller._offered_snapshot is not None
+
+    press = _mouse_event(
+        QtCore.QEvent.Type.MouseButtonPress, QtCore.Qt.MouseButton.LeftButton
+    )
+    QtWidgets.QApplication.sendEvent(bystander, press)
+    assert controller._offered_snapshot is None
+
+    controller.filtered.clear()
+    QtWidgets.QApplication.sendEvent(bystander, QtCore.QEvent(QtCore.QEvent.Type.User))
+    assert controller.filtered == []
+    controller.shutdown()

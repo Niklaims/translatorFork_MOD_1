@@ -781,6 +781,17 @@ def global_excepthook(exc_type, exc_value, exc_tb):
     _escalate_to_emergency_shutdown(app, error_message)
 
 
+def tab_wheel_guard_needed(style) -> bool:
+    """Нужен ли фильтр, который не даёт колесу листать вкладки.
+
+    Фильтр висит на всём приложении: Qt зовёт Python на каждое событие, и пока
+    другой поток держит GIL, каждый вызов ждёт интерпретатор. Родной стиль
+    macOS колесом вкладки не листает сам — там фильтр только тормозит.
+    """
+    hint = QtWidgets.QStyle.StyleHint.SH_TabBar_AllowWheelScrolling
+    return bool(style.styleHint(hint))
+
+
 class ApplicationWithContext(QtWidgets.QApplication):
     """
     Расширенный класс QApplication для управления активным контекстом настроек.
@@ -800,7 +811,8 @@ class ApplicationWithContext(QtWidgets.QApplication):
             self._show_critical_error,
             QtCore.Qt.ConnectionType.QueuedConnection,
         )
-        self.installEventFilter(self)
+        if tab_wheel_guard_needed(self.style()):
+            self.installEventFilter(self)
 
     def eventFilter(self, obj, event):
         if event.type() == QtCore.QEvent.Type.Wheel and isinstance(obj, QtWidgets.QTabBar):
