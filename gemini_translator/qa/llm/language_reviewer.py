@@ -222,6 +222,24 @@ def is_transient(error: BaseException) -> bool:
     return False
 
 
+def is_truncated(error: BaseException) -> bool:
+    """Report whether the answer was cut off by the output limit.
+
+    A handler says so with the text it did receive (``partial_text``), the way
+    PartialGenerationError does for finishReason MAX_TOKENS.  Read by attribute
+    for the same reason as ``is_transient``: this layer stays free of the
+    handler exception hierarchy.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if getattr(current, "partial_text", None) is not None:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 async def request_qa_json(
     client: QaCompletionClient,
     prompt: str,
@@ -247,6 +265,10 @@ async def request_qa_json(
         except QaResponseSchemaError:
             raise LanguageReviewError(f"{purpose}_invalid_response") from None
         except Exception as error:  # noqa: BLE001 - classified just below
+            if is_truncated(error):
+                # The answer ran into the output limit: the same «too big a
+                # question» a broken JSON says, so the caller splits the chunk.
+                raise LanguageReviewError(f"{purpose}_invalid_response") from None
             if not is_transient(error):
                 detail = f"{type(error).__name__}: {error}"
                 raise LanguageReviewError(f"{purpose}_failed", detail) from None

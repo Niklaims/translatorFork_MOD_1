@@ -305,19 +305,43 @@ def test_dimensions_none_records_effective_dimension_and_subsequent_identical_re
     np.testing.assert_array_equal(first.vectors, second.vectors)
 
 
-def test_dimensionless_partial_lookup_refetches_full_original_request_without_distortion(tmp_path):
-    """Inferring dimensions from only part of a batch can combine incompatible vector spaces."""
+def test_dimensionless_partial_lookup_sends_only_the_texts_it_lacks(tmp_path):
+    """One edited paragraph must not send the whole side of a chapter again.
+
+    Measured on 73 edited chapters of a real book: 9 423 texts went to the
+    service where 152 were new, and every one of them was stored a second time.
+    Embedding quota is the narrowest resource QA has.
+    """
     root = tmp_path / "cache"
     upstream = _CountingProvider(effective_dimensions=6)
     provider = _provider(upstream, root)
-    asyncio.run(provider.embed(_request("known", dimensions=None, language="en")))
+    known = asyncio.run(provider.embed(_request("known", dimensions=None, language="en")))
 
     result = asyncio.run(
         provider.embed(_request("known", "new", dimensions=None, language="en-US"))
     )
 
-    assert upstream.requests[-1] == _request("known", "new", dimensions=None, language="en-US")
+    assert upstream.requests[-1] == _request("new", dimensions=None, language="en-US")
     assert result.dimensions == 6
+    np.testing.assert_array_equal(result.vectors[0], known.vectors[0])
+
+
+def test_a_service_answering_in_another_size_gets_the_whole_request_again(tmp_path):
+    """Cached vectors of one size never share a batch with fresh ones of another."""
+    root = tmp_path / "cache"
+    asyncio.run(
+        _provider(_CountingProvider(effective_dimensions=6), root).embed(
+            _request("known", dimensions=None, language="en")
+        )
+    )
+    upstream = _CountingProvider(effective_dimensions=8)
+
+    result = asyncio.run(
+        _provider(upstream, root).embed(_request("known", "new", dimensions=None, language="en"))
+    )
+
+    assert upstream.requests[-1] == _request("known", "new", dimensions=None, language="en")
+    assert result.dimensions == 8
 
 
 def test_cancellation_propagates_and_does_not_create_cache_entry(tmp_path):

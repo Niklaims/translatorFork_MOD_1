@@ -276,17 +276,36 @@ def test_the_key_provider_survives_a_restart(settings_manager, tmp_path: Path):
     assert reloaded.embedding_key_provider == "gemini"
 
 
-def test_the_language_check_is_sized_by_the_project_translation_limit():
+def test_a_chapter_translated_in_one_request_is_checked_in_one():
     """Проверка шлёт главу такими же порциями, какими её переводили.
 
-    Отдельная константа в 4000 символов означала три-четыре запроса там,
-    где перевод обходился одним, и вся разница уходила в квоту ключа.
+    Лимит перевода меряет HTML оригинала, а порция проверки — перевод вместе с
+    оригиналом абзацев: та же глава весит в ней в 2,25–3,45 раза больше
+    (медиана 2,75 на семи книгах). Лимит, взятый как есть, делил главу
+    китайской новеллы на 2,6 запроса вместо одного.
     """
+    from gemini_translator.qa.language_validation import LanguageBlock, chunk_blocks
     from gemini_translator.qa.settings import language_chunk_chars_for
 
+    # Глава в 6800 символов HTML: 95 абзацев по 50 иероглифов, перевод в
+    # среднем в 3,4 раза длиннее — обычная пропорция китайской новеллы.
+    sources = {f"n.{index}": "字" * 50 for index in range(95)}
+    blocks = [LanguageBlock(block_id, "б" * 170) for block_id in sources]
+
+    size = language_chunk_chars_for({"task_size_limit": 7000, "task_size_unit": "chars"})
+
+    assert len(chunk_blocks(blocks, size, sources)) == 1
+
+
+def test_a_huge_translation_limit_still_leaves_a_request_the_model_can_answer():
+    from gemini_translator.qa.settings import (
+        MAX_LANGUAGE_CHUNK_CHARS,
+        language_chunk_chars_for,
+    )
+
     assert language_chunk_chars_for(
-        {"task_size_limit": 25000, "task_size_unit": "chars"}
-    ) == 25000
+        {"task_size_limit": 60000, "task_size_unit": "chars"}
+    ) == MAX_LANGUAGE_CHUNK_CHARS
 
 
 def test_a_limit_in_tokens_says_nothing_about_characters():
