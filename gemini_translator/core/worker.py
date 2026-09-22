@@ -586,12 +586,17 @@ class UniversalWorker(EventBusMixin):
                     break # Выходим, если увольняемся или нет работы
                 if not self.check_session():
                     break
-                if not self.rpm_limiter.can_proceed():
+                if self.rpm_limiter.seconds_until_next_allowed() > 0:
                     rpm_limited = True
                     break # Выходим, если уперлись в RPM
 
                 task_info = self.task_manager.get_next_task(self.worker_id)
                 if task_info:
+                    # Слот занимает только взятая задача. Пустой опрос в
+                    # последовательном режиме занимал его, и следующая глава
+                    # ждала до целого интервала RPM: ~10% времени сессии при
+                    # RPM 5, до 43% при RPM 1.
+                    self.rpm_limiter.take_slot()
                     task = asyncio.create_task(self._process_single_task_with_retries(task_info))
                     active_tasks.add(task)
                     self._post_event('log_message', {'message': f"Ключ …{self.api_key[-4:]} взял задачу."})

@@ -13,6 +13,7 @@ from ..language_validation import (
     LanguageReplacement,
     LanguageReviewError,
 )
+from ..glossary_terms import glossary_named_in
 from ..models import OmissionRepairerConfig, QaModelValidationError
 from ..semantic_units import flatten_visible_text
 from ...utils.epub_json import build_translation_payload
@@ -24,7 +25,7 @@ from .prompts import (
     load_prompt_template,
     render_prompt,
 )
-from .schemas import LanguageIssue
+from .schemas import LanguageIssue, book_text
 
 
 CORRECTION_PURPOSE = "language_batch_correction"
@@ -89,7 +90,7 @@ class LanguageBatchRepairer:
             if not isinstance(entry, Mapping):
                 raise LanguageReviewError("correction_invalid_response")
             issue_id = entry.get("issue_id")
-            replacement_text = entry.get("replacement_text")
+            replacement_text = book_text(entry.get("replacement_text"))
             if (
                 not isinstance(issue_id, str)
                 or issue_id not in by_id
@@ -244,7 +245,10 @@ def _correction_lines(
         [
             f"- {escaped(term.original_term)} → {escaped(term.canonical_translation)}"
             f" | policy={term.policy.value}"
-            for term in request.glossary
+            for term in glossary_named_in(
+                request.glossary,
+                " ".join(request.source_text_by_block.get(issue.block_id, "") for issue in issues),
+            )
         ]
         or ["- none supplied"]
     )

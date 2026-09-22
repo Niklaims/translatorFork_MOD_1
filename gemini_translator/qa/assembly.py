@@ -445,7 +445,6 @@ def build_chapter_qa_request(
         model=model,
         session_id=session_id,
         glossary=glossary,
-        source_text_by_block=_source_text_by_block(source_payload),
     )
 
 
@@ -1222,19 +1221,6 @@ def _read_source_chapter(event) -> str | None:
         return Path(chapter_path).read_text(encoding="utf-8")
     except OSError:
         return None
-
-
-def _source_text_by_block(source_payload: Mapping[str, object]) -> dict[str, str]:
-    from .semantic_units import flatten_visible_text
-
-    blocks = source_payload.get("blocks")
-    if not isinstance(blocks, list):
-        return {}
-    return {
-        str(block["id"]): flatten_visible_text(block["inlines"])[0]
-        for block in blocks
-        if isinstance(block, Mapping) and block.get("id")
-    }
 
 
 def _extractor(capabilities: QaCapabilitySettings):

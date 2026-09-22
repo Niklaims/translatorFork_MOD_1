@@ -903,8 +903,8 @@ class ChapterQueueManager(QObject):
         if task_for_work:
             self._log(f"[TASK] →→ Задача '{self._get_task_display_name(task_for_work[1])}' отдана воркеру …{worker_id[-4:]} в работу.")
             self.notify_task_dirty(task_for_work[0])
-        else:
-            self._safe_request_ui_update()
+        # Пустой опрос ничего в очереди не меняет: перерисовывать список задач
+        # незачем, а в последовательном режиме такие опросы идут всю сессию.
         return task_for_work
     
     def update_task(self, task_id: uuid.UUID = None, worker_id: str = None, new_status: str = None, new_payload: tuple = None, new_priority: int = None, new_sequence: int = None, unsafe_mode=False, **conditions) -> tuple | None:

@@ -588,6 +588,29 @@ class CallsiteMigrationTests(unittest.TestCase):
         self.assertFalse(tm._structural_dirty,
                          "Single-task transitions must NOT set the structural flag")
 
+    def test_an_empty_poll_changes_nothing_and_asks_no_redraw(self):
+        # В последовательном режиме воркеры опрашивают очередь, пока глава
+        # переводится, и почти всегда впустую. Пустой опрос ничего не меняет —
+        # полная перерисовка списка задач на каждый такой опрос лишняя.
+        from gemini_translator.core.task_manager import ChapterQueueManager
+        tm = types.SimpleNamespace(
+            _dirty_state_lock=Lock(),
+            _dirty_task_ids=set(),
+            _structural_dirty=False,
+            _ui_update_requested=_SignalStub(),
+            update_task=lambda **kwargs: None,
+            _log=lambda *args, **kwargs: None,
+        )
+        for name in ("notify_task_dirty", "notify_structural_change",
+                     "_safe_request_ui_update", "get_next_task"):
+            setattr(tm, name, types.MethodType(getattr(ChapterQueueManager, name), tm))
+
+        self.assertIsNone(tm.get_next_task("worker-1"))
+
+        self.assertFalse(tm._structural_dirty)
+        self.assertEqual(tm._dirty_task_ids, set())
+        self.assertEqual(tm._ui_update_requested.emit_calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
