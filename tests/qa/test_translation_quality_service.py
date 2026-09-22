@@ -1107,6 +1107,32 @@ def test_the_language_check_is_shown_the_source_of_each_translated_paragraph(
     assert shown == {ids[0]: "He opened the door.", ids[1]: "He left at once."}
 
 
+def test_the_language_check_is_given_the_glossary_terms_of_its_chapter(tmp_path, chapter):
+    """Без глоссария проверка правила «Куэнтина» в «Квентина» прямо в книге."""
+    seen = {}
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            from gemini_translator.qa.language_validation import LanguageQaResult
+
+            seen["glossary"] = request.glossary
+            return LanguageQaResult(
+                chapter_id=request.chapter_id, issues=(), suggestions=(), refusals={}
+            )
+
+    service, _journal, _path = _service(tmp_path, aligner=_CleanAligner(), language=_Language())
+    request = replace(
+        _request(chapter),
+        glossary=(GlossaryTerm("room", "комната"), GlossaryTerm("sword", "меч")),
+    )
+
+    _check(service, request)
+
+    assert [
+        (term.original_term, term.canonical_translation) for term in seen["glossary"]
+    ] == [("room", "комната")]
+
+
 def test_a_refused_fix_is_scored_against_its_own_source_paragraph(tmp_path, chapter):
     service, _journal, _path = _service(
         tmp_path,

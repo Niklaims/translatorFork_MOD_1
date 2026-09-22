@@ -259,6 +259,8 @@ REFUSAL_DESCRIPTIONS: Mapping[str, str] = {
     "no_replacement": "нет текста замены",
     "low_confidence": "уверенность ниже порога",
     "ambiguous_span": "фрагмент встречается в абзаце не один раз",
+    "span_not_found": "фрагмента, который модель предлагает исправить, в абзаце нет",
+    "deletion_for_review": "удаление текста из книги решает человек",
     "no_change": "замена совпадает с исходным текстом",
     "yo_spelling": "буква ё — единое написание книги, а не правка",
     "correction_omitted": "модель не вернула замену для этой правки",
@@ -490,7 +492,10 @@ def auto_fix_refusal(
         return "subjective"
     if issue.confidence < min_confidence:
         return "low_confidence"
-    if block_text.count(issue.original_text) != 1:
+    occurrences = block_text.count(issue.original_text)
+    if occurrences == 0:
+        return "span_not_found"
+    if occurrences > 1:
         return "ambiguous_span"
     if _asks_for_a_new_paragraph(issue.original_text, issue.replacement_text):
         return "paragraph_break"
@@ -516,8 +521,13 @@ def auto_fix_refusal(
     if issue.category in DELETION_CATEGORIES:
         # A neural aside inside the book is removed, never rewritten: giving
         # these categories a free hand would let «(Конец главы)» be replaced by
-        # whatever sentence the model liked instead.
-        return "" if issue.replacement_text == "" else "category_not_auto_fixable"
+        # whatever sentence the model liked instead.  And the removal is a
+        # person's call: measured on five books, every «(Конец главы)» the check
+        # flagged translated （本章完） of the source, and the validator refused
+        # every removal anyway — 298 of its 485 refusals, a tenth of requests.
+        if issue.replacement_text == "":
+            return "deletion_for_review"
+        return "category_not_auto_fixable"
     if issue.category == "repetition" and drops_adjacent_duplicate(
         issue.original_text, issue.replacement_text
     ):

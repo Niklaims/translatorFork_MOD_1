@@ -66,5 +66,10 @@ def render_prompt(template: str, payload_lines: Sequence[str]) -> str:
 
 
 def escaped(value: str) -> str:
-    """Escape one untrusted book fragment so it cannot close the data boundary."""
-    return escape(value, quote=True)
+    """Escape one untrusted book fragment so it cannot close the data boundary.
+
+    Only ``&``, ``<`` and ``>``: a quote cannot close a tag.  Escaping quotes
+    too sent «До'Урден» as «До&#x27;Урден», the model quoted it back that way,
+    and the fix no longer matched the paragraph it was meant for.
+    """
+    return escape(value, quote=False)

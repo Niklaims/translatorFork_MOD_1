@@ -20,6 +20,8 @@ from gemini_translator.qa.language_validation import (
     LanguageQaRequest,
     LanguageQaResult,
     LanguageQualityPipeline,
+    LanguageReplacement,
+    apply_language_replacements,
     auto_fix_refusal,
     drops_adjacent_duplicate,
     is_mechanical_edit,
@@ -28,6 +30,7 @@ from gemini_translator.qa.language_validation import (
 from gemini_translator.qa.llm import CancellationToken, QaModelSelection
 from gemini_translator.qa.llm.language_reviewer import is_transient
 from gemini_translator.qa.llm.schemas import LanguageIssue
+from gemini_translator.qa.models import QaSuggestion
 from gemini_translator.utils.epub_json import (
     build_html_document_model,
     build_translation_payload,
@@ -192,12 +195,18 @@ def test_a_yo_only_edit_is_refused_as_policy_before_it_costs_a_request():
     assert "yo_spelling" in REFUSAL_DESCRIPTIONS
 
 
-def test_a_deletion_of_a_neural_artefact_is_eligible():
-    """«(Конец главы)» — не правка текста, а мусор, который надо убрать."""
+def test_a_deletion_is_left_for_a_person_to_confirm():
+    """Удаление текста из книги решает человек, а не пара запросов к модели.
+
+    На журналах пяти книг все 176 «(Конец главы)», найденных проверкой, были
+    переводом （本章完） из оригинала, а проверщик отклонял удаления все до
+    одного: 298 из 485 отказов, около 10% запросов впустую.
+    """
     issue = _make_issue(
         category="meta_comment", original_text="(Конец главы)", replacement_text=""
     )
-    assert auto_fix_refusal(issue, "Он сел. (Конец главы)") == ""
+    assert auto_fix_refusal(issue, "Он сел. (Конец главы)") == "deletion_for_review"
+    assert "deletion_for_review" in REFUSAL_DESCRIPTIONS
 
 
 def test_a_meta_comment_that_rewrites_rather_than_removes_stays_a_suggestion():
@@ -341,31 +350,40 @@ def test_an_issue_the_repairer_forgot_gets_a_refusal_not_silence():
     assert "correction_omitted" in REFUSAL_DESCRIPTIONS
 
 
-def test_a_deletion_survives_the_whole_pipeline_and_leaves_the_book():
+def test_a_deletion_costs_no_correction_or_validation_request():
     model = _model()
     blocks = _block_ids(model)
     artefact = _issue(
         1, blocks[2], " (Конец главы)", "", category="meta_comment"
     )
-    client = _Client(
-        {
-            "language_diagnosis": {"issues": [artefact]},
-            "language_batch_correction": _made([artefact]),
-            "language_batch_validation": {
-                "confirmed_issue_ids": ["issue-1"],
-                "rejected_issue_ids": [],
-            },
-        }
-    )
+    client = _Client({"language_diagnosis": {"issues": [artefact]}})
 
     result = _run(client, _request(model))
 
-    assert [item.issue_id for item in result.applied] == ["issue-1"]
-    texts = [
-        block["inlines"][0]["text"]
-        for block in build_translation_payload(result.preview_model)["blocks"]
-    ]
-    assert not any("Конец главы" in text for text in texts)
+    assert client.purposes == ["language_diagnosis"]
+    assert result.applied == ()
+    assert result.refusals["issue-1"] == "deletion_for_review"
+    assert "issue-1" in {issue.issue_id for issue in result.suggestions}
+
+
+@pytest.mark.parametrize(
+    ("reason", "applicable"),
+    [("deletion_for_review", True), ("no_replacement", False)],
+)
+def test_a_person_can_apply_a_deletion_the_model_actually_asked_for(reason, applicable):
+    """Пустая замена у этих двух категорий — удаление, если модель его и просила;
+    если модель замены не дала вовсе, применять нечего."""
+    suggestion = QaSuggestion(
+        suggestion_id="s-1",
+        chapter_id="chapter-1",
+        block_id="n.2",
+        category="meta_comment",
+        original_text=" (Конец главы)",
+        replacement_text="",
+        reason=reason,
+    )
+
+    assert suggestion.applicable is applicable
 
 
 # ---------------------------------------------------------- transient failure
@@ -398,28 +416,22 @@ def test_an_error_with_no_pause_anywhere_stays_permanent():
         assert is_transient(wrapped) is False
 
 
-def test_deleting_a_whole_paragraph_of_artefact_leaves_the_book_intact():
-    """«(Конец главы)» часто занимает весь абзац — удаление не должно ломать главу."""
+def test_applying_a_whole_paragraph_deletion_leaves_the_book_intact():
+    """«(Конец главы)» часто занимает весь абзац — удаление не должно ломать главу.
+
+    Удаление применяет человек из окна качества той же функцией, что и правки.
+    """
     model = build_html_document_model(
         "<p>Он сел.</p><p>(Конец главы)</p>", document_id="chapter-1"
     )
     blocks = _block_ids(model)
-    artefact = _issue(1, blocks[1], "(Конец главы)", "", category="meta_comment")
-    client = _Client(
-        {
-            "language_diagnosis": {"issues": [artefact]},
-            "language_batch_correction": _made([artefact]),
-            "language_batch_validation": {
-                "confirmed_issue_ids": ["issue-1"],
-                "rejected_issue_ids": [],
-            },
-        }
+
+    edited = apply_language_replacements(
+        model,
+        (LanguageReplacement("issue-1", blocks[1], "(Конец главы)", ""),),
     )
 
-    result = _run(client, _request(model))
-
-    assert [item.issue_id for item in result.applied] == ["issue-1"]
-    payload = build_translation_payload(result.preview_model)
+    payload = build_translation_payload(edited)
     texts = [
         "".join(inline.get("text", "") for inline in block["inlines"])
         for block in payload["blocks"]

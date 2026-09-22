@@ -12,6 +12,7 @@ from ..language_validation import (
     LanguageRuleIssue,
     RussianNlpAnalysis,
 )
+from ..glossary_terms import glossary_named_in
 from ..models import OmissionRepairerConfig
 from .completion import QaCompletionClient
 from .json_response import QaResponseSchemaError
@@ -311,7 +312,10 @@ def _diagnosis_lines(
         [
             f"- {escaped(term.original_term)} → {escaped(term.canonical_translation)}"
             f" | policy={term.policy.value}"
-            for term in request.glossary
+            for term in glossary_named_in(
+                request.glossary,
+                " ".join(request.source_text_by_block.get(block.block_id, "") for block in blocks),
+            )
         ],
     )
     return lines

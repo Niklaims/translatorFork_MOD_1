@@ -75,6 +75,9 @@ from .structural_repair import (
 
 
 MAX_GLOSSARY_TERMS_PER_CANDIDATE = 12
+# The terms the language check of one chapter may protect.  Each request shows
+# the model only those its own paragraphs name, so a long list costs little.
+MAX_GLOSSARY_TERMS_PER_LANGUAGE_CHECK = 60
 # A chapter whose volume is far outside its language pair's profile or its own
 # book's norm.  Deliberately not a deferred warning: nothing failed, the chapter
 # was checked, and it is worth a second look rather than a retry.
@@ -1195,6 +1198,17 @@ class TranslationQualityService:
             # moves the DOM ids of every block after it.
             source_text_by_block=_source_paragraphs(
                 request, payload_block_texts(build_translation_payload(model))
+            ),
+            glossary=self._glossary_selector.select_for_candidate(
+                request.glossary,
+                " ".join(
+                    text
+                    for _, text in payload_block_texts(
+                        request.coverage_request.source_payload
+                    )
+                ),
+                "",
+                MAX_GLOSSARY_TERMS_PER_LANGUAGE_CHECK,
             ),
             auto_fix_categories=options.auto_fix_language_categories,
             max_chunk_chars=options.language_chunk_chars,

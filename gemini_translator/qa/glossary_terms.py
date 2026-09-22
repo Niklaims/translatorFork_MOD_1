@@ -125,8 +125,9 @@ def contains_term_forms(text: str, term: str) -> bool:
     Literal matching is not enough here: a Russian glossary term almost always
     appears declined, and «предельных атрибутах» is the same term as «предельный
     атрибут».  Lemmas answer that exactly, so pymorphy is used when the
-    application already has it loaded; the prefix rule below is the fallback for
-    a build without it, and it is deliberately the weaker of the two.
+    application already has it loaded; the ending rule below covers a build
+    without it and the names pymorphy does not know, and it is deliberately the
+    weaker of the two.
     """
 
     if match_glossary_policies(text, (GlossaryRule(term, GlossaryPolicy.EITHER),)):
@@ -142,6 +143,11 @@ def contains_term_forms(text: str, term: str) -> bool:
         for start in range(len(text_lemmas) - len(term_lemmas) + 1):
             if text_lemmas[start : start + len(term_lemmas)] == term_lemmas:
                 return True
+    # pymorphy guesses the lemma of a name it does not know, and not always the
+    # same one for two cases of that name («Белос» — белос, «Белосом» —
+    # белосом), so a word still counts as the term when it is the term plus a
+    # case ending.  Only a case ending: any longer start took «след» for
+    # «следопыт» and «мир» for «Миртл».
     for start in range(len(text_words) - len(term_words) + 1):
         window = text_words[start : start + len(term_words)]
         if all(
@@ -189,11 +195,21 @@ def _lemmatizer():
     return lemma
 
 
+# Noun case endings a word may grow by (after «ё» became «е»).
+_CASE_ENDINGS = frozenset(
+    {
+        "", "а", "я", "у", "ю", "е", "и", "ы",
+        "ом", "ем", "ой", "ей", "ою", "ею", "ам", "ям", "ах", "ях", "ов", "ев",
+        "ами", "ями",
+    }
+)
+
+
 def _same_word_form(expected: str, actual: str) -> bool:
     shorter, longer = sorted((expected, actual), key=len)
     if len(shorter) < 3:
         return shorter == longer
-    return longer.startswith(shorter)
+    return longer.startswith(shorter) and longer[len(shorter):] in _CASE_ENDINGS
 
 
 def _words(value: str) -> tuple[str, ...]:
@@ -206,6 +222,19 @@ def _words(value: str) -> tuple[str, ...]:
 # inside unrelated compounds.  Demanding their canonical translation in a
 # fragment rejects perfectly good repairs — measured live on a real chapter.
 MIN_CANONICAL_TERM_CHARS = 2
+
+
+def glossary_named_in(
+    glossary: Iterable[RelevantGlossaryTerm], source_text: str
+) -> tuple[RelevantGlossaryTerm, ...]:
+    """The terms a passage can need: the ones its own source names.
+
+    A prompt about two paragraphs has no use for the canon of the other
+    forty terms of the chapter; the source says exactly which ones matter.
+    """
+    return tuple(
+        term for term in glossary if term.original_term and term.original_term in source_text
+    )
 
 
 def glossary_violation_reason(
