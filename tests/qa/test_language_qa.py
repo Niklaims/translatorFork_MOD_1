@@ -443,8 +443,9 @@ def test_the_checker_weighs_the_source_text_when_it_splits_a_chapter():
 class TruncatingClient:
     """Обрывает ответ на первых N запросах диагностики, дальше отвечает пусто."""
 
-    def __init__(self, failures: int) -> None:
+    def __init__(self, failures: int, error: Exception | None = None) -> None:
         self.failures = failures
+        self.error = error
         self.calls: list[str] = []
         self.chunk_sizes: list[int] = []
         self.budgets: list[int] = []
@@ -463,7 +464,7 @@ class TruncatingClient:
         self.budgets.append(max_output_tokens)
         if purpose == "language_diagnosis" and self.failures > 0:
             self.failures -= 1
-            raise QaResponseSchemaError("truncated JSON")
+            raise self.error or QaResponseSchemaError("truncated JSON")
         return {"issues": []}
 
 
@@ -482,6 +483,30 @@ def test_a_truncated_diagnosis_splits_the_chunk_instead_of_losing_it():
     assert client.chunk_sizes[0] == 3, "сперва спрашиваем главу целиком"
     assert all(size < 3 for size in client.chunk_sizes[1:]), "переспрашиваем меньшим"
     assert sum(client.chunk_sizes[1:]) == 3, "и ровно про те же блоки"
+    assert result.unchecked_blocks == 0
+
+
+def test_an_answer_cut_by_the_output_limit_splits_the_chunk_too():
+    """Настоящий обработчик обрывает ответ не битым JSON, а своим исключением.
+
+    Gemini отдаёт finishReason MAX_TOKENS, обработчик бросает
+    PartialGenerationError с началом ответа, и до сих пор такая глава целиком
+    уходила в непроверенные: деление срабатывало только на битом JSON.
+    """
+    from gemini_translator.api.errors import PartialGenerationError
+
+    model = _model()
+    client = TruncatingClient(
+        failures=1,
+        error=PartialGenerationError(
+            "Генерация прервана (причина: MAX_TOKENS)", '{"issues": [', "MAX_TOKENS"
+        ),
+    )
+
+    result = _check(client, _request(model, max_chunk_chars=100_000))
+
+    assert client.chunk_sizes[0] == 3
+    assert sum(client.chunk_sizes[1:]) == 3
     assert result.unchecked_blocks == 0
 
 

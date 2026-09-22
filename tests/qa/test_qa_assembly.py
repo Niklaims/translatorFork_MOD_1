@@ -351,9 +351,14 @@ def test_the_pass_is_sized_by_the_project_translation_limit():
             return QaSettings()
 
         def load_settings(self):
-            return {"task_size_limit": 25000, "task_size_unit": "chars"}
+            return {"task_size_limit": 5000, "task_size_unit": "chars"}
 
-    assert _current_options(Manager()).language_chunk_chars == 25000
+    from gemini_translator.qa.settings import language_chunk_chars_for
+
+    assert _current_options(Manager()).language_chunk_chars == language_chunk_chars_for(
+        {"task_size_limit": 5000, "task_size_unit": "chars"}
+    )
+    assert _current_options(Manager()).language_chunk_chars > 5000
 
 
 def test_unreadable_translation_settings_leave_a_workable_size():
