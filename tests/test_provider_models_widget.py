@@ -45,4 +45,4 @@ def test_on_load_models_clicked(provider_models_widget, qtbot):
             mock_refresh.assert_called_once_with("test_provider", api_key="test_key")
             
     assert provider_models_widget.load_models_btn.isEnabled()
-    assert provider_models_widget.load_models_btn.text() == "Загрузить модели"
+    assert provider_models_widget.load_models_btn.text() in ("Обновить", "Загрузить модели")

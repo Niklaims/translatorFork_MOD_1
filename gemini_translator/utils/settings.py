@@ -10,6 +10,10 @@ import threading
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..api import config as api_config
+from .interprocess_lock import interprocess_lock
+from .io_utils import atomic_write_text
+from .key_runtime_store import KeyRuntimeStore, runtime_store_path
+from .text_sanitize import sanitize_path_segment
 
 SETTINGS_PROFILE_ENV = "GT_SETTINGS_PROFILE"
 SETTINGS_DIR_ENV = "GT_SETTINGS_DIR"
@@ -61,16 +65,18 @@ def _safe_profile_segment(profile: str) -> str:
     normalized = normalize_settings_profile(profile)
     if not normalized:
         return ""
-    safe = "".join(
-        char if char.isalnum() or char in ("-", "_") else "_"
-        for char in normalized
-    ).strip("._-")
-    return safe or "profile"
+    return sanitize_path_segment(normalized, strip_chars="._-", default="profile")
 
 
 def default_settings_dir(home_dir=None) -> str:
     root = os.path.expanduser("~") if home_dir is None else os.path.expanduser(str(home_dir))
     return os.path.abspath(os.path.join(root, DEFAULT_SETTINGS_DIRNAME))
+
+
+def settings_lock_path(config_file) -> str:
+    """Файл межпроцессного замка: скрытый и лежит рядом с файлом настроек."""
+    directory, name = os.path.split(os.path.abspath(os.path.expanduser(str(config_file))))
+    return os.path.join(directory, f".{name}.lock")
 
 
 def resolve_settings_location(config_file=None, config_dir=None, profile=None, home_dir=None):
@@ -96,10 +102,32 @@ def resolve_settings_location(config_file=None, config_dir=None, profile=None, h
 
 
 _MISSING = object()
+# Возвращается вместо результата, когда операция хранилища не выполнилась.
+_STORE_FAILED = object()
 
 # Списки, которые надо сливать поэлементно, а не заменять целиком:
 # имя настройки -> поле, по которому опознаётся запись.
 _KEYED_LIST_SETTINGS = {"api_keys_with_status": "key"}
+
+
+def _strip_key_runtime_fields(key_info: dict) -> dict:
+    cleaned = deepcopy(key_info)
+    for field in ("status_by_model", "requests", "exhausted_at", "exhausted_level"):
+        cleaned.pop(field, None)
+    return cleaned
+
+
+def _split_key_statuses(key_statuses):
+    configured = []
+    runtime = {}
+    for item in key_statuses or []:
+        copied = deepcopy(item)
+        raw_key = copied.get("key")
+        model_statuses = copied.get("status_by_model", {})
+        if raw_key and isinstance(model_statuses, dict) and model_statuses:
+            runtime[raw_key] = model_statuses
+        configured.append(_strip_key_runtime_fields(copied))
+    return configured, runtime
 
 
 def _index_entries_by(entries, id_field):
@@ -219,12 +247,24 @@ class SettingsManager(QObject):
         
         # --- КЛЮЧЕВЫЕ КОМПОНЕНТЫ КЭШИРУЮЩЕЙ АРХИТЕКТУРЫ ---
         self.file_lock = PatientLock()
+        # Замок, общий для всех процессов, которые пишут этот же файл настроек.
+        self._settings_lock_path = settings_lock_path(self.config_file)
+        self._warned_about_missing_lock = False
         self._cache = {}
         # Снимок диска на момент последней синхронизации. Нужен, чтобы при записи
         # отличить наши правки от чужих и не затереть другой экземпляр приложения.
         self._disk_baseline = {}
         self._is_dirty = False
         self._last_save_error = None
+        self._last_runtime_store_error = None
+        self._last_load_failed = False
+        # Ключи, legacy-runtime которых не удалось перенести в SQLite: их поля
+        # обязаны остаться в JSON, иначе история квот пропадёт бесследно.
+        self._unmigrated_runtime_keys = set()
+        self._key_runtime_store = KeyRuntimeStore(
+            runtime_store_path(self.config_file),
+            on_corrupt=self._on_runtime_store_corrupt,
+        )
         
         # Таймер для отложенной записи (debouncing)
         self._save_timer = QtCore.QTimer(self)
@@ -236,6 +276,42 @@ class SettingsManager(QObject):
         # Первоначальная загрузка кэша
         with self.file_lock:
             self._load_from_disk_unsafe()
+        # Запоминаем сразу: последующее сохранение перечитает файл и сбросит флаг.
+        settings_were_readable = not self._last_load_failed
+        normalized, legacy_runtime, runtime = self._run_runtime_store_operation(
+            "normalize_legacy", self._prepare_legacy_key_runtime,
+            fallback=(False, False, {}),
+        )
+        if legacy_runtime:
+            imported = self._run_runtime_store_operation(
+                "import_legacy", self._key_runtime_store.import_legacy_once, runtime,
+                fallback=_STORE_FAILED,
+            )
+            if imported is False and runtime:
+                # Маркер импорта уже стоит, но runtime приехал позже: прошлый
+                # запуск не смог мигрировать ключ исчезнувшего провайдера.
+                # merge_statuses идемпотентен по таймстампам, дублей не будет.
+                imported = self._run_runtime_store_operation(
+                    "import_legacy_late", self._key_runtime_store.merge_statuses, runtime,
+                    fallback=_STORE_FAILED,
+                )
+            if imported is _STORE_FAILED:
+                # Импорт не состоялся — срезать legacy-поля из JSON нельзя,
+                # иначе состояние квот исчезнет вместе с ними.
+                normalized = legacy_runtime = False
+        if normalized or legacy_runtime:
+            with self.file_lock:
+                self._strip_runtime_from_key_cache_unsafe()
+                self._is_dirty = True
+            # A committed import remains usable if the subsequent JSON cleanup
+            # fails; flush can retry and the marker prevents a second import.
+            self._perform_save()
+        if self._key_runtime_store.path.exists():
+            self._run_runtime_store_operation(
+                "delete_orphans", self._key_runtime_store.delete_orphans, self.get_api_keys(),
+                allow_full_wipe=settings_were_readable,
+                fallback=None,
+            )
 
         # Пока приложение открыто, своевременно снимаем истекшие ограничения
         # и очищаем счетчики запросов, не дожидаясь перезапуска или ручного
@@ -260,27 +336,95 @@ class SettingsManager(QObject):
         event = {'event': name, 'source': 'SettingsManager', 'data': data or {}}
         self.bus.event_posted.emit(event)
 
+    def _on_runtime_store_corrupt(self, database_file, backup_path):
+        self._post_event("key_runtime_store_corrupted", {
+            "database_file": str(database_file),
+            "backup_path": str(backup_path),
+        })
+
+    def _run_runtime_store_operation(self, operation, callback, *args, fallback=_MISSING, **kwargs):
+        """Выполняет операцию хранилища, сообщая об ошибке событием.
+
+        `fallback` задаётся там, где сбой не должен ронять вызывающий код:
+        операции этапа инициализации возвращают значение по умолчанию, чтобы
+        недоступная база (нет прав на папку, битый файл) не мешала приложению
+        запуститься. Мутации во время работы по-прежнему пробрасывают исключение
+        — вызывающий обязан знать, что счётчик не записан.
+        """
+        try:
+            result = callback(*args, **kwargs)
+        except Exception as error:
+            self._last_runtime_store_error = error
+            self._post_event("key_runtime_store_failed", {
+                "message": str(error),
+                "filename": str(self._key_runtime_store.path),
+                "operation": operation,
+            })
+            if fallback is _MISSING:
+                raise
+            return fallback
+        self._last_runtime_store_error = None
+        return result
+
+    def _materialize_key_statuses_unsafe(self, configured=None):
+        if configured is None:
+            with self.file_lock:
+                configured = deepcopy(self._cache.get("api_keys_with_status", []))
+        raw_keys = [item["key"] for item in configured if item.get("key")]
+        if not raw_keys:
+            return configured
+        runtime = self._run_runtime_store_operation(
+            "load_key_statuses", self._key_runtime_store.load_statuses, raw_keys,
+        )
+        for item in configured:
+            item["status_by_model"] = {
+                model_id: state.to_dict()
+                for model_id, state in runtime.get(item.get("key"), {}).items()
+            }
+        return configured
+
     # --- ВНУТРЕННИЕ МЕТОДЫ УПРАВЛЕНИЯ КЭШЕМ И ФАЙЛОМ ---
 
     def _load_from_disk_unsafe(self):
         """[Под замком] Читает файл с диска и обновляет кэш."""
         self._cache = self._load_unsafe()
         self._disk_baseline = deepcopy(self._cache)
-        self._migrate_keys_in_cache()
+        self._apply_custom_provider_models_to_runtime()
 
     def _save_to_disk_unsafe(self):
-        """
-        [Под замком] Читает диск, объединяет статистику запросов и записывает.
-        Это предотвращает потерю данных о квотах при работе нескольких экземпляров.
-        """
-        # 1. Сначала пытаемся прочитать актуальное состояние файла
-        disk_data = self._load_unsafe()
-        
-        # 2. Если файл существует и валиден, подтягиваем из него чужие запросы
-        if disk_data:
-            self._merge_disk_timestamps(disk_data)
+        """[Под замком] Объединяет конфигурацию с диском и атомарно записывает JSON.
 
-        self._check_and_reset_limits_in_cache()
+        Файл делят несколько окон приложения, то есть разные процессы. Чтение,
+        склейка и запись идут под межпроцессным замком: иначе окно, прочитавшее
+        диск раньше нашей записи, затрёт её своей, а наша следующая склейка
+        примет затёртое значение за чужую правку, и изменение пропадёт насовсем.
+        """
+        with interprocess_lock(
+            self._settings_lock_path, timeout=SETTINGS_LOCK_TIMEOUT_SECONDS
+        ) as locked:
+            if not locked:
+                self._warn_saving_without_lock()
+            self._merge_with_disk_and_write_unsafe()
+
+    def _warn_saving_without_lock(self):
+        if self._warned_about_missing_lock:
+            return
+        self._warned_about_missing_lock = True
+        logger.warning(
+            "Не удалось занять замок файла настроек %s за %.1f с. Настройки сохранены "
+            "без него: если открыто другое окно приложения, его последние правки "
+            "могут потеряться.",
+            self.config_file,
+            SETTINGS_LOCK_TIMEOUT_SECONDS,
+        )
+
+    def _merge_with_disk_and_write_unsafe(self):
+        disk_data = self._load_unsafe()
+        if "api_keys_with_status" in disk_data:
+            disk_data["api_keys_with_status"] = [
+                _strip_key_runtime_fields(item) for item in disk_data["api_keys_with_status"]
+            ]
+        self._apply_custom_provider_models_to_runtime()
 
         # 3. Если файл успел измениться со времени нашей последней синхронизации,
         # значит, с ним работает ещё один экземпляр приложения. Сливаем его правки
@@ -290,47 +434,21 @@ class SettingsManager(QObject):
             merged = merge_settings_snapshots(self._disk_baseline, self._cache, disk_data)
             self._cache.clear()
             self._cache.update(merged)
+            self._apply_custom_provider_models_to_runtime()
 
-
-        # 4. Записываем итоговый результат (наши настройки + общая история)
+        self._strip_runtime_from_key_cache_unsafe()
         self._save_unsafe(self._cache)
         self._disk_baseline = deepcopy(self._cache)
         self._is_dirty = False
 
-    def _merge_disk_timestamps(self, disk_data):
-        """Вспомогательный метод: объединяет таймстампы из файла с текущим кэшем."""
-        disk_keys = disk_data.get('api_keys_with_status', [])
-        mem_keys = self._cache.get('api_keys_with_status', [])
-        
-        # Создаем карту для быстрого сопоставления ключей в памяти
-        mem_key_map = {k['key']: k for k in mem_keys}
-
-        for disk_k in disk_keys:
-            key_str = disk_k.get('key')
-            # Если такой ключ есть у нас в памяти
-            if key_str in mem_key_map:
-                mem_k = mem_key_map[key_str]
-                
-                disk_models = disk_k.get('status_by_model', {})
-                mem_models = mem_k.get('status_by_model', {})
-                
-                # Проходим по моделям внутри ключа
-                for model_id, disk_stats in disk_models.items():
-                    # Если модель есть и у нас, мержим списки
-                    if model_id in mem_models:
-                        disk_reqs = set(disk_stats.get('requests', []))
-                        mem_stats = mem_models[model_id]
-                        mem_reqs = set(mem_stats.get('requests', []))
-                        
-                        # Объединение множеств (исключает дубликаты)
-                        if not disk_reqs.issubset(mem_reqs):
-                            # Сортируем, чтобы хронология была красивой
-                            mem_stats['requests'] = sorted(list(mem_reqs | disk_reqs))
-                    
-                    # Если в памяти этой модели еще нет (например, использовалась в другом окне), 
-                    # можно теоретически добавить, но для безопасности лучше не трогать структуру кэша,
-                    # так как мы только "обогащаем" существующие данные.
-                    
+    def _apply_custom_provider_models_to_runtime(self):
+        # Файл, в котором ключа нет (например, project_settings.json проекта),
+        # не имеет права обнулять глобальный реестр custom-моделей пользователя.
+        # Применяем только явно объявленное значение.
+        if "custom_provider_models" not in self._cache:
+            return
+        api_config.set_custom_provider_models(self._cache["custom_provider_models"])
+    
     def _request_save(self):
         """
         [Потокобезопасно] Помечает кэш как 'грязный' и ИСПУСКАЕТ СИГНАЛ
@@ -349,7 +467,13 @@ class SettingsManager(QObject):
                 try:
                     self._save_to_disk_unsafe()
                     self._last_save_error = None
-                except OSError as e:
+                except Exception as e:
+                    # Ловим не только OSError: несериализуемое значение в кэше
+                    # (например set/bytes) даёт TypeError из json.dumps внутри
+                    # _save_unsafe. Раньше такая ошибка пробрасывалась из этого
+                    # слота (таймер автосохранения / aboutToQuit) необработанной,
+                    # а _is_dirty оставался True навсегда — автосохранение
+                    # "залипало" до конца жизни процесса.
                     self._last_save_error = e
                     save_error = e
 
@@ -394,6 +518,9 @@ class SettingsManager(QObject):
         if self._save_timer.isActive():
             self._save_timer.stop()
         self._perform_save()
+        # Хранилище квот держит соединение открытым, и свежие записи лежат в -wal.
+        # Закрытие последнего соединения переносит их в основной файл базы.
+        self._key_runtime_store.close()
 
     @pyqtSlot(str, str, int)
     def _emit_request_count_updated(self, key_to_update, model_id, new_count):
@@ -403,18 +530,43 @@ class SettingsManager(QObject):
             'count': new_count
         })
 
-    def _migrate_keys_in_cache(self):
+    def _prepare_legacy_key_runtime(self):
+        with self.file_lock:
+            normalized = self._normalize_legacy_key_entries_unsafe()
+            legacy_runtime = any(
+                field in item
+                for item in self._cache.get("api_keys_with_status", [])
+                for field in ("status_by_model", "requests", "exhausted_at", "exhausted_level")
+            )
+            return normalized, legacy_runtime, self._extract_runtime_statuses_unsafe()
+
+    def _normalize_legacy_key_entries_unsafe(self):
         """[Под замком] Выполняет миграцию старого формата ключей прямо в кэше."""
         migrated = False
         key_statuses = self._cache.get('api_keys_with_status', [])
-        
+        self._unmigrated_runtime_keys = set()
+
         for key_info in key_statuses:
-            if 'exhausted_at' in key_info or 'requests' in key_info:
-                if 'status_by_model' not in key_info: key_info['status_by_model'] = {}
+            if any(field in key_info for field in ('exhausted_at', 'requests', 'exhausted_level')):
                 provider_id = key_info.get('provider', 'gemini')
                 provider_cfg = api_config.api_providers_view().get(provider_id, {})
                 default_model_id = next(iter(provider_cfg.get('models', {}).values()), {}).get('id')
-                if default_model_id and default_model_id not in key_info['status_by_model']:
+                if not default_model_id:
+                    # Провайдера нет в реестре: переименован, удалён или ещё не
+                    # загружен. Раньше это исключение валило конструктор
+                    # SettingsManager, а вместе с ним и запуск приложения.
+                    # Запись оставляем нетронутой и запрещаем срезать её
+                    # legacy-поля, чтобы история квот дождалась провайдера.
+                    raw_key = key_info.get('key')
+                    if raw_key:
+                        self._unmigrated_runtime_keys.add(raw_key)
+                    print(
+                        f"[SettingsManager WARN] Runtime ключа не перенесён: у провайдера "
+                        f"'{provider_id}' нет моделей. Legacy-поля оставлены в settings.json."
+                    )
+                    continue
+                if 'status_by_model' not in key_info: key_info['status_by_model'] = {}
+                if default_model_id not in key_info['status_by_model']:
                     key_info['status_by_model'][default_model_id] = {
                         "exhausted_at": key_info.pop('exhausted_at', None),
                         "exhausted_level": key_info.pop('exhausted_level', 0),
@@ -424,24 +576,70 @@ class SettingsManager(QObject):
         
         if not key_statuses and 'api_keys' in self._cache:
             old_keys = self._cache.pop('api_keys', [])
-            self._cache['api_keys_with_status'] = [{"key": key, "provider": "gemini", "status_by_model": {}} for key in old_keys]
+            self._cache['api_keys_with_status'] = [{"key": key, "provider": "gemini"} for key in old_keys]
             migrated = True
             
-        if migrated:
-            print("[SettingsManager] Обнаружен и мигрирован старый формат хранения ключей.")
-            self._save_to_disk_unsafe()
+        return migrated
+
+    def _extract_runtime_statuses_unsafe(self):
+        """[Под замком] Копирует runtime-поля, не изменяя исходные записи."""
+        return _split_key_statuses(self._cache.get("api_keys_with_status", []))[1]
+
+    def _strip_runtime_from_key_cache_unsafe(self):
+        """[Под замком] Оставляет в записях ключей только конфигурацию.
+
+        Записи из `_unmigrated_runtime_keys` пропускаем: их runtime до SQLite не
+        доехал, и срезать его из JSON означало бы стереть единственную копию.
+        """
+        if "api_keys_with_status" in self._cache:
+            self._cache["api_keys_with_status"] = [
+                item
+                if item.get("key") in self._unmigrated_runtime_keys
+                else _strip_key_runtime_fields(item)
+                for item in self._cache["api_keys_with_status"]
+            ]
 
     # --- ПУБЛИЧНЫЕ МЕТОДЫ: Адаптированы для работы с кэшем ---
 
     def load_settings(self):
         with self.file_lock:
-            return self._cache.copy()
+            settings = deepcopy(self._cache)
+        if "api_keys_with_status" in settings:
+            settings["api_keys_with_status"] = self._materialize_key_statuses_unsafe(
+                settings["api_keys_with_status"],
+            )
+        return settings
 
     def save_settings(self, settings_dict):
+        incoming = deepcopy(settings_dict)
+        configured = None
+        if "api_keys_with_status" in incoming:
+            # Runtime из входящего снимка отбрасывается — см. save_key_statuses.
+            configured, _ = _split_key_statuses(incoming["api_keys_with_status"])
+            incoming["api_keys_with_status"] = configured
         with self.file_lock:
-            self._cache = settings_dict
+            previous_keys = [
+                item.get("key") for item in self._cache.get("api_keys_with_status", [])
+            ]
+            self._cache = incoming
             self._save_to_disk_unsafe()
+        if configured is not None:
+            self._reconcile_removed_key_runtime(previous_keys, configured)
         return True
+
+    def _reconcile_removed_key_runtime(self, previous_keys, configured):
+        """Убирает runtime ключей, которых больше нет в конфигурации.
+
+        Иначе тот же ключ, добавленный заново, унаследует чужой счётчик запросов
+        и чужую блокировку: сироты вычищаются только при следующем запуске.
+        """
+        removed = {key for key in previous_keys if key} - {
+            item.get("key") for item in configured
+        }
+        if removed:
+            self._run_runtime_store_operation(
+                "delete_removed_keys", self._key_runtime_store.delete_keys, removed,
+            )
 
     @pyqtSlot(dict)
     def on_event(self, event_data: dict):
@@ -468,7 +666,7 @@ class SettingsManager(QObject):
             key_info['status_by_model'][model_id] = {"exhausted_at": None, "exhausted_level": 0, "requests": []}
         return key_info['status_by_model'][model_id]
 
-    def is_key_limit_active(self, key_info, model_id):
+    def is_key_limit_active(self, key_info, model_id, now_utc=None):
         if not model_id: return False
         model_status = self._get_status_for_model(key_info, model_id)
         timestamp = model_status.get("exhausted_at")
@@ -477,27 +675,40 @@ class SettingsManager(QObject):
         provider = key_info.get("provider", "default")
         policy = api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
         exhausted_time_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-        now_utc = datetime.now(timezone.utc)
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
         if policy["type"] == "rolling":
             return now_utc < exhausted_time_utc + timedelta(hours=policy["duration_hours"])
-        elif policy["type"] == "daily" and PYTZ_AVAILABLE:
+        elif policy["type"] == "daily":
             try:
-                tz = pytz.timezone(policy["timezone"])
+                tz = ZoneInfo(policy["timezone"])
                 now_in_tz = now_utc.astimezone(tz)
                 last_reset = now_in_tz.replace(hour=policy.get("reset_hour",0), minute=policy.get("reset_minute",1), second=0, microsecond=0)
                 if last_reset > now_in_tz: last_reset -= timedelta(days=1)
                 return exhausted_time_utc.astimezone(tz) > last_reset
+            except ZoneInfoNotFoundError:
+                _warn_unknown_timezone_once(
+                    policy.get('timezone'),
+                    f"[WARN] Неизвестная таймзона '{policy.get('timezone')}' в reset_policy, используется деградация до 24ч",
+                )
+                return now_utc < exhausted_time_utc + timedelta(hours=24)
             except Exception: return now_utc < exhausted_time_utc + timedelta(hours=24)
         else: return now_utc < exhausted_time_utc + timedelta(hours=24)
     
     def get_key_info(self, key_to_find):
-        with self.file_lock:
-            for key_info in self._cache.get('api_keys_with_status', []):
-                if key_info['key'] == key_to_find:
-                    return key_info.copy()
+        configured = self._get_key_configuration(key_to_find)
+        if configured is not None:
+            return self._materialize_key_statuses_unsafe([configured])[0]
         return None
 
-    def get_key_reset_time_str(self, key_info, model_id):
+    def _get_key_configuration(self, key_to_find):
+        with self.file_lock:
+            for key_info in self._cache.get("api_keys_with_status", []):
+                if key_info['key'] == key_to_find:
+                    return deepcopy(key_info)
+        return None
+
+    def get_key_reset_time_str(self, key_info, model_id, now_utc=None):
         if not model_id: return "Модель не выбрана"
         model_status = self._get_status_for_model(key_info, model_id)
         timestamp = model_status.get("exhausted_at")
@@ -505,16 +716,24 @@ class SettingsManager(QObject):
         provider = key_info.get("provider", "default")
         policy = api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
         exhausted_time_utc = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        if now_utc is None:
+            now_utc = datetime.now(timezone.utc)
         reset_time_utc = None
         if policy["type"] == "rolling":
             reset_time_utc = exhausted_time_utc + timedelta(hours=policy["duration_hours"])
-        elif policy["type"] == "daily" and PYTZ_AVAILABLE:
+        elif policy["type"] == "daily":
             try:
-                tz = pytz.timezone(policy["timezone"])
-                now_in_tz = datetime.now(tz)
+                tz = ZoneInfo(policy["timezone"])
+                now_in_tz = now_utc.astimezone(tz)
                 next_reset_in_tz = now_in_tz.replace(hour=policy.get("reset_hour", 0), minute=policy.get("reset_minute", 1), second=0, microsecond=0)
                 if next_reset_in_tz <= now_in_tz: next_reset_in_tz += timedelta(days=1)
                 reset_time_utc = next_reset_in_tz.astimezone(timezone.utc)
+            except ZoneInfoNotFoundError as e:
+                _warn_unknown_timezone_once(
+                    policy.get('timezone'),
+                    f"[WARN] Неизвестная таймзона в reset_policy ({e}), используется деградация до 24ч",
+                )
+                reset_time_utc = exhausted_time_utc + timedelta(hours=24)
             except Exception as e:
                 print(f"[ERROR] Ошибка расчета времени для ключа (daily policy): {e}")
                 reset_time_utc = exhausted_time_utc + timedelta(hours=24)
@@ -576,77 +795,57 @@ class SettingsManager(QObject):
         cutoff = self._request_window_cutoff(policy, now_ts)
         return sorted(ts for ts in normalized_timestamps if ts > cutoff)
 
-
-    def _prune_request_history_for_model(self, key_info, model_id, now_ts=None):
-        model_status = self._get_status_for_model(key_info, model_id)
-        current_requests = model_status.get('requests', [])
-        filtered_requests = self._filter_request_timestamps_in_window(
-            current_requests,
-            self._get_request_policy(key_info),
-            now_ts=now_ts,
-        )
-        was_changed = filtered_requests != current_requests
-        if was_changed:
-            model_status['requests'] = filtered_requests
-        return filtered_requests, was_changed
-
     def increment_request_count(self, key_to_update, model_id):
         if not model_id: return False
-        new_count = 0
-        updated = False
-        with self.file_lock:
-            now = int(time.time())
-            for key_info in self._cache.get('api_keys_with_status', []):
-                if key_info['key'] == key_to_update:
-                    model_status = self._get_status_for_model(key_info, model_id)
-                    model_status['requests'].append(now)
-                    valid_requests, _ = self._prune_request_history_for_model(
-                        key_info, model_id, now_ts=now)
-                    new_count = len(valid_requests)
-                    updated = True
-                    break
-            if updated:
-                self._request_save()
-        # print(f"key_to_update {key_to_update} model_id {model_id} new_count {new_count}")
-        if updated:
-            self._request_count_changed.emit(key_to_update, model_id, new_count)
-        return updated
+        key_info = self._get_key_configuration(key_to_update)
+        if key_info is None: return False
+        now = int(time.time())
+        cutoff = self._request_window_cutoff(self._get_request_policy(key_info), now)
+        new_count = self._run_runtime_store_operation(
+            "increment_request_count", self._key_runtime_store.increment,
+            key_to_update, model_id, now, cutoff,
+        )
+        self._request_count_changed.emit(key_to_update, model_id, new_count)
+        return True
 
     def decrement_request_count(self, key_to_update, model_id):
         if not model_id: return False
-        new_count = 0
-        updated = False
-        with self.file_lock:
-            for key_info in self._cache.get('api_keys_with_status', []):
-                if key_info['key'] == key_to_update:
-                    valid_requests, was_pruned = self._prune_request_history_for_model(
-                        key_info, model_id)
-                    if valid_requests:
-                        valid_requests.pop()
-                        self._get_status_for_model(key_info, model_id)['requests'] = valid_requests
-                        was_pruned = True
-                    new_count = len(valid_requests)
-                    updated = was_pruned
-                    break
-            if updated:
-                self._request_save()
-        # print(f"key_to_update {key_to_update} model_id {model_id} new_count {new_count}")
+        key_info = self._get_key_configuration(key_to_update)
+        if key_info is None: return False
+        cutoff = self._request_window_cutoff(self._get_request_policy(key_info), int(time.time()))
+        updated, new_count = self._run_runtime_store_operation(
+            "decrement_request_count", self._key_runtime_store.decrement,
+            key_to_update, model_id, cutoff,
+        )
         if updated:
             self._request_count_changed.emit(key_to_update, model_id, new_count)
         return updated
 
     def load_key_statuses(self):
-        with self.file_lock:
-            if self._check_and_reset_limits_in_cache():
-                self._save_to_disk_unsafe() # Сохраняем, если были изменения
-            return self._cache.get('api_keys_with_status', []).copy()
+        self._check_and_reset_limits_in_cache()
+        return self._materialize_key_statuses_unsafe()
 
     def save_key_statuses(self, key_statuses):
+        """Сохраняет конфигурацию ключей; runtime-состояние не трогает.
+
+        Снимок приходит из интерфейса и читался когда-то раньше, а квоты за это
+        время могли измениться в рабочем потоке: пришедшая обратно запись
+        сняла бы блокировку, поставленную уже после чтения. Единственный
+        источник runtime — SQLite, и меняют его выделенные методы
+        (increment_request_count, mark_key_as_exhausted, обслуживание лимитов).
+
+        Состав ключей, наоборот, авторитетен: runtime исчезнувших ключей
+        удаляется сразу же.
+        """
+        configured, _ = _split_key_statuses(key_statuses)
         with self.file_lock:
-            self._cache['api_keys_with_status'] = key_statuses
-            if 'api_keys' in self._cache:
-                del self._cache['api_keys']
+            previous_keys = [
+                item.get("key") for item in self._cache.get('api_keys_with_status', [])
+            ]
+            self._cache['api_keys_with_status'] = configured
+            self._cache.pop('api_keys', None)
             self._save_to_disk_unsafe()
+        self._reconcile_removed_key_runtime(previous_keys, configured)
         self._post_event('key_statuses_updated')
         return True
 
@@ -661,36 +860,22 @@ class SettingsManager(QObject):
                 self._cache['api_keys_with_status'] = updated_statuses
                 self._save_to_disk_unsafe()
         if removed_count > 0:
+            self._run_runtime_store_operation(
+                "remove_keys", self._key_runtime_store.delete_keys, keys_to_remove,
+            )
             self._post_event('key_statuses_updated')
         return removed_count
     
     def mark_key_as_exhausted(self, key_to_mark, model_id):
-        """
-        [Потокобезопасно] Помечает ключ как исчерпанный для конкретной модели.
-        Адаптировано для работы с in-memory кэшем.
-        """
+        """Помечает ключ исчерпанным; уведомляет после успешного commit."""
         if not model_id: return False
-        
-        updated = False
-        with self.file_lock:
-            # Итерируемся прямо по списку в кэше
-            for key_info in self._cache.get('api_keys_with_status', []):
-                if key_info['key'] == key_to_mark:
-                    model_status = self._get_status_for_model(key_info, model_id)
-                    model_status['exhausted_at'] = time.time()
-                    model_status['exhausted_level'] = 2
-                    updated = True
-                    break
-            
-            if updated:
-                # Используем механизм отложенного сохранения, чтобы не фризить GUI при ошибке
-                self._request_save()
-
-        # Уведомление отправляем вне блокировки
-        if updated:
-            self._post_event('key_statuses_updated')
-            
-        return updated
+        if self._get_key_configuration(key_to_mark) is None: return False
+        self._run_runtime_store_operation(
+            "mark_key_as_exhausted", self._key_runtime_store.set_exhausted,
+            key_to_mark, model_id, time.time(),
+        )
+        self._post_event('key_statuses_updated')
+        return True
         
     def add_keys_atomically(self, new_keys: set, provider_id: str):
         added_count = -1
@@ -700,7 +885,7 @@ class SettingsManager(QObject):
             added_count_internal = 0
             for key in new_keys:
                 if key not in existing_keys:
-                    key_statuses.append({"key": key, "provider": provider_id, "status_by_model": {}})
+                    key_statuses.append({"key": key, "provider": provider_id})
                     added_count_internal += 1
             if added_count_internal > 0:
                 self._cache['api_keys_with_status'] = key_statuses
@@ -740,21 +925,40 @@ class SettingsManager(QObject):
         return True
     
     def _check_and_reset_limits_in_cache(self):
-        """[Под замком] Проверяет и сбрасывает лимиты прямо в кэше."""
-        changed = False
-        now_utc = datetime.now(timezone.utc)
-        for key_info in self._cache.get('api_keys_with_status', []):
-            if 'status_by_model' in key_info:
-                for model_id in list(key_info['status_by_model'].keys()):
-                    _, was_pruned = self._prune_request_history_for_model(key_info, model_id)
-                    if was_pruned:
-                        changed = True
-                    if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
-                        if key_info['status_by_model'][model_id].get("exhausted_at") is not None:
-                            changed = True
-                            key_info['status_by_model'][model_id]["exhausted_at"] = None
-                            key_info['status_by_model'][model_id]["exhausted_level"] = 0
-        return changed
+        """Обслуживает SQLite без блокировки конфигурационного кэша.
+
+        Пары ключ×модель уходят одной транзакцией, и только те, где есть что
+        удалить или снять: каждый запрос к SQLite отпускает GIL, и 1368 пустых
+        DELETE за тик при 144 ключах подвешивали интерфейс, пока другой поток
+        держит интерпретатор. Заодно запоминает в _next_limit_change_at
+        ближайший момент, когда лимит истечёт или запрос выйдет из окна.
+        """
+        now = time.time()
+        now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
+        pairs = []
+        next_change = None
+        for key_info in self._materialize_key_statuses_unsafe():
+            policy = self._get_request_policy(key_info)
+            cutoff = self._request_window_cutoff(policy, int(now))
+            for model_id, status in key_info.get("status_by_model", {}).items():
+                clear_at = None
+                exhausted_at = status.get("exhausted_at")
+                if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
+                    clear_at = exhausted_at
+                elif exhausted_at:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, exhausted_at, now))
+                requests = status.get("requests") or ()
+                live = [stamp for stamp in requests if stamp > cutoff]
+                if live:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, min(live), now))
+                if clear_at is not None or len(live) < len(requests):
+                    pairs.append((key_info["key"], model_id, cutoff, clear_at))
+        self._next_limit_change_at = next_change
+        if not pairs:
+            return False
+        return self._run_runtime_store_operation(
+            "maintain_models", self._key_runtime_store.maintain_models, pairs,
+        )
     
     def get_qa_settings(self):
         """Return translation QA settings, migrating a missing section to defaults."""
@@ -772,21 +976,9 @@ class SettingsManager(QObject):
             qa_settings = QaSettings.from_dict(qa_settings)
         return self._generic_saver(SETTINGS_KEY, qa_settings.to_dict())
 
-    def add_custom_provider_model(self, provider_id, display_name, model_config):
-        with self.file_lock:
-            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
-            provider_key = str(provider_id or "").strip()
-            model_name = str(display_name or "").strip()
-            if not provider_key or not model_name:
-                return False
-            provider_models = custom_models.setdefault(provider_key, {})
-            provider_models[model_name] = deepcopy(model_config or {})
-            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
-            self._save_to_disk_unsafe()
-        return True
-
     def get_custom_prompt(self): return self._generic_loader('custom_prompt', '')
     def save_custom_prompt(self, prompt): return self._generic_saver('custom_prompt', prompt)
+
     def get_active_models_for_provider(self, provider_id: str) -> list[str] | None:
         with self.file_lock:
             active_models = self._cache.get("active_models", {})
@@ -800,7 +992,18 @@ class SettingsManager(QObject):
             self._cache["active_models"] = active_models
         self._save_requested.emit()
         return True
-
+    def add_custom_provider_model(self, provider_id, display_name, model_config):
+        with self.file_lock:
+            custom_models = deepcopy(self._cache.get("custom_provider_models", {}))
+            provider_key = str(provider_id or "").strip()
+            model_name = str(display_name or "").strip()
+            if not provider_key or not model_name:
+                return False
+            provider_models = custom_models.setdefault(provider_key, {})
+            provider_models[model_name] = deepcopy(model_config or {})
+            self._cache["custom_provider_models"] = api_config.set_custom_provider_models(custom_models)
+            self._save_to_disk_unsafe()
+        return True
 
     def get_last_settings(self):
         with self.file_lock:
@@ -826,18 +1029,11 @@ class SettingsManager(QObject):
         
     def clear_key_exhaustion_status(self, key_to_clear, model_id):
         if not model_id: return False
-        was_cleared = False
-        with self.file_lock:
-            for key_info in self._cache.get('api_keys_with_status', []):
-                if key_info['key'] == key_to_clear:
-                    model_status = self._get_status_for_model(key_info, model_id)
-                    if model_status.get("exhausted_at") is not None:
-                        model_status["exhausted_at"] = None
-                        model_status["exhausted_level"] = 0
-                        was_cleared = True
-                    break
-            if was_cleared:
-                self._save_to_disk_unsafe()
+        if self._get_key_configuration(key_to_clear) is None: return False
+        was_cleared = self._run_runtime_store_operation(
+            "clear_key_exhaustion_status", self._key_runtime_store.clear_exhaustion,
+            key_to_clear, model_id,
+        )
         if was_cleared:
             self._post_event('key_statuses_updated')
         return was_cleared
@@ -1134,35 +1330,21 @@ class SettingsManager(QObject):
             # Не пишем ничего, чтобы не испортить файл
             raise e
 
-        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
-        
         # --- 3. Атомарная запись (Disk) ---
-        # Пишем во временный файл, который находится в ТОЙ ЖЕ папке.
-        # Это обязательно для работы os.replace (атомарного переноса).
-        temp_file = self.config_file + ".tmp"
-        
+        # Временный файл обязан получать уникальное имя. С общим
+        # settings.json.tmp два процесса, сохранявшие настройки одновременно,
+        # усекали его друг другу, и короткий документ ложился поверх длинного:
+        # так с 16.08 по 11.09.2026 появились 14 нечитаемых settings.json.
         try:
-            # Записываем подготовленную строку
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                f.write(json_content)
-                f.flush()
-                os.fsync(f.fileno()) # Принудительно сбрасываем буфер ОС на диск
-
-            # МОМЕНТ ИСТИНЫ: Мгновенная подмена. 
-            # Либо старый файл, либо новый. Никаких промежуточных состояний.
-            os.replace(temp_file, self.config_file)
-
+            atomic_write_text(self.config_file, json_content)
         except Exception as e:
-            # Если что-то пошло не так (место на диске кончилось), удаляем мусор
-            if os.path.exists(temp_file):
-                try:
-                    os.remove(temp_file)
-                except OSError:
-                    pass
             print(f"[SettingsManager CRITICAL] Не удалось записать файл настроек: {e}")
-            raise e
+            raise
     
     def _load_unsafe(self):
+        # Отличаем «файла ещё нет» и «файл пуст» (нормальный первый запуск) от
+        # «файл не прочитался» — по последнему нельзя судить о наборе ключей.
+        self._last_load_failed = False
         if not os.path.exists(self.config_file): return {}
         encodings_to_try = ['utf-8', 'cp1251', 'cp866']
         for encoding in encodings_to_try:
@@ -1170,7 +1352,14 @@ class SettingsManager(QObject):
                 with open(self.config_file, 'r', encoding=encoding) as f: content = f.read()
                 if not content.strip(): return {}
                 data_to_load = json.loads(content)
-                if encoding != 'utf-8':
+                has_legacy_runtime = any(
+                    field in item
+                    for item in data_to_load.get("api_keys_with_status", [])
+                    for field in ("status_by_model", "requests", "exhausted_at", "exhausted_level")
+                )
+                # Runtime migration owns the first write of a legacy JSON file;
+                # preserve the original bytes until the import has committed.
+                if encoding != 'utf-8' and not has_legacy_runtime:
                     print(f"[SettingsManager] ВНИМАНИЕ: Файл настроек был в кодировке {encoding}. Конвертирую в UTF-8...")
                     try:
                         self._save_unsafe(data_to_load)
@@ -1183,6 +1372,7 @@ class SettingsManager(QObject):
                 print(f"[SettingsManager WARN] Не удалось прочитать файл настроек с кодировкой {encoding}: {e}")
                 continue
         print(f"[SettingsManager CRITICAL] Не удалось прочитать или распарсить файл {self.config_file}. Файл может быть поврежден. Возвращаю пустые настройки.")
+        self._last_load_failed = True
         backup_path = self._quarantine_corrupt_file_unsafe()
         if backup_path:
             print(f"[SettingsManager] Повреждённый файл настроек сохранён как {backup_path}.")
