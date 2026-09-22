@@ -60,6 +60,27 @@ from .event_bus_mixin import EventBusMixin
 
 _DEBUG_OPERATION_CONTEXT = contextvars.ContextVar("worker_debug_operation_context", default={})
 WORKER_IDLE_WAKE_TIMEOUT_SECONDS = 2.0
+
+# A task that hit a network failure (a dropped connection, a busy service, a
+# timeout) waits before any key takes it again: the failure is the network's or
+# the service's, and the next key hit it within seconds.  Measured: one chapter
+# failed 16 times in a row on ten keys, another 294 times in six hours.  The
+# pause is what the service asked for, not stretched with each failure: a
+# failure that asks for a pause does not spend the daily limit, and a growing
+# pause would only keep a sequential book waiting after the service recovered.
+NETWORK_RETRY_PAUSE_DEFAULT_SECONDS = 30.0
+NETWORK_RETRY_PAUSE_CAP_SECONDS = 600.0
+
+
+def network_retry_pause(error_type, error) -> float:
+    """Seconds a task waits before its next attempt; 0 unless the network failed."""
+    if error_type != ErrorType.NETWORK:
+        return 0.0
+    try:
+        asked = float(getattr(error, "delay_seconds", None) or NETWORK_RETRY_PAUSE_DEFAULT_SECONDS)
+    except (TypeError, ValueError):
+        asked = NETWORK_RETRY_PAUSE_DEFAULT_SECONDS
+    return min(NETWORK_RETRY_PAUSE_CAP_SECONDS, max(0.0, asked))
 DEFAULT_TASK_STREAM_MODE = {
     'epub_batch': False,
     'epub': True,
@@ -751,7 +772,10 @@ class UniversalWorker(EventBusMixin):
             elif action in (WorkerAction.RETRY_COUNTABLE, WorkerAction.RETRY_NON_COUNTABLE):
                 task_to_requeue = self.emerger._mutate_task_for_completion(task_info, original_exc, task_history)
                 status = 'REQUEUED_COUNTABLE' if action == WorkerAction.RETRY_COUNTABLE else 'REQUEUED_NON_COUNTABLE'
-                self._handle_task_result((task_to_requeue, False, status, f'Возврат в очередь ({error_type.name})'))
+                self._handle_task_result(
+                    (task_to_requeue, False, status, f'Возврат в очередь ({error_type.name})'),
+                    retry_after_seconds=network_retry_pause(error_type, original_exc),
+                )
     
             elif action == WorkerAction.FAIL_AND_ATTEMPT_CHUNK:
                 split_result = self.emerger._handle_chunk_split(task_info, task_history)
@@ -762,7 +786,7 @@ class UniversalWorker(EventBusMixin):
                 error_message = f"Окончательный провал ({error_type.name})"
                 self._handle_task_result((task_info, False, final_status_type, error_message))
     
-    def _handle_task_result(self, result_tuple):
+    def _handle_task_result(self, result_tuple, retry_after_seconds: float = 0):
         """
         Централизованно обрабатывает результат выполнения задачи (успех/провал/перепостановка),
         обновляет TaskManager и отправляет событие в шину.
@@ -776,6 +800,15 @@ class UniversalWorker(EventBusMixin):
             if is_requeued:
                 if 'NON_COUNTABLE' in status_type:
                     self.task_manager.task_requeued(self.worker_id, returned_task_info) # Обычный возврат в общую очередь
+                elif retry_after_seconds > 0:
+                    self.task_manager.task_requeued_for_retry(
+                        self.worker_id, returned_task_info, retry_after_seconds=retry_after_seconds
+                    )
+                    self._post_event('log_message', {'message': (
+                        f"[NETWORK] Задача '{self.task_manager._get_task_display_name(returned_task_info[1])}' "
+                        f"вернётся в работу через {retry_after_seconds:.0f} с: сеть или сервис не отвечают, "
+                        "и другой ключ тут не поможет."
+                    )})
                 else:
                     self.task_manager.task_requeued_for_retry(self.worker_id, returned_task_info) # Возврат в приоритетную очередь
             else:

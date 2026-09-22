@@ -484,6 +484,10 @@ class ChapterQueueManager(QObject):
                 conn.execute("ALTER TABLE tasks ADD COLUMN chain_id INTEGER")
             if 'chain_index' not in existing_columns:
                 conn.execute("ALTER TABLE tasks ADD COLUMN chain_index INTEGER")
+            if 'retry_after' not in existing_columns:
+                # Unix time before which a task that hit a network failure is not
+                # handed out again (task_requeued_for_retry); NULL means now.
+                conn.execute("ALTER TABLE tasks ADD COLUMN retry_after REAL")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status_chain ON tasks (status, chain_id, chain_index);")
             for column_name, column_def in _PAYLOAD_DERIVED_COLUMNS:
                 if column_name not in existing_columns:
@@ -715,11 +719,17 @@ class ChapterQueueManager(QObject):
             return None
         return {str(chapter) for chapter in raw_targets if chapter}
 
-    def _eligible_pending_task_sql(self, select_clause="task_id"):
+    def _eligible_pending_task_sql(self, select_clause="task_id", *, paused_until_param=False):
+        # With paused_until_param the query takes the current time as its one
+        # parameter and skips tasks still waiting out a network pause.
+        pause_clause = (
+            "AND (t.retry_after IS NULL OR t.retry_after <= ?)" if paused_until_param else ""
+        )
         return f"""
             SELECT {select_clause}
             FROM tasks AS t
             WHERE t.status = 'pending'
+              {pause_clause}
               AND (
                     t.chain_id IS NULL
                     OR NOT EXISTS (
@@ -931,7 +941,10 @@ class ChapterQueueManager(QObject):
     
             # Определение ID цели, если он не задан
             if not target_task_id_str:
-                cursor = conn.execute(self._eligible_pending_task_sql("t.task_id"))
+                cursor = conn.execute(
+                    self._eligible_pending_task_sql("t.task_id", paused_until_param=True),
+                    (time.time(),),
+                )
                 row = cursor.fetchone()
                 if not row: 
                     return None # Нет задач для обновления
@@ -1331,12 +1344,14 @@ class ChapterQueueManager(QObject):
             
         return {'new': new_count, 'updated': updated_count, 'total': total_inserted}
     
-    def task_requeued_for_retry(self, worker_id: str, task_info: tuple):
+    def task_requeued_for_retry(self, worker_id: str, task_info: tuple, retry_after_seconds: float = 0):
         """
         Возвращает задачу в начало очереди для повтора.
         Версия 3.0 (Smart Batch): 
         - Для 'epub_batch' НЕ обновляет payload, доверяя состоянию в БД (т.к. пакет мог мутировать).
         - Для остальных задач обновляет payload (сохраняя возможную обрезку хвоста от PartialGenerationError).
+        - retry_after_seconds: столько задача не выдаётся ни одному воркеру
+          (пауза после сетевой ошибки: другой ключ её не вылечит).
         """
         payload = task_info[1]
         task_type = payload[0]
@@ -1346,15 +1361,22 @@ class ChapterQueueManager(QObject):
         # Если это файл/чанк -> new_payload=payload (сохраняем обрезку из памяти).
         payload_to_update = None if task_type == 'epub_batch' else payload
 
-        # update_task сам управляет своей транзакцией.
-        done = self.update_task(
-            task_info[0], 
-            worker_id=worker_id, 
-            new_status='pending', 
-            new_payload=payload_to_update,  # <-- Передаем либо None, либо данные
-            new_priority=1, 
-            current_worker_id=worker_id
-        )
+        retry_after = time.time() + retry_after_seconds if retry_after_seconds > 0 else None
+        with self._get_write_conn() as conn:
+            done = self.update_task(
+                task_info[0],
+                worker_id=worker_id,
+                new_status='pending',
+                new_payload=payload_to_update,  # <-- Передаем либо None, либо данные
+                new_priority=1,
+                current_worker_id=worker_id,
+                unsafe_mode=conn,
+            )
+            if done:
+                conn.execute(
+                    "UPDATE tasks SET retry_after = ? WHERE task_id = ?",
+                    (retry_after, str(task_info[0])),
+                )
                 
         if done:
             self._log(f"[TASK] 🔄 Задача '{self._get_task_display_name(payload)}' возвращена для повтора.")
