@@ -287,6 +287,9 @@ def build_translation_quality_service(
     journal = _load_journal(paths.journal, project_manager)
     capabilities = qa_settings.effective_capabilities()
     client = ExistingHandlerCompletionClient(handler_factory, event_sink)
+    # Answers the model already gave about unchanged text: a re-check, a
+    # deferred chapter retried, a resumed session ask the same questions.
+    answers = QaAnswerCache(paths.answer_cache)
     coverage = SemanticCoverageService(
         extractor=_extractor(capabilities),
         provider=embedding_provider,
@@ -306,7 +309,7 @@ def build_translation_quality_service(
             target_language=target_language,
         ),
         coverage=coverage,
-        verifier=OmissionVerifier(client),
+        verifier=OmissionVerifier(client, cache=answers),
         repairer=OmissionRepairer(client),
         repair_engine=StructuralRepairEngine(target_language, capabilities),
         repair_validator=RepairValidator(client),
@@ -315,9 +318,7 @@ def build_translation_quality_service(
         journal_path=paths.journal,
         request_counter=client,
         additions=AdditionDetector(client),
-        language=LanguageQualityPipeline(
-            client, diagnosis_cache=QaAnswerCache(paths.answer_cache)
-        ),
+        language=LanguageQualityPipeline(client, diagnosis_cache=answers),
     )
 
 

@@ -260,6 +260,33 @@ def _check(service, request, options: QaOptions | None = None):
     )
 
 
+class _BatchVerifier(_Verifier):
+    """A verifier that is asked about all candidates of a chapter at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[int] = []
+
+    async def verify_many(self, items, model, cancellation):
+        self.batches.append(len(items))
+        return tuple(
+            [
+                await self.verify(candidate, context, glossary, model, cancellation)
+                for candidate, context, glossary in items
+            ]
+        )
+
+
+def test_the_candidates_of_a_chapter_go_to_the_verifier_together(tmp_path, chapter):
+    verifier = _BatchVerifier()
+    service, _journal, _path = _service(tmp_path, verifier=verifier)
+
+    result = _check(service, _request(chapter))
+
+    assert verifier.batches == [1]
+    assert [item.status for item in result.verified] == ["verified"]
+
+
 def test_clean_chapter_costs_no_requests_and_never_blocks(tmp_path, chapter):
     """A chapter with no candidates must not spend a single QA request."""
     verifier = _Verifier()

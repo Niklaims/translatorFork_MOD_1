@@ -946,7 +946,7 @@ class TranslationQualityService:
         cancellation: CancellationToken,
         warnings: list[str],
     ) -> tuple[VerifiedCandidate, ...]:
-        verified: list[VerifiedCandidate] = []
+        items = []
         for candidate in coverage.candidates:
             cancellation.raise_if_cancelled()
             context = coverage.contexts.get(candidate.candidate_id)
@@ -959,6 +959,19 @@ class TranslationQualityService:
                 f"{context.source_before} {context.source_after}".strip(),
                 MAX_GLOSSARY_TERMS_PER_CANDIDATE,
             )
+            items.append((candidate, context, glossary))
+        verify_many = getattr(self._verifier, "verify_many", None)
+        if items and callable(verify_many):
+            # The candidates of a chapter share requests (OmissionVerifier).
+            try:
+                return tuple(await verify_many(items, request.model, cancellation))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a bad batch is not a failed chapter
+                warnings.append("verification_failed")
+                return ()
+        verified: list[VerifiedCandidate] = []
+        for candidate, context, glossary in items:
             try:
                 verified.append(
                     await self._verifier.verify(
