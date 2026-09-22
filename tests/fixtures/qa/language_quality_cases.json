@@ -240,7 +240,7 @@
     },
     "expected": {
       "auto_fixable": false,
-      "reason": "ambiguous_span"
+      "reason": "span_not_found"
     }
   }
 ]

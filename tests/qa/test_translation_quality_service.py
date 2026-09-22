@@ -260,6 +260,33 @@ def _check(service, request, options: QaOptions | None = None):
     )
 
 
+class _BatchVerifier(_Verifier):
+    """A verifier that is asked about all candidates of a chapter at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[int] = []
+
+    async def verify_many(self, items, model, cancellation):
+        self.batches.append(len(items))
+        return tuple(
+            [
+                await self.verify(candidate, context, glossary, model, cancellation)
+                for candidate, context, glossary in items
+            ]
+        )
+
+
+def test_the_candidates_of_a_chapter_go_to_the_verifier_together(tmp_path, chapter):
+    verifier = _BatchVerifier()
+    service, _journal, _path = _service(tmp_path, verifier=verifier)
+
+    result = _check(service, _request(chapter))
+
+    assert verifier.batches == [1]
+    assert [item.status for item in result.verified] == ["verified"]
+
+
 def test_clean_chapter_costs_no_requests_and_never_blocks(tmp_path, chapter):
     """A chapter with no candidates must not spend a single QA request."""
     verifier = _Verifier()
@@ -1056,6 +1083,98 @@ def test_a_fix_already_decided_is_not_scored_again(tmp_path, chapter):
     second = _check(service, request)
 
     assert second.suggestion_windows == ()
+
+
+class _ParagraphAligner:
+    """Cover every unit one to one, in order."""
+
+    def align(self, source, target):
+        spans = tuple(
+            AlignmentSpan((left.unit_id,), (right.unit_id,), 0.99, "1:1")
+            for left, right in zip(source.units, target.units, strict=True)
+        )
+        return AlignmentResult(spans, (), 2 * len(spans))
+
+
+def _recording_language(shown: dict[str, str]):
+    """A language check that finds nothing and remembers the source it was shown."""
+    from gemini_translator.qa.language_validation import LanguageQaResult
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            shown.update(request.source_text_by_block)
+            return LanguageQaResult(
+                chapter_id=request.chapter_id, issues=(), suggestions=(), refusals={}
+            )
+
+    return _Language()
+
+
+def _with_source(request: ChapterQaRequest, *texts: str) -> ChapterQaRequest:
+    """The same chapter, its original laid out with ids of another markup."""
+    coverage = replace(
+        request.coverage_request, source_payload=_payload("source-doc", *texts)
+    )
+    return replace(request, coverage_request=coverage)
+
+
+def test_the_language_check_is_shown_the_source_of_each_translated_paragraph(
+    tmp_path, chapter
+):
+    """Оригинал абзаца ищется по порядку абзацев: id блоков оригинала и перевода
+    совпадают, только когда совпадает их разметка."""
+    shown: dict[str, str] = {}
+    service, _journal, _path = _service(
+        tmp_path, aligner=_ParagraphAligner(), language=_recording_language(shown)
+    )
+
+    _check(service, _with_source(_request(chapter), "He opened the door.", "He left at once."))
+
+    ids = _block_ids(_CHAPTER_HTML)
+    assert shown == {ids[0]: "He opened the door.", ids[1]: "He left at once."}
+
+
+def test_the_language_check_is_given_the_glossary_terms_of_its_chapter(tmp_path, chapter):
+    """Без глоссария проверка правила «Куэнтина» в «Квентина» прямо в книге."""
+    seen = {}
+
+    class _Language:
+        async def check_chapter(self, request, *, rule_candidates=(), nlp_analysis=None):
+            from gemini_translator.qa.language_validation import LanguageQaResult
+
+            seen["glossary"] = request.glossary
+            return LanguageQaResult(
+                chapter_id=request.chapter_id, issues=(), suggestions=(), refusals={}
+            )
+
+    service, _journal, _path = _service(tmp_path, aligner=_CleanAligner(), language=_Language())
+    request = replace(
+        _request(chapter),
+        glossary=(GlossaryTerm("room", "комната"), GlossaryTerm("sword", "меч")),
+    )
+
+    _check(service, request)
+
+    assert [
+        (term.original_term, term.canonical_translation) for term in seen["glossary"]
+    ] == [("room", "комната")]
+
+
+def test_a_refused_fix_is_scored_against_its_own_source_paragraph(tmp_path, chapter):
+    service, _journal, _path = _service(
+        tmp_path,
+        aligner=_ParagraphAligner(),
+        language=_refusing_language((1, "сразу ушёл", "тут же ушёл")),
+    )
+
+    result = _check(
+        service, _with_source(_request(chapter), "He opened the door.", "He left at once.")
+    )
+
+    assert [
+        (pair.before.source, pair.before.translation, pair.after.translation)
+        for pair in result.suggestion_windows
+    ] == [("He left at once.", "Он сразу ушёл.", "Он тут же ушёл.")]
 
 
 def test_scores_are_written_into_a_fix_and_its_decision_stays(tmp_path, chapter):

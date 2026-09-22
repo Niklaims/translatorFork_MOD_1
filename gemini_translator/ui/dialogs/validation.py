@@ -17,6 +17,7 @@ from ...utils.document_importer import set_all_checked
 from ...utils.html_text import extract_visible_text_normalized
 from ...utils.epub_tools import get_epub_chapter_order, extract_number_from_path
 from ...utils.language_tools import LanguageDetector
+from ..item_background import ItemBackgroundDelegate, paint_item_background
 from ..widgets.table_utils import NumericSortItem
 from ..widgets.ancestor_utils import find_ancestor_by_predicate
 from ..widgets.regex_syntax_highlighter import (
@@ -49,6 +50,8 @@ from ...utils.text import (
 )
 from ...utils.glued_words import repair_glued_russian_words_in_html
 from ...utils.io_utils import atomic_write_text
+from ...utils.qt_utils import deferred_column_autosize
+from ...utils.repeat_scan import find_most_repeated_pattern
 from ...utils.translation_versions import (
     VALIDATED_SUFFIX,
     select_target_translation_version,
@@ -373,28 +376,37 @@ class ChapterStatusDelegate(QtWidgets.QStyledItemDelegate):
         init_option = QtWidgets.QStyleOptionViewItem(option)
         self.initStyleOption(init_option, index)
         init_option.text = ""
+        paint_item_background(painter, init_option)
         style = init_option.widget.style() if init_option.widget else QApplication.style()
         style.drawControl(QtWidgets.QStyle.ControlElement.CE_ItemViewItem, init_option, painter, init_option.widget)
-        text_rect = QtCore.QRect(option.rect)
-        
+        # Текст — в той же рамке, что у соседних колонок: поля и отступы
+        # плашки темы плюс поле текста стиля. Иначе он прилипает к краю плашки.
+        text_rect = style.subElementRect(
+            QtWidgets.QStyle.SubElement.SE_ItemViewItemText, init_option, init_option.widget
+        )
+        text_margin = style.pixelMetric(
+            QtWidgets.QStyle.PixelMetric.PM_FocusFrameHMargin, None, init_option.widget
+        ) + 1
+        text_rect.adjust(text_margin, 0, -text_margin, 0)
+
         if has_validated:
             painter.save()
             indicator_rect = QtCore.QRect(option.rect)
             indicator_rect.setLeft(indicator_rect.right() - 24)
             indicator_rect.adjust(0, 2, 0, -2)
-            
+
             painter.setFont(QFont("Segoe UI Symbol", 10))
             painter.setPen(QColor("#2ECC71"))
             painter.drawText(indicator_rect, Qt.AlignmentFlag.AlignCenter, "✅")
             painter.restore()
-            text_rect.setRight(text_rect.right() - 26)
+            text_rect.setRight(min(text_rect.right(), option.rect.right() - 26))
 
         painter.save()
         text_color = QColor("#2ECC71") if has_validated else option.palette.color(QtGui.QPalette.ColorRole.Text)
         painter.setPen(text_color)
-        
+
         flags = Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap
-        painter.drawText(text_rect.adjusted(5, 0, 0, 0), int(flags), text)
+        painter.drawText(text_rect, int(flags), text)
         painter.restore()
 
     def sizeHint(self, option, index):
@@ -868,6 +880,7 @@ class AIRepairReviewPage(ShellPage):
         self.splitter = QSplitter(Qt.Orientation.Vertical)
 
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Применить", "Тип", "Файл", "Строка/блок", "Было", "Стало"])
@@ -1703,42 +1716,10 @@ class ValidationThread(QThread):
             result_data['combined_deviation'] = dev_val
             result_data['deviation_type'] = dev_type # <-- Сохраняем тип (Абзац/Цифра/Пункт)
 
-            # --- 5. Повторы (Исправленная логика) ---
-            min_reps_scan = 5 
-            max_pattern_len = 20
-            
-            best_repeat_candidate = None 
-            max_reps_found = 0
-
-            # Проходим по всем длинам, чтобы найти ТОТ, у которого больше всего повторений.
-            # (Раньше мы останавливались на первом длинном, и это скрывало частые короткие повторы)
-            for pattern_len in range(max_pattern_len, 0, -1):
-                required_extra = max(1, min_reps_scan - 1)
-                try:
-                    regex = re.compile(r'(.{' + str(pattern_len) + r'})\1{' + str(required_extra) + r',}', re.DOTALL)
-                    match = regex.search(translated_content)
-                    if match:
-                        full_sequence = match.group(0)
-                        repeated_pattern = match.group(1)
-                        
-                        # Игнорируем обычные пробельные отступы, если их не экстремально много
-                        if repeated_pattern.strip() == "" and len(full_sequence) // len(repeated_pattern) < 50:
-                            continue
-                        
-                        actual_count = len(full_sequence) // len(repeated_pattern)
-                        
-                        # ГЛАВНОЕ ИСПРАВЛЕНИЕ:
-                        # Мы сохраняем результат, только если количество повторений БОЛЬШЕ, 
-                        # чем у того, что мы нашли ранее.
-                        # Так мы найдем точку, повторенную 100 раз, даже если перед ней нашли тег, повторенный 6 раз.
-                        if actual_count > max_reps_found:
-                            max_reps_found = actual_count
-                            best_repeat_candidate = (repeated_pattern, actual_count, pattern_len == 1)
-                        
-                        # Мы НЕ делаем break, чтобы проверить все варианты длин
-                except re.error: 
-                    continue
-            
+            # --- 5. Повторы ---
+            # Все длины от 20 до 1, чтобы найти самый частый повтор, а не первый
+            # длинный (см. utils/repeat_scan.py — там же, почему это быстро).
+            best_repeat_candidate = find_most_repeated_pattern(translated_content)
             if best_repeat_candidate:
                 result_data['repeat_data'] = best_repeat_candidate # <-- СЫРОЕ ДАННОЕ: ('a', 15, True)
 
@@ -1951,13 +1932,14 @@ class ValidationThread(QThread):
                                 with open(v_path, 'r', encoding='utf-8') as f:
                                     validated_content = f.read()
 
+                        content_hash = build_text_hash(translated_content)
                         result_data = {
                             'path': version_path, 'internal_html_path': internal_html_path,
                             'original_html': original_content, 'translated_html': translated_content,
                             'status': 'neutral',
                             'has_cached_analysis': True,
-                            'current_content_hash': build_text_hash(translated_content),
-                            'analyzed_content_hash': build_text_hash(translated_content),
+                            'current_content_hash': content_hash,
+                            'analyzed_content_hash': content_hash,
                         }
                         if validated_content: result_data['validated_content'] = validated_content
                         
@@ -2028,6 +2010,18 @@ class _LazyOriginalEpubZip:
     def close(self):
         if self._zip is not None:
             self._zip.close()
+
+
+# Заливка строки по статусу — токены темы (themes.py). Прежние тёмные тона
+# в светлой теме сливались в один серый, а «К переотправке» и «Проблема»
+# не различались ни в одной из тем.
+STATUS_ROW_FILLS = {
+    "delete": "danger_row_bg",
+    "ok": "success_row_bg",
+    "retry": "pending_row_bg",
+    "problem": "warning_row_bg",
+    "edited": "info_row_bg",
+}
 
 
 # --- Главное окно диалога ---
@@ -2811,42 +2805,45 @@ class TranslationValidatorPage(ShellPage):
         self.table_results.setSortingEnabled(False)
         self.table_results.setUpdatesEnabled(False)
         
-        for internal_path in ordered_originals:
-            # Даем интерфейсу "дышать" каждые 50 файлов
-            if row_pos % 50 == 0:
-                QApplication.processEvents()
-                if self._is_destroyed():
-                    return
+        # Столбцы с ResizeToContents Qt меряет заново после каждого setItem —
+        # по всем строкам; 514 глав так заполнялись 5,9 с вместо 0,6.
+        with deferred_column_autosize(self.table_results):
+            for internal_path in ordered_originals:
+                # Даем интерфейсу "дышать" каждые 50 файлов
+                if row_pos % 50 == 0:
+                    QApplication.processEvents()
+                    if self._is_destroyed():
+                        return
 
-            versions = self.project_manager.get_versions_for_original(internal_path)
-            if not versions:
-                continue
+                versions = self.project_manager.get_versions_for_original(internal_path)
+                if not versions:
+                    continue
 
-            target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
+                target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
             
-            if not target_rel_path:
-                continue
+                if not target_rel_path:
+                    continue
             
-            full_path = os.path.join(self.translated_folder, target_rel_path)
+                full_path = os.path.join(self.translated_folder, target_rel_path)
 
-            # Данные
-            data_placeholder, needs_analysis = self._build_row_data_for_file(
-                internal_path,
-                full_path,
-                is_validated_present,
-            )
+                # Данные
+                data_placeholder, needs_analysis = self._build_row_data_for_file(
+                    internal_path,
+                    full_path,
+                    is_validated_present,
+                )
 
-            self._append_result_row(
-                row_pos,
-                internal_path,
-                target_rel_path,
-                is_validated_present,
-                data_placeholder,
-                needs_analysis,
-                placeholder_text="Ожидание...",
-            )
+                self._append_result_row(
+                    row_pos,
+                    internal_path,
+                    target_rel_path,
+                    is_validated_present,
+                    data_placeholder,
+                    needs_analysis,
+                    placeholder_text="Ожидание...",
+                )
 
-            row_pos += 1
+                row_pos += 1
 
         if self._is_destroyed():
             return
@@ -3521,6 +3518,7 @@ class TranslationValidatorPage(ShellPage):
         self.table_results.setAlternatingRowColors(True)
         self.table_results.setMinimumHeight(180)
         self.table_results.verticalHeader().setDefaultSectionSize(39)
+        self.table_results.setItemDelegate(ItemBackgroundDelegate(self.table_results))
         self.table_results.setItemDelegateForColumn(0, ChapterStatusDelegate(self.table_results))
         self.table_results.setColumnCount(4); self.table_results.setHorizontalHeaderLabels(["Исходный файл в EPUB", "Проблемы", "Длина (Ориг|Перевод)", "Статус"])
         
@@ -4760,37 +4758,39 @@ class TranslationValidatorPage(ShellPage):
         ordered_originals, _ = get_epub_chapter_order(self.original_epub_path, return_method=True)
         row_pos = 0
         
-        for internal_path in ordered_originals:
-            versions = self.project_manager.get_versions_for_original(internal_path)
-            if not versions:
-                continue
+        # См. _populate_initial_table: столбцы меряем один раз в конце.
+        with deferred_column_autosize(self.table_results):
+            for internal_path in ordered_originals:
+                versions = self.project_manager.get_versions_for_original(internal_path)
+                if not versions:
+                    continue
 
-            target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
-            if not target_rel_path:
-                continue
+                target_rel_path, is_validated_present = self._resolve_target_translation_version(versions)
+                if not target_rel_path:
+                    continue
 
-            full_path = os.path.join(self.translated_folder, target_rel_path)
-            data, needs_analysis = self._build_row_data_for_file(
-                internal_path,
-                full_path,
-                is_validated_present,
-                preserved_data=preserved_data.get(internal_path),
-            )
-            if internal_path in old_dirty_set:
-                needs_analysis = True
-                self._invalidate_analysis_for_data(data)
+                full_path = os.path.join(self.translated_folder, target_rel_path)
+                data, needs_analysis = self._build_row_data_for_file(
+                    internal_path,
+                    full_path,
+                    is_validated_present,
+                    preserved_data=preserved_data.get(internal_path),
+                )
+                if internal_path in old_dirty_set:
+                    needs_analysis = True
+                    self._invalidate_analysis_for_data(data)
 
-            self._append_result_row(
-                row_pos,
-                internal_path,
-                target_rel_path,
-                is_validated_present,
-                data,
-                needs_analysis,
-                placeholder_text="...",
-            )
+                self._append_result_row(
+                    row_pos,
+                    internal_path,
+                    target_rel_path,
+                    is_validated_present,
+                    data,
+                    needs_analysis,
+                    placeholder_text="...",
+                )
 
-            row_pos += 1
+                row_pos += 1
         
         self._refresh_previous_problem_paths()
         self.reapply_filters()
@@ -5616,17 +5616,9 @@ class TranslationValidatorPage(ShellPage):
                 self.update_row_color(row, internal_status)
 
     def update_row_color(self, row, status):
-        alpha = 85 
-        color = QColor("transparent") # Нейтральный цвет по умолчанию
-
-        if status == 'delete': color = QColor(90, 58, 58, alpha)
-        elif status == 'ok': color = QColor(46, 75, 62, alpha)
-        elif status == 'retry': color = QColor(88, 68, 46, alpha)
-        elif status == 'problem': color = QColor(93, 72, 53, alpha)
-        elif status == 'edited': color = QColor(58, 75, 95, alpha)
-        # Для 'neutral' мы просто оставляем прозрачный цвет по умолчанию
-
-        brush = QBrush(color)
+        token = STATUS_ROW_FILLS.get(status)
+        # У 'neutral' заливки нет.
+        brush = QBrush(theme_manager.qcolor(token)) if token else QBrush()
         for col in range(self.table_results.columnCount()):
             item = self.table_results.item(row, col)
             if item:
@@ -6095,10 +6087,13 @@ class TranslationValidatorPage(ShellPage):
             if row_index not in soup_cache:
                 soup_cache[row_index] = BeautifulSoup(html_content, 'html.parser')
             soup = soup_cache[row_index]
+            # Текстовые узлы главы — одним обходом дерева: find_all(string=...)
+            # обходил его заново на каждое слово (треть открытия помощника).
+            chapter_strings = [node for node in soup.descendants if isinstance(node, NavigableString)]
 
             for term in result_data['untranslated_words']:
                 term_pattern = re.compile(re.escape(term), re.IGNORECASE)
-                text_nodes = soup.find_all(string=term_pattern)
+                text_nodes = [node for node in chapter_strings if term_pattern.search(node)]
 
                 for node in text_nodes:
                     if not node.parent:

@@ -43,6 +43,7 @@ except ImportError:
 
 # --- Импорты из нашего проекта ---
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from gemini_translator.ui.wait_dialogs import show_when_slow
 from ...utils.epub_tools import (
     get_epub_chapter_order, extract_number_from_path, extract_number_from_path_reversed,
@@ -494,6 +495,7 @@ class EpubHtmlSelectorDialog(QDialog):
     
         # --- СПИСОК ГЛАВ ---
         self.list_widget = QListWidget()
+        self.list_widget.setItemDelegate(ItemBackgroundDelegate(self.list_widget))
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         content_layout.addWidget(self.list_widget, 1)
@@ -730,6 +732,11 @@ class EpubHtmlSelectorDialog(QDialog):
 
     def _populate_list_widget(self, chapters_to_show):
         self.list_widget.clear()
+        # Заливки статусов — токены темы: проверенная глава как «Готов» в
+        # проверке перевода, переведённая без проверки — info. Прежние тёмные
+        # тона в светлой теме были почти одним серым.
+        validated_fill = theme_manager.qcolor("success_row_bg")
+        unvalidated_fill = theme_manager.qcolor("info_row_bg")
         for i, file_path in enumerate(chapters_to_show):
             size_chars = self._size_cache.get(file_path, 0)
             
@@ -739,9 +746,9 @@ class EpubHtmlSelectorDialog(QDialog):
             self._apply_chapter_item_tooltip(item, file_path)
             
             if file_path in self.validated_chapters:
-                item.setBackground(QtGui.QColor(46, 75, 62, 80))
+                item.setBackground(validated_fill)
             elif file_path in self.unvalidated_chapters:
-                item.setBackground(QtGui.QColor(58, 75, 95, 80))
+                item.setBackground(unvalidated_fill)
             
             self.list_widget.addItem(item)
 

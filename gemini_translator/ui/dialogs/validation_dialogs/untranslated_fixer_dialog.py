@@ -26,6 +26,7 @@ from ...widgets import (
     KeyManagementWidget, ModelSettingsWidget, LogWidget, PresetWidget
 )
 from ...widgets.common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from ...item_background import ItemBackgroundDelegate
 from ...widgets.ancestor_utils import find_ancestor_by_predicate
 from ...shell import ShellPage
 from gemini_translator.ui import theme_manager
@@ -76,6 +77,10 @@ SOURCE_TYPE_LABELS = {
     'system': 'SYSTEM',
     'user': 'USER',
 }
+# Заливки правленого и очищенного контекста — те же токены темы, что у
+# статусов «Редакт.» и «На удаление» в проверке перевода.
+EDITED_CONTEXT_FILL = 'info_row_bg'
+CLEARED_CONTEXT_FILL = 'danger_row_bg'
 UNTRANSLATED_FIXER_BACKGROUND_ROLE = 'untranslated_fixer'
 UNTRANSLATED_PROMPT_GUARDRAILS_MARKER = "## ОБЯЗАТЕЛЬНЫЙ ПАТЧ ПРОМПТА: CJK, ССЫЛКИ И РЕКЛАМА"
 UNTRANSLATED_PROMPT_GUARDRAILS = f"""{UNTRANSLATED_PROMPT_GUARDRAILS_MARKER}
@@ -1201,6 +1206,7 @@ class UntranslatedFixerPage(ShellPage):
         
         # --- ТАБЛИЦА ---
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(5)
         # Меняем заголовок последней колонки
@@ -1535,7 +1541,7 @@ class UntranslatedFixerPage(ShellPage):
             ctx_item.setData(Qt.ItemDataRole.UserRole, idx)
             
             if current_ctx != original_ctx:
-                ctx_item.setBackground(QtGui.QColor(58, 75, 95, 120))
+                ctx_item.setBackground(theme_manager.qcolor(EDITED_CONTEXT_FILL))
             
             # 3. Info
             tot, alien, ratio = data.get('_current_stats', data.get('stats', (0,0,0)))
@@ -2041,17 +2047,8 @@ class UntranslatedFixerPage(ShellPage):
                 return
 
             rows = sorted(list(set(item.row() for item in selected_items)))
-            count = 0
-            for row in rows:
-                ctx_item = self.table.item(row, 2)
-                if not ctx_item: continue
-                
-                idx = ctx_item.data(Qt.ItemDataRole.UserRole)
-                self.original_data[idx]['new_context'] = ""
-                ctx_item.setText("")
-                ctx_item.setBackground(QtGui.QColor(90, 58, 58, 100))
-                count += 1
-            
+            count = self._clear_context_rows(rows)
+
             if count > 0:
                 QMessageBox.information(self, "Очищено", f"Очищен текст в {count} выделенных строках.")
 
@@ -2135,6 +2132,21 @@ class UntranslatedFixerPage(ShellPage):
                 f"Успешно очищен английский мусор в {cleaned_count} фрагментах."
             )
         return cleaned_count
+
+    def _clear_context_rows(self, rows):
+        """Очищает контекст в строках таблицы и помечает их. Возвращает число очищенных."""
+        fill = theme_manager.qcolor(CLEARED_CONTEXT_FILL)
+        count = 0
+        for row in rows:
+            ctx_item = self.table.item(row, 2)
+            if not ctx_item: continue
+
+            idx = ctx_item.data(Qt.ItemDataRole.UserRole)
+            self.original_data[idx]['new_context'] = ""
+            ctx_item.setText("")
+            ctx_item.setBackground(fill)
+            count += 1
+        return count
 
     def _start_ai_translation(self):
         # 1. Сначала сохраняем ручные правки, если они были до нажатия кнопки

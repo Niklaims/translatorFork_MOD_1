@@ -84,6 +84,41 @@ def test_the_matcher_still_refuses_a_different_word_with_a_shared_prefix():
     assert contains_term_forms("о пределах прочности", "предельный атрибут") is False
 
 
+@pytest.mark.parametrize(
+    ("text", "term"),
+    [
+        ("и след простыл", "следопыт"),
+        ("целый мир вокруг", "Миртл"),
+        ("Трое детей стояли у ворот", "«Троецарствие»"),
+    ],
+)
+def test_with_lemmas_a_word_is_not_a_term_just_for_being_its_start(text, term):
+    """Словарь лемм знает, что «след» — не «следопыт»; начало слова тут не довод."""
+    assert contains_term_forms(text, term) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "term"),
+    [
+        ("и Белосу стало не по себе", "Белос"),
+        ("рядом с Дриззтом", "Дриззт"),
+        ("вместе с Куэнтином", "Куэнтин"),
+    ],
+)
+def test_a_name_the_lemmas_guess_wrong_still_counts_in_its_cases(text, term):
+    """pymorphy не знает этих имён и угадывает леммы вразнобой («Белос» — белос,
+    «Белосом» — белосом): имя с падежным окончанием всё равно то же имя."""
+    assert contains_term_forms(text, term) is True
+
+
+def test_without_lemmas_the_start_of_a_word_is_still_the_fallback(monkeypatch):
+    from gemini_translator.qa import glossary_terms
+
+    monkeypatch.setattr(glossary_terms, "_lemmatizer", lambda: None)
+
+    assert contains_term_forms("об атрибутах", "атрибут") is True
+
+
 # --- the style window -------------------------------------------------------
 
 

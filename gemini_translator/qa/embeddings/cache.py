@@ -432,6 +432,9 @@ class EmbeddingCache:
             preprocessing_identity, "preprocessing_identity"
         )
         texts = tuple(dict.fromkeys(_normalized_text(text) for text in normalized_texts))
+        # Whatever part of the texts is cached, in the size the first of them
+        # was stored in.  Texts cached in another size count as misses: vectors
+        # of two sizes never share a batch.
         with self._lock:
             index = self._index_unlocked()
             keys: list[EmbeddingCacheKey] = []
@@ -447,15 +450,17 @@ class EmbeddingCache:
                 )
                 metadata = index["dimensionless"].get(alias)
                 if metadata is None:
-                    return None, {}
+                    continue
                 key = self._key_from_dimensionless(metadata)
                 if dimensions is None:
                     dimensions = key.dimensions
                 elif key.dimensions != dimensions:
-                    return None, {}
+                    continue
                 keys.append(key)
+            if not keys:
+                return None, {}
             hits = self._get_many_unlocked(tuple(keys), index)
-            if len(hits) != len(keys):
+            if not hits:
                 return None, {}
             return dimensions, hits
 
@@ -830,19 +835,19 @@ class CachedEmbeddingProvider:
         if not missing_texts:
             return self._validated_result(request, normalized, keys, hits, None)
 
-        missing_request = EmbeddingRequest(
-            texts=tuple(first_text[text] for text in missing_texts),
-            language=request.language,
-            model=request.model,
-            dimensions=request.dimensions,
-            task_type=request.task_type,
-        )
-        upstream_batch = await self._upstream.embed(missing_request)
-        self._validate_upstream_metadata(upstream_batch, request, len(missing_texts))
+        upstream_batch = await self._embed_upstream(first_text, missing_texts, request)
+        if (
+            request.dimensions is None
+            and hits
+            and upstream_batch.dimensions != effective_dimensions
+        ):
+            # The service now answers in another size than the cached part was
+            # stored in: the whole request is asked again, in the new size.
+            hits = {}
+            missing_texts = tuple(first_text)
+            upstream_batch = await self._embed_upstream(first_text, missing_texts, request)
         effective_dimensions = upstream_batch.dimensions
         keys = self._keys_for_texts(tuple(first_text), request, effective_dimensions)
-        if request.dimensions is None:
-            hits = {}
 
         result = self._validated_result(
             request,
@@ -865,6 +870,24 @@ class CachedEmbeddingProvider:
             dimensionless=request.dimensions is None,
         )
         return result
+
+    async def _embed_upstream(
+        self,
+        first_text: Mapping[str, str],
+        missing_texts: tuple[str, ...],
+        request: EmbeddingRequest,
+    ) -> EmbeddingBatch:
+        batch = await self._upstream.embed(
+            EmbeddingRequest(
+                texts=tuple(first_text[text] for text in missing_texts),
+                language=request.language,
+                model=request.model,
+                dimensions=request.dimensions,
+                task_type=request.task_type,
+            )
+        )
+        self._validate_upstream_metadata(batch, request, len(missing_texts))
+        return batch
 
     def _keys_for_texts(
         self,

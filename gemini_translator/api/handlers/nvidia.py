@@ -6,7 +6,7 @@ import json
 import re
 import traceback
 
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError,
     LocationBlockedError,
@@ -491,7 +491,7 @@ class NvidiaApiHandler(BaseApiHandler):
 
             except asyncio.TimeoutError:
                 raise NetworkError("Таймаут соединения с NVIDIA NIM", delay_seconds=10)
-            except (aiohttp.ClientError, OSError) as error:
+            except TRANSPORT_ERRORS as error:
                 error_msg = self._format_transport_error(error, "NVIDIA NIM")
                 raise NetworkError(error_msg, delay_seconds=20) from error
             except (

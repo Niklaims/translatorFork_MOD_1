@@ -47,6 +47,7 @@ from .glossary_dialogs.import_master import (
     ImporterWizardDialog,
     MultiImportManagerDialog
 )
+from .glossary_dialogs.paste_terms import run_glossary_paste
 # Кастомные виджеты
 from .glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 
@@ -575,6 +576,14 @@ class GlossaryManagerPage(ShellPage):
         
         add_term_button = QPushButton("➕ Добавить термин"); add_term_button.clicked.connect(self._add_new_term)
         top_controls.addWidget(add_term_button)
+
+        self.paste_terms_button = QPushButton("📋 Вставить термины…")
+        self.paste_terms_button.setToolTip(
+            "Вставить список терминов: новые добавятся, а для уже известных "
+            "покажется, что заменится"
+        )
+        self.paste_terms_button.clicked.connect(self._paste_terms)
+        top_controls.addWidget(self.paste_terms_button)
         
         main_layout.addLayout(top_controls)
         
@@ -901,8 +910,8 @@ class GlossaryManagerPage(ShellPage):
                     conn.execute("UPDATE glossary_editor_state SET original=?, rus=?, note=? WHERE id=?",
                                  (old_entry['original'], old_entry['rus'], old_entry['note'], old_entry['id']))
                 elif change_type == 'delete':
-                    conn.executemany("INSERT OR REPLACE INTO glossary_editor_state (id, sequence, original, rus, note) VALUES (?, ?, ?, ?, ?)",
-                                     [(e['id'], e['sequence'], e['original'], e['rus'], e['note']) for e in data['entries']])
+                    conn.executemany("INSERT OR REPLACE INTO glossary_editor_state (id, sequence, original, rus, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                                     [(e['id'], e['sequence'], e['original'], e['rus'], e['note'], e['timestamp']) for e in data['entries']])
                 elif change_type == 'add':
                     conn.execute("DELETE FROM glossary_editor_state WHERE id=?", (data['added_id'],))
             
@@ -911,8 +920,8 @@ class GlossaryManagerPage(ShellPage):
                 old_state = data['old_state']
                 if old_state:
                     # При восстановлении wholesale-состояния, генерируем новые ID, чтобы избежать коллизий
-                    conn.executemany("INSERT INTO glossary_editor_state (id, sequence, original, rus, note) VALUES (?, ?, ?, ?, ?)",
-                                     [(str(uuid.uuid4()), i, e['original'], e['rus'], e['note']) for i, e in enumerate(old_state)])
+                    conn.executemany("INSERT INTO glossary_editor_state (id, sequence, original, rus, note, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+                                     [(str(uuid.uuid4()), i, e['original'], e['rus'], e['note'], e['timestamp']) for i, e in enumerate(old_state)])
 
         # --- КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Вместо всех sync/update вызываем одну функцию ---
         self._load_current_page()
@@ -998,7 +1007,24 @@ class GlossaryManagerPage(ShellPage):
                 self.table.scrollToItem(item, QAbstractItemView.ScrollHint.PositionAtCenter)
                 self.table.editItem(item)
                 break
-    
+
+    def _paste_terms(self):
+        """Массовая вставка терминов; расхождения с глоссарием пользователь
+        подтверждает в карточке (см. glossary_dialogs/paste_terms.py)."""
+        self.table.setCurrentItem(None)
+        run_glossary_paste(self, self.get_glossary(include_db_id=True), self._apply_pasted_terms)
+
+    def _apply_pasted_terms(self, plan, accepted_conflicts):
+        # Одна запись истории на всю вставку: «Отменить» откатывает её целиком.
+        patch_list = [
+            {'before': conflict.current, 'after': conflict.replacement}
+            for conflict in accepted_conflicts
+        ]
+        patch_list += [{'before': None, 'after': entry} for entry in plan.additions]
+        self._apply_patch_and_log_history(patch_list, "Вставка терминов", self.get_glossary())
+        if self.launch_mode != 'child':
+            self.save_button.setEnabled(True)
+
     def open_frequency_analyzer(self):
         """Открывает страницу частотного анализа и применяет полученный патч."""
         if self._is_glossary_empty():
@@ -1142,8 +1168,11 @@ class GlossaryManagerPage(ShellPage):
         
         color = QColor("transparent")
         if conflict_types:
-            # Можно задать разные цвета для разных типов, но пока используем один
-            color = QColor(255, 243, 205, 120) # Полупрозрачный желтый
+            # Можно задать разные цвета для разных типов, но пока используем один.
+            # Заливка строки-предупреждения из темы: прежний светло-жёлтый
+            # (255, 243, 205, 120) терялся на светлой теме, а на тёмной
+            # светлел до 3,5:1 со светлым текстом.
+            color = theme_manager.qcolor('warning_row_bg')
     
         for col in range(3): # Подсвечиваем только ячейки с данными
             cell_item = self.table.item(row, col)
@@ -2266,9 +2295,22 @@ class GlossaryManagerPage(ShellPage):
         return " ".join(filter(None, [main_word_info, other_info])).strip()
         
     def set_glossary(self, glossary_data: list, run_analysis: bool = True):
-        import time
+        """Первичная загрузка: история правок начинается заново. Правка, которая
+        заменяет глоссарий целиком, идёт через _replace_glossary_and_log_history,
+        иначе её нельзя отменить."""
         self.history.clear()
         self.history_table.setRowCount(0)
+        self._replace_rows(glossary_data)
+        if run_analysis:
+            self.add_history('wholesale', {'action_name': "Начальная загрузка", 'description': f"Загружено {len(glossary_data)} терминов.", 'old_state': []})
+            self.is_analysis_dirty = True
+            self._run_full_analysis()
+        else:
+            self._update_analysis_widgets()
+
+    def _replace_rows(self, glossary_data: list):
+        """Переписывает строки редактора в БД и перерисовывает таблицу.
+        История и анализ — забота вызывающего."""
         conn = self._get_db_conn()
         current_now = time.time()
         
@@ -2295,12 +2337,6 @@ class GlossaryManagerPage(ShellPage):
         if self.launch_mode != 'child':
             self.save_button.setEnabled(bool(glossary_data))
         self._update_project_save_controls()
-        if run_analysis:
-            self.add_history('wholesale', {'action_name': "Начальная загрузка", 'description': f"Загружено {len(glossary_data)} терминов.", 'old_state': []})
-            self.is_analysis_dirty = True
-            self._run_full_analysis()
-        else:
-            self._update_analysis_widgets()
 
     def get_glossary(self, include_db_id: bool = False) -> list:
         """Строки редактора в порядке sequence (timestamp обязателен — он
@@ -2530,14 +2566,12 @@ class GlossaryManagerPage(ShellPage):
             if not hasattr(self, 'new_state_from_work'): return
             changed_terms = self.changed_terms_from_work
             if changed_terms:
-                old_state = self.get_glossary()
-                history_data = {
-                    'action_name': "Массовая генерация",
-                    'description': f"Сгенерировано/обновлено {len(changed_terms)} примечаний.",
-                    'old_state': old_state
-                }
-                self.add_history('wholesale', history_data)
-                self.set_glossary(self.new_state_from_work)
+                self._replace_glossary_and_log_history(
+                    self.new_state_from_work,
+                    "Массовая генерация",
+                    f"Сгенерировано/обновлено {len(changed_terms)} примечаний.",
+                    self.get_glossary(),
+                )
             else: 
                 QMessageBox.information(self, "Нет изменений", "Не найдено терминов для генерации примечаний.")
         finally: 
@@ -2651,12 +2685,7 @@ class GlossaryManagerPage(ShellPage):
                     desc = f"Дополнение. Добавлено {len(unique_new)} новых. Пропущено {skipped} существующих."
                     action_name = "Импорт (Дополнение)"
                 
-                self.add_history('wholesale', {
-                    'action_name': action_name,
-                    'description': desc,
-                    'old_state': old_state,
-                })
-                self.set_glossary(new_state)
+                self._replace_glossary_and_log_history(new_state, action_name, desc, old_state)
             finally: 
                 self._close_wait_dialog()
         QtCore.QTimer.singleShot(0, do_work)
@@ -2709,8 +2738,12 @@ class GlossaryManagerPage(ShellPage):
         if exec_dialog(self, wizard) == QDialog.DialogCode.Accepted:
             new_glossary = wizard.get_glossary()
             if new_glossary:
-                self.add_history('wholesale', {'action_name': "Мастер импорта", 'description': f"Данные пересобраны ({len(new_glossary)} записей).", 'old_state': current_glossary})
-                self.set_glossary(new_glossary)
+                self._replace_glossary_and_log_history(
+                    new_glossary,
+                    "Мастер импорта",
+                    f"Данные пересобраны ({len(new_glossary)} записей).",
+                    current_glossary,
+                )
     
 
     def analyze_and_update_ui(self, structural_patch=None):
@@ -2724,9 +2757,13 @@ class GlossaryManagerPage(ShellPage):
             self._update_analysis_widgets()
     
 
-    def _run_full_analysis(self, force=False, changed_entries: list[dict] | None = None):
+    def _run_full_analysis(self, force=False, changed_entries: list[dict] | None = None, log_analysis_step: bool = True):
         """
         Умный анализатор v4.0 (Истинная инкрементальность).
+
+        ``log_analysis_step=False`` не пишет в историю шаг «Анализ» полного
+        прохода — для правок, у которых своя запись (авто-разрешение конфликтов
+        всё равно записывается отдельным шагом).
         """
         if not force and not self.is_analysis_dirty and not changed_entries:
             return
@@ -2805,7 +2842,8 @@ class GlossaryManagerPage(ShellPage):
         # --- ПОЛНЫЙ АНАЛИЗ ---
         else:
             print("DEBUG: Running full, structural analysis on DB data…")
-            self.add_history('wholesale', {'action_name': "Анализ", 'description': "Выполнен полный анализ глоссария.", 'old_state': current_glossary})
+            if log_analysis_step:
+                self.add_history('wholesale', {'action_name': "Анализ", 'description': "Выполнен полный анализ глоссария.", 'old_state': current_glossary})
             _, self.direct_conflicts = self.logic.find_direct_conflicts(current_glossary)
             self.reverse_issues = self.logic.find_reverse_issues(current_glossary)
             
@@ -3487,6 +3525,26 @@ class GlossaryManagerPage(ShellPage):
         ]
         self._run_full_analysis(changed_entries=changed_entries_for_analysis)
         
+    def _replace_glossary_and_log_history(self, new_state: list, action_name: str, description: str, old_state_for_history: list):
+        """
+        Заменяет глоссарий целиком одним шагом истории: «Отменить» вернёт
+        old_state_for_history. Для правок — импорта, Мастера импорта, массовой
+        генерации, групповой правки. set_glossary для них не годится: он
+        начинает историю заново.
+        """
+        # Как в _apply_patch_and_log_history: данные, запись, анализ. Запись
+        # раньше анализа, чтобы её снимок анализа был ещё от old_state.
+        self._replace_rows(new_state)
+        self.add_history('wholesale', {
+            'action_name': action_name,
+            'description': description,
+            'old_state': old_state_for_history,
+        })
+        # Весь глоссарий новый — полный анализ (инкрементальный на такой правке
+        # квадратичен). Его шаг «Анализ» лёг бы поверх правки, и первое
+        # «Отменить» откатило бы его, а не правку.
+        self._run_full_analysis(force=True, log_analysis_step=False)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.reflow_timer.start()

@@ -3,11 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import html
 import math
 from types import MappingProxyType
 from typing import Literal, Mapping
 
 from .json_response import QaResponseSchemaError
+
+
+def book_text(value: object) -> object:
+    """A text field of a model answer, read back as the book's own text.
+
+    The model is shown every book fragment escaped (``prompts.escaped``) and may
+    quote it back that way; the answer is matched against the book as it is.
+    """
+    return html.unescape(value) if isinstance(value, str) else value
 
 
 OmissionDecision = Literal[
@@ -508,8 +518,10 @@ class LanguageIssue:
             issue_id=data["issue_id"],
             category=data["category"],
             block_id=data["block_id"],
-            original_text=data["original_text"],
-            replacement_text=data["replacement_text"],
+            # The model read the book escaped (prompts.escaped) and may quote it
+            # back that way; the fix is matched against the book as it is.
+            original_text=book_text(data["original_text"]),
+            replacement_text=book_text(data["replacement_text"]),
             objective=data["objective"],
             confidence=data["confidence"],
             explanation=data["explanation"],

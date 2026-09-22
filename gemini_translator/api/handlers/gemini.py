@@ -1,9 +1,8 @@
-import aiohttp
 import asyncio
 import json
 import traceback
 import re
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError, 
     RateLimitExceededError, ApiAccessError, ModelNotFoundError, ValidationFailedError,
@@ -281,7 +280,7 @@ class GeminiApiHandler(BaseApiHandler):
 
         except asyncio.TimeoutError:
             raise NetworkError(f"Таймаут запроса к Gemini.", delay_seconds=30)
-        except (aiohttp.ClientError, OSError) as e:
+        except TRANSPORT_ERRORS as e:
             # Это подавит трейсбек в консоли и отправит ошибку в штатный обработчик ретраев
             error_msg = self._format_transport_error(e)
             raise NetworkError(error_msg, delay_seconds=30) from e

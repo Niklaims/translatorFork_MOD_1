@@ -287,6 +287,9 @@ def build_translation_quality_service(
     journal = _load_journal(paths.journal, project_manager)
     capabilities = qa_settings.effective_capabilities()
     client = ExistingHandlerCompletionClient(handler_factory, event_sink)
+    # Answers the model already gave about unchanged text: a re-check, a
+    # deferred chapter retried, a resumed session ask the same questions.
+    answers = QaAnswerCache(paths.answer_cache)
     coverage = SemanticCoverageService(
         extractor=_extractor(capabilities),
         provider=embedding_provider,
@@ -306,7 +309,7 @@ def build_translation_quality_service(
             target_language=target_language,
         ),
         coverage=coverage,
-        verifier=OmissionVerifier(client),
+        verifier=OmissionVerifier(client, cache=answers),
         repairer=OmissionRepairer(client),
         repair_engine=StructuralRepairEngine(target_language, capabilities),
         repair_validator=RepairValidator(client),
@@ -315,9 +318,7 @@ def build_translation_quality_service(
         journal_path=paths.journal,
         request_counter=client,
         additions=AdditionDetector(client),
-        language=LanguageQualityPipeline(
-            client, diagnosis_cache=QaAnswerCache(paths.answer_cache)
-        ),
+        language=LanguageQualityPipeline(client, diagnosis_cache=answers),
     )
 
 
@@ -445,7 +446,6 @@ def build_chapter_qa_request(
         model=model,
         session_id=session_id,
         glossary=glossary,
-        source_text_by_block=_source_text_by_block(source_payload),
     )
 
 
@@ -1222,19 +1222,6 @@ def _read_source_chapter(event) -> str | None:
         return Path(chapter_path).read_text(encoding="utf-8")
     except OSError:
         return None
-
-
-def _source_text_by_block(source_payload: Mapping[str, object]) -> dict[str, str]:
-    from .semantic_units import flatten_visible_text
-
-    blocks = source_payload.get("blocks")
-    if not isinstance(blocks, list):
-        return {}
-    return {
-        str(block["id"]): flatten_visible_text(block["inlines"])[0]
-        for block in blocks
-        if isinstance(block, Mapping) and block.get("id")
-    }
 
 
 def _extractor(capabilities: QaCapabilitySettings):

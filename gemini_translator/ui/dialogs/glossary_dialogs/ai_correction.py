@@ -27,6 +27,7 @@ from gemini_translator.ui.widgets.log_widget import LogWidget
 from gemini_translator.ui.widgets.preset_widget import PresetWidget
 from gemini_translator.ui.widgets.ancestor_utils import find_ancestor_by_class_name
 from gemini_translator.ui.overlay_host import exec_dialog
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 from ..validation_dialogs.quality_widgets import plural
 from gemini_translator.ui.shell import ShellPage
@@ -991,9 +992,11 @@ class CorrectionSessionPage(ShellPage):
             self._apply_term_frequency_payload(cached_payload, from_cache=True)
             return
 
-        self.frequency_status_label.setStyleSheet(f"color: {theme_manager.color('text_muted')}")
-        self.frequency_status_label.setText("Частотный анализ запускается в фоне…")
-        self._start_frequency_analysis()
+        # Анализ проходит всю книгу и держит GIL, окно при этом подвисает на
+        # секунды. Фильтр выключен по умолчанию, поэтому считаем по запросу —
+        # когда его включат (_on_frequency_filter_toggled).
+        self.cb_frequency_filter.setEnabled(True)
+        self._update_frequency_status_label()
 
     def _start_frequency_analysis(self):
         main_window = self._get_glossary_owner()
@@ -1018,7 +1021,6 @@ class CorrectionSessionPage(ShellPage):
         self._frequency_worker.start()
 
     def _on_frequency_progress(self, current, total, filename):
-        self.frequency_status_label.setStyleSheet(f"color: {theme_manager.color('text_muted')}")
         self.frequency_status_label.setText(
             f"Частотный анализ: {current}/{max(1, total)} — {filename}"
         )
@@ -1083,7 +1085,7 @@ class CorrectionSessionPage(ShellPage):
     def _update_frequency_status_label(self, from_cache=False):
         if not self._term_frequency_map:
             self.frequency_status_label.setStyleSheet(f"color: {theme_manager.color('text_muted')}")
-            self.frequency_status_label.setText("Частотный анализ не запускался.")
+            self.frequency_status_label.setText("Частотный анализ запустится, когда вы включите фильтр.")
             return
 
         min_count, max_count = get_term_frequency_range(self._term_frequency_payload)
@@ -1107,6 +1109,9 @@ class CorrectionSessionPage(ShellPage):
         enabled = checked and bool(self._term_frequency_map)
         self.freq_min_spinbox.setEnabled(enabled)
         self.freq_max_spinbox.setEnabled(enabled)
+        if checked and not self._term_frequency_map:
+            self._start_frequency_analysis()
+            return
         self._update_frequency_status_label()
         self.update_token_estimation()
 
@@ -3049,6 +3054,7 @@ class CorrectionPreviewDialog(QDialog):
         self.preview_splitter.setChildrenCollapsible(False)
 
         self.table = QTableWidget()
+        self.table.setItemDelegate(ItemBackgroundDelegate(self.table))
         self.table.setAlternatingRowColors(True)
         self.table.setColumnCount(6)
         self.table.setHorizontalHeaderLabels(["Применить?", "Оригинал", "Было (Перевод)", "Стало (Перевод)", "Было (Примечание)", "Стало (Примечание)"])

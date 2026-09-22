@@ -332,14 +332,22 @@ def _language_chunk_setting(value: object) -> int:
     return min(max(value, MIN_LANGUAGE_CHUNK_CHARS), MAX_LANGUAGE_CHUNK_CHARS)
 
 
+# The translation limit counts the source HTML; a language-check portion counts
+# the translation together with the source of each paragraph.  Measured on seven
+# books, the same chapter weighs 2.25-3.45 times more in the check (median 2.75),
+# so the limit taken as is cut a chapter translated in one request into 2.6.
+CHECK_CHARS_PER_TRANSLATION_CHAR = 3
+
+
 def language_chunk_chars_for(saved_settings: Mapping | None) -> int:
     """Size one language-check request the way the project sizes a translation.
 
     Whatever amount of text this project translates in one go, it also checks
     in one go: the check reads the same chapter through the same model, and a
-    separate constant only meant more requests for the same work.  A limit
-    expressed in tokens says nothing about characters, so it takes the default
-    rather than a guessed conversion.
+    separate constant only meant more requests for the same work.  The limit is
+    converted into the check's own measure (CHECK_CHARS_PER_TRANSLATION_CHAR).
+    A limit expressed in tokens says nothing about characters, so it takes the
+    default rather than a guessed conversion.
     """
 
     if not isinstance(saved_settings, Mapping):
@@ -352,7 +360,7 @@ def language_chunk_chars_for(saved_settings: Mapping | None) -> int:
     if isinstance(limit, bool) or not isinstance(limit, (int, float)):
         return DEFAULT_LANGUAGE_CHUNK_CHARS
     return _bounded_int(
-        int(limit),
+        int(limit) * CHECK_CHARS_PER_TRANSLATION_CHAR,
         default=DEFAULT_LANGUAGE_CHUNK_CHARS,
         minimum=MIN_LANGUAGE_CHUNK_CHARS,
         maximum=MAX_LANGUAGE_CHUNK_CHARS,

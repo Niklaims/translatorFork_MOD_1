@@ -6,6 +6,8 @@ Qt-touching parts are thin wrappers at the bottom of the module.
 """
 from __future__ import annotations
 
+import gc
+import re
 from typing import Any
 
 THEME_MODE_KEY = "ui_theme_mode"
@@ -108,14 +110,35 @@ def apply(
     scheme = resolve_scheme(normalize_mode(mode), system_is_dark(app))
     base = resolve_base_colors(scheme, manual_colors, system_accent(app))
     use_glass = bool(glass) and glass_available()
-    app.setStyleSheet(
-        build_glass_stylesheet(base, glass_opacities) if use_glass else build_stylesheet(base)
-    )
+    stylesheet = build_glass_stylesheet(base, glass_opacities) if use_glass else build_stylesheet(base)
+    # setStyleSheet перестилизует все виджеты приложения даже при той же
+    # строке, а окна зовут apply при каждой загрузке настроек: окно перевода
+    # теряло на этом полсекунды при каждом открытии.
+    if app.styleSheet() != stylesheet:
+        set_app_stylesheet(app, stylesheet)
     setattr(app, "_active_theme_mode", normalize_mode(mode))
     setattr(app, "_theme_palette", build_theme_palette(base))
     setattr(app, "_glass_active", use_glass)
     _apply_vibrancy_to_top_levels(app, use_glass)
     return scheme
+
+
+def set_app_stylesheet(app, stylesheet: str) -> None:
+    """Таблица стилей всего приложения — только через эту функцию.
+
+    Qt перебирает сырые указатели на все виджеты и на каждом зовёт Python —
+    фильтры событий, обработчики StyleChange. Сборщик мусора, сработавший в
+    таком вызове, может удалить виджет из циклической ссылки, до которого
+    перебор ещё не дошёл, и процесс падает (так падал полный набор тестов).
+    Поэтому на время перестилизации автоматическая сборка выключена.
+    """
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        app.setStyleSheet(stylesheet)
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 def migrate_theme_mode(settings: dict | None) -> str:
@@ -227,6 +250,23 @@ def color(name: str, app=None) -> str:
     return palette(app).get(name, "#888888")
 
 
+_RGBA_TOKEN = re.compile(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([\d.]+)\)")
+
+
+def qcolor(name: str, app=None):
+    """A token as a QColor, including the ``rgba(...)`` soft fills QColor cannot parse."""
+    from PyQt6.QtGui import QColor
+
+    value = color(name, app)
+    match = _RGBA_TOKEN.fullmatch(value)
+    if match is None:
+        return QColor(value)
+    red, green, blue, alpha = match.groups()
+    result = QColor(int(red), int(green), int(blue))
+    result.setAlphaF(float(alpha))
+    return result
+
+
 GLASS_KEY = "ui_glass_enabled"
 
 
@@ -238,7 +278,9 @@ def glass_available() -> bool:
     """
     try:
         from .platform import macos_vibrancy
-        return macos_vibrancy.is_available() and macos_vibrancy.VIBRANCY_READY
+        # Флаг первым: is_available() импортирует AppKit (~0,2 с), а пока
+        # стекло выключено флагом, этот импорт не нужен.
+        return macos_vibrancy.VIBRANCY_READY and macos_vibrancy.is_available()
     except Exception:
         return False
 
@@ -266,6 +308,9 @@ def save_glass(settings_manager, on: bool) -> None:
 def _apply_vibrancy_to_top_levels(app, use_glass: bool) -> None:
     try:
         from .platform import macos_vibrancy
+        if not macos_vibrancy.VIBRANCY_READY:
+            # Пока стекло выключено флагом, его никто не ставил — и снимать нечего.
+            return
         for widget in app.topLevelWidgets():
             try:
                 if widget.isVisible():

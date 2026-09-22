@@ -14,10 +14,11 @@ from collections import Counter, defaultdict, deque
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from .html_text import extract_visible_text
 from .language_tools import LanguageDetector, get_chinese_script_variants, normalize_glossary_search_text
 
 try:
-    from bs4 import BeautifulSoup, UnicodeDammit
+    from bs4 import UnicodeDammit
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False
@@ -26,8 +27,14 @@ except ImportError:
 # 4: счёт термина больше не зависит от остальных терминов глоссария. Кэши
 # версии 3 посчитаны старым способом, где длинные термины забирали текст у
 # коротких, — их нужно пересчитать, а не показывать.
-TERM_FREQUENCY_CACHE_VERSION = 4
+# 5: текст главы берётся без <head>: <title> повторяет заголовок из <h1>, и
+# каждый термин заголовка получал в каждой главе лишнее вхождение.
+TERM_FREQUENCY_CACHE_VERSION = 5
 VIRTUAL_PATH_PREFIX = "mem://"
+
+# Прогресс не чаще этого интервала. Сигнал на каждую главу — это сотни
+# перерисовок метки в главном потоке, пока анализ держит GIL.
+PROGRESS_INTERVAL_S = 0.1
 
 
 def collect_glossary_originals(glossary_source):
@@ -194,11 +201,9 @@ def _decode_epub_html(raw_content):
 
 
 def _extract_text_from_html(raw_content):
-    raw_content = _decode_epub_html(raw_content)
-    if BS4_AVAILABLE:
-        soup = BeautifulSoup(raw_content, "html.parser")
-        return soup.get_text(separator=" ")
-    return re.sub(r"<[^>]+>", " ", raw_content)
+    # Видимый текст главы через selectolax: BeautifulSoup тратил на разбор
+    # 70% анализа (книга в 758 глав — 3,2 с против 1,3 с).
+    return extract_visible_text(_decode_epub_html(raw_content))
 
 
 def _last_word_variants(word):
@@ -413,13 +418,21 @@ def calculate_term_frequency_payload(
             and not name.startswith("__MACOSX")
         ]
         total_files = len(html_files)
+        last_report = None
 
         for index, filename in enumerate(html_files):
             if should_continue is not None and not should_continue():
                 return None
 
             if progress_callback is not None:
-                progress_callback(index + 1, total_files, os.path.basename(filename))
+                now = time.monotonic()
+                if (
+                    last_report is None
+                    or index + 1 == total_files
+                    or now - last_report >= PROGRESS_INTERVAL_S
+                ):
+                    last_report = now
+                    progress_callback(index + 1, total_files, os.path.basename(filename))
 
             try:
                 raw_content = archive.read(filename)

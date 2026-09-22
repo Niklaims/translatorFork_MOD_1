@@ -22,9 +22,14 @@ from ..dialogs.glossary import (
     MultiImportManagerDialog,
 )
 from ..dialogs.glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
+from ..dialogs.glossary_dialogs.paste_terms import run_glossary_paste
 from .ancestor_utils import find_ancestor_by_class_name
 from ...utils.document_importer import set_all_checked
-from ...utils.glossary_tools import glossary_entry_key, glossary_entries_as_list
+from ...utils.glossary_tools import (
+    apply_glossary_paste,
+    glossary_entry_key,
+    glossary_entries_as_list,
+)
 from ...utils.io_utils import atomic_write_json
 from ...utils.settings import SettingsManager
 from ...api import config as api_config
@@ -348,6 +353,12 @@ class GlossaryWidget(QWidget):
         self.add_row_btn = QPushButton("➕ Добавить")
         self.add_row_btn.setToolTip("Добавить новый термин в таблицу")
         self.add_row_btn.clicked.connect(self._add_row)
+        self.paste_btn = QPushButton("📋 Вставить…")
+        self.paste_btn.setToolTip(
+            "Вставить список терминов: новые добавятся, а для уже известных "
+            "покажется, что заменится"
+        )
+        self.paste_btn.clicked.connect(self._paste_terms)
         self.remove_row_btn = QPushButton("➖ Удалить")
         self.remove_row_btn.setToolTip("Удалить выделенные строки")
         self.remove_row_btn.clicked.connect(self._remove_selected_rows)
@@ -360,6 +371,7 @@ class GlossaryWidget(QWidget):
         # ------------------------------------------
 
         table_actions_layout.addWidget(self.add_row_btn)
+        table_actions_layout.addWidget(self.paste_btn)
         table_actions_layout.addWidget(self.remove_row_btn)
         table_actions_layout.addWidget(self.cleanup_btn) # Добавляем в лейаут
         
@@ -679,6 +691,19 @@ class GlossaryWidget(QWidget):
         
         self.glossary_changed.emit()
 
+    def _paste_terms(self):
+        """Массовая вставка терминов; расхождения с глоссарием пользователь
+        подтверждает в карточке (см. glossary_dialogs/paste_terms.py)."""
+        self.commit_active_editor()
+        existing = self.get_glossary()
+        run_glossary_paste(
+            self,
+            existing,
+            lambda plan, accepted: self.set_glossary(
+                apply_glossary_paste(existing, plan, accepted)
+            ),
+        )
+
     def _remove_selected_rows(self):
         selected_rows_on_page = sorted(list(set(index.row() for index in self.table.selectedIndexes())), reverse=True)
         if not selected_rows_on_page: return
@@ -870,6 +895,7 @@ class GlossaryWidget(QWidget):
         
     # --- Остальные методы (без изменений) ---
     def set_simplified_mode(self):
+        self.paste_btn.hide()
         self.load_btn.hide()
         self.manage_btn.hide()
         self.generate_btn.hide()

@@ -98,6 +98,12 @@ except (ImportError, AttributeError):
     ProxyType = None
     PROXY_ERRORS = ()
 
+# Транспортные сбои для `except` в хендлерах на aiohttp. Без PROXY_ERRORS отказ
+# прокси (выключенный SSH-туннель и т. п.) проскакивал мимо `(ClientError, OSError)`
+# в `except Exception` хендлера и становился API_ERROR — глава проваливалась
+# после двух попыток вместо сетевой паузы.
+TRANSPORT_ERRORS = (aiohttp.ClientError, OSError) + PROXY_ERRORS
+
 def get_worker_loop():
     """Получает или создает event loop для текущего потока воркера."""
     if not hasattr(_thread_local, "loop") or _thread_local.loop.is_closed():

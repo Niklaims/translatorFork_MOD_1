@@ -231,5 +231,54 @@ class SmartReloadTableRoutingTests(_RoutingTestsBase):
         self.assertEqual(mock_append.call_args.args[1], "Text/ch1.xhtml")
 
 
+class TableFillDefersColumnAutosizeTests(_RoutingTestsBase):
+    """Столбцы с ResizeToContents не меряются после каждой ячейки заполнения.
+
+    Qt при каждом setItem заново меряет такой столбец по всем строкам: на
+    514 главах заполнение шло 5,9 с, из них 4,7 с внутри setItem."""
+
+    _VERSIONS = {
+        "Text/ch1.xhtml": {"_translated.html": "ch1_translated.html"},
+        "Text/ch2.xhtml": {"_translated.html": "ch2_translated.html"},
+    }
+
+    def _fill(self, method_name):
+        page = self._make_page(self._VERSIONS)
+        header = page.table_results.horizontalHeader()
+        modes_during_fill = []
+
+        def record(*_args, **_kwargs):
+            modes_during_fill.append(header.sectionResizeMode(1))
+
+        with (
+            patch.object(TranslationValidatorPage, "_load_validation_snapshot_state"),
+            patch(
+                "gemini_translator.ui.dialogs.validation.get_epub_chapter_order",
+                return_value=(list(self._VERSIONS), "spine"),
+            ),
+            patch.object(
+                TranslationValidatorPage,
+                "_build_row_data_for_file",
+                return_value=({"len_orig": 1, "len_trans": 1}, True),
+            ),
+            patch.object(TranslationValidatorPage, "_append_result_row", MagicMock(side_effect=record)),
+        ):
+            getattr(page, method_name)()
+
+        return modes_during_fill, header.sectionResizeMode(1)
+
+    def test_initial_fill_measures_columns_once_at_the_end(self):
+        during, after = self._fill("_populate_initial_table")
+
+        self.assertEqual(during, [QtWidgets.QHeaderView.ResizeMode.Interactive] * 2)
+        self.assertEqual(after, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+
+    def test_smart_reload_measures_columns_once_at_the_end(self):
+        during, after = self._fill("_smart_reload_table_preserving_data")
+
+        self.assertEqual(during, [QtWidgets.QHeaderView.ResizeMode.Interactive] * 2)
+        self.assertEqual(after, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
+
+
 if __name__ == "__main__":
     unittest.main()

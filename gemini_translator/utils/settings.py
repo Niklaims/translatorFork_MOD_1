@@ -5,13 +5,9 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from PyQt6 import QtWidgets, QtCore
 from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
+import logging
 import threading
-
-try:
-    import pytz
-    PYTZ_AVAILABLE = True
-except ImportError:
-    PYTZ_AVAILABLE = False
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..api import config as api_config
 
@@ -20,6 +16,38 @@ SETTINGS_DIR_ENV = "GT_SETTINGS_DIR"
 DEFAULT_SETTINGS_DIRNAME = ".epub_translator"
 PROFILE_SETTINGS_DIRNAME = "profiles"
 _DEFAULT_PROFILE_ALIASES = {"", "default", "global", "main"}
+
+# Лимиты ключей меняются редко: Gemini сбрасывает квоту раз в сутки (00:01 по
+# Лос-Анджелесу), у скользящих политик блокировка и запросы выходят из окна
+# через сутки. Таймер обслуживания будится к ближайшему такому моменту, но не
+# реже MAX: на macOS таймер не идёт, пока компьютер спит, и сброс в полночь
+# иначе заметили бы через много часов после пробуждения. И не чаще MIN, чтобы
+# не просыпаться на каждый выпавший из окна запрос активного ключа.
+LIMIT_MAINTENANCE_MIN_DELAY_S = 60
+LIMIT_MAINTENANCE_MAX_DELAY_S = 15 * 60
+
+logger = logging.getLogger(__name__)
+
+
+def _earlier(current, candidate):
+    return candidate if current is None or candidate < current else current
+
+# Сколько ждать, пока другое окно приложения допишет настройки. Обычная запись
+# занимает десятки миллисекунд; дольше замок держит только зависший процесс, и
+# замораживать ради него интерфейс нельзя.
+SETTINGS_LOCK_TIMEOUT_SECONDS = 3.0
+
+# Неизвестные таймзоны в reset_policy встречаются в хот-пути (таймер обслуживания
+# лимитов раз в 5с на каждый ключ/модель, перерисовка UI, выбор ключа в QA/воркерах).
+# Печатаем предупреждение один раз на имя зоны за процесс, а не на каждый вызов.
+_WARNED_UNKNOWN_TIMEZONES = set()
+
+
+def _warn_unknown_timezone_once(zone_name, message):
+    if zone_name in _WARNED_UNKNOWN_TIMEZONES:
+        return
+    _WARNED_UNKNOWN_TIMEZONES.add(zone_name)
+    print(message)
 
 
 def normalize_settings_profile(profile) -> str:
@@ -211,9 +239,12 @@ class SettingsManager(QObject):
 
         # Пока приложение открыто, своевременно снимаем истекшие ограничения
         # и очищаем счетчики запросов, не дожидаясь перезапуска или ручного
-        # сохранения настроек.
+        # сохранения настроек. Срок следующей проверки — см.
+        # LIMIT_MAINTENANCE_MIN_DELAY_S и _schedule_limit_maintenance.
+        self._next_limit_change_at = None
         self._limit_maintenance_timer = QtCore.QTimer(self)
-        self._limit_maintenance_timer.setInterval(5000)
+        self._limit_maintenance_timer.setSingleShot(True)
+        self._limit_maintenance_timer.setInterval(LIMIT_MAINTENANCE_MIN_DELAY_S * 1000)
         self._limit_maintenance_timer.setTimerType(QtCore.Qt.TimerType.CoarseTimer)
         self._limit_maintenance_timer.timeout.connect(
             self._refresh_expired_key_limits)
@@ -337,17 +368,25 @@ class SettingsManager(QObject):
     @pyqtSlot()
     def _refresh_expired_key_limits(self):
         """Снимает истекшие ограничения ключей и сразу уведомляет интерфейс."""
-        changed = False
-        with self.file_lock:
-            changed = self._check_and_reset_limits_in_cache()
-            if changed:
-                self._request_save()
+        try:
+            if self._check_and_reset_limits_in_cache():
+                self._post_event(
+                    'key_statuses_updated',
+                    {'reason': 'automatic_limit_reset'},
+                )
+        finally:
+            self._schedule_limit_maintenance()
 
-        if changed:
-            self._post_event(
-                'key_statuses_updated',
-                {'reason': 'automatic_limit_reset'},
-            )
+    def _schedule_limit_maintenance(self):
+        """Будит таймер к ближайшему моменту, когда лимит может смениться."""
+        if QtCore.QCoreApplication.instance() is None:
+            return
+        delay = LIMIT_MAINTENANCE_MAX_DELAY_S
+        if self._next_limit_change_at is not None:
+            delay = min(delay, max(
+                LIMIT_MAINTENANCE_MIN_DELAY_S, self._next_limit_change_at - time.time(),
+            ))
+        self._limit_maintenance_timer.start(int(delay * 1000))
 
     @pyqtSlot()
     def flush(self):
@@ -490,24 +529,22 @@ class SettingsManager(QObject):
         provider = key_info.get("provider", "default")
         return api_config.api_providers_view().get(provider, {}).get('reset_policy', api_config.default_reset_policy())
 
-    def _filter_request_timestamps_in_window(self, timestamps, policy, now_ts=None):
-        if not timestamps:
-            return []
+    def _limit_expiry(self, policy, stamp, now):
+        """Когда запрос или исчерпание с меткой ``stamp`` перестанет действовать."""
+        if policy.get('type') == 'daily':
+            next_reset = self._request_window_cutoff(policy, int(now)) + 24 * 3600
+            if next_reset > now:
+                return next_reset
+        hours = policy.get('duration_hours', 24) if policy.get('type') == 'rolling' else 24
+        return stamp + int(hours) * 3600
 
-        if now_ts is None:
-            now_ts = int(time.time())
-
-        normalized_timestamps = [int(ts) for ts in timestamps if isinstance(ts, (int, float))]
-        if not normalized_timestamps:
-            return []
-
+    def _request_window_cutoff(self, policy, now_ts):
         if policy['type'] == 'rolling':
-            cutoff = now_ts - (int(policy.get('duration_hours', 24)) * 3600)
-            return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+            return now_ts - (int(policy.get('duration_hours', 24)) * 3600)
 
-        if policy['type'] == 'daily' and PYTZ_AVAILABLE:
+        if policy['type'] == 'daily':
             try:
-                tz = pytz.timezone(policy["timezone"])
+                tz = ZoneInfo(policy["timezone"])
                 now_in_tz = datetime.fromtimestamp(now_ts, tz=timezone.utc).astimezone(tz)
                 last_reset = now_in_tz.replace(
                     hour=policy.get("reset_hour", 0),
@@ -517,13 +554,28 @@ class SettingsManager(QObject):
                 )
                 if last_reset > now_in_tz:
                     last_reset -= timedelta(days=1)
-                cutoff = int(last_reset.timestamp())
-                return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+                return int(last_reset.timestamp())
+            except ZoneInfoNotFoundError:
+                _warn_unknown_timezone_once(
+                    policy.get('timezone'),
+                    f"[WARN] Неизвестная таймзона '{policy.get('timezone')}' в reset_policy, используется деградация до 24ч",
+                )
             except Exception:
                 pass
 
-        cutoff = now_ts - (24 * 3600)
+        return now_ts - (24 * 3600)
+
+    def _filter_request_timestamps_in_window(self, timestamps, policy, now_ts=None):
+        if not timestamps:
+            return []
+        if now_ts is None:
+            now_ts = int(time.time())
+        normalized_timestamps = [int(ts) for ts in timestamps if isinstance(ts, (int, float))]
+        if not normalized_timestamps:
+            return []
+        cutoff = self._request_window_cutoff(policy, now_ts)
         return sorted(ts for ts in normalized_timestamps if ts > cutoff)
+
 
     def _prune_request_history_for_model(self, key_info, model_id, now_ts=None):
         model_status = self._get_status_for_model(key_info, model_id)
@@ -688,24 +740,40 @@ class SettingsManager(QObject):
         return True
     
     def _check_and_reset_limits_in_cache(self):
-        """[Под замком] Проверяет и сбрасывает лимиты прямо в кэше."""
-        changed = False
-        # Работаем с кэшем напрямую, так как мы под замком
-        for key_info in self._cache.get('api_keys_with_status', []):
-            if 'status_by_model' in key_info:
-                # list() для создания копии, чтобы избежать ошибки изменения размера во время итерации
-                for model_id in list(key_info['status_by_model'].keys()):
-                    _, was_pruned = self._prune_request_history_for_model(key_info, model_id)
-                    if was_pruned:
-                        changed = True
-                    # ВЫЗЫВАЕМ МЕТОД У SELF, А НЕ У SELF.SETTINGS_MANAGER
-                    if not self.is_key_limit_active(key_info, model_id):
-                        # Проверяем, есть ли что сбрасывать
-                        if key_info['status_by_model'][model_id].get("exhausted_at") is not None:
-                            changed = True
-                            key_info['status_by_model'][model_id]["exhausted_at"] = None
-                            key_info['status_by_model'][model_id]["exhausted_level"] = 0
-        return changed
+        """Обслуживает SQLite без блокировки конфигурационного кэша.
+
+        Пары ключ×модель уходят одной транзакцией, и только те, где есть что
+        удалить или снять: каждый запрос к SQLite отпускает GIL, и 1368 пустых
+        DELETE за тик при 144 ключах подвешивали интерфейс, пока другой поток
+        держит интерпретатор. Заодно запоминает в _next_limit_change_at
+        ближайший момент, когда лимит истечёт или запрос выйдет из окна.
+        """
+        now = time.time()
+        now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
+        pairs = []
+        next_change = None
+        for key_info in self._materialize_key_statuses_unsafe():
+            policy = self._get_request_policy(key_info)
+            cutoff = self._request_window_cutoff(policy, int(now))
+            for model_id, status in key_info.get("status_by_model", {}).items():
+                clear_at = None
+                exhausted_at = status.get("exhausted_at")
+                if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
+                    clear_at = exhausted_at
+                elif exhausted_at:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, exhausted_at, now))
+                requests = status.get("requests") or ()
+                live = [stamp for stamp in requests if stamp > cutoff]
+                if live:
+                    next_change = _earlier(next_change, self._limit_expiry(policy, min(live), now))
+                if clear_at is not None or len(live) < len(requests):
+                    pairs.append((key_info["key"], model_id, cutoff, clear_at))
+        self._next_limit_change_at = next_change
+        if not pairs:
+            return False
+        return self._run_runtime_store_operation(
+            "maintain_models", self._key_runtime_store.maintain_models, pairs,
+        )
     
     def get_qa_settings(self):
         """Return translation QA settings, migrating a missing section to defaults."""

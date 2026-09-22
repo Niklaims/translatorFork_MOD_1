@@ -365,7 +365,7 @@ def test_status_colours_follow_a_theme_switch(qt_app):
     finally:
         view.close()
         view.deleteLater()
-        qt_app.setStyleSheet("")
+        theme_manager.set_app_stylesheet(qt_app, "")
         for name in ("_theme_palette", "_active_theme_mode", "_glass_active"):
             if hasattr(qt_app, name):
                 delattr(qt_app, name)
@@ -653,7 +653,7 @@ def test_status_colours_follow_a_theme_switch_in_a_filtered_list(qt_app):
     finally:
         view.close()
         view.deleteLater()
-        qt_app.setStyleSheet("")
+        theme_manager.set_app_stylesheet(qt_app, "")
         for name in ("_theme_palette", "_active_theme_mode", "_glass_active"):
             if hasattr(qt_app, name):
                 delattr(qt_app, name)

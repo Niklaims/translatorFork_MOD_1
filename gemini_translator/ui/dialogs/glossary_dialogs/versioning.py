@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt
 from gemini_translator.utils.epub_tools import get_epub_chapter_order, extract_number_from_path
 from gemini_translator.ui import theme_manager
 from gemini_translator.ui.dialogs import chapter_selection_dialog as _selection_utils
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 
 class ChapterSelectorWidget(QWidget):
     """
@@ -46,6 +47,7 @@ class ChapterSelectorWidget(QWidget):
 
         # Список
         self.list_widget = QListWidget()
+        self.list_widget.setItemDelegate(ItemBackgroundDelegate(self.list_widget))
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.itemChanged.connect(self._on_item_changed) # Следим за изменениями для подсветки

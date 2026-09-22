@@ -1,10 +1,9 @@
-import aiohttp
 import asyncio
 import json
 import traceback
 import os
 import platform
-from ..base import BaseApiHandler
+from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError,
     RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
@@ -301,7 +300,7 @@ class OpenRouterApiHandler(BaseApiHandler):
 
         except asyncio.TimeoutError:
             raise NetworkError("Таймаут запроса.", delay_seconds=30)
-        except (aiohttp.ClientError, OSError) as e:
+        except TRANSPORT_ERRORS as e:
             # Здесь мы видим, куда пытались стучаться
             raise NetworkError(f"Сбой сети ({type(e).__name__}) при обращении к {self.base_url}: {e}", delay_seconds=10) from e
         except (RateLimitExceededError, ContentFilterError, NetworkError, 

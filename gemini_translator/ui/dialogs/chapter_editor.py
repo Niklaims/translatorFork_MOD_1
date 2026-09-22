@@ -51,6 +51,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from gemini_translator.ui import theme_manager
+from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from ...utils.io_utils import atomic_write_json, atomic_write_text
 from ..widgets.overlay_tab_widget import install_tab_fade
 from ..widgets.regex_syntax_highlighter import HTML_PALETTE_LIGHT, HtmlSyntaxHighlighter
@@ -815,6 +816,7 @@ class ChapterEditorDialog(QDialog):
         self.mode_tabs.addTab(side_by_side_widget, "Оригинал + перевод")
 
         self.block_table = QTableWidget(0, 5)
+        self.block_table.setItemDelegate(ItemBackgroundDelegate(self.block_table))
         self.block_table.setAlternatingRowColors(True)
         self.block_table.setHorizontalHeaderLabels(["#", "Тег", "Исходник", "Перевод", "Изм."])
         self.block_table.verticalHeader().setVisible(False)
@@ -1243,7 +1245,9 @@ class ChapterEditorDialog(QDialog):
 
             if changed:
                 changed_item.setForeground(QtGui.QBrush(QColor("#b35c00")))
-                translated_item.setBackground(QColor("#fff4d6"))
+                # Непрозрачный светло-жёлтый #fff4d6 под светлым текстом
+                # тёмной темы читался на 1,08:1.
+                translated_item.setBackground(theme_manager.qcolor("warning_row_bg"))
 
             self.block_table.setItem(row, 0, number_item)
             self.block_table.setItem(row, 1, tag_item)
