@@ -64,6 +64,7 @@ from .repair_store import (
 )
 from .repair_validator import ChapterSnapshot
 from .semantic_units import flatten_visible_text
+from .source_pairing import pair_source_text, payload_block_texts
 from .structural_repair import (
     RepairValidationContext,
     StructuralPatch,
@@ -169,6 +170,9 @@ class ChapterQaRequest:
     session_id: str = "session"
     glossary: tuple[GlossaryTerm, ...] = ()
     style_guide: str = ""
+    # Source text by *translated* block id, for a caller that already knows the
+    # pairing.  Left empty, the pairing is made from the source payload against
+    # the chapter as it stands when a step reads it (see _source_paragraphs).
     source_text_by_block: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -765,8 +769,7 @@ class TranslationQualityService:
         pass's automatic edits, is the text the fix would go into.
         """
         suggestions = _suggestions_for(result) or ()
-        sources = request.source_text_by_block
-        if not suggestions or not sources:
+        if not suggestions:
             return ()
         try:
             html = request.translated_path.read_text(encoding="utf-8")
@@ -777,6 +780,9 @@ class TranslationQualityService:
         paragraphs = {
             block.get("id"): flatten_visible_text(block["inlines"])[0] for block in blocks
         }
+        sources = _source_paragraphs(request, tuple(paragraphs.items()))
+        if not sources:
+            return ()
         windows: list[SuggestionWindows] = []
         for suggestion in suggestions:
             recorded = self._journal.suggestion(suggestion.suggestion_id)
@@ -1185,7 +1191,11 @@ class TranslationQualityService:
             target_language=request.target_language,
             model=request.model,
             cancellation=cancellation,
-            source_text_by_block=request.source_text_by_block,
+            # Paired against the chapter as it is now: a restored paragraph
+            # moves the DOM ids of every block after it.
+            source_text_by_block=_source_paragraphs(
+                request, payload_block_texts(build_translation_payload(model))
+            ),
             auto_fix_categories=options.auto_fix_language_categories,
             max_chunk_chars=options.language_chunk_chars,
         )
@@ -1467,6 +1477,22 @@ def _chapter_status(result: ChapterQaResult) -> str:
     if any(warning in DEFERRED_WARNINGS for warning in result.warnings):
         return "deferred"
     return "checked"
+
+
+def _source_paragraphs(
+    request: ChapterQaRequest, target_blocks: Sequence[tuple[str, str]]
+) -> Mapping[str, str]:
+    """Source text of each translated block of the chapter as it stands now.
+
+    A pairing the caller supplied wins.  Otherwise paragraphs pair by their
+    order, never by block id: the id is a DOM path and matches between source
+    and translation only when both share the same markup.
+    """
+    if request.source_text_by_block:
+        return request.source_text_by_block
+    return pair_source_text(
+        payload_block_texts(request.coverage_request.source_payload), target_blocks
+    )
 
 
 def _suggestions_for(result: ChapterQaResult) -> tuple[QaSuggestion, ...] | None:
