@@ -148,6 +148,14 @@ class ErrorAnalyzer:
             # Do not lower RPM because of a network glitch.
             self.worker.rpm_limiter.update_last_request_time(delay)
             self.worker._post_event('temporary_limit_warning_received', {'delay_seconds': delay, 'original_exception': exc, "model_id": worker_model_id})
+            
+            if getattr(self.worker, 'skip_content_filter_retry', False):
+                network_attempts = task_history.get('errors', {}).get(ErrorType.NETWORK.name, 0)
+                if network_attempts + 1 >= 3:
+                    self._record_and_log_failure(task_info, error_for_history, exc)
+                    setattr(exc, 'reason', 'Сеть лежит')
+                    return self._log_and_fail_permanently(task_name, ErrorType.NETWORK, exc)
+                    
             self._record_and_log_failure(task_info, error_for_history, exc)
             return WorkerAction.RETRY_COUNTABLE, error_for_history, exc
 
