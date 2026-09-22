@@ -740,40 +740,21 @@ class SettingsManager(QObject):
         return True
     
     def _check_and_reset_limits_in_cache(self):
-        """Обслуживает SQLite без блокировки конфигурационного кэша.
-
-        Пары ключ×модель уходят одной транзакцией, и только те, где есть что
-        удалить или снять: каждый запрос к SQLite отпускает GIL, и 1368 пустых
-        DELETE за тик при 144 ключах подвешивали интерфейс, пока другой поток
-        держит интерпретатор. Заодно запоминает в _next_limit_change_at
-        ближайший момент, когда лимит истечёт или запрос выйдет из окна.
-        """
-        now = time.time()
-        now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
-        pairs = []
-        next_change = None
-        for key_info in self._materialize_key_statuses_unsafe():
-            policy = self._get_request_policy(key_info)
-            cutoff = self._request_window_cutoff(policy, int(now))
-            for model_id, status in key_info.get("status_by_model", {}).items():
-                clear_at = None
-                exhausted_at = status.get("exhausted_at")
-                if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
-                    clear_at = exhausted_at
-                elif exhausted_at:
-                    next_change = _earlier(next_change, self._limit_expiry(policy, exhausted_at, now))
-                requests = status.get("requests") or ()
-                live = [stamp for stamp in requests if stamp > cutoff]
-                if live:
-                    next_change = _earlier(next_change, self._limit_expiry(policy, min(live), now))
-                if clear_at is not None or len(live) < len(requests):
-                    pairs.append((key_info["key"], model_id, cutoff, clear_at))
-        self._next_limit_change_at = next_change
-        if not pairs:
-            return False
-        return self._run_runtime_store_operation(
-            "maintain_models", self._key_runtime_store.maintain_models, pairs,
-        )
+        """[Под замком] Проверяет и сбрасывает лимиты прямо в кэше."""
+        changed = False
+        now_utc = datetime.now(timezone.utc)
+        for key_info in self._cache.get('api_keys_with_status', []):
+            if 'status_by_model' in key_info:
+                for model_id in list(key_info['status_by_model'].keys()):
+                    _, was_pruned = self._prune_request_history_for_model(key_info, model_id)
+                    if was_pruned:
+                        changed = True
+                    if not self.is_key_limit_active(key_info, model_id, now_utc=now_utc):
+                        if key_info['status_by_model'][model_id].get("exhausted_at") is not None:
+                            changed = True
+                            key_info['status_by_model'][model_id]["exhausted_at"] = None
+                            key_info['status_by_model'][model_id]["exhausted_level"] = 0
+        return changed
     
     def get_qa_settings(self):
         """Return translation QA settings, migrating a missing section to defaults."""
