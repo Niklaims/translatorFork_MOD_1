@@ -154,7 +154,16 @@ class ErrorAnalyzer:
                 if network_attempts + 1 >= 3:
                     self._record_and_log_failure(task_info, error_for_history, exc)
                     setattr(exc, 'reason', 'Сеть лежит')
-                    return self._log_and_fail_permanently(task_name, ErrorType.NETWORK, exc)
+                    log_message = (
+                        f"❌ СЕТЬ: Задача '{task_name}' провалена после {network_attempts + 1} сетевых ошибок "
+                        f"(опция «Не повторять блокировки»): {str(exc)}"
+                    )
+                    log_payload = {'message': log_message}
+                    error_details = self._build_error_details(task_name, ErrorType.NETWORK, exc)
+                    if error_details:
+                        log_payload.update(error_details)
+                    self.worker._post_event('log_message', log_payload)
+                    return WorkerAction.FAIL_PERMANENTLY, ErrorType.NETWORK, exc
                     
             self._record_and_log_failure(task_info, error_for_history, exc)
             return WorkerAction.RETRY_COUNTABLE, error_for_history, exc

@@ -87,13 +87,38 @@ class SkipContentFilterRetryTests(unittest.TestCase):
         )
         self.assertEqual(action, WorkerAction.RETRY_COUNTABLE)
 
-    def test_network_error_unaffected_by_flag(self):
+    def test_network_error_retries_when_under_limit_with_flag(self):
+        """Network errors still retry when under 3 attempts with flag on."""
         worker = _DummyWorker(skip_content_filter_retry=True)
         action, error_type, _ = ErrorAnalyzer(worker).analyze_and_act(
             NetworkError("conn reset"), TASK, EMPTY
         )
         self.assertEqual(action, WorkerAction.RETRY_COUNTABLE)
         self.assertEqual(error_type.name, "NETWORK")
+
+    def test_network_503_fails_permanently_after_3_with_flag(self):
+        """503 'Сервер Gemini перегружен' fails permanently after 3 attempts
+        when skip_content_filter_retry is enabled."""
+        worker = _DummyWorker(skip_content_filter_retry=True)
+        # Simulate 2 prior NETWORK failures already recorded
+        history = {"total_count": 2, "errors": {"NETWORK": 2}}
+        action, error_type, _ = ErrorAnalyzer(worker).analyze_and_act(
+            NetworkError("Сервер Gemini перегружен (503).", delay_seconds=20),
+            TASK, history
+        )
+        self.assertEqual(action, WorkerAction.FAIL_PERMANENTLY)
+        self.assertEqual(error_type.name, "NETWORK")
+
+    def test_network_503_still_retries_without_flag(self):
+        """Without the flag, network errors keep retrying even after 3."""
+        worker = _DummyWorker(skip_content_filter_retry=False)
+        history = {"total_count": 2, "errors": {"NETWORK": 2}}
+        action, error_type, _ = ErrorAnalyzer(worker).analyze_and_act(
+            NetworkError("Сервер Gemini перегружен (503).", delay_seconds=20),
+            TASK, history
+        )
+        # Without the flag, NETWORK goes through normal path (not FAIL_PERMANENTLY)
+        self.assertNotEqual(action, WorkerAction.FAIL_PERMANENTLY)
 
 
 if __name__ == "__main__":

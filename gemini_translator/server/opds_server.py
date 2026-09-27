@@ -39,6 +39,42 @@ EPUB_MIME = "application/epub+zip"
 
 
 # ---------------------------------------------------------------------------
+# Утилиты нормализации путей
+# ---------------------------------------------------------------------------
+def normalize_book_id(book_id: str) -> str:
+    r"""
+    Приводит ID книги (путь к папке проекта) к единому каноническому виду:
+    - Абсолютный путь
+    - Нормализованные разделители ОС
+    - Верхний регистр буквы диска на Windows (C:\ вместо c:\)
+    """
+    if not book_id:
+        return ""
+    try:
+        norm = os.path.abspath(os.path.normpath(str(book_id).strip()))
+        drive, rest = os.path.splitdrive(norm)
+        if drive:
+            norm = drive.upper() + rest
+        return norm
+    except Exception:
+        return os.path.normpath(str(book_id).strip())
+
+
+def normalize_filepath(filepath: str) -> str:
+    """Приводит путь к файлу главы к нормализованному абсолютному виду."""
+    if not filepath:
+        return ""
+    try:
+        norm = os.path.abspath(os.path.normpath(str(filepath).strip()))
+        drive, rest = os.path.splitdrive(norm)
+        if drive:
+            norm = drive.upper() + rest
+        return norm
+    except Exception:
+        return os.path.normpath(str(filepath).strip())
+
+
+# ---------------------------------------------------------------------------
 # Утилиты XML
 # ---------------------------------------------------------------------------
 def _xml_escape(value: str) -> str:
@@ -70,13 +106,13 @@ class OPDSManager:
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Файл для сохранения состояния OPDS
         self._state_file = os.path.join(os.path.expanduser("~"), ".gemini_translator_opds.json")
 
         # Словарь раздаваемых книг
-        # Формат: { book_id: {"title": str, "author": str, "uuid": str, "chapters": list, "updated": str} }
+        # Формат: { canonical_book_id: {"title": str, "author": str, "uuid": str, "chapters": list, "updated": str} }
         self._books: dict = self._load_state()
 
         # Сервер
@@ -92,13 +128,85 @@ class OPDSManager:
 
     # ─── Сохранение и загрузка состояния ────────────────────────────────
     def _load_state(self) -> dict:
+        loaded = {}
         try:
             if os.path.exists(self._state_file):
                 with open(self._state_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    loaded = json.load(f)
         except Exception as e:
             print(f"[OPDS] Ошибка загрузки состояния: {e}")
-        return {}
+            return {}
+
+        if not isinstance(loaded, dict):
+            return {}
+
+        # Дедупликация и миграция ключей к каноническому виду
+        cleaned = {}
+        dirty = False
+
+        for raw_id, book_data in loaded.items():
+            if not isinstance(book_data, dict):
+                continue
+            canonical_id = normalize_book_id(raw_id)
+            if raw_id != canonical_id:
+                dirty = True
+
+            # Нормализуем пути глав
+            norm_chapters = []
+            for ch in book_data.get("chapters", []):
+                if isinstance(ch, dict):
+                    fp = ch.get("filepath", "")
+                    nfp = normalize_filepath(fp)
+                    if fp != nfp:
+                        dirty = True
+                    norm_chapters.append({
+                        "title": ch.get("title", ""),
+                        "filepath": nfp
+                    })
+
+            if canonical_id in cleaned:
+                # Уже есть книга с таким нормализованным ID (дубликат из-за разных слешей!)
+                dirty = True
+                existing = cleaned[canonical_id]
+                # Сохраняем первичный UUID
+                chosen_uuid = existing.get("uuid") or book_data.get("uuid") or str(uuid.uuid4())
+
+                # Объединяем главы (если в одном из дубликатов больше глав, берем более полный набор)
+                if len(norm_chapters) >= len(existing.get("chapters", [])):
+                    chosen_chapters = norm_chapters
+                    chosen_title = book_data.get("title") or existing.get("title", "")
+                    chosen_author = book_data.get("author") or existing.get("author", "")
+                else:
+                    chosen_chapters = existing.get("chapters", [])
+                    chosen_title = existing.get("title") or book_data.get("title", "")
+                    chosen_author = existing.get("author") or book_data.get("author", "")
+
+                cleaned[canonical_id] = {
+                    "title": chosen_title,
+                    "author": chosen_author,
+                    "uuid": chosen_uuid,
+                    "chapters": chosen_chapters,
+                    "updated": max(existing.get("updated", ""), book_data.get("updated", ""), _utc_now_iso())
+                }
+            else:
+                cleaned[canonical_id] = {
+                    "title": book_data.get("title", "Unknown Book"),
+                    "author": book_data.get("author", "Unknown Author"),
+                    "uuid": book_data.get("uuid") or str(uuid.uuid4()),
+                    "chapters": norm_chapters,
+                    "updated": book_data.get("updated", _utc_now_iso())
+                }
+
+        # Если была миграция или дедупликация, сохраняем очищенный файл
+        if dirty:
+            try:
+                with open(self._state_file, 'w', encoding='utf-8') as f:
+                    json.dump(cleaned, f, ensure_ascii=False, indent=2)
+                print(f"[OPDS] Выполнена дедупликация и миграция состояния ({len(loaded)} -> {len(cleaned)} книг)")
+            except Exception as e:
+                print(f"[OPDS] Не удалось сохранить очищенное состояние: {e}")
+
+        return cleaned
 
     def _save_state(self):
         try:
@@ -109,28 +217,138 @@ class OPDSManager:
 
     # ─── Управление списком глав ────────────────────────────────────────
     def add_or_update_book(self, book_id: str, title: str, author: str, chapters: list[dict]):
-        """Добавляет новую книгу или обновляет существующую."""
+        """Добавляет новую книгу или обновляет существующую с сохранением UUID."""
+        canonical_id = normalize_book_id(book_id)
         with self._lock:
-            book_uuid = self._books.get(book_id, {}).get("uuid", str(uuid.uuid4()))
-            self._books[book_id] = {
+            # Ищем существующую книгу: по каноническому ID, либо по совпадению нормализованных путей,
+            # либо по title, если папка указывает на ту же директорию
+            existing_key = None
+            book_uuid = None
+            for k, b in self._books.items():
+                if normalize_book_id(k) == canonical_id:
+                    existing_key = k
+                    book_uuid = b.get("uuid")
+                    break
+
+            if not book_uuid:
+                # Проверим совпадение по title и директории
+                for k, b in self._books.items():
+                    if b.get("title") == title:
+                        try:
+                            if os.path.exists(k) and os.path.exists(canonical_id) and os.path.samefile(k, canonical_id):
+                                existing_key = k
+                                book_uuid = b.get("uuid")
+                                break
+                        except Exception:
+                            pass
+
+            if not book_uuid:
+                book_uuid = str(uuid.uuid4())
+
+            # Удаляем старый ключ, если он отличался по написанию (например со слешами /)
+            if existing_key and existing_key != canonical_id:
+                self._books.pop(existing_key, None)
+
+            # Нормализуем пути глав
+            norm_chapters = []
+            for ch in chapters:
+                norm_chapters.append({
+                    "title": ch.get("title", ""),
+                    "filepath": normalize_filepath(ch.get("filepath", ""))
+                })
+
+            self._books[canonical_id] = {
                 "title": title,
                 "author": author,
                 "uuid": book_uuid,
-                "chapters": list(chapters),
+                "chapters": norm_chapters,
                 "updated": _utc_now_iso()
             }
             self._save_state()
 
+    def _get_book_unlocked(self, canonical_id: str) -> dict | None:
+        """Внутренний поиск книги без повторного захвата блокировки."""
+        if canonical_id in self._books:
+            return self._books[canonical_id]
+        for k, b in self._books.items():
+            if normalize_book_id(k) == canonical_id:
+                return b
+        return None
+
     def get_book(self, book_id: str) -> dict | None:
-        """Возвращает информацию о конкретной книге."""
+        """Возвращает информацию о конкретной книге по ID."""
+        canonical_id = normalize_book_id(book_id)
         with self._lock:
-            return self._books.get(book_id)
+            return self._get_book_unlocked(canonical_id)
+
+    def update_chapter_filepath(self, book_id: str, old_filepath: str, new_filepath: str) -> bool:
+        """
+        Обновляет путь к файлу главы при переименовании/валидации.
+        Возвращает True, если путь был найден и обновлён.
+        """
+        if not old_filepath or not new_filepath:
+            return False
+        old_norm = normalize_filepath(old_filepath)
+        new_norm = normalize_filepath(new_filepath)
+        if old_norm == new_norm:
+            return False
+
+        canonical_id = normalize_book_id(book_id)
+        with self._lock:
+            book = self._get_book_unlocked(canonical_id)
+            if not book:
+                return False
+            updated = False
+            for ch in book.get("chapters", []):
+                if normalize_filepath(ch.get("filepath", "")) == old_norm:
+                    ch["filepath"] = new_norm
+                    updated = True
+            if updated:
+                book["updated"] = _utc_now_iso()
+                self._save_state()
+            return updated
+
+    def update_chapter_filepaths(self, book_id: str, path_mapping: dict[str, str]) -> int:
+        """
+        Пакетное обновление путей к файлам глав (old_path -> new_path).
+        Возвращает количество обновлённых глав.
+        """
+        if not path_mapping:
+            return 0
+        norm_map = {}
+        for old_p, new_p in path_mapping.items():
+            on = normalize_filepath(old_p)
+            nn = normalize_filepath(new_p)
+            if on and nn and on != nn:
+                norm_map[on] = nn
+
+        if not norm_map:
+            return 0
+
+        canonical_id = normalize_book_id(book_id)
+        with self._lock:
+            book = self._get_book_unlocked(canonical_id)
+            if not book:
+                return 0
+            count = 0
+            for ch in book.get("chapters", []):
+                cur_norm = normalize_filepath(ch.get("filepath", ""))
+                if cur_norm in norm_map:
+                    ch["filepath"] = norm_map[cur_norm]
+                    count += 1
+            if count > 0:
+                book["updated"] = _utc_now_iso()
+                self._save_state()
+            return count
 
     def remove_book(self, book_id: str):
         """Удаляет книгу из раздачи."""
+        canonical_id = normalize_book_id(book_id)
         with self._lock:
-            if book_id in self._books:
-                self._books.pop(book_id, None)
+            keys_to_remove = [k for k in self._books if normalize_book_id(k) == canonical_id]
+            for k in keys_to_remove:
+                self._books.pop(k, None)
+            if keys_to_remove:
                 self._save_state()
 
     def clear_all_books(self):
@@ -277,7 +495,7 @@ class OPDSManager:
         Возвращает байтовое содержимое ePub-файла или None, если глав нет.
         """
         book = self.get_book(book_id)
-        if not book or not book["chapters"]:
+        if not book or not book.get("chapters"):
             return None
 
         creator = EpubCreator(
@@ -285,6 +503,8 @@ class OPDSManager:
             author=book["author"],
             language="ru",
         )
+
+        state_modified = False
 
         for i, chapter_info in enumerate(book["chapters"]):
             filepath = chapter_info.get("filepath", "")
@@ -295,20 +515,64 @@ class OPDSManager:
             if not safe_name.lower().endswith(('.html', '.xhtml', '.htm')):
                 safe_name += ".xhtml"
 
+            actual_path = filepath
+            # Если файл не существует по указанному пути, ищем валидированную версию или fallback
+            if not os.path.exists(actual_path):
+                recovered = self._find_fallback_chapter_file(filepath)
+                if recovered and os.path.exists(recovered):
+                    actual_path = recovered
+                    chapter_info["filepath"] = normalize_filepath(recovered)
+                    state_modified = True
+
             # Читаем содержимое главы
             try:
-                with open(filepath, "r", encoding="utf-8") as f:
+                with open(actual_path, "r", encoding="utf-8") as f:
                     content = f.read()
             except Exception as e:
-                print(f"[OPDS] Не удалось прочитать главу «{filepath}»: {e}")
+                print(f"[OPDS] Не удалось прочитать главу «{actual_path}»: {e}")
                 content = f"<html><body><h1>{_xml_escape(title)}</h1><p>Ошибка чтения файла.</p></body></html>"
 
             creator.add_chapter(safe_name, content, title)
+
+        if state_modified:
+            with self._lock:
+                self._save_state()
 
         # Собираем ePub в память (BytesIO)
         buf = io.BytesIO()
         creator.create_epub(buf)
         return buf.getvalue()
+
+    @staticmethod
+    def _find_fallback_chapter_file(filepath: str) -> str | None:
+        """
+        Если исходный файл главы был перемещён/переименован (например, в _validated.html),
+        пытается найти актуальный файл главы в той же директории.
+        """
+        if not filepath:
+            return None
+        folder = os.path.dirname(filepath)
+        if not os.path.isdir(folder):
+            return None
+
+        fname = os.path.basename(filepath)
+        stem = fname.split("__")[0] if "__" in fname else fname.split("_")[0]
+        if not stem:
+            return None
+
+        try:
+            candidates = []
+            for item in os.listdir(folder):
+                if item.startswith(stem) and item.lower().endswith(('.html', '.xhtml', '.htm')):
+                    full_p = os.path.join(folder, item)
+                    is_val = "_validated" in item
+                    candidates.append((is_val, full_p))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                return candidates[0][1]
+        except Exception:
+            pass
+        return None
 
 
 # ---------------------------------------------------------------------------

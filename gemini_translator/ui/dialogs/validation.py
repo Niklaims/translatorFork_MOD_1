@@ -5341,6 +5341,15 @@ class TranslationValidatorPage(ShellPage):
                         
                         shutil.move(source_path, dest_path)
                         
+                        # Обновляем OPDS-сервер при переименовании файла
+                        app = QtWidgets.QApplication.instance()
+                        opds_mgr = getattr(app, "opds_manager", None)
+                        if opds_mgr:
+                            try:
+                                opds_mgr.update_chapter_filepath(self.translated_folder, source_path, dest_path)
+                            except Exception:
+                                pass
+
                         # Атомарно обновляем карту
                         self.project_manager.remove_translation(internal_path, old_suffix)
                         new_rel_path = os.path.relpath(dest_path, self.translated_folder)
@@ -5797,6 +5806,14 @@ class TranslationValidatorPage(ShellPage):
                     # Перемещаем файл
                     if source_path != destination_path:
                         shutil.move(source_path, destination_path)
+                        # Обновляем OPDS-сервер при переименовании файла
+                        app = QtWidgets.QApplication.instance()
+                        opds_mgr = getattr(app, "opds_manager", None)
+                        if opds_mgr:
+                            try:
+                                opds_mgr.update_chapter_filepath(self.translated_folder, source_path, destination_path)
+                            except Exception:
+                                pass
                     
                     # Обновляем менеджер проекта
                     if old_suffix:

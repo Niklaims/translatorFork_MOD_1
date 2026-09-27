@@ -2036,10 +2036,36 @@ class TranslatedChaptersManagerDialog(QDialog):
         app = QtWidgets.QApplication.instance()
         opds_manager = getattr(app, "opds_manager", None)
         opds_filepaths = set()
+        opds_basenames = {}  # {stem: opds_filepath}
+
+        def _norm_p(p):
+            if not p:
+                return ""
+            try:
+                norm = os.path.abspath(os.path.normpath(str(p).strip()))
+                drive, rest = os.path.splitdrive(norm)
+                if drive:
+                    norm = drive.upper() + rest
+                return norm
+            except Exception:
+                return os.path.normpath(str(p).strip())
+
+        def _chapter_stem(fp):
+            fname = os.path.basename(fp)
+            return fname.split("__")[0] if "__" in fname else fname.split("_")[0]
+
         if opds_manager:
             book = opds_manager.get_book(self.translated_folder)
             if book:
-                opds_filepaths = {ch.get("filepath") for ch in book["chapters"]}
+                for ch in book.get("chapters", []):
+                    ch_fp = _norm_p(ch.get("filepath", ""))
+                    if ch_fp:
+                        opds_filepaths.add(ch_fp)
+                        stem = _chapter_stem(ch_fp)
+                        if stem:
+                            opds_basenames[stem] = ch_fp
+
+        stale_heals = {}
 
         for i in range(self.table.rowCount()):
             item = QTableWidgetItem(str(i + 1))
@@ -2047,24 +2073,45 @@ class TranslatedChaptersManagerDialog(QDialog):
             # Добавляем индикатор OPDS
             version_combo = self.table.cellWidget(i, self.COL_FILE)
             if version_combo:
-                current_filepath = version_combo.currentData()
+                current_raw = version_combo.currentData()
+                current_filepath = _norm_p(current_raw) if current_raw else ""
                 
-                if current_filepath in opds_filepaths:
+                if current_filepath and current_filepath in opds_filepaths:
                     item.setText(f"{i + 1} 📡")
                     item.setToolTip("Эта версия главы сейчас доступна на OPDS-сервере")
-                else:
+                elif current_filepath:
                     # Ищем, загружена ли другая (предыдущая) версия этой же главы
                     is_other_version_on_opds = False
                     for combo_idx in range(version_combo.count()):
-                        if version_combo.itemData(combo_idx) in opds_filepaths:
+                        c_data = version_combo.itemData(combo_idx)
+                        if c_data and _norm_p(c_data) in opds_filepaths:
                             is_other_version_on_opds = True
                             break
                     
-                    if is_other_version_on_opds:
+                    # Если в комбобоксе не нашлось, проверяем по базовому имени главы
+                    # (например, если файл был переименован при проверке качества в _validated.html)
+                    cur_stem = _chapter_stem(current_filepath)
+                    if not is_other_version_on_opds and cur_stem and cur_stem in opds_basenames:
+                        old_opds_fp = opds_basenames[cur_stem]
+                        # Если старого файла больше нет на диске, но текущий существует — автоматически исцеляем путь в OPDS
+                        if not os.path.exists(old_opds_fp) and os.path.exists(current_filepath):
+                            stale_heals[old_opds_fp] = current_filepath
+                            item.setText(f"{i + 1} 📡")
+                            item.setToolTip("Эта версия главы доступна на OPDS-сервере (путь обновлён после проверки качества)")
+                        else:
+                            item.setText(f"{i + 1} 📡")
+                            item.setToolTip("Внимание: на OPDS загружена ДРУГАЯ (предыдущая) версия этой главы.\nНажмите 'Загрузить на OPDS', чтобы обновить её до текущей.")
+                    elif is_other_version_on_opds:
                         item.setText(f"{i + 1} 📡")
                         item.setToolTip("Внимание: на OPDS загружена ДРУГАЯ (предыдущая) версия этой главы.\nНажмите 'Загрузить на OPDS', чтобы обновить её до текущей.")
                     
             self.table.setItem(i, self.COL_NUMBER, item)
+
+        if stale_heals and opds_manager:
+            try:
+                opds_manager.update_chapter_filepaths(self.translated_folder, stale_heals)
+            except Exception:
+                pass
 
     def _move_row(self, offset):
         """Перемещение выделенной строки на offset."""

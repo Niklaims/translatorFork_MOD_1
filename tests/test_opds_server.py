@@ -142,3 +142,150 @@ def test_opds_server_not_found(opds_manager):
         assert exc_info.value.code == 404
     finally:
         opds_manager.stop()
+
+
+def test_opds_path_normalization_and_uuid_preservation(opds_manager, temp_chapter_file):
+    """
+    Проверяет, что при передаче book_id с прямыми и обратными слешами
+    не создается дубликат книги, а UUID сохраняется.
+    """
+    path_forward = "C:/Users/TestUser/Documents/My Book"
+    path_backward = "C:\\Users\\TestUser\\Documents\\My Book"
+
+    # Добавляем книгу по пути со слешами /
+    chapters = [{"title": "Ch 1", "filepath": temp_chapter_file}]
+    opds_manager.add_or_update_book(path_forward, "My Book", "Author", chapters)
+
+    book1 = opds_manager.get_book(path_forward)
+    assert book1 is not None
+    orig_uuid = book1["uuid"]
+    assert len(book1["chapters"]) == 1
+
+    # Читаем по пути со слешами \
+    book_lookup = opds_manager.get_book(path_backward)
+    assert book_lookup is not None
+    assert book_lookup["uuid"] == orig_uuid
+
+    # Обновляем книгу, передав путь с \ и добавив вторую главу
+    chapters2 = [
+        {"title": "Ch 1", "filepath": temp_chapter_file},
+        {"title": "Ch 2", "filepath": temp_chapter_file},
+    ]
+    opds_manager.add_or_update_book(path_backward, "My Book", "Author", chapters2)
+
+    # Должна остаться ровно 1 книга, UUID не должен измениться
+    assert len(opds_manager._books) == 1
+    book2 = opds_manager.get_book(path_forward)
+    assert book2 is not None
+    assert book2["uuid"] == orig_uuid
+    assert len(book2["chapters"]) == 2
+
+
+def test_opds_load_state_deduplication(tmp_path, temp_chapter_file):
+    """
+    Проверяет, что при загрузке состояния из JSON дубликаты книг с разными
+    слешами объединяются в одну книгу с сохранением глав и UUID.
+    """
+    import json
+    from gemini_translator.server.opds_server import OPDSManager
+
+    state_file = tmp_path / "test_dedup_opds.json"
+    dummy_data = {
+        "C:/Users/TestUser/Documents/Book1": {
+            "title": "Book 1",
+            "author": "Author",
+            "uuid": "uuid-12345",
+            "chapters": [{"title": "Ch 1", "filepath": temp_chapter_file}],
+            "updated": "2026-09-20T10:00:00Z"
+        },
+        "C:\\Users\\TestUser\\Documents\\Book1": {
+            "title": "Book 1",
+            "author": "Author",
+            "uuid": "uuid-67890",
+            "chapters": [
+                {"title": "Ch 1", "filepath": temp_chapter_file},
+                {"title": "Ch 2", "filepath": temp_chapter_file}
+            ],
+            "updated": "2026-09-23T10:00:00Z"
+        }
+    }
+    state_file.write_text(json.dumps(dummy_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    manager = OPDSManager()
+    manager._state_file = str(state_file)
+    manager._books = manager._load_state()
+
+    # После дедупликации должна остаться ровно 1 книга
+    assert len(manager._books) == 1
+    book = next(iter(manager._books.values()))
+    assert book["title"] == "Book 1"
+    # Сохранен UUID первичной записи
+    assert book["uuid"] == "uuid-12345"
+    # Сохранены обе главы
+    assert len(book["chapters"]) == 2
+
+
+def test_opds_update_chapter_filepath(opds_manager, tmp_path):
+    """
+    Проверяет обновление пути к файлу главы при переименовании/валидации.
+    """
+    old_file = tmp_path / "ch1__translated.html"
+    new_file = tmp_path / "ch1__validated.html"
+    old_file.write_text("<p>old</p>", encoding="utf-8")
+    new_file.write_text("<p>new</p>", encoding="utf-8")
+
+    book_id = "test_project_rename"
+    opds_manager.add_or_update_book(book_id, "Rename Book", "Author", [
+        {"title": "Ch1", "filepath": str(old_file)}
+    ])
+
+    from gemini_translator.server.opds_server import normalize_filepath
+
+    # Проверяем старый путь
+    book = opds_manager.get_book(book_id)
+    assert book["chapters"][0]["filepath"] == normalize_filepath(str(old_file))
+
+    # Обновляем путь
+    res = opds_manager.update_chapter_filepath(book_id, str(old_file), str(new_file))
+    assert res is True
+
+    # Проверяем, что путь обновился
+    book_after = opds_manager.get_book(book_id)
+    assert book_after["chapters"][0]["filepath"] == normalize_filepath(str(new_file))
+
+
+def test_opds_build_epub_fallback_validated_file(opds_manager, tmp_path):
+    """
+    Проверяет, что build_epub_bytes подхватывает файл _validated.html,
+    если исходный файл _translated.html был перемещен/переименован.
+    """
+    # Создаем сразу валидированный файл (старый файл "исчез")
+    validated_file = tmp_path / "0001_ch1__validated.html"
+    validated_file.write_text("<html><body><h1>Recovered Chapter</h1><p>Validated content.</p></body></html>", encoding="utf-8")
+
+    # В OPDS регистрируем старый путь, которого нет на диске
+    missing_file = tmp_path / "0001_ch1__translated_gemini.html"
+    book_id = str(tmp_path)
+
+    opds_manager.add_or_update_book(book_id, "Fallback Book", "Author", [
+        {"title": "Ch1", "filepath": str(missing_file)}
+    ])
+
+    # Собираем ePub — должно подхватить validated_file без ошибок
+    epub_bytes = opds_manager.build_epub_bytes(book_id)
+    assert epub_bytes is not None
+    assert len(epub_bytes) > 0
+
+    # Проверяем, что файл ePub содержит текст из validated_file, а не заглушку об ошибке
+    import zipfile
+    import io
+    with zipfile.ZipFile(io.BytesIO(epub_bytes)) as zf:
+        ch_content = None
+        for name in zf.namelist():
+            if (name.endswith(".xhtml") or name.endswith(".html")) and "nav" not in name:
+                ch_content = zf.read(name).decode("utf-8")
+                break
+        assert ch_content is not None
+        assert "Recovered Chapter" in ch_content
+        assert "Ошибка чтения файла" not in ch_content
+
