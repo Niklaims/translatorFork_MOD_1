@@ -403,11 +403,15 @@ def _resolve_api_keys(
     keys.extend(_read_api_key_file(getattr(args, "api_key_file", None)))
     keys = [str(key).strip() for key in keys if str(key).strip()]
     if not keys:
+        from .utils.active_keys import owned_active_keys
+
         active_by_provider = saved_settings.get("active_keys_by_provider")
         if isinstance(active_by_provider, dict):
             active = active_by_provider.get(provider_id)
             if isinstance(active, (list, tuple, set)):
-                keys = [str(key).strip() for key in active if str(key).strip()]
+                # В наборе могут лежать ключи другого провайдера: берём только
+                # сохранённые под этим, иначе ниже подставятся все его ключи.
+                keys = owned_active_keys(active, provider_statuses)
 
     if getattr(args, "all_keys", False) or not keys:
         keys = _configured_provider_keys(key_statuses, provider_id)
@@ -483,6 +487,7 @@ def build_session_settings(settings_manager, project_manager, chapters: list[str
         "chunk_on_error": bool(saved_settings.get("chunk_on_error", False)),
         "sequential_translation": bool(saved_settings.get("sequential_translation", False)),
         "sequential_translation_splits": int(saved_settings.get("sequential_translation_splits", 1) or 1),
+        "system_text_rules": bool(saved_settings.get("system_text_rules", False)),
         "task_size_limit": int(saved_settings.get("task_size_limit", 30000) or 30000),
         "dynamic_glossary": bool(saved_settings.get("dynamic_glossary", True)),
         "use_jieba": bool(saved_settings.get("use_jieba", False)),

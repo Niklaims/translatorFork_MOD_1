@@ -301,6 +301,7 @@ class UniversalWorker(EventBusMixin):
             sequential_chain_starts=getattr(self, 'sequential_chain_starts', []),
             sequential_reference_char_limit=getattr(self, 'sequential_reference_char_limit', 60000),
             extract_glossary=getattr(self, 'extract_glossary', False),
+            system_text_rules=getattr(self, 'system_text_rules', False),
         )
 
         # D. ResponseParser

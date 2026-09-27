@@ -35,12 +35,96 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ...utils.system_windows import replace_blocks as replace_system_blocks
 from ...utils.epub_tools import (
     extract_first_epub_heading_text,
     find_opf_path,
     normalize_epub_chapter_heading_to_h1,
     read_spine_html_order,
 )
+
+
+# Блоки системных окон (см. utils/system_windows.py) уходят на Rulate как
+# сырой HTML: загрузчик сайта пропускает инлайн-стили, но оборачивает каждую
+# строку файла в <p>, поэтому блок обязан остаться одной строкой. Атрибут
+# data-sys-orig хранит исходные абзацы для снятия оформления и сайту не нужен.
+# Сборка EPUB пересобирает главы через BeautifulSoup, а он пишет значение
+# с двойными кавычками внутри в одинарных кавычках.
+SYSTEM_BLOCK_RE = re.compile(r'<div\b[^>]*\bdata-sys="[^"]*"[^>]*>.*?</div>', re.IGNORECASE | re.DOTALL)
+# (?<!\s) — только начало серии пробелов: длинную серию без совпадения
+# иначе проходили бы заново с каждого пробела. Совпадений это не меняет.
+SYSTEM_BLOCK_ORIG_RE = re.compile(r"""(?<!\s)\s*\bdata-sys-orig=(?:"[^"]*"|'[^']*')""", re.IGNORECASE)
+_NEWLINE_RUN_RE = re.compile(r"(?<!\s)\s*\n\s*")
+_SYSTEM_BLOCK_PLACEHOLDER = "\x00SYSBLOCK{index}\x00"
+# Загрузчик Rulate прогоняет файл через Markdown. Строка «[Метка]: 80 (обожание)»
+# для него — определение ссылки: она пропадает со страницы. Обратная косая черта
+# перед скобкой делает её обычным текстом.
+_REFERENCE_DEFINITION_RE = re.compile(
+    r"""^\[[^\]\n]+\]:[ \t]*<?\S+?>?(?:[ \t]+(?:"[^"]*"|'[^']*'|\([^)]*\)))?[ \t]*$"""
+)
+
+
+# Курсив и жирный текста. Загрузчик Rulate пропускает теги <i> и <b>, а остальные
+# теги конвертер снимает, поэтому выделения до сноса тегов меняются на метки
+# и возвращаются тегами уже после экранирования строки.
+_EMPHASIS_TAG_RE = re.compile(r"<(/?)(em|i|strong|b)\b[^>]*>", re.IGNORECASE)
+_EMPHASIS_NAMES = {"em": "i", "i": "i", "strong": "b", "b": "b"}
+_EMPHASIS_MARK_RE = re.compile("\x01(/?)([ib])\x02")
+_EMPTY_EMPHASIS_RE = re.compile(r"<([ib])>(\s*)</\1>")
+
+
+def _mark_emphasis(match) -> str:
+    return f"\x01{match.group(1)}{_EMPHASIS_NAMES[match.group(2).lower()]}\x02"
+
+
+def _restore_emphasis(line: str, carried: list) -> tuple[str, list]:
+    """Метки выделений строки → ``<i>``/``<b>``, открытые с прошлой строки абзаца.
+
+    Незакрытое выделение закрывается в конце строки и открывается снова на
+    следующей строке того же абзаца (``<em>раз<br/>два</em>``); лишний
+    закрывающий тег пропадает. Возвращает строку и выделения, открытые к её концу.
+    """
+    parts = [f"<{name}>" for name in carried]
+    stack = list(carried)
+    position = 0
+    for match in _EMPHASIS_MARK_RE.finditer(line):
+        parts.append(line[position:match.start()])
+        position = match.end()
+        closing, name = match.groups()
+        if not closing:
+            stack.append(name)
+            parts.append(f"<{name}>")
+        elif name in stack:
+            reopen = []
+            while stack:
+                top = stack.pop()
+                parts.append(f"</{top}>")
+                if top == name:
+                    break
+                reopen.append(top)
+            for top in reversed(reopen):
+                stack.append(top)
+                parts.append(f"<{top}>")
+    parts.append(line[position:])
+    open_at_end = list(stack)
+    parts.extend(f"</{name}>" for name in reversed(stack))
+    text = "".join(parts)
+    previous = None
+    while previous != text:
+        previous, text = text, _EMPTY_EMPHASIS_RE.sub(r"\2", text)
+    return text, open_at_end
+
+
+def _protect_from_markdown(line: str) -> str:
+    """Строка текста главы, которую Markdown сайта покажет как есть.
+
+    ``<`` уходит сущностью, чтобы «<Shadow>» не приняли за тег, а строки вида
+    определения ссылки получают ``\\`` перед скобкой.
+    """
+    line = line.replace("<", "&lt;")
+    if _REFERENCE_DEFINITION_RE.match(line):
+        line = "\\" + line
+    return line
 
 
 class SimpleEpubReader:
@@ -248,7 +332,18 @@ class EPUBConverterThread(QThread):
 
     def _html_to_plain_text(self, html_content):
         text = html_content
+        system_blocks = []
+
+        def keep_system_block(block):
+            block = SYSTEM_BLOCK_ORIG_RE.sub("", block)
+            block = _NEWLINE_RUN_RE.sub(" ", block).strip()
+            system_blocks.append(block)
+            return "\n\n" + _SYSTEM_BLOCK_PLACEHOLDER.format(index=len(system_blocks) - 1) + "\n\n"
+
+        # Блок с вложенными div (карточки постов форума) — целиком, до парного </div>.
+        text = replace_system_blocks(text, keep_system_block)
         text = re.sub(r"<(script|style|head)[^>]*>.*?</\1>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = _EMPHASIS_TAG_RE.sub(_mark_emphasis, text)
         text = re.sub(r"</(p|div|h[1-6]|li|blockquote)>", "\n\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
         text = re.sub(r"<hr\s*/?>", "\n***\n", text, flags=re.IGNORECASE)
@@ -256,12 +351,24 @@ class EPUBConverterThread(QThread):
         text = unescape(text)
 
         lines = []
+        carried: list = []
         for line in text.split("\n"):
             stripped = line.strip()
-            if stripped:
+            # Пустая строка — граница абзаца: незакрытое выделение дальше не тянется.
+            if not _EMPHASIS_MARK_RE.sub("", stripped).strip():
+                carried = []
+                continue
+            if stripped.startswith("\x00SYSBLOCK"):
                 lines.append(stripped)
+                continue
+            restored, carried = _restore_emphasis(_protect_from_markdown(stripped), carried)
+            if restored.strip():
+                lines.append(restored)
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        for index, block in enumerate(system_blocks):
+            result = result.replace(_SYSTEM_BLOCK_PLACEHOLDER.format(index=index), block)
+        return result
 
     def _clean_xml_artifacts(self, content):
         content = re.sub(r"xml version='[^']+' encoding='[^']+'?", "", content)

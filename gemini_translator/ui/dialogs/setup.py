@@ -49,6 +49,7 @@ from ...core.consistency_engine import (
 from ...core.translation_engine import TranslationEngine
 from ...core.task_manager import ChapterQueueManager, TaskDBWorker
 from ...utils.settings import SettingsManager
+from ...utils.active_keys import sanitize_active_keys_by_provider
 from ...utils.epub_tools import (
     extract_number_from_path,
     calculate_potential_output_size,
@@ -107,6 +108,22 @@ TASK_LIST_MIN_HEIGHT = 420
 TASK_OPTIONS_MIN_HEIGHT = 400
 TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
 # --- КОНЕЦ НОВЫХ КОНСТАНТ ---
+
+
+def _owned_active_keys_by_provider(settings_manager, active_keys_by_provider: dict) -> dict:
+    """Наборы активных ключей без ключей, сохранённых под другими провайдерами.
+
+    Окно ключей раньше записывало в набор нового провайдера ключи прежнего,
+    такие наборы лежат в settings.json и чистятся при загрузке и сохранении.
+    Если сохранённые ключи прочитать не удалось, наборы возвращаются как есть:
+    стирать выбор пользователя из-за сбоя чтения нельзя.
+    """
+    try:
+        key_statuses = settings_manager.load_key_statuses()
+    except Exception as exc:
+        print(f"[WARN] Активные ключи не сверены с сохранёнными: {exc}")
+        return active_keys_by_provider
+    return sanitize_active_keys_by_provider(active_keys_by_provider, key_statuses)
 
 
 def load_bool_setting(settings_manager, key: str, default: bool) -> bool:
@@ -513,7 +530,16 @@ class InitialSetupPage(ShellPage):
             get_last_text_func=self.settings_manager.get_custom_prompt,
             get_last_preset_func=self.settings_manager.get_last_prompt_preset_name,
             save_last_preset_func=self.settings_manager.save_last_prompt_preset_name,
-            builtin_presets_func=api_config.builtin_translation_prompt_variants
+            builtin_presets_func=api_config.builtin_translation_prompt_variants,
+            # Последовательный перевод берёт свой промпт и выбранный
+            # игнорирует (PromptBuilder._effective_translation_prompt).
+            override_prompt_func=api_config.default_sequential_prompt,
+            override_prompt_title="Промпт последовательного перевода",
+            override_prompt_notice=(
+                "Включён «Последовательный перевод глав»: этот промпт модель "
+                "не получит. Вместо него работает встроенный промпт "
+                "последовательного перевода — посмотреть его можно кнопкой внизу."
+            ),
         )
         self.preset_widget.load_last_session_state()
 
@@ -775,6 +801,9 @@ class InitialSetupPage(ShellPage):
         self.project_actions_widget.sync_project_requested.connect(self._run_project_sync)
 
         self.translation_options_widget.settings_changed.connect(self._on_translation_options_changed)
+        sequential_checkbox = self.translation_options_widget.sequential_checkbox
+        sequential_checkbox.toggled.connect(self.preset_widget.set_override_active)
+        self.preset_widget.set_override_active(sequential_checkbox.isChecked())
         self.task_management_widget.tasks_changed.connect(lambda: self._prepare_and_display_tasks(clean_rebuild=True))
 
         self.model_settings_widget.recalibrate_requested.connect(self._calibrate_cpu)
@@ -3850,7 +3879,10 @@ class InitialSetupPage(ShellPage):
 
         settings['active_keys_by_provider'] = {
             provider_id: sorted(list(keys))
-            for provider_id, keys in self.key_management_widget.current_active_keys_by_provider.items()
+            for provider_id, keys in _owned_active_keys_by_provider(
+                self.settings_manager,
+                self.key_management_widget.current_active_keys_by_provider,
+            ).items()
             if keys
         }
         settings[QUEUE_AUTOSAVE_SETTING_KEY] = self._is_queue_autosave_enabled()
@@ -3899,6 +3931,7 @@ class InitialSetupPage(ShellPage):
                 'chunk_on_error',
                 'sequential_translation',
                 'sequential_translation_splits',
+                'system_text_rules',
                 'task_size_limit',
                 'task_size_unit',
             )):
@@ -3925,6 +3958,9 @@ class InitialSetupPage(ShellPage):
 
             active_keys_by_provider = settings.get('active_keys_by_provider')
             if isinstance(active_keys_by_provider, dict):
+                active_keys_by_provider = _owned_active_keys_by_provider(
+                    self.settings_manager, active_keys_by_provider
+                )
                 for provider_id, active_keys in active_keys_by_provider.items():
                     if not provider_id:
                         continue
@@ -5317,7 +5353,10 @@ class InitialSetupPage(ShellPage):
             'num_instances': self.instances_spin.value(),
             'active_keys_by_provider': {
                 provider_id: sorted(list(keys))
-                for provider_id, keys in self.key_management_widget.current_active_keys_by_provider.items()
+                for provider_id, keys in _owned_active_keys_by_provider(
+                    self.settings_manager,
+                    self.key_management_widget.current_active_keys_by_provider,
+                ).items()
                 if keys
             },
         }
@@ -5557,8 +5596,13 @@ class InitialSetupPage(ShellPage):
                 self.global_settings = self._get_full_ui_settings()
                 self._apply_full_ui_settings(local_settings)
             else:
-                print("[INFO] Файл настроек проекта не найден. Сохраняем текущие настройки как настройки проекта.")
+                # Файла ещё нет: создаём его из текущих настроек, как обещает
+                # подсказка кнопки. Раньше кнопка показывала «Настройки
+                # проекта», а local_set оставался False, и всё, что меняли
+                # «для проекта», сохранялось в глобальные настройки.
+                print("[INFO] Файл настроек проекта не найден. Создаю его из текущих настроек UI.")
                 self.global_settings = self._get_full_ui_settings()
+                self._save_project_settings_only()
             self.local_set = True
         else:
             print("[SETTINGS] Переключение на глобальные настройки…")
