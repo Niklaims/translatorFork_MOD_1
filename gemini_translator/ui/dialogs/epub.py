@@ -2632,6 +2632,40 @@ class TranslatedChaptersManagerDialog(QDialog):
         elif self.update_original_radio.isChecked():
             self._update_original_epub_with_updater(build_rows)
 
+    @staticmethod
+    def _find_opds_fallback_file(filepath):
+        """Ищет переименованный файл главы (например, после валидации) в той же папке.
+
+        Логика аналогична OPDSManager._find_fallback_chapter_file, но используется
+        на этапе загрузки глав, чтобы не пропускать главы, файлы которых были
+        переименованы валидатором (_translated.html → _validated.html) или иначе.
+        """
+        if not filepath:
+            return None
+        folder = os.path.dirname(filepath)
+        if not os.path.isdir(folder):
+            return None
+
+        fname = os.path.basename(filepath)
+        stem = fname.split("__")[0] if "__" in fname else fname.split("_")[0]
+        if not stem:
+            return None
+
+        try:
+            candidates = []
+            for item in os.listdir(folder):
+                if item.startswith(stem) and item.lower().endswith(('.html', '.xhtml', '.htm')):
+                    full_p = os.path.join(folder, item)
+                    is_val = "_validated" in item
+                    candidates.append((is_val, full_p))
+            if candidates:
+                # Предпочитаем _validated версию
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                return candidates[0][1]
+        except Exception:
+            pass
+        return None
+
     def _upload_to_opds(self):
         """Загружает выбранные (отмеченные галочкой) главы на OPDS-сервер."""
         app = QtWidgets.QApplication.instance()
@@ -2655,23 +2689,44 @@ class TranslatedChaptersManagerDialog(QDialog):
             return
 
         chapters = []
+        skipped = []  # [(row_display_name, reason), ...]
         for row_idx in build_rows:
+            # Определяем отображаемое имя главы для отчёта о пропусках
+            source_item = self.table.item(row_idx, self.COL_SOURCE)
+            row_label = source_item.text() if source_item else f"Строка {row_idx + 1}"
+
             version_combo = self.table.cellWidget(row_idx, self.COL_FILE)
-            if not version_combo:
+            if not version_combo or version_combo.count() == 0:
+                skipped.append((row_label, "нет файла перевода"))
                 continue
+
             filepath = version_combo.currentData()
-            if not filepath or not os.path.exists(filepath):
+            if not filepath:
+                skipped.append((row_label, "нет файла перевода"))
                 continue
+
+            if not os.path.exists(filepath):
+                # Пытаемся найти переименованный файл (fallback)
+                recovered = self._find_opds_fallback_file(filepath)
+                if recovered and os.path.exists(recovered):
+                    filepath = recovered
+                else:
+                    skipped.append((row_label, f"файл не найден: {os.path.basename(filepath)}"))
+                    continue
 
             # Пытаемся извлечь заголовок из файла
             title = self._extract_chapter_title(filepath, row_idx)
             chapters.append({"title": title, "filepath": filepath})
 
         if not chapters:
+            skip_details = "\n".join(f"  • {name}: {reason}" for name, reason in skipped[:10])
+            if len(skipped) > 10:
+                skip_details += f"\n  … и ещё {len(skipped) - 10}"
             QMessageBox.warning(
                 self,
                 "Нет доступных файлов",
-                "Ни один из выбранных файлов не найден на диске."
+                f"Ни один из {len(build_rows)} выбранных файлов не найден на диске.\n\n"
+                f"Причины:\n{skip_details}"
             )
             return
 
@@ -2700,6 +2755,12 @@ class TranslatedChaptersManagerDialog(QDialog):
             status += f"\n📡 Доступно по адресу: {opds_manager.get_url()}"
         else:
             status += "\n⚠️ Сервер сейчас остановлен. Включите его в настройках «Приложение → OPDS Сервер»."
+
+        if skipped:
+            skip_details = "\n".join(f"  • {name}: {reason}" for name, reason in skipped[:8])
+            if len(skipped) > 8:
+                skip_details += f"\n  … и ещё {len(skipped) - 8}"
+            status += f"\n\n⚠️ Пропущено глав: {len(skipped)}\n{skip_details}"
 
         QMessageBox.information(self, "OPDS", status)
 

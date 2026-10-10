@@ -24,17 +24,21 @@ def test_build_all_models_last_write_wins_silently_but_now_logged(caplog):
         "openrouter": {"models": {"My Model": {"id": "or-1"}}},
     }
 
-    with caplog.at_level(logging.WARNING, logger="gemini_translator.api.config"):
+    with caplog.at_level(logging.INFO, logger="gemini_translator.api.config"):
         result = api_config._build_all_models(providers_config)
 
-    # Поведение (last-write-wins) сознательно не меняем — composite-ключ
-    # затронул бы резолв модели по имени за пределами этого модуля.
-    assert result["My Model"]["provider"] == "openrouter"
-    assert result["My Model"]["id"] == "or-1"
+    # Теперь поведение изменено: модель второго провайдера переименовывается,
+    # чтобы избежать потери данных.
+    assert result["My Model"]["provider"] == "local"
+    assert result["My Model"]["id"] == "local-1"
+    
+    assert "My Model (openrouter)" in result
+    assert result["My Model (openrouter)"]["provider"] == "openrouter"
+    assert result["My Model (openrouter)"]["id"] == "or-1"
 
     collision_warnings = [
         record for record in caplog.records
-        if record.levelno == logging.WARNING and "My Model" in record.getMessage()
+        if record.levelno == logging.INFO and "My Model" in record.getMessage()
     ]
     assert collision_warnings, "коллизия имён моделей между провайдерами должна попадать в лог"
     message = collision_warnings[0].getMessage()
@@ -49,14 +53,14 @@ def test_build_all_models_warns_only_once_per_name(caplog):
         "openrouter": {"models": {"My Model": {"id": "or-1"}}},
     }
 
-    with caplog.at_level(logging.WARNING, logger="gemini_translator.api.config"):
+    with caplog.at_level(logging.INFO, logger="gemini_translator.api.config"):
         api_config._build_all_models(providers_config)
         caplog.clear()
         api_config._build_all_models(providers_config)
 
     collision_warnings = [
         record for record in caplog.records
-        if record.levelno == logging.WARNING and "My Model" in record.getMessage()
+        if record.levelno == logging.INFO and "My Model" in record.getMessage()
     ]
     assert not collision_warnings, "повторные вызовы не должны спамить лог одной и той же коллизией"
 
@@ -80,7 +84,7 @@ def test_build_all_models_warns_again_for_a_different_provider_pair(caplog):
     провайдеров, а не только имя."""
     api_config._MODEL_NAME_COLLISION_WARNED.clear()
 
-    with caplog.at_level(logging.WARNING, logger="gemini_translator.api.config"):
+    with caplog.at_level(logging.INFO, logger="gemini_translator.api.config"):
         api_config._build_all_models({
             "local": {"models": {"My Model": {"id": "local-1"}}},
             "openrouter": {"models": {"My Model": {"id": "or-1"}}},
@@ -94,7 +98,7 @@ def test_build_all_models_warns_again_for_a_different_provider_pair(caplog):
 
     collision_warnings = [
         record for record in caplog.records
-        if record.levelno == logging.WARNING and "My Model" in record.getMessage()
+        if record.levelno == logging.INFO and "My Model" in record.getMessage()
     ]
     assert collision_warnings, "коллизия с новым провайдером должна снова попасть в лог"
     message = collision_warnings[0].getMessage()

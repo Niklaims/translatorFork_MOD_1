@@ -465,29 +465,30 @@ _MODEL_NAME_COLLISION_WARNED = set()
 def _build_all_models(providers_config: dict) -> dict:
     """Строит плоскую карту {display_name: {...,'provider':...}} по всем провайдерам.
 
-    Ключ — только отображаемое имя модели: при совпадении имени у двух
-    провайдеров запись, обработанная позже в порядке providers_config.items(),
-    молча перезаписывала бы предыдущую. Это унаследованное поведение
-    сохранено (менять формат ключа нельзя — от него зависит резолв модели по
-    имени во множестве мест за пределами этого модуля), но коллизия больше не
-    остаётся незамеченной: каждая пара провайдеров, столкнувшаяся на одном
-    имени модели, один раз попадает в лог с указанием обоих провайдеров."""
+    Ключ — только отображаемое имя модели. Если у двух провайдеров
+    совпадает отображаемое имя модели, к имени второго провайдера будет
+    автоматически добавлен суффикс с его ID (например, 'My Model (openrouter)'),
+    чтобы обе модели остались доступны пользователю."""
     combined = {}
     for provider_id, provider_data in providers_config.items():
         for model_name, model_config in provider_data.get("models", {}).items():
             existing = combined.get(model_name)
+            final_model_name = model_name
             if existing is not None and existing.get('provider') != provider_id:
                 warn_key = (model_name, existing.get('provider'), provider_id)
                 if warn_key not in _MODEL_NAME_COLLISION_WARNED:
                     _MODEL_NAME_COLLISION_WARNED.add(warn_key)
-                    _logger.warning(
+                    _logger.info(
                         "Модель '%s' объявлена у нескольких провайдеров ('%s' и '%s'); "
-                        "в all_models()/all_models_view() останется только последняя "
-                        "по порядку обхода — резолв по имени для другого провайдера "
-                        "станет недоступен.",
-                        model_name, existing.get('provider'), provider_id,
+                        "модель от '%s' будет переименована, чтобы избежать потери данных.",
+                        model_name, existing.get('provider'), provider_id, provider_id
                     )
-            combined[model_name] = {**model_config, 'provider': provider_id}
+                # Устраняем коллизию, чтобы модель не потерялась
+                final_model_name = f"{model_name} ({provider_id})"
+                while final_model_name in combined and combined[final_model_name].get('provider') != provider_id:
+                    final_model_name += " *"
+            
+            combined[final_model_name] = {**model_config, 'provider': provider_id}
     return combined
 
 
