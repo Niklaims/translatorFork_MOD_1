@@ -13,6 +13,12 @@ from ..utils.async_helpers import run_sync
 from ..utils.debug_logger import create_operation_trace
 from ..utils.helpers import estimate_gemini_tokens
 from . import token_usage
+from .dns_fallback import (
+    DOH_OVERRIDE_TTL_SECONDS,
+    OverridingResolver,
+    is_ip_literal,
+    resolve_via_doh,
+)
 from .errors import (
     OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
     ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
@@ -23,6 +29,11 @@ _current_debug_trace = contextvars.ContextVar("current_debug_trace", default=Non
 
 _DEFAULT_TRANSIENT_DISCONNECT_RETRIES = 1
 _DEFAULT_TRANSIENT_DISCONNECT_RETRY_DELAY_SECONDS = 1.0
+
+# Last-resort DNS: the system resolver can be hijacked by an ISP and answer
+# with an address that does not accept connections.  DoH is consulted only
+# after such a failure, so a healthy network never pays for it.
+_DEFAULT_DOH_FALLBACK_TIMEOUT_SECONDS = 4.0
 
 # Перегрузка на стороне провайдера: ответ пришёл, но сервер просит подождать.
 # Отдельно от transient-disconnect — там рвётся соединение и запрос не доехал.
@@ -135,6 +146,9 @@ class BaseApiHandler:
         self._session_proxy_signature = None
         self._session_timeout = None
         self._session_ssl_context_signature = None
+        # hostname -> (expires_at_monotonic, [(family, address), ...]); filled
+        # by the DoH fallback when the system resolver returns a dead address.
+        self._dns_overrides = {}
 
     @staticmethod
     def _normalize_content(content):
@@ -320,7 +334,8 @@ class BaseApiHandler:
                     return ProxyConnector.from_url(url, rdns=True, ssl=ssl_context)
             except Exception as e:
                 print(f"[API ERROR] Не удалось создать прокси-коннектор: {e}")
-        return aiohttp.TCPConnector(ssl=ssl_context)
+        resolver = OverridingResolver(self._dns_overrides) if self._dns_overrides else None
+        return aiohttp.TCPConnector(ssl=ssl_context, resolver=resolver)
 
     async def _get_or_create_session_internal(self, api_timeout=600):
         """[Внутренний] Лениво создает per-handler сессию, привязанную к текущему
@@ -579,6 +594,65 @@ class BaseApiHandler:
             category = "Сетевой сбой"
         return f"{category}{context} ({type(error).__name__}): {error}"
 
+    def _doh_fallback_timeout(self) -> float:
+        raw_value = self._config_value(
+            "doh_fallback_timeout_seconds",
+            _DEFAULT_DOH_FALLBACK_TIMEOUT_SECONDS,
+        )
+        try:
+            return max(0.1, float(raw_value))
+        except (TypeError, ValueError):
+            return _DEFAULT_DOH_FALLBACK_TIMEOUT_SECONDS
+
+    def _connector_error_host(self, error: Exception):
+        """Hostname of the first ClientConnectorError in the exception chain."""
+        for chained_error in self._exception_chain(error):
+            if not isinstance(chained_error, aiohttp.ClientConnectorError):
+                continue
+            host = getattr(chained_error, "host", None)
+            if isinstance(host, str) and host and not is_ip_literal(host):
+                return host
+        return None
+
+    async def _retry_with_doh_fallback(self, error: Exception, attempted_hosts: set) -> bool:
+        """Resolve the failed hostname through DoH and ask for one retry.
+
+        A hijacked resolver answers with an address that refuses connections;
+        the real address still passes certificate verification because TLS
+        keeps using the original hostname.  Runs at most once per host and
+        only when no proxy is configured.
+        """
+        if self.proxy_settings and self.proxy_settings.get('enabled'):
+            return False
+        if not self._config_value("doh_fallback_enabled", True):
+            return False
+        host = self._connector_error_host(error)
+        if not host or host in attempted_hosts:
+            return False
+        attempted_hosts.add(host)
+
+        addresses = await resolve_via_doh(
+            host,
+            ssl_context=_create_ssl_context(),
+            timeout=self._doh_fallback_timeout(),
+        )
+        if not addresses:
+            return False
+
+        self._dns_overrides[host] = (
+            time.monotonic() + DOH_OVERRIDE_TTL_SECONDS,
+            addresses,
+        )
+        self._force_session_reset()
+        shown = ", ".join(address for _family, address in addresses[:3])
+        self.worker._post_event('log_message', {
+            'message': (
+                f"🌐 DNS: системный резолвер вернул недоступный адрес для {host}. "
+                f"Повторяю запрос через DNS-over-HTTPS ({shown})."
+            )
+        })
+        return True
+
     def _temperature_payload_value(self):
         if not getattr(self.worker, "temperature_override_enabled", True):
             return None
@@ -646,6 +720,7 @@ class BaseApiHandler:
         started_at = time.perf_counter()
         attempt = 1
         transient_disconnect_retries = self._transient_disconnect_retry_attempts()
+        doh_attempted_hosts = set()
 
         try:
             while True:
@@ -668,6 +743,8 @@ class BaseApiHandler:
                         raise NetworkError(error_msg, delay_seconds=10) from exc
                     except Exception as exc:
                         self._post_failed_attempt_token_usage()
+                        if await self._retry_with_doh_fallback(exc, doh_attempted_hosts):
+                            continue
                         if self._should_retry_transient_disconnect(exc, attempt, transient_disconnect_retries):
                             self._debug_record_error(
                                 exc,
