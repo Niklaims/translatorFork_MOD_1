@@ -9,8 +9,13 @@ from gemini_translator.core.worker_helpers.content_filter_fallback import (
     run_content_filter_fallback,
 )
 from gemini_translator.core.worker_helpers.provider_orchestrator import (
+    TRANSLATION_TASK_TYPES,
     execute_orchestrated_api_call,
     should_orchestrate_api_call,
+)
+from gemini_translator.utils.translation_response import (
+    validate_content_filter_response,
+    validate_translation_response,
 )
 
 
@@ -88,9 +93,10 @@ class BaseTaskProcessor:
 
     async def _execute_api_call(self, prompt, log_prefix, *, task_info, operation_context: dict | None = None, **kwargs):
         context_payload = operation_context or self._build_operation_context(task_info)
+        is_translation = context_payload.get('task_type') in TRANSLATION_TASK_TYPES
         try:
             if should_orchestrate_api_call(self.worker, context_payload):
-                raw_response = await execute_orchestrated_api_call(
+                response = await execute_orchestrated_api_call(
                     self.worker,
                     prompt,
                     log_prefix,
@@ -100,28 +106,45 @@ class BaseTaskProcessor:
                 )
             else:
                 with self.worker.debug_operation_context(context_payload):
-                    raw_response = await self.worker.api_handler_instance.execute_api_call(
+                    response = await self.worker.api_handler_instance.execute_api_call(
                         prompt,
                         log_prefix,
                         **kwargs,
                     )
+            validate_content_filter_response(response)
         except (ContentFilterError, PartialGenerationError) as exc:
+            if isinstance(exc, PartialGenerationError):
+                try:
+                    validate_content_filter_response(exc.partial_text)
+                except ContentFilterError as block_exc:
+                    exc = block_exc
+            if is_translation and isinstance(exc, PartialGenerationError):
+                validate_translation_response(exc.partial_text)
             if fallback_enabled(self.worker) and is_content_block_exception(exc):
-                raw_response = await run_content_filter_fallback(
-                    self.worker,
-                    prompt,
-                    log_prefix,
-                    task_info=task_info,
-                    operation_context=context_payload,
-                    call_kwargs=kwargs,
-                )
+                try:
+                    response = await run_content_filter_fallback(
+                        self.worker,
+                        prompt,
+                        log_prefix,
+                        task_info=task_info,
+                        operation_context=context_payload,
+                        call_kwargs=kwargs,
+                    )
+                except PartialGenerationError as fallback_exc:
+                    if is_translation:
+                        validate_translation_response(fallback_exc.partial_text)
+                    raise
             else:
-                raise
-                
-        if getattr(self.worker, 'response_parser', None) and getattr(self.worker.prompt_builder, 'extract_glossary', False):
-            raw_response = self.worker.response_parser.extract_and_remove_glossary(raw_response)
-            
-        return raw_response
+                raise exc
+        if is_translation:
+            validate_translation_response(response)
+
+        response_parser = getattr(self.worker, 'response_parser', None)
+        prompt_builder = getattr(self.worker, 'prompt_builder', None)
+        if response_parser and getattr(prompt_builder, 'extract_glossary', False):
+            response = response_parser.extract_and_remove_glossary(response)
+
+        return response
 
     def _raise_validation_error(self, message, raw_package_text=""):
         error = ValidationFailedError(message)
