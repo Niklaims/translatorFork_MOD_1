@@ -13,7 +13,7 @@
 
 import os
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from collections import Counter
 
 # BS4 imports with fallback

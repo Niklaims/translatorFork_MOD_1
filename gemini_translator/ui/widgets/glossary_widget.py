@@ -11,7 +11,7 @@ from PyQt6 import QtWidgets
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QFileDialog, QMessageBox, QDialog, QDialogButtonBox, QGroupBox,
-    QRadioButton, QFrame, QSizePolicy, QAbstractItemView, QLabel, QCheckBox
+    QAbstractItemView, QLabel, QCheckBox
 )
 from PyQt6.QtCore import pyqtSignal, Qt, pyqtSlot, QTimer
 
@@ -32,8 +32,6 @@ from ...utils.glossary_tools import (
 )
 from ...utils.io_utils import atomic_write_json
 from ...utils.settings import SettingsManager
-from ...api import config as api_config
-from collections import defaultdict
 from ..overlay_host import exec_dialog
 
 
@@ -1234,7 +1232,7 @@ class GlossaryWidget(QWidget):
         if project_folder:
             msg_box.setInformativeText("Хотите сохранить этот результат в файл 'project_glossary.json'?")
             save_btn = msg_box.addButton("Сохранить в проект", QMessageBox.ButtonRole.AcceptRole)
-            discard_btn = msg_box.addButton("Не сохранять", QMessageBox.ButtonRole.RejectRole)
+            msg_box.addButton("Не сохранять", QMessageBox.ButtonRole.RejectRole)
             msg_box.setDefaultButton(save_btn)
         else:
             msg_box.setInformativeText("Данные обновлены в таблице. Папка проекта не выбрана, поэтому автосохранение недоступно.")

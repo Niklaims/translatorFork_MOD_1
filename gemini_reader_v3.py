@@ -8,7 +8,6 @@ import array
 import queue
 import time
 import threading
-import traceback
 import platform
 import subprocess
 import io
@@ -29,12 +28,12 @@ from PyQt6.QtWidgets import (
     QHBoxLayout, QWidget, QTextEdit, QPushButton, QLabel,
     QProgressBar, QMessageBox, QInputDialog, QSplitter,
     QListWidget, QListWidgetItem, QToolBar,
-    QSizePolicy, QCheckBox, QMenu, QComboBox, QSpinBox, QDoubleSpinBox,
+    QCheckBox, QMenu, QComboBox, QSpinBox, QDoubleSpinBox,
     QDialog, QDialogButtonBox, QScrollArea, QTabWidget, QPlainTextEdit,
-    QSystemTrayIcon, QGridLayout, QGroupBox
+    QSystemTrayIcon, QGroupBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer, QSettings
-from PyQt6.QtGui import QTextCursor, QTextCharFormat, QColor, QAction, QDragEnterEvent, QDropEvent, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QTextCursor, QColor, QAction
 
 # Libraries
 try:
@@ -3534,7 +3533,7 @@ class AudioPlayer(QThread):
                             arr[i] = max(min(int(arr[i] * self.vol), 32767), -32768)
                     self.stream.write(arr.tobytes())
                 self.audio_queue.task_done()
-            except Exception as e:
+            except Exception:
                 continue
 
     def stop(self):
@@ -4325,7 +4324,6 @@ class GeminiWorker(QThread):
                     continue
 
                 data_received = False
-                request_budget_acquired = False
                 try:
                     if request_payload.get("mode") == "author_gender":
                         audio_bytes = await self._collect_live_payload_audio(client, request_payload)

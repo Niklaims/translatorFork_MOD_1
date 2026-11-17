@@ -1,15 +1,14 @@
 from collections import defaultdict, deque
 
 # --- Импорты из PyQt6 ---
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtGui
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
+    QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
     QWidget, QGroupBox, QCheckBox, QHBoxLayout, QGridLayout, QTableWidget,
     QHeaderView, QTableWidgetItem, QMessageBox, QAbstractItemView, QListWidget,
     QListWidgetItem, QSplitter, QStackedWidget, QLineEdit, QStyle
 )
 from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QColor
 
 # --- Импорты из вашего проекта ---
 from gemini_translator.ui.widgets.common_widgets import NoScrollComboBox
@@ -17,11 +16,6 @@ from gemini_translator.ui.shell import ShellPage
 from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from .custom_widgets import ExpandingTextEditDelegate, SmartTextEdit
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
-
-# --- Аннотация типа для избежания циклического импорта ---
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from ..glossary import MainWindow
 
 # --- Глобальные переменные, которые нужны этому диалогу ---
 # Предполагаем, что они будут переданы из главного файла

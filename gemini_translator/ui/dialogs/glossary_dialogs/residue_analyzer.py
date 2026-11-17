@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 
-from .custom_widgets import ExpandingTextEditDelegate, ExpandingTextEdit
+from .custom_widgets import ExpandingTextEdit
 from ....ui.widgets.ancestor_utils import find_ancestor_by_class_name
 from ....api import config as api_config
 from ...shell import ShellPage
@@ -182,7 +182,7 @@ class ResidueAnalyzerPage(ShellPage):
         if self.left_list.count() > 0: self.left_list.setCurrentRow(0)
         else: self._clear_right_panel()
 
-    def _on_item_selected(self, current_item, previous_item):
+    def _on_item_selected(self, current_item, _previous_item):
         if not current_item: 
             self._clear_right_panel()
         else: 
@@ -336,7 +336,7 @@ class ResidueAnalyzerPage(ShellPage):
         table = QTableWidget(); table.setColumnCount(5)
         table.setAlternatingRowColors(True)
         table.setHorizontalHeaderLabels(["Тип", "Оригинал/Фрагмент", "Перевод", "Примечание", "Действия"])
-        delegate = ExpandingTextEditDelegate(table); header = table.horizontalHeader()
+        header = table.horizontalHeader()
         for i in [1,2,3]: header.setSectionResizeMode(i, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)

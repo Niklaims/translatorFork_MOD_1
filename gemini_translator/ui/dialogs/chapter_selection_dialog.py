@@ -5,11 +5,11 @@ ChapterSelectionDialog - Диалог выбора глав для провер�
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget,
-    QListWidgetItem, QLabel, QMessageBox, QLineEdit,
-    QGroupBox, QCheckBox, QDialogButtonBox
+    QListWidgetItem, QLabel, QLineEdit,
+    QDialogButtonBox
 )
 from PyQt6.QtCore import Qt
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional
 
 try:
     from ...api import config as api_config

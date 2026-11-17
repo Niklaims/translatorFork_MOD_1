@@ -1,5 +1,4 @@
 import asyncio
-import time
 from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (
     ContentFilterError, NetworkError, LocationBlockedError,

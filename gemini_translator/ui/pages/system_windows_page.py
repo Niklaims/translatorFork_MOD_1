@@ -59,7 +59,6 @@ from gemini_translator.utils.system_windows import (
     chat_readers,
     find_source_epub,
     forum_structure,
-    is_chat_header,
     is_reader,
     render_preview_document,
     render_window,

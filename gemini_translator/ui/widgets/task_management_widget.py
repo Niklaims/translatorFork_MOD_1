@@ -1,9 +1,8 @@
 # gemini_translator/ui/widgets/task_management_widget.py
-from collections import Counter
 import traceback
-from PyQt6 import QtWidgets, QtCore, QtGui # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
+from PyQt6 import QtWidgets, QtCore # <-- ИЗМЕНЕНИЕ ЗДЕСЬ
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox
-from PyQt6.QtCore import pyqtSignal, Qt, pyqtSlot
+from PyQt6.QtCore import pyqtSignal
 
 # Импортируем наш же виджет списка глав
 from .chapter_list_widget import ChapterListWidget

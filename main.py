@@ -9,7 +9,6 @@ if os.path.exists(_venv_site) and _venv_site not in sys.path:
     sys.path.insert(0, _venv_site)
 
 import os_patch
-import builtins
 import argparse
 import traceback
 import asyncio
@@ -19,17 +18,13 @@ import base64
 import threading
 import time
 import importlib
-import subprocess
 from collections import deque
 from pathlib import Path
 from PyQt6 import QtWidgets, QtCore, QtGui, sip
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
-from gemini_translator.api.managers import ApiKeyManager
 from gemini_translator.utils.glossary_tools import ContextManager
-from gemini_translator.ui.dialogs.setup import InitialSetupDialog
-from gemini_translator.ui.dialogs.glossary import MainWindow as GlossaryToolWindow
-from gemini_translator.ui.dialogs.validation import TranslationValidatorDialog
+from gemini_translator.ui.dialogs.setup import InitialSetupDialog  # noqa: F401  (ре-экспорт для main_translator_only)
 from gemini_translator.utils.settings import SettingsManager, configure_settings_scope
 from gemini_translator.utils.project_manager import TranslationProjectManager
 from gemini_translator.core.translation_engine import TranslationEngine
@@ -40,11 +35,8 @@ from gemini_translator.utils.server_manager import ServerManager
 from gemini_translator.server.opds_server import OPDSManager
 from gemini_translator.version import APP_VERSION
 from window_branding import install_window_title_branding
-from gemini_translator.ui.dialogs.proxy import ProxySettingsDialog
 from gemini_translator.ui.themes import (
     DARK_STYLESHEET,
-    build_dark_stylesheet,
-    extract_theme_colors,
 )
 from gemini_translator.ui import theme_manager
 from gemini_translator.ui.selection_translator import install_selection_translator

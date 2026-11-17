@@ -7,8 +7,7 @@ import urllib.request
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
-    QGroupBox, QGridLayout, QLabel, QComboBox, QSpinBox, QDoubleSpinBox,
-    QFormLayout, QHBoxLayout, QCheckBox, QWidget, QVBoxLayout, QPushButton,
+    QGroupBox, QGridLayout, QLabel, QComboBox, QFormLayout, QHBoxLayout, QCheckBox, QWidget, QVBoxLayout, QPushButton,
     QDialog, QDialogButtonBox, QLineEdit
 )
 from PyQt6.QtCore import pyqtSignal, pyqtSlot
@@ -1087,8 +1086,6 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
     def _update_provider_specific_controls(self, provider_id):
         self._current_provider_id = provider_id
         is_workascii = provider_id == "workascii_chatgpt"
-        provider_config = api_config.api_providers_view().get(provider_id, {}) if provider_id else {}
-        is_dynamic_provider = provider_id == "local" or bool(provider_config.get("dynamic_model_discovery"))
         is_free_deepseek = provider_id == FREE_DEEPSEEK_PROVIDER_ID
         self.workascii_group.setVisible(is_workascii)
         self.free_deepseek_tools_btn.setVisible(is_free_deepseek)
@@ -1913,8 +1910,8 @@ class SystemInstructionEditorDialog(QDialog):
         layout.addWidget(self.preset_widget)
 
         button_box = QDialogButtonBox()
-        ok_button = button_box.addButton("Принять", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        button_box.addButton("Принять", QDialogButtonBox.ButtonRole.AcceptRole)
+        button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)

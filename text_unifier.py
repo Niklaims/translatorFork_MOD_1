@@ -3,7 +3,6 @@
 import sys
 import os
 import zipfile  # <<< Добавлено для работы с EPUB
-import html     # Для безопасной обработки ошибок
 
 # --- ИМПОРТ ФУНКЦИИ ЛЕЧЕНИЯ ---
 try:
@@ -31,7 +30,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPlainTextEdit, QPushButton, QSplitter,
     QFileDialog, QMessageBox, QProgressBar, QFrame, QHBoxLayout
 )
-from PyQt6.QtGui import QFont, QColor, QPalette
+from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from window_branding import install_window_title_branding
 

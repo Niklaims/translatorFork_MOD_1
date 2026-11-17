@@ -6,8 +6,6 @@ from PyQt6.QtWidgets import (
     QComboBox, QInputDialog, QDialog
 )
 
-from ...api import config as api_config
-from ...utils.settings import SettingsManager
 from .common_widgets import NoScrollComboBox
 from ..overlay_host import exec_dialog
 
@@ -450,7 +448,7 @@ class PresetWidget(QWidget):
 
     def set_session_mode(self, is_session_active):
         """Переводит виджет в режим активной сессии (блокирует элементы управления)."""
-        from PyQt6.QtWidgets import QPushButton, QLineEdit, QComboBox
+        from PyQt6.QtWidgets import QPushButton, QLineEdit
         for widget in self.findChildren(QPushButton):
             widget.setEnabled(not is_session_active)
         for widget in self.findChildren(QLineEdit):

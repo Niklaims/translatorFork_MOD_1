@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 from .base_processor import BaseTaskProcessor
-from gemini_translator.api.errors import ValidationFailedError, PartialGenerationError
+from gemini_translator.api.errors import PartialGenerationError
 from gemini_translator.utils.text import clean_html_content, safe_format
 
 

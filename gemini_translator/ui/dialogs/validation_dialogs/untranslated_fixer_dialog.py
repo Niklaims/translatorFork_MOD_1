@@ -9,8 +9,7 @@ from bs4 import BeautifulSoup
 from PyQt6 import QtGui
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QTableWidget, QHeaderView, QApplication, QHBoxLayout, QLineEdit,
-    QDialogButtonBox, QTableWidgetItem, QMessageBox, QGroupBox, QWidget, QListWidget, QStyle,
-    QCheckBox, QLabel, QPushButton, QGridLayout, QComboBox, QFrame, QSizePolicy, QLayout, QScrollArea, QMenu, QTextEdit
+    QDialogButtonBox, QTableWidgetItem, QMessageBox, QGroupBox, QWidget, QListWidget, QCheckBox, QLabel, QPushButton, QGridLayout, QComboBox, QFrame, QLayout, QScrollArea, QMenu, QTextEdit
 )
 from PyQt6.QtCore import Qt, QSize, pyqtSignal, pyqtSlot, QRect, QPoint, QTimer
 
@@ -25,7 +24,7 @@ from ....utils.io_utils import atomic_write_json
 from ...widgets import (
     KeyManagementWidget, ModelSettingsWidget, LogWidget, PresetWidget
 )
-from ...widgets.common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from ...widgets.common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox
 from ...item_background import ItemBackgroundDelegate
 from ...widgets.ancestor_utils import find_ancestor_by_predicate
 from ...shell import ShellPage
@@ -146,7 +145,6 @@ class FlowLayout(QLayout):
         spacing_x, spacing_y = self._h_spacing, self._v_spacing
         
         for item in self._items:
-            w = item.widget()
             space_x = spacing_x
             space_y = spacing_y
             next_x = x + item.sizeHint().width() + space_x
@@ -571,8 +569,8 @@ class AdvancedTagFilterDialog(QDialog):
         
         # --- Кнопки диалога (РУСИФИКАЦИЯ) ---
         bbox = QDialogButtonBox()
-        apply_btn = bbox.addButton("Применить фильтры", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_btn = bbox.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        bbox.addButton("Применить фильтры", QDialogButtonBox.ButtonRole.AcceptRole)
+        bbox.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         
         bbox.accepted.connect(self.accept)
         bbox.rejected.connect(self.reject)
@@ -798,7 +796,7 @@ class UntranslatedFixerPage(ShellPage):
 
         _, clean_text, stats = self._get_effective_context_payload(item)
         clean_text_lower = clean_text.lower()
-        source_type = item.get('source_type', 'system')
+        item.get('source_type', 'system')
         term = str(item.get('term', '') or '').strip()
         term_lower = term.lower()
 
@@ -1293,8 +1291,8 @@ class UntranslatedFixerPage(ShellPage):
 
         # --- Dialog Buttons ---
         button_box = QDialogButtonBox()
-        apply_button = button_box.addButton("Применить и закрыть", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        button_box.addButton("Применить и закрыть", QDialogButtonBox.ButtonRole.AcceptRole)
+        button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
@@ -2235,7 +2233,7 @@ class UntranslatedFixerPage(ShellPage):
         msg.setInformativeText("Как применить?")
         
         b_save = msg.addButton("Применить и Сохранить", QMessageBox.ButtonRole.AcceptRole)
-        b_apply = msg.addButton("Только в память", QMessageBox.ButtonRole.YesRole)
+        msg.addButton("Только в память", QMessageBox.ButtonRole.YesRole)
         b_cancel = msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
         
         msg.exec()

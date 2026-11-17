@@ -134,7 +134,7 @@ def estimate_openrouter_tokens(text):
 
 # --- Добавляем глобальную проверку BeautifulSoup, так как она нужна в main.py ---
 try:
-    from bs4 import BeautifulSoup
+    import bs4  # noqa: F401  # проверка доступности beautifulsoup4, см. BS4_AVAILABLE
     BS4_AVAILABLE = True
 except ImportError:
     BS4_AVAILABLE = False

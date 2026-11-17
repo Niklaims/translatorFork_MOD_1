@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import re
 import unicodedata
-from collections import Counter, defaultdict
+from collections import Counter
 from difflib import SequenceMatcher
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from .document_importer import _read_text_with_fallbacks
 from .epub_tools import EpubCreator
-from .language_tools import LanguageDetector
 # NumericSortItem намеренно НЕ импортируется здесь на верхнем уровне:
 # gemini_translator/utils — слой utils, а gemini_translator.ui.widgets — слой
 # ui с жадным __init__.py (тянет 14 виджет-модулей). Импорт ниже локальный,

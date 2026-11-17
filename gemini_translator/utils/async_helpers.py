@@ -4,7 +4,6 @@
 import asyncio
 import contextvars
 import functools
-from concurrent.futures import Future, ThreadPoolExecutor
 import threading
 
 def run_sync(func, *args, forget: bool = False, timeout: float = None, executor=None, **kwargs) -> any:

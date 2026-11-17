@@ -8,7 +8,6 @@ import contextvars
 import time
 import sys
 import certifi
-from PyQt6.QtWidgets import QApplication
 from ..utils.async_helpers import run_sync
 from ..utils.debug_logger import create_operation_trace
 from ..utils.helpers import estimate_gemini_tokens
@@ -20,8 +19,7 @@ from .dns_fallback import (
     resolve_via_doh,
 )
 from .errors import (
-    OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, SuccessSignal,
-    ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError, GracefulShutdownInterrupt
+    OperationCancelledError, ContentFilterError, RateLimitExceededError, LocationBlockedError, ModelNotFoundError, ValidationFailedError, NetworkError, PartialGenerationError, TemporaryRateLimitError
 )
 
 _thread_local = threading.local()
@@ -89,7 +87,6 @@ try:
     import socks
     from aiohttp_socks import (
         ProxyConnector,
-        ProxyType,
         ProxyError as _AiohttpSocksProxyError,
         ProxyConnectionError as _AiohttpSocksProxyConnectionError,
         ProxyTimeoutError as _AiohttpSocksProxyTimeoutError,
@@ -106,7 +103,6 @@ try:
 except (ImportError, AttributeError):
     socks = None
     ProxyConnector = None
-    ProxyType = None
     PROXY_ERRORS = ()
 
 # Транспортные сбои для `except` в хендлерах на aiohttp. Без PROXY_ERRORS отказ

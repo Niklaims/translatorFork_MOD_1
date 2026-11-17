@@ -26,9 +26,6 @@ from ...shell import ShellPage
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 
 # --- Аннотация типа для избежания циклического импорта ---
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from gemini_translator.ui.dialogs.glossary import MainWindow, GlossaryLogic
 
 
 PATTERN_TEXT_ROLE = Qt.ItemDataRole.UserRole + 11

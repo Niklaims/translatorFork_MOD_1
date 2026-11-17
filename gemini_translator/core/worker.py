@@ -8,7 +8,6 @@
 # ---------------------------------------------------------------------------
     
 import copy
-import time
 import traceback
 
 import sys
@@ -22,7 +21,6 @@ import asyncio
 from concurrent.futures import CancelledError
 
 from PyQt6 import QtCore, QtWidgets
-from PyQt6.QtCore import QObject
 # --- Импорты из сторонних библиотек ---
 
 # --- Импорты из нашего проекта ---
@@ -32,10 +30,7 @@ from gemini_translator.utils.text import validate_html_structure
 
 # Импорт ошибок
 from gemini_translator.api.errors import (
-    ErrorType, WorkerAction, SuccessSignal, ContentFilterError, 
-    OperationCancelledError, LocationBlockedError, ModelNotFoundError, 
-    RateLimitExceededError, TemporaryRateLimitError, NetworkError, OperationCancelledError,
-    GracefulShutdownInterrupt, ValidationFailedError, PartialGenerationError
+    ErrorType, WorkerAction, SuccessSignal, GracefulShutdownInterrupt
 )
 # Импорт ресурсов потока
 from gemini_translator.api.base import get_worker_loop
@@ -940,7 +935,7 @@ class UniversalWorker(EventBusMixin):
             # Исключение SuccessSignal от hello_task также является успехом
             self._post_event('log_message', {'message': f"🔥 [WARMUP] Ритуал-приветствие для ключа …{self.api_key[-4:]} завершен."})
             return True
-        except Exception as e:
+        except Exception:
             # Любое другое исключение - это провал.
             # analyze_and_act уже залогировал причину, нам не нужно дублировать.
             self._post_event('log_message', {'message': f"🔻 [WARMUP] Ритуал-приветствие для ключа …{self.api_key[-4:]} провален. Воркер будет остановлен."})

@@ -3,8 +3,8 @@
 import math
 import itertools  # <<< ДОБАВЛЕН ИМПОРТ
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
-    QSpinBox, QCheckBox, QDialogButtonBox, QMessageBox
+    QDialog, QVBoxLayout, QGridLayout, QGroupBox, QLabel,
+    QCheckBox, QDialogButtonBox, QMessageBox
 )
 from PyQt6.QtCore import Qt
 from ..utils.epub_tools import TASK_SIZE_UNIT_CHARS, extract_number_from_path, normalize_task_size_unit

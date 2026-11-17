@@ -734,7 +734,7 @@ class PatientLock:
     def __enter__(self):
         self.acquire()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, _exc_val, exc_tb):
         self.release()
   
 class PatientSQLiteConnection(sqlite3.Connection):

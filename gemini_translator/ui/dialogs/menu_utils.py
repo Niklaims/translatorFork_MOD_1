@@ -68,7 +68,7 @@ def prompt_return_to_menu(parent: QWidget, title="Завершение рабо�
 
     btn_menu = msg_box.addButton(menu_button_text, QMessageBox.ButtonRole.ActionRole)
     btn_exit = msg_box.addButton("Выйти из программы", QMessageBox.ButtonRole.DestructiveRole)
-    btn_cancel = msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+    msg_box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
 
     msg_box.exec()
     clicked = msg_box.clickedButton()

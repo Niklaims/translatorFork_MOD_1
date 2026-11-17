@@ -7,7 +7,7 @@ import time
 from collections import defaultdict, Counter
 from PyQt6 import QtWidgets
 from PyQt6 import QtCore
-from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, pyqtSlot
 from ..api import config as api_config
 from ..utils.translated_paths import build_translated_output_path
 from .task_manager import decompress_chunk_content

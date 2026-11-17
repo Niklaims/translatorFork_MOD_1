@@ -310,7 +310,7 @@ def _extract_final_answer_and_model_from_sse(lines: Iterable[bytes]) -> Tuple[st
                  line_str = raw.decode('utf-8', 'ignore')
                  if line_str.startswith("data:"):
                      json_part = line_str[5:].strip()
-                     data = json.loads(json_part)
+                     json.loads(json_part)
                      detected_model = False
                      break # Немедленно выходим из цикла
         except Exception:
@@ -591,7 +591,6 @@ def chat_completions() -> Any:
         error_type = result.get("error_type", "") # <--- Получаем наш флаг
         if error_type == "model_not_found":
             code = 404 # Not Found
-            error_payload = {"message": err_msg, "type": "invalid_request_error", "code": 404}
 
         elif "Вам включили лимиты" in err_msg:
             return jsonify({"error": {"message": err_msg, "type": "quota_exceeded", "code": 402}}), 402

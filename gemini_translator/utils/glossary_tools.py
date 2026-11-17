@@ -4,12 +4,10 @@
 # Инструменты для работы с глоссарием
 # ---------------------------------------------------------------------------
 
-import os
 import json
 import re
 import time
 import zipfile
-import threading
 import random
 from dataclasses import dataclass
 from ..utils.language_tools import SmartGlossaryFilter, GlossaryRegexService, get_chinese_script_variants

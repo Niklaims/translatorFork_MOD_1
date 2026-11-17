@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-from copy import deepcopy
-import json
-from pathlib import Path
 import traceback
-from typing import Any
 
-from PyQt6 import QtCore, QtGui
+from PyQt6 import QtCore
 
-from ...api import config as api_config
 from ...benchmark.runner import BenchmarkRunner
-from ...utils.document_importer import DOCUMENT_INPUT_FILTER, extract_document_chapters
 
 
 class BenchmarkRunWorker(QtCore.QThread):

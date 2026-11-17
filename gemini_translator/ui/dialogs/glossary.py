@@ -10,8 +10,7 @@ import json
 import os
 import time
 import copy
-from collections import defaultdict, Counter
-import functools
+from collections import defaultdict
 import itertools
 import sqlite3 # <-- Новый импорт
 import uuid    # <-- Новый импорт
@@ -21,28 +20,30 @@ from PyQt6.QtCore import Qt, pyqtSlot, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
-    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QLineEdit,
-    QFileDialog, QMessageBox, QWidget, QHBoxLayout, QComboBox,
-    QSplitter, QStyle, QGroupBox, QAbstractItemView, QGridLayout
+    QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox, QWidget, QHBoxLayout, QComboBox,
+    QSplitter, QGroupBox, QAbstractItemView, QGridLayout
 )
 
 # --- Импорты из модулей проекта ---
 
 # Диалоги, вынесенные в отдельные файлы
-from .glossary_dialogs.ai_correction import CorrectionSessionDialog, CorrectionSessionPage
-from .glossary_dialogs.core_term_dialog import CoreTermAnalyzerDialog, CoreTermAnalyzerPage
+# Часть имён ниже не используется внутри этого файла: они импортируются как
+# ре-экспорт, потому что другие модули и тесты обращаются к ним через атрибут
+# этого модуля (например patch.object(glossary_module, "CorrectionSessionDialog")).
+from .glossary_dialogs.ai_correction import CorrectionSessionDialog, CorrectionSessionPage  # noqa: F401
+from .glossary_dialogs.core_term_dialog import CoreTermAnalyzerDialog, CoreTermAnalyzerPage  # noqa: F401
 from .glossary_dialogs.versioning import TermVersioningDialog
 from .glossary_dialogs.action_delegate import ACTIONS_ROLE, GlossaryActionDelegate
-from .glossary_dialogs.residue_analyzer import ResidueAnalyzerDialog, ResidueAnalyzerPage
+from .glossary_dialogs.residue_analyzer import ResidueAnalyzerDialog, ResidueAnalyzerPage  # noqa: F401
 from .glossary_dialogs.conflict_resolvers import (
     DirectConflictResolverDialog,
-    ReverseConflictResolverDialog,
+    ReverseConflictResolverDialog,  # noqa: F401
     ReverseConflictResolverPage,
-    ComplexOverlapResolverDialog,
+    ComplexOverlapResolverDialog,  # noqa: F401
     ComplexOverlapResolverPage,
 )
-from .glossary_dialogs.group_analyzer import GroupAnalysisDialog, GroupAnalysisPage
-from .glossary_dialogs.term_frequency_analyzer import TermFrequencyAnalyzerDialog, TermFrequencyAnalyzerPage
+from .glossary_dialogs.group_analyzer import GroupAnalysisDialog, GroupAnalysisPage  # noqa: F401
+from .glossary_dialogs.term_frequency_analyzer import TermFrequencyAnalyzerDialog, TermFrequencyAnalyzerPage  # noqa: F401
 from .glossary_dialogs.import_master import (
     ImporterWizardDialog,
     MultiImportManagerDialog
@@ -55,10 +56,9 @@ from .glossary_dialogs.custom_widgets import ExpandingTextEditDelegate
 from ..shell import ShellPage
 from .menu_utils import PageDialogProxyMixin, make_page_delegating_meta, prompt_return_to_menu
 from ...api import config as api_config
-from ...utils.settings import SettingsManager
 from ...utils.io_utils import atomic_write_json
 from ...utils.language_tools import (
-    LanguageDetector, ChineseTextProcessor, GlossaryLogic
+    ChineseTextProcessor, GlossaryLogic
 )
 from gemini_translator.ui import theme_manager
 
@@ -1575,7 +1575,7 @@ class GlossaryManagerPage(ShellPage):
         
         # --- НАЧАЛО ИЗМЕНЕНИЙ ---
         button_box = QDialogButtonBox()
-        cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         button_box.rejected.connect(dialog.reject)
         # --- КОНЕЦ ИЗМЕНЕНИЙ ---
         
@@ -2370,7 +2370,7 @@ class GlossaryManagerPage(ShellPage):
         msg_box.setText(f"Вы уверены, что хотите удалить {len(db_ids_to_delete)} выделенных строк(у)?")
         msg_box.setIcon(QMessageBox.Icon.Question)
         yes_button = msg_box.addButton("Да, удалить", QMessageBox.ButtonRole.YesRole)
-        no_button = msg_box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+        msg_box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
         msg_box.exec()
         
         if msg_box.clickedButton() == yes_button:
@@ -3717,7 +3717,7 @@ class GlossaryManagerPage(ShellPage):
             msg_box.setIcon(QMessageBox.Icon.Question)
             
             btn_yes = msg_box.addButton("Да, восстановить", QMessageBox.ButtonRole.YesRole)
-            btn_no = msg_box.addButton("Нет, пропустить", QMessageBox.ButtonRole.NoRole)
+            msg_box.addButton("Нет, пропустить", QMessageBox.ButtonRole.NoRole)
             
             msg_box.exec()
             
@@ -3754,7 +3754,7 @@ class GlossaryManagerPage(ShellPage):
                 msg_box.setIcon(QMessageBox.Icon.Question)
                 
                 btn_yes = msg_box.addButton("Да, удалить", QMessageBox.ButtonRole.YesRole)
-                btn_no = msg_box.addButton("Нет, оставить", QMessageBox.ButtonRole.NoRole)
+                msg_box.addButton("Нет, оставить", QMessageBox.ButtonRole.NoRole)
                 
                 msg_box.exec()
                 

@@ -10,7 +10,6 @@
 import re
 import unicodedata # Этот импорт должен быть
 import itertools
-import math
 from collections import Counter, defaultdict # Убедимся, что Counter импортирован
 
 import importlib
@@ -916,7 +915,6 @@ class SmartGlossaryFilter:
         Проверяет кандидатов на соответствие корейскому тексту, сегментированному пробелами.
         Использует "скользящее окно" для точного поиска фраз.
         """
-        validated = set()
         
         # --- Подготовка глоссария кандидатов ---
         prepared_glossary = {}

@@ -124,7 +124,6 @@ def remove_vibrancy(widget) -> bool:
     try:
         import objc
         import AppKit
-        from PyQt6.QtCore import Qt
 
         view = objc.objc_object(c_void_p=int(widget.winId()))
         window = view.window()

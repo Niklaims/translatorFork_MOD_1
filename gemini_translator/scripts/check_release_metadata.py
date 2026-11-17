@@ -9,7 +9,8 @@ from pathlib import Path
 from gemini_translator.version import APP_VERSION, __version__
 
 
-RELEASE_NOTES_PATTERN = re.compile(r"^RELEASE_NOTES_v(?P<version>\d+\.\d+\.\d+)\.md$")
+RELEASE_NOTES_DIRNAME = "docs/release_notes"
+RELEASE_NOTES_PATTERN = re.compile(r"^v?(?P<version>\d+\.\d+\.\d+)\.md$")
 RELEASE_VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 
 
@@ -23,9 +24,16 @@ def _version_tuple(value: str) -> tuple[int, ...]:
     return tuple(int(part) for part in parts)
 
 
+def _release_notes_dir(project_root: Path) -> Path:
+    return project_root / RELEASE_NOTES_DIRNAME
+
+
 def _release_note_versions(project_root: Path) -> list[tuple[int, ...]]:
+    notes_dir = _release_notes_dir(project_root)
+    if not notes_dir.is_dir():
+        return []
     versions = []
-    for path in project_root.glob("RELEASE_NOTES_v*.md"):
+    for path in notes_dir.glob("*.md"):
         match = RELEASE_NOTES_PATTERN.match(path.name)
         if match:
             versions.append(_version_tuple(match.group("version")))
@@ -54,16 +62,13 @@ def check_release_metadata(project_root: Path | None = None, *, release: bool = 
     current_version = _version_tuple(__version__)
 
     release_versions = _release_note_versions(root)
-    if not release_versions:
-        errors.append("No RELEASE_NOTES_v*.md files found.")
-        return errors
-
-    latest_release_version = max(release_versions)
-    if current_version < latest_release_version:
-        latest = ".".join(str(part) for part in latest_release_version)
-        errors.append(
-            f"Application version {__version__!r} is older than latest release notes v{latest}."
-        )
+    if release_versions:
+        latest_release_version = max(release_versions)
+        if current_version < latest_release_version:
+            latest = ".".join(str(part) for part in latest_release_version)
+            errors.append(
+                f"Application version {__version__!r} is older than latest release notes v{latest}."
+            )
 
     if release:
         if not release_version:

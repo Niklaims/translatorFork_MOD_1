@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 
-import sys
 import os
 import zipfile
 import re
@@ -61,8 +60,8 @@ from ...qa.ratio_profiles import validation_ratio_presets
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QFileDialog, QTableWidget, QTableWidgetItem, QLabel, QHeaderView,
-    QMessageBox, QAbstractItemView, QSpinBox, QCheckBox, QGroupBox,
+    QTableWidget, QTableWidgetItem, QLabel, QHeaderView,
+    QMessageBox, QAbstractItemView, QCheckBox, QGroupBox,
     QDialog, QTextEdit, QSplitter, QComboBox, QScrollArea, QDialogButtonBox,
     QGridLayout, QProgressDialog
 )
@@ -81,7 +80,7 @@ from ..overlay_host import exec_dialog
 from .word_exceptions_dialog import open_word_exceptions_manager
 from .validation_dialogs.untranslated_fixer_dialog import (
     AITranslationDialog,
-    UntranslatedFixerDialog,
+    UntranslatedFixerDialog,  # noqa: F401  (ре-экспорт: используется как атрибут модуля)
     UntranslatedFixerPage,
     build_effective_untranslated_prompt,
     build_translation_tasks_from_data_items,
@@ -250,8 +249,8 @@ class LargeTextInputDialog(QDialog):
 
         # Кнопки Ok/Cancel
         button_box = QDialogButtonBox()
-        ok_button = button_box.addButton("Принять", QDialogButtonBox.ButtonRole.AcceptRole)
-        cancel_button = button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
+        button_box.addButton("Принять", QDialogButtonBox.ButtonRole.AcceptRole)
+        button_box.addButton("Отмена", QDialogButtonBox.ButtonRole.RejectRole)
         
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
@@ -6981,7 +6980,6 @@ class TranslationValidatorPage(ShellPage):
 
     def request_retry_translation(self):
         files_to_retry = []
-        original_epub_path = self.original_epub_path
 
         for data in self.results_data.values():
             if data['status'] == 'retry':

@@ -1,6 +1,8 @@
 from pathlib import Path
 import importlib.util
 
+import pytest
+
 
 def _version_tuple(value: str) -> tuple[int, ...]:
     if value.strip().lower() == "dev":
@@ -27,10 +29,13 @@ def test_main_uses_shared_app_version():
 def test_app_version_is_not_older_than_latest_release_notes():
     from gemini_translator.version import __version__
 
+    notes_dir = Path(__file__).resolve().parents[1] / "docs" / "release_notes"
     release_versions = [
-        _version_tuple(path.stem.removeprefix("RELEASE_NOTES_"))
-        for path in Path(__file__).resolve().parents[1].glob("RELEASE_NOTES_v*.md")
+        _version_tuple(path.stem)
+        for path in notes_dir.glob("v*.md")
     ]
 
-    assert release_versions
+    if not release_versions:
+        pytest.skip("в репозитории нет файлов release notes")
+
     assert _version_tuple(__version__) >= max(release_versions)

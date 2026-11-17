@@ -282,7 +282,7 @@ class MainShell(QtWidgets.QMainWindow):
         msg_box.setText("Вы действительно хотите выйти из программы?")
         msg_box.setIcon(QtWidgets.QMessageBox.Icon.Question)
 
-        btn_exit = msg_box.addButton("Выйти", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        msg_box.addButton("Выйти", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
         btn_cancel = msg_box.addButton("Отмена", QtWidgets.QMessageBox.ButtonRole.RejectRole)
 
         msg_box.exec()

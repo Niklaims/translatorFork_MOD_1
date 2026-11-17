@@ -14,22 +14,7 @@ from html import escape
 from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString, Tag
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtWidgets import (
-    QFileDialog,
-    QFormLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QSpinBox,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtCore import QThread, pyqtSignal
 from ...utils.epub_tools import find_opf_path
 
 

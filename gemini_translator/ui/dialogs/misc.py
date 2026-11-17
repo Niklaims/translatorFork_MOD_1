@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 
 import os
-import json
 from PyQt6 import QtWidgets, QtCore
 from PyQt6.QtWidgets import (
     QListWidget, QFileDialog, QDialog, QVBoxLayout, QPushButton, QLabel, 
-    QGroupBox, QDialogButtonBox, QCheckBox, QLineEdit, QHBoxLayout, 
-    QComboBox, QTextEdit, QSpinBox, QGridLayout, QMessageBox, QStyle, 
+    QDialogButtonBox, QCheckBox, QLineEdit, QHBoxLayout, 
+    QTextEdit, QMessageBox, QStyle, 
     QListWidgetItem
 )
 from PyQt6.QtCore import pyqtSignal

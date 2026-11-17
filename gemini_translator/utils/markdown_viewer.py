@@ -10,7 +10,6 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QTextBrowser,
                              QPushButton, QFrame, QWidget, QHBoxLayout, QLabel,
                              QSpacerItem, QSizePolicy, QScrollArea)
-from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt, QTimer
 
 try:
@@ -286,7 +285,6 @@ def copy_to_clipboard(text, button):
     button.setText("✓") # Ставим галочку
     button.setEnabled(False)
     # Через 2 секунды возвращаем кнопку в исходное состояние
-    from PyQt6.QtCore import QTimer
     QTimer.singleShot(2000, lambda: (button.setText(original_text), button.setEnabled(True)))
 
 class CodeBlockWidget(QFrame):

@@ -12,7 +12,6 @@ import sys
 import re
 import json
 import sqlite3
-import uuid
 import zipfile
 import shutil
 from bs4 import BeautifulSoup
@@ -21,33 +20,24 @@ import math  # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 import traceback # <--- ДОБАВЬТЕ ЭТУ СТРОКУ
 
 # --- Импорты из PyQt6 ---
-from ..widgets.overlay_tab_widget import OverlayTabWidget
 from ..wait_dialogs import show_when_slow
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QListWidget, QPushButton, QDialogButtonBox, QLabel,
-    QTextEdit, QFileDialog, QDoubleSpinBox, QListWidgetItem, QCheckBox,
-    QMessageBox, QStyle, QColorDialog,
-    QTableWidget, QTableWidgetItem, QGroupBox, QFormLayout, QHBoxLayout, QHeaderView,
-    QScrollArea, QWidget, QTabWidget, QGridLayout,
-    QPlainTextEdit, QComboBox, QSpinBox, QSplitter, QAbstractItemView, QFrame,
-    QStackedWidget, QTabBar
+    QTextEdit, QFileDialog, QListWidgetItem, QCheckBox,
+    QMessageBox, QColorDialog,
+    QGroupBox, QFormLayout, QHBoxLayout, QScrollArea, QWidget, QTabWidget, QGridLayout,
+    QPlainTextEdit, QComboBox, QSpinBox, QSplitter, QFrame,
+    QStackedWidget
 )
 
-from PyQt6.QtCore import pyqtSlot, pyqtSignal, QThread, QItemSelectionModel, QItemSelection
+from PyQt6.QtCore import pyqtSlot, pyqtSignal
 from ...scripts.package_filter_tasks import FilterPackagingDialog
 
 # --- Импорты из нашего проекта ---
 from ...api import config as api_config
-from ...api.managers import ApiKeyManager
 from ...core import auto_workflow_helpers
-from ...core.consistency_engine import (
-    DEEP_CONSISTENCY_MODE,
-    FAST_PROOFREAD_MODE,
-    normalize_consistency_mode,
-)
-from ...core.translation_engine import TranslationEngine
-from ...core.task_manager import ChapterQueueManager, TaskDBWorker
+from ...core.task_manager import TaskDBWorker
 from ...utils.settings import SettingsManager
 from ...utils.active_keys import sanitize_active_keys_by_provider
 from ...utils.epub_tools import (
@@ -73,7 +63,6 @@ from ...utils.translated_paths import build_translated_output_path
 
 from ..themes import (
     THEME_SETTINGS_KEY,
-    build_dark_stylesheet,
     editable_theme_colors,
     extract_theme_colors,
     sanitize_theme_colors,
@@ -90,8 +79,6 @@ from ..widgets.common_widgets import NoScrollSpinBox
 from .epub import EpubHtmlSelectorDialog, TranslatedChaptersManagerDialog
 from .misc import ProjectHistoryDialog, ProjectFolderDialog, GeoBlockDialog
 from .menu_utils import post_session_separator, prompt_return_to_menu, return_to_main_menu
-from .glossary import MainWindow as GlossaryToolWindow
-from .glossary import ImporterWizardDialog
 from ..shell import ShellPage
 from datetime import datetime
 import time # <-- НОВЫЙ ИМПОРТ
@@ -104,6 +91,15 @@ BENCHMARK_TEXT_SIZE = 10000     # Увеличиваем размер текст
 BASE_GLOSSARY_PROMPT_STATE_FILE = "base_glossary_prompt_state.json"
 QUEUE_AUTOSAVE_SETTING_KEY = "queue_autosave_enabled"
 SHOW_CHAPTER_CHAR_COUNT_SETTING_KEY = "show_chapter_char_count"
+
+# Поля снимка настроек, которые нельзя писать в файлы проекта: папку проекта
+# архивируют и передают вместе с книгой, поэтому ключи остаются только в
+# глобальном файле настроек пользователя.
+PROJECT_SNAPSHOT_SECRET_KEYS = frozenset({
+    "api_keys",
+    "api_keys_with_status",
+    "active_keys_by_provider",
+})
 TASK_LIST_MIN_HEIGHT = 420
 TASK_OPTIONS_MIN_HEIGHT = 400
 TASKS_TAB_MIN_HEIGHT = TASK_LIST_MIN_HEIGHT + TASK_OPTIONS_MIN_HEIGHT + 24
@@ -147,6 +143,22 @@ def load_bool_setting(settings_manager, key: str, default: bool) -> bool:
         if isinstance(settings, dict) and key in settings:
             return bool(settings.get(key))
     return bool(default)
+
+
+def _strip_secret_key_settings(settings: dict) -> dict:
+    """Возвращает копию снимка настроек без секретных полей.
+
+    Файлы проекта (``project_settings.json``, ``queue_snapshot.db``) лежат в
+    пользовательской папке: их архивируют, передают вместе с книгой и держат в
+    облаке, поэтому полные строки API-ключей туда попадать не должны.
+    """
+    if not isinstance(settings, dict):
+        return settings
+    return {
+        key: value
+        for key, value in settings.items()
+        if key not in PROJECT_SNAPSHOT_SECRET_KEYS
+    }
 
 
 def _prepare_project_location(folder_path, file_path, choice, move_original):
@@ -364,7 +376,6 @@ class ChapterTextPreviewDialog(QDialog):
         chapter_path: str,
         text_content: str,
         parent=None,
-        render_html: bool = False,
         path_caption: str | None = None,
     ):
         super().__init__(parent)
@@ -1309,17 +1320,9 @@ class InitialSetupPage(ShellPage):
             self.opds_chapters_label.setText(f"Глав в раздаче: {count}")
 
     def _load_show_chapter_char_count_enabled(self) -> bool:
-        for loader_name in ("load_full_session_settings", "load_settings"):
-            loader = getattr(self.settings_manager, loader_name, None)
-            if not callable(loader):
-                continue
-            try:
-                settings = loader()
-            except Exception:
-                continue
-            if isinstance(settings, dict) and SHOW_CHAPTER_CHAR_COUNT_SETTING_KEY in settings:
-                return bool(settings.get(SHOW_CHAPTER_CHAR_COUNT_SETTING_KEY))
-        return False
+        return load_bool_setting(
+            self.settings_manager, SHOW_CHAPTER_CHAR_COUNT_SETTING_KEY, False
+        )
 
     def _create_chapter_display_group(self) -> QGroupBox:
         group = QGroupBox("Список глав")
@@ -1344,17 +1347,9 @@ class InitialSetupPage(ShellPage):
         return group
 
     def _load_queue_autosave_enabled(self) -> bool:
-        for loader_name in ("load_full_session_settings", "load_settings"):
-            loader = getattr(self.settings_manager, loader_name, None)
-            if not callable(loader):
-                continue
-            try:
-                settings = loader()
-            except Exception:
-                continue
-            if isinstance(settings, dict) and QUEUE_AUTOSAVE_SETTING_KEY in settings:
-                return bool(settings.get(QUEUE_AUTOSAVE_SETTING_KEY))
-        return True
+        return load_bool_setting(
+            self.settings_manager, QUEUE_AUTOSAVE_SETTING_KEY, True
+        )
 
     def _create_queue_persistence_group(self) -> QGroupBox:
         group = QGroupBox("Очередь задач")
@@ -1902,7 +1897,6 @@ class InitialSetupPage(ShellPage):
         if num_chapters == 0: self.distribution_label.setText("Сначала выберите главы."); return
         num_instances = self.instances_spin.value()
         if num_instances > num_chapters: self.distribution_label.setText(f"<font color='orange'><b>Предупреждение:</b> Обработчиков ({num_instances}) больше, чем заданий ({num_chapters}).</font>"); return
-        base, extra = num_chapters // num_instances, num_chapters % num_instances
 
         avg_chapters = math.ceil(num_chapters / num_instances)
 
@@ -2409,7 +2403,7 @@ class InitialSetupPage(ShellPage):
 
         btn_skip_all = msg_box.addButton("Пропустить все переведенные", QMessageBox.ButtonRole.ActionRole)
         btn_skip_validated = msg_box.addButton("Пропустить только 'готовые'", QMessageBox.ButtonRole.ActionRole)
-        btn_keep_all = msg_box.addButton("Оставить все как есть", QMessageBox.ButtonRole.AcceptRole)
+        msg_box.addButton("Оставить все как есть", QMessageBox.ButtonRole.AcceptRole)
 
         msg_box.exec()
         clicked_button = msg_box.clickedButton()
@@ -2421,7 +2415,7 @@ class InitialSetupPage(ShellPage):
         # Если нажата "Оставить все", ничего не делаем
 
 
-    def _handle_project_initialization(self, select_mode=True):
+    def _handle_project_initialization(self):
         """
         Главный оркестратор. Вызывается, когда и файл, и папка, и главы заданы.
         Файловые операции запускаются в фоне, чтобы главное окно не зависало.
@@ -2943,7 +2937,7 @@ class InitialSetupPage(ShellPage):
 
         btn_save = msg_box.addButton("💾 Сохранить текущую", QtWidgets.QMessageBox.ButtonRole.ActionRole)
         btn_load = msg_box.addButton("📂 Загрузить с диска", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        btn_cancel = msg_box.addButton("Отмена", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        msg_box.addButton("Отмена", QtWidgets.QMessageBox.ButtonRole.RejectRole)
 
         btn_load.setEnabled(has_snapshot)
 
@@ -3441,7 +3435,6 @@ class InitialSetupPage(ShellPage):
             chapter_path=preview_path,
             text_content=preview_content,
             parent=self,
-            render_html=True,
             path_caption=(
                 f"Источник: итоговый файл проекта ({suffix_label})\n"
                 f"{preview_path}\n\n"
@@ -3978,11 +3971,40 @@ class InitialSetupPage(ShellPage):
                     self.key_management_widget.current_active_keys_by_provider[provider_id] = set(normalized_keys)
 
             provider_id = settings.get('provider')
-            active_keys = settings.get('api_keys', [])
-            if not isinstance(active_keys, (list, tuple, set)):
-                active_keys = []
-            if provider_id:
-                self.key_management_widget.set_active_keys_for_provider(provider_id, active_keys)
+            if 'api_keys' in settings:
+                # Глобальный снимок: секретные поля есть, выставляем ключи явно.
+                active_keys = settings.get('api_keys') or []
+                if not isinstance(active_keys, (list, tuple, set)):
+                    active_keys = []
+                normalized_active_keys = [
+                    key for key in active_keys
+                    if isinstance(key, str) and key.strip()
+                ]
+                if provider_id:
+                    self.key_management_widget.set_active_keys_for_provider(
+                        provider_id, normalized_active_keys
+                    )
+                else:
+                    self.key_management_widget._load_and_refresh_keys()
+            elif provider_id:
+                # Снимок из файла проекта: секретные поля вырезаны намеренно.
+                # Наборы провайдеров уже восстановлены выше, поэтому берём их
+                # как есть и не перезапрашиваем список — иначе устаревший экран
+                # затрёт восстановленный набор пустым.
+                known_keys = sorted(
+                    key
+                    for key in (
+                        self.key_management_widget.current_active_keys_by_provider.get(provider_id)
+                        or ()
+                    )
+                    if isinstance(key, str) and key.strip()
+                )
+                if known_keys or isinstance(settings.get('active_keys_by_provider'), dict):
+                    self.key_management_widget.set_active_keys_for_provider(
+                        provider_id, known_keys
+                    )
+                else:
+                    self.key_management_widget._load_and_refresh_keys()
             else:
                 self.key_management_widget._load_and_refresh_keys()
 
@@ -4022,7 +4044,10 @@ class InitialSetupPage(ShellPage):
 
         conn = None
         try:
-            payload = json.dumps(settings, ensure_ascii=False)
+            sanitized_settings = _strip_secret_key_settings(settings)
+            if not sanitized_settings:
+                return
+            payload = json.dumps(sanitized_settings, ensure_ascii=False)
             conn = sqlite3.connect(snapshot_path)
             conn.execute("CREATE TABLE IF NOT EXISTS meta_info (key TEXT PRIMARY KEY, value TEXT)")
             conn.execute(
@@ -4061,15 +4086,18 @@ class InitialSetupPage(ShellPage):
 
         project_settings_path = os.path.join(self.output_folder, "project_settings.json")
         manager_to_save = SettingsManager(config_file=project_settings_path)
-        manager_to_save.save_full_session_settings(self._get_full_ui_settings())
+        manager_to_save.save_full_session_settings(
+            _strip_secret_key_settings(self._get_full_ui_settings())
+        )
 
         self.is_settings_dirty = False
         self._refresh_dirty_window_title()
         print("[SETTINGS] Настройки проекта сохранены.")
-        if hasattr(self, 'save_settings_status_label'):
+        status_label = _instance_attr(self, "save_settings_status_label")
+        if status_label is not None:
             timestamp = datetime.now().strftime("%H:%M:%S")
-            self.save_settings_status_label.setText(f"✅ Настройки проекта сохранены · {timestamp}")
-            self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('success')};")
+            status_label.setText(f"✅ Настройки проекта сохранены · {timestamp}")
+            status_label.setStyleSheet(f"color: {theme_manager.color('success')};")
 
     def _reset_to_default_settings(self):
         msg = QMessageBox(self)
@@ -4085,9 +4113,10 @@ class InitialSetupPage(ShellPage):
                     print(f"[SETTINGS] Удален файл настроек: {config_path}")
                 except Exception as e:
                     print(f"[SETTINGS] Ошибка удаления файла настроек: {e}")
-            if hasattr(self, 'save_settings_status_label'):
-                self.save_settings_status_label.setText(f"🔄 Настройки сброшены. Перезапустите приложение.")
-                self.save_settings_status_label.setStyleSheet(f"color: {theme_manager.color('warning')};")
+            status_label = _instance_attr(self, "save_settings_status_label")
+            if status_label is not None:
+                status_label.setText("🔄 Настройки сброшены. Перезапустите приложение.")
+                status_label.setStyleSheet(f"color: {theme_manager.color('warning')};")
             QMessageBox.information(self, "Сброс завершен", "Настройки сброшены до стандартных.\nЧтобы изменения полностью вступили в силу, пожалуйста, перезапустите приложение.")
 
 
@@ -4167,7 +4196,7 @@ class InitialSetupPage(ShellPage):
         """Запускает синхронизацию проекта в фоновом потоке."""
         if not self.project_manager: return
 
-        from ...utils.project_migrator import ProjectMigrator, SyncThread
+        from ...utils.project_migrator import SyncThread
 
         self.wait_dialog = QMessageBox(self)
         self.wait_dialog.setWindowTitle("Синхронизация")
@@ -4783,7 +4812,7 @@ class InitialSetupPage(ShellPage):
             msg_box.setText(f"Не удалось найти файл или папку для проекта '{project_data.get('name')}'.")
             msg_box.setInformativeText(f"Файл: {epub_path}\nПапка: {output_folder}\n\nУдалить эту некорректную запись из истории?")
             yes_button = msg_box.addButton("Да, удалить", QMessageBox.ButtonRole.YesRole)
-            no_button = msg_box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+            msg_box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
             msg_box.exec()
             if msg_box.clickedButton() == yes_button:
                 history = self.settings_manager.load_project_history()
@@ -4999,7 +5028,7 @@ class InitialSetupPage(ShellPage):
             msg_box.setIcon(QMessageBox.Icon.Warning)
             msg_box.setText("В выбранной папке отсутствует файл 'translation_map.json'.")
             msg_box.setInformativeText("Сборщик может работать некорректно. Продолжить?")
-            yes_button = msg_box.addButton("Да, продолжить", QMessageBox.ButtonRole.YesRole)
+            msg_box.addButton("Да, продолжить", QMessageBox.ButtonRole.YesRole)
             no_button = msg_box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
             msg_box.setDefaultButton(no_button)
             msg_box.exec()
@@ -5044,7 +5073,6 @@ class InitialSetupPage(ShellPage):
         else:
             from ...utils.glossary_tools import TaskPreparer
             import zipfile
-            import os
 
             cached_sizes = get_epub_chapter_sizes_with_cache(self.project_manager, self.selected_file)
             real_chapter_sizes = {
@@ -5786,7 +5814,7 @@ class InitialSetupPage(ShellPage):
         if informative_text:
             msg_box.setInformativeText(informative_text)
         # Добавляем свою кнопку с нужным текстом
-        ok_button = msg_box.addButton(button_text, QMessageBox.ButtonRole.AcceptRole)
+        msg_box.addButton(button_text, QMessageBox.ButtonRole.AcceptRole)
         msg_box.exec()
 
     def on_enter(self) -> None:

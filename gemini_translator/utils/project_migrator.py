@@ -1,10 +1,6 @@
 # gemini_translator/utils/project_migrator.py
 
 import os
-import re
-import shutil
-import zipfile
-from .project_manager import TranslationProjectManager
 from PyQt6.QtWidgets import QMessageBox
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QMutex, QWaitCondition, Qt, QObject
 

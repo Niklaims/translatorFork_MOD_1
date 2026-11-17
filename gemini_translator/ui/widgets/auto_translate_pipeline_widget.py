@@ -1,14 +1,13 @@
 # gemini_translator/ui/widgets/auto_translate_pipeline_widget.py
 
-import os
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFrame, QScrollArea, QSizePolicy, QMessageBox
+    QFrame, QScrollArea, QMessageBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QPropertyAnimation, QSize
-from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QColor
+from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter
 from PyQt6.QtSvg import QSvgRenderer
 
 from gemini_translator.ui import theme_manager
@@ -18,8 +17,6 @@ from gemini_translator.ui.widgets.chapter_list_widget import (
     get_task_status_display_info,
     get_task_status_tooltip,
 )
-from gemini_translator.utils.settings import SettingsManager
-from gemini_translator.utils.epub_tools import extract_number_from_path
 
 _ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
@@ -609,7 +606,6 @@ class AutoTranslatePipelineWidget(QWidget):
         bus = getattr(parent, "bus", None) or getattr(parent, "event_bus", None)
         if bus:
             return bus
-        app = QMessageBox.instance() if hasattr(QMessageBox, "instance") else None
         from PyQt6.QtWidgets import QApplication
         q_app = QApplication.instance()
         return getattr(q_app, "event_bus", None)

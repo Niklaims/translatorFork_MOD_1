@@ -17,7 +17,6 @@ from itertools import groupby
 from difflib import SequenceMatcher
 from collections import Counter
 import math
-from ..api import config as api_config
 from .glued_words import repair_glued_russian_words_in_html
 
 DASH_CHARS = '—–−─-'
@@ -1401,7 +1400,7 @@ def repair_quotes(text: str) -> str:
         return ""
 
     chars = list(text)
-    n = len(chars)
+    len(chars)
     
     # --- РЕЕСТР СОСТОЯНИЙ ---
     # quote_map[index] = { 'type': 'OPEN'/'CLOSE', 'power': 'STRICT'/'FLEXIBLE', 'marry': partner_index }
@@ -2325,14 +2324,12 @@ def repair_json_string(json_string: str) -> str | None:
                 pass # Не получилось, идем к "тяжелой артиллерии"
 
         # Попытка №2: "Примерка" скобок (режим Титана)
-        repaired = False
         for i in range(1, 6):
             closing_braces = '}' * i
             test_value = '{' + content.rstrip(' \t\n\r,') + closing_braces
             try:
                 json.loads(test_value)
                 rescued_pairs.append((key_str, test_value))
-                repaired = True
                 break
             except json.JSONDecodeError:
                 continue

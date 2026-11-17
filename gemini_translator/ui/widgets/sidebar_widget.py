@@ -1,6 +1,6 @@
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QSpacerItem, QSizePolicy, QFrame
-from PyQt6.QtCore import pyqtSignal, QPropertyAnimation
+from PyQt6 import QtCore, QtWidgets
+from PyQt6.QtWidgets import QVBoxLayout, QPushButton, QLabel, QSpacerItem, QSizePolicy, QFrame
+from PyQt6.QtCore import pyqtSignal
 
 from gemini_translator.ui import theme_manager
 

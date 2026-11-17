@@ -1,18 +1,17 @@
 # gemini_translator/ui/dialogs/glossary_dialogs/versioning.py
 
 import os
-import zipfile
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtGui
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
     QListWidget, QListWidgetItem, QGroupBox, QTextEdit, 
-    QDialogButtonBox, QWidget, QSplitter, QCheckBox, QLineEdit,
+    QWidget, QLineEdit,
     QMessageBox, QAbstractItemView, QFrame
 )
 from PyQt6.QtCore import Qt
 
 # Импортируем утилиту для правильной сортировки глав
-from gemini_translator.utils.epub_tools import get_epub_chapter_order, extract_number_from_path
+from gemini_translator.utils.epub_tools import get_epub_chapter_order
 from gemini_translator.ui import theme_manager
 from gemini_translator.ui.dialogs import chapter_selection_dialog as _selection_utils
 from gemini_translator.ui.item_background import ItemBackgroundDelegate

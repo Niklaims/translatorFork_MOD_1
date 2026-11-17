@@ -3,7 +3,7 @@ import json
 import re
 
 # --- Импорты из PyQt6 ---
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtCore
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
     QWidget, QGroupBox, QHBoxLayout, QGridLayout, QTableWidget,
@@ -11,7 +11,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QLineEdit, QTextEdit
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QColor
 
 # --- Импорты из вашего проекта ---
 from gemini_translator.ui.widgets.common_widgets import NoScrollComboBox, NoScrollSpinBox
@@ -212,8 +212,6 @@ class ImporterWizardDialog(QDialog):
             else: # Пользователь нажал "Отмена"
                 self.reject() # Закрываем диалог
                 return None, "cancelled"
-                
-        return None, None
     
     def _prepare_for_parsing(self):
         self.preview_data_as_rows = self.original_data_as_rows[:50]
@@ -623,7 +621,6 @@ class StandaloneFileParser:
         return self.run_on_pre_split_data(initial_rows, parsing_rules, column_mapping)
 
     def _run_parsing_pipeline(self, initial_rows, parsing_rules):
-        import re
         processed_data = []
         for row in initial_rows:
             # <<< ИСПРАВЛЕНИЕ ЗДЕСЬ >>>

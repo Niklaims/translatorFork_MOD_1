@@ -156,7 +156,7 @@ class ProxySettingsDialog(QDialog):
         self.proxy_user_edit.setText(self.proxies_table.item(row, 3).text())
 
         # Загружаем пароль из настроек (если он есть)
-        settings = self.settings_manager.load_proxy_settings()
+        self.settings_manager.load_proxy_settings()
         selected_proxy = self.get_proxy_from_table_row(row)
         if selected_proxy:
             self.proxy_pass_edit.setText(selected_proxy.get('pass', ''))

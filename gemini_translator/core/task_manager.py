@@ -1,6 +1,5 @@
 # ======================================== Файл: .\gemini_translator\core\task_manager.py (ФИНАЛЬНАЯ ВЕРСИЯ) ========================================
 
-import threading
 from threading import Lock
 
 try:
@@ -16,7 +15,6 @@ import os
 import re
 import uuid
 import io
-import zipfile
 import json
 import time
 import sqlite3

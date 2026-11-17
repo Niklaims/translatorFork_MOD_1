@@ -1,23 +1,18 @@
 # gemini_translator/core/translation_engine.py
 
-import os
 import re
 import time
 import traceback
 import uuid
-import zipfile
 import threading
 
 from PyQt6 import QtWidgets, QtCore 
-from PyQt6.QtCore import QObject, pyqtSignal, QThread, pyqtSlot
-from PyQt6.QtWidgets import QMessageBox
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED, CancelledError
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
+from concurrent.futures import ThreadPoolExecutor
 
 from ..api import config as api_config
-from ..core.task_manager import ChapterQueueManager
 from ..core.worker import UniversalWorker
 from ..core.async_worker_runtime import AsyncWorkerRuntime
-from ..utils.project_manager import TranslationProjectManager
 from ..api.managers import ApiKeyManager
 from ..core.chunk_assembler import ChunkAssembler
 from ..utils.power_inhibitor import PREVENT_SLEEP_SETTING_KEY, PowerInhibitor
@@ -1302,7 +1297,7 @@ class TranslationEngine(EventBusMixin, QObject):
 
         try:
             future.result() 
-        except Exception as e:
+        except Exception:
             pass # Лог уже есть выше
 
         # ЗАЩИТА ОТ ЗОМБИ:
@@ -1593,7 +1588,6 @@ class TranslationEngine(EventBusMixin, QObject):
     @pyqtSlot()
     def log_thread_identity(self):
         """Выводит ID потока и регистрирует его как VIP."""
-        import threading
         # Импортируем os_patch, чтобы добраться до класса
         import os_patch 
         

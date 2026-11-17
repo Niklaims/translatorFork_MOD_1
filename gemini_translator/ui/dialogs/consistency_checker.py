@@ -4,7 +4,6 @@ ConsistencyValidatorDialog v2 — UI для проверки согласова�
 Включает полноценный выбор ключей через KeyManagementWidget, подсветку diff, массовое исправление.
 """
 
-import difflib
 import os
 import logging
 import tempfile
@@ -12,11 +11,10 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTableWidget,
     QTableWidgetItem, QLabel, QHeaderView, QSplitter, QTextEdit,
     QProgressBar, QMessageBox, QWidget, QComboBox, QSpinBox,
-    QGroupBox, QCheckBox, QApplication, QDialogButtonBox, QTabWidget,
+    QGroupBox, QCheckBox, QApplication, QTabWidget,
     QFrame, QStyledItemDelegate, QStyle, QStyleOptionButton
 )
 import json
-import shutil
 from pathlib import Path
 from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSlot, QThread, pyqtSignal, QRect, QEvent, QEventLoop, QTimer
@@ -1898,7 +1896,7 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
         
         # Fuzzy поиск: ищем наиболее похожий фрагмент
         if FUZZYWUZZY_AVAILABLE and len(quote) > 10:
-            best_match, best_ratio, best_pos = None, 0, -1
+            best_match, best_ratio, _best_pos = None, 0, -1
             window = len(quote)
             step = max(1, window // 4)  # Шаг для оптимизации
             
@@ -1908,7 +1906,6 @@ class ConsistencyValidatorPage(TokenUsageTrackerMixin, ShellPage):
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_match = candidate
-                    best_pos = i
             
             if best_ratio >= 70:  # Порог схожести
                 # Подсвечиваем найденный фрагмент с пометкой о fuzzy match

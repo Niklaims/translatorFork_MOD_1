@@ -3,16 +3,14 @@
 import copy
 import json
 import os
-import io
 import zipfile
 import time
 import traceback
-import json
 import math
 from os_patch import PatientLock
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
+    QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
     QWidget, QGroupBox, QHBoxLayout, QTableWidget, QHeaderView, QTableWidgetItem,
     QMessageBox, QCheckBox, QPlainTextEdit
 )
@@ -31,13 +29,11 @@ from gemini_translator.utils.language_tools import LanguageDetector
 # Импорты для работы движка
 from gemini_translator.api import config as api_config
 from gemini_translator.utils.epub_tools import TASK_SIZE_UNIT_CHARS, estimate_epub_chapter_input_size
-from gemini_translator.utils.glossary_tools import GlossaryAggregator, ContextManager
 from gemini_translator.utils.power_inhibitor import (
     PREVENT_SLEEP_SETTING_KEY,
     load_prevent_sleep_setting,
     save_prevent_sleep_setting,
 )
-from gemini_translator.utils.settings import SettingsManager
 from gemini_translator.utils.io_utils import atomic_write_json
 from gemini_translator.core.task_manager import TaskDBWorker
 from gemini_translator.ui.dialogs._shared import session_and_tasks
@@ -48,7 +44,6 @@ from gemini_translator.core.glossary_pipeline import (
     STEP_STATUS_CANCELLED,
     STEP_STATUS_FAILED,
     STEP_STATUS_LABELS,
-    STEP_STATUS_PENDING,
     STEP_STATUS_RUNNING,
     STEP_STATUS_SUCCESS,
     GlossaryPipelineRun,
@@ -61,7 +56,6 @@ from gemini_translator.core.glossary_pipeline import (
 )
 from gemini_translator.ui.widgets.common_widgets import NoScrollSpinBox
 from gemini_translator.core.worker_helpers.rpm_limiter import RPMLimiter
-from gemini_translator.utils.text import prettify_html_for_ai
 from ..menu_utils import post_session_separator, PageDialogProxyMixin, make_page_delegating_meta
 from .numbers_master import NumeralsExtractionWorker
 from ...widgets.overlay_tab_widget import install_tab_fade
@@ -1683,7 +1677,7 @@ class GenerationSessionPage(ShellPage):
         
         # --- КАСТОМНЫЕ КНОПКИ ---
         start_btn = msg.addButton("Начать поиск", QMessageBox.ButtonRole.AcceptRole)
-        cancel_btn = msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        msg.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
         
         msg.exec()
         
@@ -1933,7 +1927,7 @@ class GenerationSessionPage(ShellPage):
             QMessageBox.information(self, "Нечего убирать", "Список сгенерированных глав в базе данных пуст.")
             return
     
-        initial_count = len(self.html_files)
+        len(self.html_files)
         # Находим только те главы из текущего списка, которые есть в истории
         chapters_to_remove = [ch for ch in self.html_files if ch in processed_chapters]
         removed_count = len(chapters_to_remove)
@@ -1949,7 +1943,7 @@ class GenerationSessionPage(ShellPage):
         msg_box.setInformativeText("Вы уверены, что хотите продолжить?")
         msg_box.setIcon(QtWidgets.QMessageBox.Icon.Question)
         yes_button = msg_box.addButton("Да, убрать", QtWidgets.QMessageBox.ButtonRole.YesRole)
-        no_button = msg_box.addButton("Нет", QtWidgets.QMessageBox.ButtonRole.NoRole)
+        msg_box.addButton("Нет", QtWidgets.QMessageBox.ButtonRole.NoRole)
         msg_box.exec()
 
         if msg_box.clickedButton() != yes_button:
@@ -2539,8 +2533,8 @@ class GenerationSessionPage(ShellPage):
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Нет сессии")
             msg_box.setText("Запуск невозможен: нет активной сессии сервиса или подключенного MCP-клиента.")
-            yes_btn = msg_box.addButton("Понял", QMessageBox.ButtonRole.YesRole)
-            no_btn = msg_box.addButton("Осознал", QMessageBox.ButtonRole.NoRole)
+            msg_box.addButton("Понял", QMessageBox.ButtonRole.YesRole)
+            msg_box.addButton("Осознал", QMessageBox.ButtonRole.NoRole)
             msg_box.exec()
             return
         
@@ -3193,7 +3187,7 @@ class GenerationSessionPage(ShellPage):
             msg_box.setInformativeText("Выберите действие:")
             
             save_recovery_btn = msg_box.addButton("Сохранить в резервный файл и выйти", QtWidgets.QMessageBox.ButtonRole.ActionRole)
-            discard_btn = msg_box.addButton("Отбросить и выйти", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            msg_box.addButton("Отбросить и выйти", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
             cancel_btn = msg_box.addButton("Отмена", QtWidgets.QMessageBox.ButtonRole.RejectRole)
             msg_box.setDefaultButton(cancel_btn)
             

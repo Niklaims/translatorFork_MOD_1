@@ -7,7 +7,6 @@ from pathlib import Path
 
 from PyQt6.QtCore import QDateTime, QObject, QSettings, QThread, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import (
-    QAction,
     QDesktopServices,
     QDragEnterEvent,
     QDropEvent,
@@ -21,7 +20,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
-    QDialog,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -41,7 +39,6 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QTabWidget,
     QTextEdit,
-    QToolBar,
     QVBoxLayout,
     QWidget,
 )

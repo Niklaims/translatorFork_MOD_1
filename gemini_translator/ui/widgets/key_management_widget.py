@@ -1,4 +1,4 @@
-from .common_widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+from .common_widgets import NoScrollComboBox
 from .mcp_control_widget import McpControlWidget
 from ...api import config as api_config
 from ..dialogs.misc import KeyInputDialog, DeleteKeysDialog, CustomListWidget

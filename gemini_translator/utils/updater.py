@@ -13,7 +13,6 @@ import requests
 from PyQt6.QtCore import QThread, pyqtSignal
 from gemini_translator.api import config as api_config
 from gemini_translator.utils.qt_worker import _CallableThread
-from gemini_translator.version import APP_VERSION
 
 
 # --- Версии релизов -------------------------------------------------------

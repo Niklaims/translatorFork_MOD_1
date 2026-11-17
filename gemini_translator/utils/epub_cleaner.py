@@ -17,7 +17,6 @@ import re
 import io
 import zipfile
 from typing import List, Dict, Any, Optional, Tuple
-from xml.etree import ElementTree as ET
 
 # BS4 imports with fallback
 try:

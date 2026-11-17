@@ -1,5 +1,4 @@
 
-import io
 import os
 import time
 import zipfile
@@ -8,7 +7,7 @@ import re
 from collections import defaultdict, namedtuple
 import uuid # <--- ДОБАВИТЬ ЭТОТ ИМПОРТ
 # --- Импорты из PyQt6 ---
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtWidgets, QtCore
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QPushButton, QDialogButtonBox, QLabel,
     QWidget, QGroupBox, QCheckBox, QHBoxLayout, QGridLayout, QTableWidget,
@@ -31,19 +30,16 @@ from gemini_translator.ui.item_background import ItemBackgroundDelegate
 from ..menu_utils import PageDialogProxyMixin, make_page_delegating_meta
 from ..validation_dialogs.quality_widgets import plural
 from gemini_translator.ui.shell import ShellPage
-from gemini_translator.ui.widgets.overlay_tab_widget import OverlayTabWidget
 from gemini_translator.ui import theme_manager
 
 # API и утилиты
 from gemini_translator.api import config as api_config
 from gemini_translator.utils.glossary_review import (
     classify_translation_review_change,
-    normalize_translation_review_key,
 )
 from gemini_translator.utils.helpers import TokenCounter
 from gemini_translator.utils.language_tools import LanguageDetector
 from gemini_translator.utils.project_manager import TranslationProjectManager
-from gemini_translator.utils.settings import SettingsManager
 from gemini_translator.utils.term_frequency_tools import (
     GlossaryFrequencyWorker,
     get_term_frequency_map,
@@ -52,10 +48,7 @@ from gemini_translator.utils.term_frequency_tools import (
 )
 
 # --- Аннотация типа для избежания циклического импорта ---
-from typing import TYPE_CHECKING
 from ...widgets.overlay_tab_widget import install_tab_fade
-if TYPE_CHECKING:
-    from ..glossary import MainWindow
 
 
 
@@ -2368,7 +2361,7 @@ class CorrectionSessionPage(ShellPage):
         if not term_list: return lines
 
         # Подготовка констант для валидации
-        noise_chars = set(' .,;:!?"\'()[]{}-–—_=/\\|<>`~@#$%^&*+0123456789\t\n\r')
+        set(' .,;:!?"\'()[]{}-–—_=/\\|<>`~@#$%^&*+0123456789\t\n\r')
         structural_chars = set('/()[]+<>')
         cjk_pattern = re.compile(r'[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]')
 
@@ -3582,7 +3575,7 @@ class CorrectionPreviewDialog(QDialog):
             return False
         return True
 
-    def _on_table_current_cell_changed(self, current_row, current_col, previous_row, previous_col):
+    def _on_table_current_cell_changed(self, current_row, _current_col, previous_row, _previous_col):
         if self._suppress_table_navigation or current_row == previous_row:
             return
 

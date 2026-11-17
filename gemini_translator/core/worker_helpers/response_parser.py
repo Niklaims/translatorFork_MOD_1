@@ -528,7 +528,7 @@ class ResponseParser:
                     })
                 except Exception as e:
                     report['failed'].append((chapter_path, f"Ошибка обработки: {str(e)}"))
-        except Exception as es:
+        except Exception:
             for ch in chapter_list:
                 report['failed'].append((ch, "Критическая ошибка разбора пакета"))
             report['successful'].clear()

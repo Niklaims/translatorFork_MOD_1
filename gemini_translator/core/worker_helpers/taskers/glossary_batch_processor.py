@@ -10,7 +10,7 @@ _CJK_RE = re.compile(r'[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]')
 from bs4 import BeautifulSoup
 
 from .base_processor import BaseTaskProcessor
-from gemini_translator.api.errors import ValidationFailedError, PartialGenerationError
+from gemini_translator.api.errors import PartialGenerationError
 from gemini_translator.utils.text import clean_html_content, repair_json_string
 from gemini_translator.utils.language_tools import SmartGlossaryFilter
 from gemini_translator.utils.term_frequency_tools import (

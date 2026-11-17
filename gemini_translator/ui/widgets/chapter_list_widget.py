@@ -4,18 +4,11 @@ import os
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QGridLayout, QPushButton, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QHBoxLayout, QStyle, QMessageBox, QDialog,
+    QHeaderView, QAbstractItemView, QHBoxLayout, QMessageBox, QDialog,
     QLabel, QListWidget, QDialogButtonBox
 )
 from PyQt6.QtCore import pyqtSignal, Qt
-import uuid # Добавляем импорт
 from ..overlay_host import exec_dialog
-
-try:
-    import Levenshtein
-    LEVENSHTEIN_AVAILABLE = True
-except ImportError:
-    LEVENSHTEIN_AVAILABLE = False
 
 
 TASK_TABLE_ROW_HEIGHT = 40

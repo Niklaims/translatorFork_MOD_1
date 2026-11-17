@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Виджет настроек и промпта для этапа 'ИИ-редактирование для улучшения читаемости'."""
 
-from PyQt6 import QtCore, QtWidgets
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6 import QtWidgets
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QGroupBox,
     QCheckBox, QPushButton

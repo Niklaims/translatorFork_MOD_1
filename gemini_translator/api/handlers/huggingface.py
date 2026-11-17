@@ -1,6 +1,5 @@
 import asyncio
 import json
-import time
 import traceback
 from ..base import BaseApiHandler, TRANSPORT_ERRORS
 from ..errors import (

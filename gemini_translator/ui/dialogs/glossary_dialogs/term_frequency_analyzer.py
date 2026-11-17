@@ -554,7 +554,7 @@ class TermFrequencyAnalyzerPage(ShellPage):
         msg.setInformativeText("\n".join(details))
         
         btn_yes = msg.addButton("Да, применить", QMessageBox.ButtonRole.YesRole)
-        btn_no = msg.addButton("Нет, вернуться", QMessageBox.ButtonRole.NoRole)
+        msg.addButton("Нет, вернуться", QMessageBox.ButtonRole.NoRole)
         msg.setDefaultButton(btn_yes)
         
         msg.exec()

@@ -10,23 +10,19 @@
 
 import os
 import re
-import glob
 import zipfile
 import shutil
 import tempfile
 import json
 import html as html_lib
 import unicodedata
-from xml.etree import ElementTree as ET
 
 from defusedxml import ElementTree as SafeET
 import traceback
-from functools import partial
 import io
-import mimetypes
 # --- Импорты из PyQt6 ---
 from PyQt6 import QtWidgets, QtCore, QtGui
-from PyQt6.QtCore import pyqtSignal, pyqtSlot, QThread
+from PyQt6.QtCore import pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QListWidget, QPushButton, QListWidgetItem, QTableWidget,
     QTableWidgetItem, QGroupBox, QFormLayout, QFileDialog, QTextEdit, QMessageBox,
@@ -53,7 +49,6 @@ from ...utils.epub_tools import (
     # слишком медленным (см. _scan_chapter_titles_batch).
     _extract_first_epub_heading_text_regex,
 )
-from ...utils.text import unify_paragraphs_for_ai
 from ...utils.epub_cleaner import EpubCleaner
 from ...utils.epub_analyzer import EpubAnalyzer
 from ...utils.project_manager import TranslationProjectManager
@@ -73,22 +68,9 @@ from ...core.epub_deep_cleanup_helpers import (
 from ..overlay_host import exec_dialog
 from ..widgets.overlay_tab_widget import install_tab_fade
 from ...core.epub_duplicate_helpers import (
-    DUPLICATE_REVIEW_BLOCK_TAGS,
     analyze_duplicate_findings,
-    blocks_are_equivalent,
-    blocks_look_like_same_heading,
-    build_tag_path,
-    collect_boundary_duplicate_findings,
-    collect_start_duplicate_findings,
     extract_duplicate_review_blocks,
-    format_duplicate_preview_blocks,
-    get_duplicate_block_text,
-    get_duplicate_text_tokens,
-    is_meaningful_duplicate_text,
-    merge_finding_entry,
-    normalize_duplicate_text,
     resolve_tag_path,
-    summarize_duplicate_run,
 )
 
 # --- Вспомогательная функция (перенесена сюда, так как используется только здесь) ---
@@ -1031,7 +1013,7 @@ class EpubHtmlSelectorDialog(QDialog):
             msg_box.setIcon(QMessageBox.Icon.Information)
             
             btn_open = msg_box.addButton("Открыть инструменты", QMessageBox.ButtonRole.AcceptRole)
-            btn_close = msg_box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+            msg_box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
             
             msg_box.exec()
             
@@ -2626,7 +2608,7 @@ class TranslatedChaptersManagerDialog(QDialog):
             
             # Добавляем кнопки
             yes_button = msg_box.addButton("Да, запустить сверку", QMessageBox.ButtonRole.YesRole)
-            no_button = msg_box.addButton("Нет, отменить сборку", QMessageBox.ButtonRole.NoRole)
+            msg_box.addButton("Нет, отменить сборку", QMessageBox.ButtonRole.NoRole)
             
             msg_box.exec()
             

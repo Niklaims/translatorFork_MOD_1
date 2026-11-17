@@ -9,7 +9,6 @@ from ..errors import (
     RateLimitExceededError, ModelNotFoundError, ValidationFailedError,
     TemporaryRateLimitError, PartialGenerationError
 )
-from ._sse_stream import SSEStreamInterrupted, parse_openai_compatible_sse_stream
 from ..retry_hints import retry_after_seconds
 
 # A 429 is a pause, never a spent key. OmniRoute answers one for a closed

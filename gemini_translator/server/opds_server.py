@@ -18,7 +18,6 @@ import re
 import html as html_lib
 import threading
 import uuid
-import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from functools import partial

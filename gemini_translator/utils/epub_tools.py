@@ -361,7 +361,7 @@ class EpubUpdater:
         with zipfile.ZipFile(self.original_epub_path, 'r') as original_zip:
             
             # Список всех файлов для поиска TOC
-            all_files = original_zip.namelist()
+            original_zip.namelist()
             
             for item in original_zip.infolist():
                 if item.is_dir(): continue

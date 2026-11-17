@@ -2,7 +2,7 @@ import zipfile
 import re
 from bs4 import BeautifulSoup
 from PyQt6 import QtCore
-from PyQt6.QtCore import pyqtSignal, QThread
+from PyQt6.QtCore import pyqtSignal
 from num2words import num2words
 from gemini_translator.utils.recognizers_shim import Culture, recognize_number
 

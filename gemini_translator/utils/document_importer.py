@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import re
 
-from PyQt6 import QtCore, QtGui, QtWidgets
+from PyQt6 import QtCore, QtWidgets
 from PyQt6.QtCore import Qt
 
 from .epub_tools import EpubCreator

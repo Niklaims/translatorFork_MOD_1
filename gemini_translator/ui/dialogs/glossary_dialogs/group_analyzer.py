@@ -1,10 +1,9 @@
 import re
 from collections import Counter, defaultdict
-from PyQt6 import QtWidgets, QtCore, QtGui
+from PyQt6 import QtWidgets, QtCore
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
-    QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, 
-    QSpinBox, QGroupBox, QMessageBox, QAbstractItemView, QApplication
+    QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QGroupBox, QMessageBox, QAbstractItemView, QApplication
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from gemini_translator.ui.shell import ShellPage

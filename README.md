@@ -229,9 +229,8 @@ python -m playwright install chromium
 
 ## Пользовательская документация
 
-Основная документация для обычного пользователя находится в папке [`docs/user-guide/`](./docs/user-guide/README.md). Она описывает не внутренний код, а инструменты программы, их назначение, пошаговые сценарии и типичные ошибки.
+Основная документация для обычного пользователя находится в папке [`docs/user-guide/`](./docs/user-guide/). Она описывает не внутренний код, а инструменты программы, их назначение, пошаговые сценарии и типичные ошибки.
 
-- [`docs/user-guide/README.md`](./docs/user-guide/README.md): главный индекс пользовательской документации.
 - [`docs/user-guide/01-start-here.md`](./docs/user-guide/01-start-here.md): с чего начать и как устроен базовый рабочий процесс.
 - [`docs/user-guide/02-epub-translator.md`](./docs/user-guide/02-epub-translator.md): подробное руководство по основному переводчику EPUB.
 - [`docs/user-guide/03-validator.md`](./docs/user-guide/03-validator.md): проверка, ручная правка и AI-согласованность.

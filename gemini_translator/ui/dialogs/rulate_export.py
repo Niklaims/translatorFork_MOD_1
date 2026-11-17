@@ -3,38 +3,11 @@
 import os
 import re
 import zipfile
-import xml.etree.ElementTree as ET
 
 from html import unescape
 from pathlib import Path
 
-from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtWidgets import (
-    QAbstractItemView,
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QHeaderView,
-    QInputDialog,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QRadioButton,
-    QSpinBox,
-    QSplitter,
-    QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtCore import QThread, pyqtSignal
 from ...utils.system_windows import replace_blocks as replace_system_blocks
 from ...utils.epub_tools import (
     extract_first_epub_heading_text,

@@ -79,7 +79,6 @@ def _get_shared_map_lock(map_file_path):
         return lock
 
 import zipfile
-import re
 from ..api import config as api_config
 from .translated_paths import build_translated_relative_path
 
