@@ -96,7 +96,7 @@ jobs:
             --output update-build.json
 
       - name: Run PyInstaller
-        run: pyinstaller translatorFork_MOD.spec
+        run: pyinstaller translatorFork.spec
 
       - name: Package Windows
         if: matrix.os == 'windows-latest'
@@ -109,18 +109,18 @@ jobs:
       - name: Package macOS
         if: matrix.os == 'macos-latest'
         run: |
-          codesign --force --deep --sign - "dist/GeminiTranslator.app"
+          codesign --force --deep --sign - "dist/translatorFork.app"
           # Без --ignore-scripts сознательно: create-dmg тянет appdmg →
           # fs-xattr, а это нативный аддон с install: node-gyp rebuild.
           # Запрет скриптов сломал бы сборку DMG, и || true ниже молча
           # подсунул бы пользователям macOS архив вместо образа.
           npm install -g create-dmg@8.1.0
-          create-dmg dist/GeminiTranslator.app || true
-          mv *.dmg GeminiTranslator-macOS.dmg || true
+          create-dmg dist/translatorFork.app || true
+          mv *.dmg translatorFork-macOS.dmg || true
           # Fallback to ZIP if create-dmg fails (which can happen on some CI environments)
-          if [ ! -f GeminiTranslator-macOS.dmg ]; then
+          if [ ! -f translatorFork-macOS.dmg ]; then
             cd dist
-            zip -y -r ../GeminiTranslator-macOS.zip GeminiTranslator.app
+            zip -y -r ../translatorFork-macOS.zip translatorFork.app
             cd ..
           fi
 
@@ -131,19 +131,24 @@ jobs:
           name: GeminiTranslator-Windows-Installer
           path: installer_output/GeminiTranslator-Setup.exe
 
-      - name: Upload Windows Artifact (Portable EXE)
+      - name: Upload Windows Artifact (Portable folder)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: Compress-Archive -Path dist/translatorFork -DestinationPath dist/translatorFork-windows.zip
+
+      - name: Upload Windows Folder
         if: matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v4
         with:
           name: GeminiTranslator-Windows-Portable
-          path: dist/GeminiTranslator-Portable.exe
+          path: dist/translatorFork-windows.zip
 
       - name: Upload macOS Artifact (DMG)
         if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
           name: GeminiTranslator-macOS-DMG
-          path: GeminiTranslator-macOS.dmg
+          path: translatorFork-macOS.dmg
           if-no-files-found: ignore
 
       - name: Upload macOS Artifact (ZIP)
@@ -151,7 +156,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: GeminiTranslator-macOS-ZIP
-          path: GeminiTranslator-macOS.zip
+          path: translatorFork-macOS.zip
           if-no-files-found: ignore
 
   release:

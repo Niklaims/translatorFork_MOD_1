@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from PyQt6 import QtWidgets, sip
 
-from gemini_translator.ui.pages.validation_page import TranslationValidatorPage
+from gemini_translator.ui.dialogs.validation import TranslationValidatorPage
 from gemini_translator.ui.shell import ShellPage
 
 

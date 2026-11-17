@@ -17,16 +17,13 @@ import atexit
 import base64
 import threading
 import time
-import importlib
 from collections import deque
-from pathlib import Path
 from PyQt6 import QtWidgets, QtCore, QtGui, sip
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 from gemini_translator.utils.glossary_tools import ContextManager
-from gemini_translator.ui.dialogs.setup import InitialSetupDialog  # noqa: F401  (ре-экспорт для main_translator_only)
+from gemini_translator.ui.dialogs.setup import InitialSetupDialog  # noqa: F401  (ре-экспорт для точки входа)
 from gemini_translator.utils.settings import SettingsManager, configure_settings_scope
-from gemini_translator.utils.project_manager import TranslationProjectManager
 from gemini_translator.core.translation_engine import TranslationEngine
 from gemini_translator.api import config as api_config
 from gemini_translator.core.task_manager import ChapterQueueManager
@@ -39,9 +36,24 @@ from gemini_translator.ui.themes import (
     DARK_STYLESHEET,
 )
 from gemini_translator.ui import theme_manager
-from gemini_translator.ui.selection_translator import install_selection_translator
 
 RESTART_INFO = {}
+
+# Приложение собрано только вокруг переводчика EPUB.
+TRANSLATOR_ONLY_DISABLED_PROVIDER_IDS = (
+    "workascii_chatgpt",
+    "web_chatgpt_free",
+    "web_perplexity",
+)
+
+os.environ["GT_TRANSLATOR_ONLY_MODE"] = "1"
+_disabled_ids = {
+    item.strip()
+    for item in os.environ.get("GT_DISABLED_PROVIDER_IDS", "").split(",")
+    if item.strip()
+}
+_disabled_ids.update(TRANSLATOR_ONLY_DISABLED_PROVIDER_IDS)
+os.environ["GT_DISABLED_PROVIDER_IDS"] = ",".join(sorted(_disabled_ids))
 
 # ---------------------------------------------------------------------------
 # Gemini EPUB Translator - Точка входа в приложение
@@ -55,276 +67,6 @@ RESTART_INFO = {}
 
 
 # --- БЛОК: АВАРИЙНЫЙ ПРОСМОТРЩИК ОШИБОК ---
-
-
-RANOBELIB_BUNDLED_DIRNAME = "ranobelib"
-RANOBELIB_MODULE_NAMES = (
-    "api_upload",
-    "constants",
-    "dialogs",
-    "main_window",
-    "models",
-    "parsers",
-    "utils",
-    "workers",
-)
-
-def patch_ranobelib_login_worker():
-    workers_module = importlib.import_module("workers")
-    login_worker_class = getattr(workers_module, "LoginWorker", None)
-    if not login_worker_class or getattr(login_worker_class, "_translatorfork_patched", False):
-        return
-
-    def verify_ranobelib_session(profile_dir):
-        from playwright.sync_api import sync_playwright
-
-        try:
-            with sync_playwright() as playwright:
-                context = workers_module._launch_persistent_chromium_context(
-                    playwright,
-                    user_data_dir=str(profile_dir),
-                    headless=True,
-                    viewport={"width": 1280, "height": 900},
-                )
-                try:
-                    page = context.pages[0] if context.pages else context.new_page()
-                    page.goto("https://ranobelib.me", wait_until="domcontentloaded", timeout=30000)
-                    page.wait_for_timeout(1200)
-                    has_auth = page.evaluate(
-                        """() => {
-                            try {
-                                const raw = localStorage.getItem("auth");
-                                if (!raw) {
-                                    return false;
-                                }
-                                const parsed = JSON.parse(raw);
-                                return !!(parsed && parsed.token && parsed.token.access_token);
-                            } catch (error) {
-                                return false;
-                            }
-                        }"""
-                    )
-                    return bool(has_auth), None
-                finally:
-                    context.close()
-        except Exception as error:
-            return False, str(error)
-
-    def stable_patched_run(self):
-        debug_log_path = None
-
-        def append_debug(message):
-            if not debug_log_path:
-                return
-            try:
-                debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-                with debug_log_path.open("a", encoding="utf-8") as debug_file:
-                    debug_file.write(message.rstrip() + "\n")
-            except Exception:
-                pass
-
-        try:
-            profile_dir = (
-                workers_module.BROWSER_PROFILE_DIR
-                if self._site == "ranobelib"
-                else workers_module.BROWSER_RULATE_DIR
-            )
-            debug_log_path = Path(profile_dir).parent / "login_worker_debug.log"
-            start_url = (
-                "https://ranobelib.me"
-                if self._site == "ranobelib"
-                else "https://tl.rulate.ru"
-            )
-            site_label = "RanobeLib" if self._site == "ranobelib" else "Rulate"
-            append_debug(
-                f"[START] site={self._site} profile={profile_dir} "
-                f"browsers={os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '')} "
-                f"node={os.environ.get('PLAYWRIGHT_NODEJS_PATH', '')} "
-                f"pkg={os.environ.get('PLAYWRIGHT_PACKAGE_ROOT', '')}"
-            )
-
-            from playwright.sync_api import sync_playwright
-
-            with sync_playwright() as playwright:
-                self._browser = workers_module._launch_persistent_chromium_context(
-                    playwright,
-                    user_data_dir=str(profile_dir),
-                    headless=False,
-                    log_callback=self.log_signal.emit,
-                )
-                page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
-                try:
-                    page.goto(start_url, timeout=60000)
-                except Exception:
-                    pass
-                self.log_signal.emit(
-                    "WARNING",
-                    f">>> ВОЙДИТЕ В АККАУНТ {site_label} И ЗАКРОЙТЕ БРАУЗЕР <<<",
-                )
-                append_debug(f"[BROWSER_OPENED] site={self._site}")
-                try:
-                    while True:
-                        page.wait_for_timeout(1000)
-                except Exception:
-                    pass
-                append_debug(f"[BROWSER_CLOSED] site={self._site}")
-
-            if self._site == "ranobelib":
-                auth_detected, verify_error = verify_ranobelib_session(profile_dir)
-                if auth_detected:
-                    append_debug("[VERIFY_OK] ranobelib auth detected")
-                    self.log_signal.emit(
-                        "SUCCESS",
-                        "Авторизация RanobeLib сохранена. Браузер можно не открывать повторно.",
-                    )
-                elif verify_error:
-                    append_debug(f"[VERIFY_WARN] {verify_error}")
-                    self.log_signal.emit(
-                        "WARNING",
-                        f"Браузер RanobeLib закрыт, но проверить сохранённую сессию не удалось: {verify_error}",
-                    )
-                else:
-                    append_debug("[VERIFY_FAIL] ranobelib auth not found")
-                    self.log_signal.emit(
-                        "WARNING",
-                        "Браузер RanobeLib закрыт, но автопроверка не нашла сохранённый токен. "
-                        "Если вход был выполнен, продолжайте работу в режиме «Через браузер». "
-                        "Для API-режима может понадобиться повторный вход.",
-                    )
-            else:
-                append_debug("[SUCCESS] rulate cookies saved")
-                self.log_signal.emit("SUCCESS", f"Браузер {site_label} закрыт. Куки сохранены.")
-        except Exception as error:
-            append_debug(f"[ERROR] {type(error).__name__}: {error}")
-            append_debug(traceback.format_exc())
-            self.log_signal.emit("ERROR", f"Ошибка авторизации: {error}")
-        finally:
-            append_debug("[FINISH]")
-            self.finished_signal.emit()
-
-    login_worker_class.run = stable_patched_run
-    login_worker_class._translatorfork_patched = True
-
-
-def iter_ranobelib_source_locations():
-    seen = set()
-    candidate_dirs = []
-
-    bundled_base = getattr(sys, "_MEIPASS", None)
-    if bundled_base:
-        candidate_dirs.append(Path(bundled_base) / RANOBELIB_BUNDLED_DIRNAME)
-
-    if getattr(sys, "frozen", False):
-        candidate_dirs.append(Path(sys.executable).resolve().parent / RANOBELIB_BUNDLED_DIRNAME)
-
-    candidate_dirs.append(Path(__file__).resolve().parent / RANOBELIB_BUNDLED_DIRNAME)
-
-    for candidate in candidate_dirs:
-        normalized = str(candidate.resolve(strict=False)).lower()
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        yield candidate
-
-
-def resolve_ranobelib_source_dir():
-    searched_locations = []
-
-    for base_dir in iter_ranobelib_source_locations():
-        searched_locations.append(str(base_dir))
-        if (base_dir / "main_window.py").exists():
-            return base_dir, searched_locations
-
-    return None, searched_locations
-
-
-def _make_return_to_menu_handler():
-    """Каноническая фабрика обработчика «вернуться в меню» для окон-инструментов
-    (RanobeLib, Gemini Reader): закрывает текущий QApplication.exec() с кодом
-    EXIT_CODE_REBOOT, чтобы главный цикл main.py пересоздал MainShell.
-
-    Была продублирована байт-в-байт как вложенная функция return_to_menu()
-    внутри build_ranobelib_window() и build_gemini_reader_window()
-    (dups-main-62, root-entry/design/8-return-to-menu-duplicate-closu).
-    """
-    def return_to_menu():
-        app = QtWidgets.QApplication.instance()
-        if app is not None:
-            app.exit(EXIT_CODE_REBOOT)
-
-    return return_to_menu
-
-
-def build_ranobelib_window():
-    source_dir, searched_locations = resolve_ranobelib_source_dir()
-    if not source_dir:
-        checked_paths = "\n".join(f"- {path}" for path in searched_locations) or "- (нет проверенных путей)"
-        raise FileNotFoundError(
-            "Не удалось найти встроенные исходники RanobeLib.\n\n"
-            f"Проверенные пути:\n{checked_paths}"
-        )
-
-    source_dir_str = str(source_dir)
-    sys.path = [path for path in sys.path if path != source_dir_str]
-    sys.path.insert(0, source_dir_str)
-    api_config.configure_playwright_runtime()
-
-    for module_name in RANOBELIB_MODULE_NAMES:
-        sys.modules.pop(module_name, None)
-
-    importlib.invalidate_caches()
-    import docx  # noqa: F401
-    patch_ranobelib_login_worker()
-
-    main_window_module = importlib.import_module("main_window")
-    window_class = getattr(main_window_module, "RanobeUploaderApp")
-    window = window_class()
-
-    if hasattr(window, "set_return_to_menu_handler"):
-        window.set_return_to_menu_handler(_make_return_to_menu_handler())
-
-    return window
-
-
-def launch_ranobelib_uploader():
-    try:
-        return build_ranobelib_window(), False
-    except Exception as direct_error:
-        source_dir, searched_locations = resolve_ranobelib_source_dir()
-        checked_paths = "\n".join(f"- {path}" for path in searched_locations) or "- (нет проверенных путей)"
-        source_status = f"Источник RanobeLib: {source_dir}" if source_dir else "Источник RanobeLib не найден."
-
-        QtWidgets.QMessageBox.critical(
-            None,
-            "Ошибка запуска RanobeLib",
-            f"Не удалось открыть встроенный RanobeLib.\n\n"
-            f"{type(direct_error).__name__}: {direct_error}\n\n"
-            f"{source_status}\n\n"
-            f"Проверенные пути исходников:\n{checked_paths}"
-        )
-        return None, False
-
-
-def build_gemini_reader_window():
-    import gemini_reader_v3
-
-    window = gemini_reader_v3.MainWindow()
-    if hasattr(window, "set_return_to_menu_handler"):
-        window.set_return_to_menu_handler(_make_return_to_menu_handler())
-
-    return window
-
-
-def launch_gemini_reader():
-    try:
-        return build_gemini_reader_window(), False
-    except Exception as direct_error:
-        QtWidgets.QMessageBox.critical(
-            None,
-            "Ошибка запуска Gemini Reader",
-            f"Не удалось открыть Gemini Reader.\n\n{type(direct_error).__name__}: {direct_error}",
-        )
-        return None, False
 
 
 def prepare_console_streams():
@@ -466,156 +208,6 @@ class LoadingDialog(QtWidgets.QDialog):
         self.label.setStyleSheet("font-size: 12pt; padding: 20px;")
         layout.addWidget(self.label)
         self.setFixedSize(300, 100)
-
-
-class ValidatorStartupDialog(QtWidgets.QDialog):
-    """Новый диалог для выбора способа запуска Валидатора."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Запуск инструмента проверки")
-        self.setMinimumWidth(400)
-        self.output_folder = None
-        self.original_epub_path = None
-        self.settings_manager = SettingsManager()
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.addWidget(QtWidgets.QLabel(
-            "Выберите, как запустить инструмент проверки:"))
-
-        history_btn = QtWidgets.QPushButton("📂 Загрузить проект из истории")
-        history_btn.clicked.connect(self.load_from_history)
-        layout.addWidget(history_btn)
-
-        manual_btn = QtWidgets.QPushButton("✍️ Выбрать папку и файл вручную")
-        manual_btn.clicked.connect(self.select_manually)
-        layout.addWidget(manual_btn)
-
-        cancel_btn = QtWidgets.QPushButton("Отмена")
-        cancel_btn.clicked.connect(self.reject)
-        layout.addWidget(cancel_btn)
-
-    def load_from_history(self):
-        history = self.settings_manager.load_project_history()
-        from gemini_translator.ui.dialogs.setup import ProjectHistoryDialog
-        dialog = ProjectHistoryDialog(history, self.settings_manager, self)
-        if dialog.exec():
-            project = dialog.get_selected_project()
-            if project:
-                self.output_folder = project.get("output_folder")
-                if self.output_folder:
-                    self.settings_manager.save_last_project_folder(self.output_folder)
-                self.original_epub_path = project.get("epub_path")
-                if self.output_folder and (
-                    not self.original_epub_path or not os.path.exists(self.original_epub_path)
-                ):
-                    self.original_epub_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                        self,
-                        "Выберите исходный EPUB для проекта",
-                        self.output_folder,
-                        "*.epub"
-                    )
-                    if not self.original_epub_path:
-                        return
-                    self.settings_manager.add_to_project_history(self.original_epub_path, self.output_folder)
-                if (
-                    self.output_folder
-                    and self.original_epub_path
-                    and os.path.isdir(self.output_folder)
-                    and os.path.exists(self.original_epub_path)
-                ):
-                    self._finalize_project_selection()
-                else:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Ошибка", "Пути в выбранном проекте недействительны.")
-
-    def select_manually(self):
-        start_folder = self.settings_manager.get_project_start_folder()
-        folder_dialog = QtWidgets.QFileDialog(self)
-        folder_dialog.setFileMode(QtWidgets.QFileDialog.FileMode.Directory)
-        folder_dialog.setOption(QtWidgets.QFileDialog.Option.ShowDirsOnly, True)
-        folder_dialog.setDirectory(start_folder)
-        if folder_dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
-            return
-
-        folder = folder_dialog.selectedFiles()[0]
-        self.settings_manager.save_last_project_folder(folder)
-
-        epub, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Выберите исходный EPUB", folder, "*.epub")
-        if not epub:
-            return
-
-        self.output_folder = folder
-        self.original_epub_path = epub
-        self._finalize_project_selection()
-        return
-
-    def _finalize_project_selection(self):
-        self._offer_cleanup_old_translations()
-        self.accept()
-
-    def _offer_cleanup_old_translations(self):
-        if not self.output_folder or not self.original_epub_path:
-            return
-
-        try:
-            project_manager = TranslationProjectManager(self.output_folder)
-            stale_entries = project_manager.find_stale_translations(self.original_epub_path)
-        except Exception as exc:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Проверка проекта",
-                f"Не удалось проверить проект на старые переводы:\n{exc}"
-            )
-            return
-
-        if not stale_entries:
-            return
-
-        preview = "\n".join(
-            f"- {os.path.basename(entry['full_path'])}"
-            for entry in stale_entries[:6]
-        )
-        if len(stale_entries) > 6:
-            preview += f"\n- ... и еще {len(stale_entries) - 6}"
-
-        msg_box = QtWidgets.QMessageBox(self)
-        msg_box.setWindowTitle("Очистка старых переводов")
-        msg_box.setIcon(QtWidgets.QMessageBox.Icon.Question)
-        msg_box.setText(
-            f"Найдено {len(stale_entries)} старых файлов перевода, которые относятся к главам, "
-            "уже отсутствующим в выбранном EPUB."
-        )
-        msg_box.setInformativeText(
-            f"Их можно удалить сразу перед открытием проекта.\n\nПримеры:\n{preview}"
-        )
-        yes_button = msg_box.addButton("Да, очистить", QtWidgets.QMessageBox.ButtonRole.YesRole)
-        msg_box.addButton("Нет, оставить", QtWidgets.QMessageBox.ButtonRole.NoRole)
-        msg_box.exec()
-
-        if msg_box.clickedButton() != yes_button:
-            return
-
-        result = project_manager.cleanup_stale_translations(stale_entries)
-        if result["failed"]:
-            failed_preview = "\n".join(
-                f"- {os.path.basename(path)}: {error}"
-                for path, error in result["failed"][:6]
-            )
-            QtWidgets.QMessageBox.warning(
-                self,
-                "Очистка завершена частично",
-                f"Удалено файлов: {result['removed']}.\n"
-                f"Не удалось удалить: {len(result['failed'])}.\n\n{failed_preview}"
-            )
-            return
-
-        QtWidgets.QMessageBox.information(
-            self,
-            "Очистка завершена",
-            f"Удалено старых файлов перевода: {result['removed']}."
-        )
 
 
 # Сколько ждём подтверждения, что Qt event loop реально доставил
@@ -1242,67 +834,12 @@ def initialize_global_resources(app: QApplication):
             f"КРИТИЧЕСКАЯ ОШИБКА при инициализации глобальных ресурсов: {e}")
 
 
-def open_tool_in_shell(shell, tool_id):
-    """Route a HomePage tool selection into the shared navigation shell."""
-    nav = shell.navigation
-    try:
-        if tool_id == 'translator':
-            from gemini_translator.ui.dialogs.setup import InitialSetupPage
-            nav.push(InitialSetupPage())
-        elif tool_id == 'validator':
-            startup = ValidatorStartupDialog()
-            if startup.exec():
-                from gemini_translator.ui.dialogs.validation import TranslationValidatorPage
-                pm = TranslationProjectManager(startup.output_folder)
-                nav.push(TranslationValidatorPage(
-                    startup.output_folder, startup.original_epub_path,
-                    retry_enabled=False, project_manager=pm))
-        elif tool_id == 'glossary':
-            from gemini_translator.ui.dialogs.glossary import GlossaryStartupDialog, GlossaryManagerPage
-            startup = GlossaryStartupDialog()
-            if startup.exec():
-                nav.push(GlossaryManagerPage(mode='standalone', project_path=startup.project_path))
-        elif tool_id == 'rulate_export':
-            from gemini_translator.ui.pages.rulate_export_page import RulateExportPage
-            nav.push(RulateExportPage())
-        elif tool_id == 'chapter_splitter':
-            from gemini_translator.ui.pages.chapter_splitter_page import ChapterSplitterPage
-            nav.push(ChapterSplitterPage())
-        elif tool_id == 'qidian_rulate_creator':
-            from gemini_translator.ui.pages.qidian_creator_page import QidianCreatorPage
-            nav.push(QidianCreatorPage())
-        elif tool_id == 'prompt_benchmark':
-            from gemini_translator.ui.pages.benchmark_page import PromptBenchmarkPage
-            nav.push(PromptBenchmarkPage())
-        elif tool_id == 'system_windows':
-            from gemini_translator.ui.pages.system_windows_page import SystemWindowsPage
-            nav.push(SystemWindowsPage())
-        elif tool_id == 'gemini_reader':
-            window, _ = launch_gemini_reader()
-            if window is not None:
-                from gemini_translator.ui.pages.external_window_page import EmbeddedWindowPage
-                nav.push(EmbeddedWindowPage(window, title=window.windowTitle() or "Gemini Reader"))
-        elif tool_id == 'ranobelib_uploader':
-            window, _ = launch_ranobelib_uploader()
-            if window is not None:
-                from gemini_translator.ui.pages.external_window_page import EmbeddedWindowPage
-                nav.push(EmbeddedWindowPage(window, title=window.windowTitle() or "RanobeLib Uploader"))
-    except Exception as e:
-        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-        QtWidgets.QMessageBox.critical(
-            shell, "Ошибка",
-            f"Не удалось открыть инструмент '{tool_id}':\n\n{tb_str}"
-        )
+def bootstrap_application(argv):
+    """Инициализация QApplication и основных сервисов переводчика.
 
-
-def bootstrap_application(argv, *, translator_only=False):
-    """Единая инициализация QApplication и основных сервисов приложения.
-
-    Общий bootstrap для обычного запуска (main.py) и для translator-only
-    режима (main_translator_only.py): регистрация главного потока,
-    Qt-локализация, Fusion-стиль на Windows, фикс дублирования Dock-иконки
-    на macOS, глобальные ресурсы, менеджеры и TranslationEngine в фоновом
-    потоке. Возвращает готовый к показу окна `app`.
+    Регистрация главного потока, Qt-локализация, Fusion-стиль на Windows,
+    фикс дублирования Dock-иконки на macOS, глобальные ресурсы, менеджеры и
+    TranslationEngine в фоновом потоке. Возвращает готовый к показу окна `app`.
 
     jieba больше не греется на старте безусловно (~18МБ у всех сессий):
     словарь строится при первом CJK-вызове в воркере (незаметно на фоне
@@ -1321,12 +858,8 @@ def bootstrap_application(argv, *, translator_only=False):
 
     app = ApplicationWithContext(argv)
 
-    if not translator_only:
-        # Health-подтверждение апдейтера: если процесс запущен хелпером
-        # обновления, пишем ack-файл — иначе хелпер откатит установку.
-        from gemini_translator.utils import update_installer as _upd_install
-        _upd_install.write_startup_acknowledgement()
-        _upd_install.cleanup_stale_staging()
+    # Health-подтверждение апдейтера в этой сборке не требуется: автообновление
+    # запускается не из переводчика, поэтому ack-файл не пишем.
 
     # --- ЛОКАЛИЗАЦИЯ СТАНДАРТНЫХ ЭЛЕМЕНТОВ QT ---
     # Загружаем русскую локализацию для контекстных меню (ПКМ) и диалогов Qt (QMessageBox, QInputDialog и т.д.)
@@ -1375,7 +908,6 @@ def bootstrap_application(argv, *, translator_only=False):
     app.initialize_managers()
     app.settings_manager = app.get_settings_manager()
     apply_saved_app_theme(app, app.settings_manager)
-    install_selection_translator(app)
     app.task_manager = ChapterQueueManager(event_bus=app.event_bus)
     app.global_version = APP_VERSION
     app.proxy_controller = GlobalProxyController(app.event_bus)
@@ -1421,53 +953,66 @@ if len(sys.argv) > 1 and sys.argv[1] == '--emergency-viewer':
 # Специальный код возврата для перезагрузки приложения (возврат в меню)
 EXIT_CODE_REBOOT = 2000
 
-if __name__ == "__main__":
-    app = bootstrap_application(sys.argv, translator_only=False)
+def run_translator_app():
+    """Единственный режим приложения — переводчик EPUB.
 
-    # --- ГЛАВНЫЙ ЦИКЛ ПРИЛОЖЕНИЯ ---
-    from gemini_translator.ui.shell import MainShell
-    from gemini_translator.ui.pages.home_page import HomePage
+    Окно настройки сессии перевода открывается напрямую, без главного меню
+    и без остальных инструментов.
+    """
+    app = bootstrap_application(sys.argv)
 
-    while True:
-        try:
-            shell = MainShell()
-            home = HomePage()
-            shell.set_home(home)
-            home.tool_selected.connect(lambda tool_id, s=shell: open_tool_in_shell(s, tool_id))
-        except Exception as e:
-            tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
-            QtWidgets.QMessageBox.critical(None, "Ошибка запуска", f"Не удалось создать главное окно:\n\n{tb_str}")
-            break
+    try:
+        while True:
+            main_window_to_run = None
+            loading_dialog = LoadingDialog()
 
-        shell.show()
-        exit_code = app.exec()
-        
-        # Гарантируем, что старое окно будет скрыто и уничтожено перед созданием нового
-        # в случае перезагрузки (EXIT_CODE_REBOOT)
-        if shell:
-            shell.hide()
-            shell.deleteLater()
-
-        if exit_code != EXIT_CODE_REBOOT:
-            break
-
-    # --- ЗАВЕРШЕНИЕ ---
-    print(f"[INFO] Приложение завершает работу.")
-    # Останавливаем OPDS-сервер
-    if hasattr(app, 'opds_manager') and app.opds_manager.is_running():
-        app.opds_manager.stop()
-    if hasattr(app, 'proxy_controller'):
-        app.proxy_controller.shutdown()
-    if hasattr(app, 'engine_thread') and app.engine_thread.isRunning():
-        if hasattr(app, 'engine'):
             try:
-                QtCore.QMetaObject.invokeMethod(
-                    app.engine,
-                    "cleanup",
-                    QtCore.Qt.ConnectionType.BlockingQueuedConnection,
+                main_window_to_run = InitialSetupDialog()
+            except Exception as error:
+                if loading_dialog.isVisible():
+                    loading_dialog.close()
+
+                tb_str = "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
                 )
-            except Exception:
-                pass
-        app.engine_thread.quit()
-        app.engine_thread.wait()
-    sys.exit(0)
+                error_message = (
+                    f"Произошла критическая ошибка при инициализации переводчика: "
+                    f"{type(error).__name__}\n\n--- Полный Traceback ---\n{tb_str}"
+                )
+                print(f"[CRITICAL STARTUP ERROR]\n{error_message}")
+                QtWidgets.QMessageBox.critical(
+                    None, "Ошибка запуска", error_message
+                )
+                main_window_to_run = None
+
+            if main_window_to_run:
+                main_window_to_run.show()
+                exit_code = app.exec()
+                if exit_code != EXIT_CODE_REBOOT:
+                    break
+            else:
+                break
+    finally:
+        print("[INFO] Приложение переводчика завершает работу.")
+        if hasattr(app, "opds_manager") and app.opds_manager.is_running():
+            app.opds_manager.stop()
+        if hasattr(app, "proxy_controller"):
+            app.proxy_controller.shutdown()
+        if hasattr(app, "engine_thread") and app.engine_thread.isRunning():
+            if hasattr(app, "engine"):
+                try:
+                    QtCore.QMetaObject.invokeMethod(
+                        app.engine,
+                        "cleanup",
+                        QtCore.Qt.ConnectionType.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
+            app.engine_thread.quit()
+            app.engine_thread.wait()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_translator_app())

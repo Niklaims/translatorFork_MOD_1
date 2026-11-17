@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import runpy
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files, copy_metadata
@@ -7,52 +8,32 @@ from PyInstaller.utils.hooks import collect_data_files, copy_metadata
 
 _BUILD_CONFIG = runpy.run_path(str(Path(SPECPATH) / "pyinstaller_config.py"))
 LAZY_HANDLER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_HANDLER_HIDDEN_IMPORTS"]
-LAZY_SERVER_HIDDEN_IMPORTS = _BUILD_CONFIG["LAZY_SERVER_HIDDEN_IMPORTS"]
+QA_RUNTIME_HIDDEN_IMPORTS = [
+    "gemini_translator.qa.book_metrics",
+    "razdel",
+]
 
 
-PROJECT_ROOT = Path.cwd()
-
-
-def discover_ranobelib_source_data():
-    base_dir = PROJECT_ROOT / "ranobelib"
-    if not (base_dir / "main_window.py").exists():
-        return []
-
-    return [
-        (str(file_path), "ranobelib")
-        for file_path in sorted(base_dir.iterdir())
-        if file_path.is_file()
-        and file_path.suffix.lower() in {".py", ".mjs"}
-        and ".bak" not in file_path.name
-    ]
+PROJECT_ROOT = Path.cwd().resolve()
+ICON_PATH = PROJECT_ROOT / "gemini_translator" / "GT.ico"
+APP_NAME = "translatorFork"
 
 
 datas = [
     ('config', 'config'),
-    ('README.md', '.'),
-    ('gemini_translator\\scripts\\chatgpt_workascii_bridge.cjs', 'gemini_translator\\scripts'),
-    ('gemini_translator\\scripts\\chatgpt_profile_launcher.cjs', 'gemini_translator\\scripts'),
-    ('qidian_rulate\\tags.txt', 'qidian_rulate'),
-    ('tools\\tomato', 'tools\\tomato'),
-    ('playwright_runtime\\node.exe', 'playwright_runtime'),
-    ('playwright_runtime\\package', 'playwright_runtime\\package'),
-    ('playwright_runtime\\ms-playwright', 'playwright_runtime\\ms-playwright'),
+    # Versioned QA prompts are read through importlib.resources at runtime and
+    # must therefore be collected, or every QA request fails closed.
+    ('gemini_translator/config/translation_qa_prompts.json', 'gemini_translator/config'),
 ]
-datas += [
-    (name, '.')
-    for name in ('ffmpeg.exe', 'ffprobe.exe')
-    if (PROJECT_ROOT / name).exists()
-]
-datas += discover_ranobelib_source_data()
 datas += collect_data_files('PyQt6')
 datas += collect_data_files('certifi')
 datas += collect_data_files('docx')
 datas += collect_data_files('jieba')
 datas += collect_data_files('lxml')
-datas += collect_data_files('werkzeug')
 # Qoder CLI (~100 МБ) в сборку не кладётся: хендлер скачивает его при первом
 # запросе к Qoder и сверяет с хешем из RECORD пакета, поэтому нужны его метаданные.
 datas += copy_metadata('qoder-agent-sdk')
+datas += collect_data_files('werkzeug')
 
 
 a = Analysis(
@@ -64,16 +45,21 @@ a = Analysis(
         'PyQt6.sip',
         'docx',
         'pypdf',
-        'playwright.sync_api',
-        'google.genai',
-        'google.genai.types',
         *LAZY_HANDLER_HIDDEN_IMPORTS,
-        *LAZY_SERVER_HIDDEN_IMPORTS,
+        *QA_RUNTIME_HIDDEN_IMPORTS,
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'edge_tts',
+        'nltk',
+        'playwright',
+        'playwright.async_api',
+        'playwright.sync_api',
+        'pyaudio',
+        'pydub',
+    ],
     noarchive=False,
     optimize=0,
 )
@@ -84,7 +70,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='translatorFork-full',
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -95,7 +81,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['gemini_translator\\GT.ico'],
+    icon=[str(ICON_PATH)] if sys.platform == "win32" and ICON_PATH.exists() else None,
 )
 
 coll = COLLECT(
@@ -105,5 +91,13 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='translatorFork-full',
+    name=APP_NAME,
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name='translatorFork.app',
+        icon=str(ICON_PATH) if ICON_PATH.exists() else None,
+        bundle_identifier='com.siberianteam.translatorfork',
+    )

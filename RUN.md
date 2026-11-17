@@ -20,14 +20,8 @@ chmod +x build_translator_linux.sh
 ./build_translator_linux.sh
 ```
 
-The resulting file will be `dist/translatorFork-translator`.
+The resulting file will be `dist/translatorFork`.
 
-If you plan to use Playwright-based tools such as ChatGPT Web automation or RanobeLib uploader, install the browser once after the virtual environment is created:
-
-```bash
-.venv/bin/python -m playwright install chromium
-```
-
-For the ChatGPT Web browser mode, `node` must also be available in `PATH`.
+This build is translator-only: it does not ship Playwright or browser web providers, so Chromium and `node` are not required.
 
 If your distro does not have `python3-venv`, install it first with your system package manager.

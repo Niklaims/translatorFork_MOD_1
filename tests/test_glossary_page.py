@@ -10,7 +10,7 @@ from PyQt6 import QtWidgets  # noqa: F401
 # that direction) resolves the cycle before we try the other direction.
 from gemini_translator.ui.widgets.glossary_widget import GlossaryWidget  # noqa: F401
 
-from gemini_translator.ui.pages.glossary_page import GlossaryManagerPage
+from gemini_translator.ui.dialogs.glossary import GlossaryManagerPage
 from gemini_translator.ui.shell import ShellPage
 
 

@@ -1,5 +1,5 @@
 #ifndef AppBuildName
-#define AppBuildName "translatorFork_MOD"
+#define AppBuildName "translatorFork"
 #endif
 
 ; Версия приходит из CI: iscc /DMyAppVersion=<версия из version.py>.

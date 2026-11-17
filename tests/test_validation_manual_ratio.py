@@ -3,7 +3,7 @@ import zipfile
 import pytest
 from PyQt6 import QtWidgets
 
-from gemini_translator.ui.pages.validation_page import TranslationValidatorPage
+from gemini_translator.ui.dialogs.validation import TranslationValidatorPage
 
 
 class SavedFilters:

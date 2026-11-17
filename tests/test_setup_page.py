@@ -5,7 +5,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import QtWidgets  # noqa: F401
 
-from gemini_translator.ui.pages.setup_page import InitialSetupPage
+from gemini_translator.ui.dialogs.setup import InitialSetupPage
 from gemini_translator.ui.shell import ShellPage
 
 

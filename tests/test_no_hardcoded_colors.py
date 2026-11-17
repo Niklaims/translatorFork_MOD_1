@@ -20,7 +20,6 @@ TOKENIZED_FILES: list[str] = [
     "gemini_translator/ui/dialogs/epub.py",
     "gemini_translator/ui/dialogs/misc.py",
     "gemini_translator/ui/dialogs/chapter_editor.py",
-    "gemini_translator/ui/pages/rulate_export_page.py",
     "gemini_translator/utils/markdown_viewer.py",
 ]
 

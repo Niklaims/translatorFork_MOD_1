@@ -92,26 +92,6 @@ class RenderProxyStatusCharacterizationTests(unittest.TestCase):
         self.assertNotIn("Пользователь", label.tooltip)
 
 
-class HomePageRoutesThroughCanonicalRendererTests(unittest.TestCase):
-    """(б) HomePage._update_proxy_display обязан звать render_proxy_status."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-
-    def test_update_proxy_display_delegates_to_render_proxy_status(self):
-        from gemini_translator.ui.pages import home_page
-
-        home = home_page.HomePage()
-        self.addCleanup(home.close)
-
-        settings = {"enabled": True, "type": "SOCKS5", "host": "10.0.0.1", "port": 9050}
-        with patch.object(home_page, "render_proxy_status") as mock_render:
-            home._update_proxy_display(settings)
-
-        mock_render.assert_called_once_with(home.proxy_status_label, settings)
-
-
 class InitialSetupDialogRoutesThroughCanonicalRendererTests(unittest.TestCase):
     """(б) InitialSetupDialog._update_proxy_display обязан звать render_proxy_status."""
 

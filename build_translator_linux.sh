@@ -48,8 +48,8 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   "$PYTHON_BIN" -m pip install --upgrade pip
 fi
 
-REQ_FILE="requirements-translator-only.txt"
-SPEC_FILE="translatorFork-translator-only.spec"
+REQ_FILE="requirements.txt"
+SPEC_FILE="translatorFork.spec"
 BUILD_STAMP="$VENV_DIR/.translator-build.sha256"
 CURRENT_HASH="$("$PYTHON_BIN" -c "from pathlib import Path; import hashlib; files = [Path('$REQ_FILE'), Path('$SPEC_FILE')]; digest = hashlib.sha256(); [digest.update(path.read_bytes()) for path in files]; print(digest.hexdigest())")"
 SAVED_HASH=""
@@ -63,17 +63,23 @@ if [[ "$CURRENT_HASH" != "$SAVED_HASH" ]] || ! "$PYTHON_BIN" -c "import PyInstal
   printf '%s' "$CURRENT_HASH" > "$BUILD_STAMP"
 fi
 
-rm -rf "build/translatorFork-translator"
-rm -f "dist/translatorFork-translator" "dist/translatorFork-translator.exe"
+rm -rf "build/translatorFork"
+rm -rf "dist/translatorFork" "dist/translatorFork.exe" "dist/translatorFork.app"
 
 "$PYTHON_BIN" -m PyInstaller --clean --noconfirm "$SPEC_FILE"
 
-ARTIFACT="dist/translatorFork-translator"
-if [[ -f "${ARTIFACT}.exe" ]]; then
-  ARTIFACT="${ARTIFACT}.exe"
+if [[ -d "dist/translatorFork" ]]; then
+  ARTIFACT="dist/translatorFork/translatorFork"
+elif [[ -f "dist/translatorFork" ]]; then
+  ARTIFACT="dist/translatorFork"
+elif [[ -f "dist/translatorFork.exe" ]]; then
+  ARTIFACT="dist/translatorFork.exe"
+else
+  echo "[ERROR] Build finished without an output artifact."
+  exit 1
 fi
 
-if [[ ! -f "$ARTIFACT" ]]; then
+if [[ ! -e "$ARTIFACT" ]]; then
   echo "[ERROR] Build finished without an output artifact."
   exit 1
 fi
@@ -81,3 +87,4 @@ fi
 echo
 echo "[OK] Translator-only build finished:"
 echo "     $SCRIPT_DIR/$ARTIFACT"
+
