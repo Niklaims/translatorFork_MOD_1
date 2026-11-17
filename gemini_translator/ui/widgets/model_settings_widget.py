@@ -434,6 +434,9 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
         self._provider_event_source_id = None
         self._mcp_mode = False
         self._mcp_restore_provider_id = None
+        # Сохранённая модель, которую ещё нельзя применить: список моделей
+        # провайдера подгрузится позже (смена провайдера/асинхронный refresh).
+        self._pending_model_name = None
         self._models_refresher = DynamicModelsRefresher(self)
         self._models_refresher.refreshed.connect(self._on_dynamic_models_refreshed)
         # Виджету интересна только смена провайдера; не будимся на чужие события.
@@ -484,6 +487,8 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
     
         # 2. Основной обработчик смены модели остается
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        # Ручной выбор модели отменяет отложенное восстановление из снимка.
+        self.model_combo.activated.connect(self._on_model_combo_activated)
     
 
         
@@ -1264,8 +1269,14 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
                 index = self.model_combo.findText(model_name)
                 if index != -1:
                     self.model_combo.setCurrentIndex(index)
-                elif self.model_combo.count() > 0:
-                    self.model_combo.setCurrentIndex(0)
+                    self._pending_model_name = None
+                else:
+                    # Список моделей ещё не соответствует сохранённому
+                    # провайдеру или модель появится после refresh — запоминаем
+                    # выбор и применим, когда список моделей будет готов.
+                    self._pending_model_name = model_name
+                    if self.model_combo.count() > 0:
+                        self.model_combo.setCurrentIndex(0)
             
             self.rpm_spin.setValue(settings.get('rpm_limit', 10))
             self.rpd_spin.setValue(settings.get('rpd_limit', 0))
@@ -1352,6 +1363,10 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
             finally:
                 self.thinking_level_combo.blockSignals(False)
     
+    def _on_model_combo_activated(self, _index: int):
+        """Пользователь сам выбрал модель — отложенное восстановление не нужно."""
+        self._pending_model_name = None
+
     # --- ИЗМЕНЕНИЕ 2: Новый слот для прослушки шины ---
     @pyqtSlot(dict)
     def on_event(self, event: dict):
@@ -1550,7 +1565,15 @@ class ModelSettingsWidget(EventBusMixin, QGroupBox):
         self._update_model_combo_popup_width()
         
         if self.model_combo.count() > 0:
-            preferred_index = self._find_model_index(model_id=current_model_id)
+            preferred_index = -1
+            # Отложенный выбор из снимка настроек важнее текущего текста:
+            # комбобокс мог остаться от другого провайдера.
+            if self._pending_model_name:
+                preferred_index = self._find_model_index(model_name=self._pending_model_name)
+                if preferred_index != -1:
+                    self._pending_model_name = None
+            if preferred_index == -1:
+                preferred_index = self._find_model_index(model_id=current_model_id)
             if preferred_index == -1:
                 preferred_index = self._find_model_index(model_name=current_model_name)
             if preferred_index == -1:
